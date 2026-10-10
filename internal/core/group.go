@@ -86,14 +86,50 @@ func park(t *task.TCB, c mem.CommitSet, evs ...proto.Event) mem.CommitSet {
 
 // afterPark runs once a task parked in Waiting(Group) is in the wait set. If
 // the group came back between the decision and the hand-back, the group_up
-// that woke the others missed it: it is woken here. Otherwise the half-open
-// timer is armed, so a probe goes out when one is due.
-func (e *Env) afterPark(ctx context.Context, id string, g *Group) {
-	if g == nil || g.Ctl.Breaker.State() == group.Closed {
+// that woke the others missed it: it is woken here. So is a task that parked
+// because every group along its fallback chain was down (movable) when one of
+// them has come back since: it gets to move. Otherwise the half-open timer is
+// armed, so a probe goes out when one is due.
+func (e *Env) afterPark(ctx context.Context, id string, g *Group, movable bool) {
+	if g == nil || g.Ctl.Breaker.State() == group.Closed || (movable && e.fallbackUp(g)) {
 		e.Wake(ctx, id, task.WaitGroup)
 		return
 	}
 	e.armKick(g, -1)
+}
+
+// fallbackUp reports whether a group along g's fallback chain is up.
+func (e *Env) fallbackUp(g *Group) bool {
+	seen := map[string]bool{g.Class: true}
+	for name := g.Fallback; name != "" && !seen[name]; {
+		seen[name] = true
+		fg := e.groupOf(name)
+		if fg == nil {
+			return false
+		}
+		if !e.groupDown(fg) {
+			return true
+		}
+		name = fg.Fallback
+	}
+	return false
+}
+
+// fallsBackTo reports whether up is along h's fallback chain.
+func (e *Env) fallsBackTo(h, up *Group) bool {
+	seen := map[string]bool{h.Class: true}
+	for name := h.Fallback; name != "" && !seen[name]; {
+		if name == up.Class {
+			return true
+		}
+		seen[name] = true
+		fg := e.groupOf(name)
+		if fg == nil {
+			return false
+		}
+		name = fg.Fallback
+	}
+	return false
 }
 
 // armKick sets the group's half-open timer, unless one is set: in d, or when
@@ -159,11 +195,22 @@ func (e *Env) onKick(g *Group) {
 	}
 }
 
-// wakeGroup makes every task waiting for the group Ready again.
+// wakeGroup makes every task waiting for the group Ready again, and every
+// task waiting for a group whose fallback chain reaches it, unless pinned to
+// its class: those parked because their fallback was down too, and are woken
+// to try the move again (design §6.3). One that cannot move parks again.
 func (e *Env) wakeGroup(ctx context.Context, g *Group) {
 	e.stopKick(g)
 	for _, id := range e.Sched.WaitingFor(g.Class, task.WaitGroup) {
 		e.Wake(ctx, id, task.WaitGroup)
+	}
+	for _, h := range e.Groups {
+		if h == g || !e.fallsBackTo(h, g) {
+			continue
+		}
+		for _, id := range e.Sched.WaitingFor(h.Class, task.WaitGroup) {
+			e.wakeIf(ctx, id, task.WaitGroup, func(t *task.TCB) bool { return !t.PinClass })
+		}
 	}
 }
 
@@ -174,8 +221,13 @@ func (e *Env) wakeGroup(ctx context.Context, g *Group) {
 // cancel committed first makes the store refuse the commit, and the task is
 // finalised instead.
 func (e *Env) Wake(ctx context.Context, id string, why task.WaitReason) bool {
-	t, ok := e.Sched.CheckoutIf(id, func(t *task.TCB) bool { return t.State == task.Waiting && t.Wait == why })
-	if !ok {
+	return e.wakeIf(ctx, id, why, func(*task.TCB) bool { return true })
+}
+
+// wakeIf is Wake for a task that also satisfies ok.
+func (e *Env) wakeIf(ctx context.Context, id string, why task.WaitReason, ok func(*task.TCB) bool) bool {
+	t, found := e.Sched.CheckoutIf(id, func(t *task.TCB) bool { return t.State == task.Waiting && t.Wait == why && ok(t) })
+	if !found {
 		return false
 	}
 	if e.halt().Err() != nil {

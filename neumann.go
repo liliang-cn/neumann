@@ -1067,13 +1067,18 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 	sem := make(chan struct{}, 32)
 	var wg sync.WaitGroup
 	for i, t := range tasks {
-		if m.byClass[t.Class] == nil {
-			m.cfg.Logf("neumann: recovered task %s belongs to class %q, which this machine does not run", t.ID, t.Class)
-		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer func() { <-sem; wg.Done() }()
+			if m.byClass[t.Class] == nil && !t.State.Terminal() {
+				// Its class is gone from the configuration: it moves to the
+				// default group, or fails (design §4.5).
+				m.cfg.Logf("neumann: recovered task %s belongs to class %q, which this machine does not run; moving it to %q", t.ID, t.Class, m.defClass)
+				if errs[i] = m.env.Rehome(ctx, t, m.defClass); errs[i] != nil {
+					return
+				}
+			}
 			batches[i], errs[i] = m.env.Recover(ctx, t)
 		}()
 	}

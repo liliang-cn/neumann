@@ -23,7 +23,8 @@ func TestForProvider(t *testing.T) {
 		{Role: task.RoleAssistant, Parts: []task.Part{r("b"), {Kind: task.PartText, Text: "y"}}},
 	}
 	got := forProvider(msgs, "b")
-	if len(got) != 3 || len(got[1].Parts) != 2 || got[1].Parts[0].Provider != "" || len(got[2].Parts) != 2 {
+	// The two assistant turns around the one left out are joined.
+	if len(got) != 2 || len(got[1].Parts) != 4 || got[1].Parts[0].Provider != "" || got[1].Parts[2].Provider != "b" {
 		t.Fatalf("for b: %+v", got)
 	}
 	if len(msgs[1].Parts) != 3 || len(msgs[2].Parts) != 1 {
@@ -31,6 +32,24 @@ func TestForProvider(t *testing.T) {
 	}
 	if a := forProvider(msgs[:2], "a"); &a[0] != &msgs[0] {
 		t.Fatal("copied with nothing to leave out")
+	}
+}
+
+// Leaving out a message whose only part was foreign reasoning does not leave
+// two messages of one role side by side: the ones it separated are joined.
+func TestForProviderKeepsRolesAlternating(t *testing.T) {
+	msgs := []task.Message{
+		task.Text(task.RoleUser, "q"),
+		{Role: task.RoleAssistant, Parts: []task.Part{{Kind: task.PartReasoning, Provider: "a", Opaque: json.RawMessage(`{}`)}}},
+		task.Text(task.RoleUser, "steer"),
+		task.Text(task.RoleAssistant, "x"),
+	}
+	got := forProvider(msgs, "b")
+	if len(got) != 2 || got[0].Role != task.RoleUser || len(got[0].Parts) != 2 || got[0].Parts[1].Text != "steer" || got[1].TextContent() != "x" {
+		t.Fatalf("for b: %+v", got)
+	}
+	if len(msgs[0].Parts) != 1 {
+		t.Fatal("the registers were changed")
 	}
 }
 

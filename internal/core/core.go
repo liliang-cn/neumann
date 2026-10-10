@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -217,8 +218,10 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	allow := append([]string(nil), t.Allow...)
 	deny := append([]string(nil), t.Deny...)
 	var parked *Group
+	movable := false // parked though it may still move: every group along its fallback chain was down
 	if t.State == task.Waiting && t.Wait == task.WaitGroup {
 		parked = e.groupOf(t.Class)
+		movable = !t.PinClass && !slices.ContainsFunc(c.Events, func(ev proto.Event) bool { return ev.Kind == proto.EvMigrateRefused })
 	}
 	if !e.handBack(ctx, t, batch) {
 		return // cancelled meanwhile and finalised: the batch is never sent
@@ -228,7 +231,7 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		e.dispatch(id, allow, deny, batch)
 	}
 	if parked != nil {
-		e.afterPark(ctx, id, parked)
+		e.afterPark(ctx, id, parked, movable)
 	}
 }
 

@@ -18,7 +18,19 @@ import (
 const (
 	ReasonCancelled = "cancelled" // an outside Cancel: the task ends Cancelled
 	ReasonDeadline  = "deadline"  // its deadline passed: the task ends Failed
+
+	// ReasonClassRemoved: a restart found the task's class gone from the
+	// configuration and the default group unable to take it (Rehome). The
+	// task ends Failed.
+	ReasonClassRemoved = "class_removed"
 )
+
+// failReasons are the cancel reasons that end a task Failed rather than
+// Cancelled, with the error text of their failed event.
+var failReasons = map[string]string{
+	ReasonDeadline:     "deadline exceeded",
+	ReasonClassRemoved: "its class is no longer configured, and the default group cannot take it (see migrate_refused)",
+}
 
 // Cancel commits a cancel for a task, then signals it (design §9.5): the
 // task's context ends, so a model call or tool call in flight for it stops at
@@ -127,7 +139,7 @@ var errCannotFinalise = errors.New("cannot assemble the final commit of a cancel
 //     is cancelled; any other ran, or may have, and is unknown, with a
 //     reconcile_needed event marked cancelled: the record is left for an
 //     operator, and the task does not wait for it;
-//   - the task ends Cancelled, or Failed for a deadline, with the reason as
+//   - the task ends Cancelled, or Failed for a deadline or a removed class, with the reason as
 //     StopReason. The store reports each undelivered steer as steer_dropped
 //     in the same commit.
 func (e *Env) cancelSet(ctx context.Context, t *task.TCB, c mem.CommitSet, fates map[string]fate, fallback string) (mem.CommitSet, error) {
@@ -184,10 +196,10 @@ func (e *Env) cancelSet(ctx context.Context, t *task.TCB, c mem.CommitSet, fates
 	t.Wait = task.WaitNone
 	t.StopReason = reason
 	t.Version++
-	if reason == ReasonDeadline {
+	if text, ok := failReasons[reason]; ok {
 		t.State = task.Failed
 		c.Events = append(c.Events, proto.NewEvent(proto.EvFailed, t.ID,
-			map[string]string{"error": "deadline exceeded", "stop_reason": reason}))
+			map[string]string{"error": text, "stop_reason": reason}))
 	} else {
 		t.State = task.Cancelled
 		c.Events = append(c.Events, proto.NewEvent(proto.EvCancelled, t.ID, map[string]string{"stop_reason": reason}))

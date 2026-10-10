@@ -17,6 +17,7 @@ import (
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/bus/builtin"
 	"github.com/liliang-cn/neumann/limit"
+	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/sim"
@@ -927,5 +928,164 @@ func TestStatusReportsGroups(t *testing.T) {
 	}
 	if !strings.Contains(st.Groups[1].Model, "py") {
 		t.Fatalf("group y %+v", st.Groups[1])
+	}
+}
+
+// A task parked on its own group because its fallback was down too moves
+// once the fallback comes back: group_up on the fallback also wakes the
+// waiting tasks of every group whose fallback chain reaches it, though the
+// task's own group, open for quota, never half-opens.
+func TestParkedTaskMigratesWhenItsFallbackReturns(t *testing.T) {
+	clk := sim.NewClock(clock0)
+	var littleQuota atomic.Bool
+	littleQuota.Store(true)
+	big := &adapter{name: "big", fn: func(ctx context.Context, req model.Request) (model.Response, error) {
+		return model.Response{}, sim.QuotaExhausted()
+	}}
+	little := &adapter{name: "little", fn: func(ctx context.Context, req model.Request) (model.Response, error) {
+		if littleQuota.Load() {
+			return model.Response{}, sim.QuotaExhausted()
+		}
+		return sim.Reply("little done"), nil
+	}}
+	m := startWith(t, neumann.Config{
+		Clock: clk,
+		Groups: []neumann.GroupConfig{
+			{Class: "big", Model: big, Fallback: "little"},
+			{Class: "little", Model: little},
+		},
+	})
+	l := submit(t, m, proto.Instruction{TaskID: "L", Input: "l", Class: "little"})
+	waitFor(t, func() bool { tc, _ := m.Load(bg, l); return tc.State == task.Waiting && tc.Wait == task.WaitGroup })
+	b := submit(t, m, proto.Instruction{TaskID: "B", Input: "b", Class: "big"})
+	waitFor(t, func() bool { tc, _ := m.Load(bg, b); return tc.State == task.Waiting && tc.Wait == task.WaitGroup })
+
+	littleQuota.Store(false)
+	if err := m.GroupReset(bg, "little"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { tc, _ := m.Load(bg, l); return tc.State == task.Done })
+	for range 50 {
+		clk.Advance(time.Hour)
+		time.Sleep(2 * time.Millisecond)
+	}
+	got := loadTask(t, m, b)
+	t.Logf("B: %s/%s in class %q; little is %s", got.State, got.Wait, got.Class, groupOf(t, m, "little").Breaker)
+	if got.State == task.Waiting && got.Class == "big" {
+		t.Fatalf("B is still parked on its quota-open group 50h after its fallback came back")
+	}
+	if got.State != task.Done || got.Class != "little" || got.LastAnswer() != "little done" {
+		t.Fatalf("B ended %s in %q: %q", got.State, got.Class, got.LastAnswer())
+	}
+}
+
+// The same with the task's own group open for transient failures: a backlog
+// parked there while the fallback was down too moves as soon as the fallback
+// comes back (its own half-open probe succeeds), not one task per open period
+// of the task's group.
+func TestParkedBacklogMovesWhenTheFallbackComesBack(t *testing.T) {
+	clk := sim.NewClock(clock0)
+	var littleDown atomic.Bool
+	littleDown.Store(true)
+	big := &adapter{name: "big", fn: func(ctx context.Context, req model.Request) (model.Response, error) {
+		return model.Response{}, sim.Transient()
+	}}
+	little := &adapter{name: "little", fn: func(ctx context.Context, req model.Request) (model.Response, error) {
+		if littleDown.Load() {
+			return model.Response{}, sim.Transient()
+		}
+		return sim.Reply("little done"), nil
+	}}
+	m := startWith(t, neumann.Config{
+		Clock: clk, BackoffJitter: identity, MaxModelRetries: 100,
+		Groups: []neumann.GroupConfig{
+			{Class: "big", Model: big, Fallback: "little", BreakerThreshold: 1, BreakerOpenFor: time.Hour},
+			{Class: "little", Model: little, BreakerThreshold: 1, BreakerOpenFor: time.Minute},
+		},
+	})
+	l := submit(t, m, proto.Instruction{Input: "l", Class: "little"})
+	waitFor(t, func() bool { return groupOf(t, m, "little").Breaker == "open" })
+	var ids []string
+	for range 5 {
+		ids = append(ids, submit(t, m, proto.Instruction{Input: "b", Class: "big"}))
+	}
+	waitFor(t, func() bool { return groupOf(t, m, "big").Breaker == "open" })
+	clk.Advance(2 * time.Second) // the backoffs run out: every task parks
+	quiet(t, m)
+	for _, id := range ids {
+		if tc := loadTask(t, m, id); tc.State != task.Waiting || tc.Wait != task.WaitGroup || tc.Class != "big" {
+			t.Fatalf("%s is %s/%s in %q before the fallback is back", id, tc.State, tc.Wait, tc.Class)
+		}
+	}
+	littleDown.Store(false)
+	begin := clk.Now()
+	runUntilDone(t, m, clk, time.Second, append(ids, l)...)
+	if took := clk.Now().Sub(begin); took > 5*time.Minute {
+		t.Fatalf("the backlog took %v to move", took)
+	}
+	for _, id := range ids {
+		if tc := loadTask(t, m, id); tc.State != task.Done || tc.Class != "little" {
+			t.Fatalf("%s ended %s in %q", id, tc.State, tc.Class)
+		}
+	}
+}
+
+// A restart under a configuration without the task's class moves the task to
+// the default group (migrated, reason class_removed), when that group can
+// take it; otherwise the task ends Failed, StopReason class_removed.
+func TestRecoveredTaskOfARemovedClass(t *testing.T) {
+	for _, fits := range []bool{true, false} {
+		t.Run(map[bool]string{true: "moved", false: "failed"}[fits], func(t *testing.T) {
+			store := mem.NewMemory()
+			old := &adapter{name: "old", fn: func(context.Context, model.Request) (model.Response, error) {
+				return model.Response{}, sim.QuotaExhausted()
+			}}
+			m1, err := neumann.New(neumann.Config{Store: store, Logf: t.Logf, Devices: []bus.Device{echoDev()},
+				Groups: []neumann.GroupConfig{{Class: "old", Model: old}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m1.Start(bg); err != nil {
+				t.Fatal(err)
+			}
+			id := submit(t, m1, proto.Instruction{Input: "q"})
+			waitFor(t, func() bool { tc, _ := m1.Load(bg, id); return tc.State == task.Waiting && tc.Wait == task.WaitGroup })
+			stop(t, m1)
+
+			var caps *model.Caps
+			if !fits {
+				caps = &model.Caps{} // calls no tools; the task has one
+			}
+			m2 := startWith(t, neumann.Config{Store: store, Devices: []bus.Device{echoDev()},
+				Groups: []neumann.GroupConfig{{Class: "new", Model: &adapter{name: "new", caps: caps, fn: reply("new done")}}}})
+			got := waitDone(t, m2, id)
+			mig := migratedEvents(t, m2, id)
+			if fits {
+				if got.State != task.Done || got.Class != "new" || got.LastAnswer() != "new done" {
+					t.Fatalf("task ended %s in %q: %q", got.State, got.Class, got.LastAnswer())
+				}
+				if len(mig) != 1 || mig[0]["from"] != "old" || mig[0]["to"] != "new" || mig[0]["reason"] != "class_removed" {
+					t.Fatalf("migrated %v", mig)
+				}
+				return
+			}
+			if got.State != task.Failed || got.StopReason != "class_removed" || len(mig) != 0 {
+				t.Fatalf("task ended %s %q, migrated %v", got.State, got.StopReason, mig)
+			}
+			var check string
+			for _, ev := range eventsOf(t, m2, id) {
+				if ev.Kind == proto.EvMigrateRefused {
+					var d map[string]string
+					json.Unmarshal(ev.Data, &d)
+					check = d["check"]
+				}
+			}
+			if d := failedEvent(t, m2, id); d["stop_reason"] != "class_removed" || check != "tools" {
+				t.Fatalf("failed event %v, refused by %q", d, check)
+			}
+			if st := m2.Status(); st.Unfinished != 0 {
+				t.Fatalf("status %+v", st)
+			}
+		})
 	}
 }

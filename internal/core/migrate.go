@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -198,12 +199,50 @@ func (e *Env) SetClass(ctx context.Context, t *task.TCB, class string) error {
 	return nil
 }
 
+// Rehome gives a recovered task whose class the machine no longer runs to
+// class, the default group (design §4.5), before Recover settles it. It
+// passes the same capability checks as any move: the task is then committed
+// in class, its state unchanged, with a migrated event (reason
+// class_removed). Otherwise a cancel whose reason is class_removed is
+// committed with a migrate_refused event naming the failed check, and
+// Recover's final commit ends the task Failed with that StopReason, settling
+// its calls as for any cancel. A task with a cancel already pending is left
+// to Recover. t is the caller's, as for Recover.
+func (e *Env) Rehome(ctx context.Context, t *task.TCB, class string) error {
+	target := e.groupOf(class)
+	if target == nil {
+		return fmt.Errorf("neumann: unknown class %q", class)
+	}
+	if refused := e.fits(t, target); refused != nil {
+		in := mem.Interrupt{TaskID: t.ID, Kind: mem.InterruptCancel, Text: ReasonClassRemoved}
+		return e.Commit(ctx, mem.CommitSet{
+			NewInterrupts: []mem.Interrupt{in},
+			Events:        []proto.Event{proto.NewEvent(proto.EvMigrateRefused, t.ID, refused.data())},
+		})
+	}
+	moved := t.Clone()
+	moved.Class = class
+	moved.Version++
+	ev := proto.NewEvent(proto.EvMigrated, t.ID, map[string]any{"from": t.Class, "to": class, "reason": ReasonClassRemoved})
+	err := e.Commit(ctx, mem.CommitSet{Task: moved, Events: []proto.Event{ev}})
+	switch {
+	case errors.Is(err, mem.ErrCancelPending):
+		return nil // cancelled before: Recover finalises it where it is
+	case err != nil:
+		return err
+	}
+	*t = *moved
+	return nil
+}
+
 // forProvider is msgs as a request to provider carries them: a reasoning
 // part another provider produced is left out (design §3.1), since its
 // signature is bound to that provider and no other can read it. A message
-// left with no parts is left out too. The registers keep everything: a task
-// moved back finds its reasoning again. msgs is returned as it is when there
-// is nothing to leave out.
+// left with no parts is left out too, and when that puts two messages of one
+// role side by side, they are joined into one, so a provider that wants the
+// roles to alternate is never sent anything else. The registers keep
+// everything: a task moved back finds its reasoning again. msgs is returned
+// as it is when there is nothing to leave out.
 func forProvider(msgs []task.Message, provider string) []task.Message {
 	foreign := func(p task.Part) bool {
 		return p.Kind == task.PartReasoning && p.Provider != "" && p.Provider != provider
@@ -215,14 +254,21 @@ func forProvider(msgs []task.Message, provider string) []task.Message {
 	}
 	out := make([]task.Message, i, len(msgs))
 	copy(out, msgs[:i])
+	join := false // a message was left out just before this one
 	for _, m := range msgs[i:] {
 		if has(m) {
 			m.Parts = slices.DeleteFunc(slices.Clone(m.Parts), foreign)
 			if len(m.Parts) == 0 {
+				join = true
 				continue
 			}
 		}
-		out = append(out, m)
+		if n := len(out); join && n > 0 && out[n-1].Role == m.Role {
+			out[n-1].Parts = append(slices.Clone(out[n-1].Parts), m.Parts...)
+		} else {
+			out = append(out, m)
+		}
+		join = false
 	}
 	return out
 }
