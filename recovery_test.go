@@ -170,7 +170,8 @@ type crashScenario struct {
 	deadline time.Duration // from the world clock's start; 0 = none
 	ends     map[task.State]string
 	maxPays  int32
-	flaky    bool // time runs, and calls go through a limiter
+	flaky    bool   // time runs, and calls go through a limiter
+	retries  string // the model_retry classes a clean run must show, comma-separated
 }
 
 func fixed(fn modelFn) func(*world) modelFn { return func(*world) modelFn { return fn } }
@@ -211,7 +212,13 @@ var (
 	// After the payment, the provider fails once transiently and then rate
 	// limits the task: two backoffs, a limiter pause and two wake-ups, each a
 	// commit point.
-	flakyScenario = crashScenario{name: "flaky", model: flakyModel, flaky: true, maxPays: 1,
+	flakyScenario = crashScenario{name: "flaky", model: flakyModel, flaky: true, maxPays: 1, retries: "transient,rate_limited",
+		ends: map[task.State]string{task.Done: "end_turn"}}
+	// After the payment, the account's quota runs out: the group goes down
+	// and the task waits for it, so a restart recovers it from
+	// Waiting(Group). A machine that sees the group go down resets it, as an
+	// operator would.
+	quotaScenario = crashScenario{name: "quota", model: quotaModel, maxPays: 1, retries: "quota_exhausted",
 		ends: map[task.State]string{task.Done: "end_turn"}}
 )
 
@@ -228,6 +235,19 @@ func flakyModel(w *world) modelFn {
 			return model.Response{}, sim.Transient()
 		case 2:
 			return model.Response{}, sim.RateLimited(time.Second)
+		}
+		return sim.Reply("done"), nil
+	}
+}
+
+// quotaModel pays, then finds the quota exhausted once, then answers.
+func quotaModel(w *world) modelFn {
+	return func(req model.Request) (model.Response, error) {
+		if sim.ToolRounds(req) == 0 {
+			return sim.CallTools("dev_pay", "dev_look"), nil
+		}
+		if w.fails.Add(1) == 1 {
+			return model.Response{}, sim.QuotaExhausted()
 		}
 		return sim.Reply("done"), nil
 	}
@@ -288,6 +308,11 @@ func quiesce(t *testing.T, m *neumann.Machine, store mem.Store, id string) {
 		if st.Ready+st.Waiting+st.Held == 0 {
 			return
 		}
+		// Waiting for a group that only an operator brings back: nothing
+		// more happens in this process.
+		if tc, err := store.Load(bg, id); err == nil && tc.State == task.Waiting && tc.Wait == task.WaitGroup && st.Ready+st.Held == 0 {
+			return
+		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("machine never went quiet: %+v", m.Status())
@@ -308,6 +333,7 @@ type crashRun struct {
 	resolved  bool     // the second machine needed an operator
 	recovered bool     // the second machine finished a cancel the first one committed
 	unsent    bool     // a read-only call it may have re-sent was not, and is unknown
+	fromGroup bool     // the second machine recovered the task from Waiting(Group)
 	retries   []string // the classes of the model_retry events, in order
 }
 
@@ -369,6 +395,11 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	defer stop(t, m2)
 	for ev := range events {
+		if ev.Kind == proto.EvGroupDown {
+			if err := m2.GroupReset(bg, neumann.DefaultClass); err != nil {
+				t.Fatalf("group reset: %v", err)
+			}
+		}
 		if ev.TaskID != id {
 			continue
 		}
@@ -376,10 +407,14 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 			CallID    string `json:"call_id"`
 			Cancelled bool   `json:"cancelled"`
 			Cancel    string `json:"cancel"`
+			From      string `json:"from"`
 		}
 		json.Unmarshal(ev.Data, &d)
 		if ev.Kind == proto.EvRecovered && d.Cancel != "" {
 			run.recovered = true
+		}
+		if ev.Kind == proto.EvRecovered && d.From == "waiting_group" {
+			run.fromGroup = true
 		}
 		if ev.Kind == proto.EvReconcileNeeded && !d.Cancelled {
 			// The operator checks the bank: the payment went through exactly
@@ -527,16 +562,16 @@ func checkEventsHaveState(t *testing.T, s mem.Store, id string) {
 // right after, each possible number of commits, and a fresh machine on the
 // same database always finishes the task without paying twice.
 func sweep(t *testing.T, sc crashScenario) (points int, resolved, recovered int) {
-	points, resolved, recovered, _ = sweepAll(t, sc)
+	points, resolved, recovered, _, _ = sweepAll(t, sc)
 	return points, resolved, recovered
 }
 
-func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, unsent int) {
+func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, unsent, fromGroup int) {
 	clean := runAndCrash(t, sc, 1<<30, false) // a clean run: how many commits there are
 	if clean.commits < 3 {
 		t.Fatalf("a clean run made only %d commits", clean.commits)
 	}
-	if sc.flaky && strings.Join(clean.retries, ",") != "transient,rate_limited" {
+	if strings.Join(clean.retries, ",") != sc.retries {
 		t.Fatalf("the clean run retried %v", clean.retries)
 	}
 	var mu sync.Mutex
@@ -558,11 +593,14 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 					if run.unsent {
 						unsent++
 					}
+					if run.fromGroup {
+						fromGroup++
+					}
 				})
 			}
 		})
 	}
-	return points, resolved, recovered, unsent
+	return points, resolved, recovered, unsent, fromGroup
 }
 
 func TestCrashAtEveryCommitPoint(t *testing.T) {
@@ -652,10 +690,24 @@ func TestCrashAtEveryCommitPointWithModelFailures(t *testing.T) {
 	t.Logf("%d crash points; the operator was needed at %d of them", points, held)
 }
 
+// The same sweep with the quota running out after the payment: the first
+// process leaves the task in Waiting(Group), and every crash point, before
+// and after its commit, still finishes the task once, paying once.
+func TestCrashAtEveryCommitPointWithTheGroupDown(t *testing.T) {
+	points, held, _, _, fromGroup := sweepAll(t, quotaScenario)
+	if held == 0 {
+		t.Fatal("no crash point left the payment's outcome unknown")
+	}
+	if fromGroup == 0 {
+		t.Fatal("no crash point left the task in Waiting(Group) for the restart")
+	}
+	t.Logf("%d crash points; the operator was needed at %d; recovered from Waiting(Group) at %d", points, held, fromGroup)
+}
+
 // The same sweep with the deadline passing inside a read-only call, so that
 // a restart finds the call re-sendable after the deadline.
 func TestCrashAtEveryCommitPointPastTheDeadline(t *testing.T) {
-	points, _, recovered, unsent := sweepAll(t, expireScenario)
+	points, _, recovered, unsent, _ := sweepAll(t, expireScenario)
 	if unsent == 0 {
 		t.Fatal("no crash point left a re-sendable call behind a passed deadline")
 	}
