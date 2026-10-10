@@ -342,6 +342,9 @@ func (r *Request) validate() *Error {
 			if len(d.Args) == 0 || string(d.Args) == "null" {
 				return errorf(CodeBadRequest, `decision: "edit" needs "args", the arguments the call runs with`)
 			}
+			if t := bytes.TrimSpace(d.Args); t[0] != '{' {
+				return errorf(CodeBadRequest, `decision: "args" must be a JSON object`)
+			}
 			if d.Reason != "" {
 				return errorf(CodeBadRequest, `decision: only "deny" carries a "reason"`)
 			}

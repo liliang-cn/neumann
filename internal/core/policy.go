@@ -20,7 +20,7 @@ type Verdict int
 const (
 	Allow           Verdict = iota // dispatch the call as the model wrote it
 	Deny                           // never execute it; the model gets an error result with the reason
-	Rewrite                        // dispatch it with Decision.Args instead (valid JSON only)
+	Rewrite                        // dispatch it with Decision.Args instead (a JSON object)
 	RequireApproval                // hold the call's round until an operator decides (Approve)
 )
 
@@ -38,7 +38,7 @@ func (v Verdict) String() string {
 type Decision struct {
 	Verdict Verdict
 	Reason  string
-	Args    json.RawMessage // Rewrite: the arguments the call is dispatched with
+	Args    json.RawMessage // Rewrite: the arguments the call is dispatched with, a JSON object
 }
 
 // ToolCallInfo is what the tool policy is shown of a call about to be
@@ -66,7 +66,7 @@ type ApprovalVerdict int
 const (
 	ApproveAllow ApprovalVerdict = iota // run the call as it is
 	ApproveDeny                         // never run it; the model gets an error result with the reason
-	ApproveEdit                         // run it with ApprovalDecision.Args instead (valid JSON only)
+	ApproveEdit                         // run it with ApprovalDecision.Args instead (a JSON object)
 )
 
 var approvalNames = [...]string{"allow", "deny", "edit"}
@@ -105,7 +105,8 @@ type ApprovalDecision struct {
 }
 
 // Check refuses a decision that cannot be applied: an unknown verdict, an
-// edit without valid JSON arguments, or arguments on anything but an edit.
+// edit whose arguments are not a JSON object, or arguments on anything but an
+// edit.
 func (d ApprovalDecision) Check() error {
 	switch d.Verdict {
 	case ApproveAllow, ApproveDeny:
@@ -113,13 +114,20 @@ func (d ApprovalDecision) Check() error {
 			return fmt.Errorf("an approval that does not edit carries no arguments (verdict %s)", d.Verdict)
 		}
 	case ApproveEdit:
-		if len(d.Args) == 0 || !json.Valid(d.Args) {
-			return errors.New("an edit needs arguments that are valid JSON")
+		if !isObject(d.Args) {
+			return errors.New("an edit needs arguments that are a JSON object")
 		}
 	default:
 		return fmt.Errorf("unknown approval verdict %d", int(d.Verdict))
 	}
 	return nil
+}
+
+// isObject reports whether b is a JSON object: what a tool call's arguments
+// are, and what a rewrite or an edit must give.
+func isObject(b []byte) bool {
+	b = bytes.TrimSpace(b)
+	return len(b) > 0 && b[0] == '{' && json.Valid(b)
 }
 
 // ErrNotAwaitingApproval is returned by Approve for a task or call that is
@@ -170,8 +178,8 @@ func (e *Env) decide(ctx context.Context, t *task.TCB, rs []mem.CallRecord) []pr
 		case Allow:
 			r.Policy = mem.PolicyAllow
 		case Rewrite:
-			if len(d.Args) == 0 || !json.Valid(d.Args) {
-				evs = append(evs, deny(t, r, mem.PolicyDeny, "the tool policy rewrote the arguments to invalid JSON", byPolicy))
+			if !isObject(d.Args) {
+				evs = append(evs, deny(t, r, mem.PolicyDeny, "the tool policy rewrote the arguments to something that is not a JSON object", byPolicy))
 				continue
 			}
 			r.Policy = mem.PolicyRewrite

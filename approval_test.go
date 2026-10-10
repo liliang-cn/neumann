@@ -189,7 +189,7 @@ func TestToolPolicyDecidesEachCall(t *testing.T) {
 	if !parts[1].IsError || !strings.Contains(parts[1].Text, "b is not for you") {
 		t.Fatalf("the denied call's result %+v", parts[1])
 	}
-	if !parts[3].IsError || !strings.Contains(parts[3].Text, "invalid JSON") {
+	if !parts[3].IsError || !strings.Contains(parts[3].Text, "not a JSON object") {
 		t.Fatalf("a rewrite to invalid JSON is denied: %+v", parts[3])
 	}
 
@@ -427,6 +427,9 @@ func TestApproveErrors(t *testing.T) {
 	for _, d := range []neumann.ApprovalDecision{
 		{Verdict: neumann.ApproveEdit, Args: json.RawMessage(`{"n":`)},
 		{Verdict: neumann.ApproveEdit},
+		{Verdict: neumann.ApproveEdit, Args: json.RawMessage(`null`)},
+		{Verdict: neumann.ApproveEdit, Args: json.RawMessage(` [1]`)},
+		{Verdict: neumann.ApproveEdit, Args: json.RawMessage(`"x"`)},
 		{Verdict: neumann.ApproveDeny, Args: json.RawMessage(`{}`)},
 		{Verdict: 9},
 	} {
@@ -647,5 +650,27 @@ func TestApproveRightAfterTheAnnouncement(t *testing.T) {
 	}
 	if done != tasks {
 		t.Fatalf("%d of %d tasks finished", done, tasks)
+	}
+}
+
+// Arguments are a JSON object: a rewrite to anything else (null, an array, a
+// string) denies the call, as a rewrite to invalid JSON does.
+func TestRewriteArgsMustBeAnObject(t *testing.T) {
+	dev := &recDev{}
+	p := &policy{by: map[string]neumann.Decision{
+		"dev_a": neumann.RewriteArgs([]byte(`null`)),
+		"dev_b": neumann.RewriteArgs([]byte(`[1]`)),
+		"dev_c": neumann.RewriteArgs([]byte(` {"n":9} `)),
+	}}
+	m, _ := start(t, neumann.Config{Devices: []bus.Device{dev.device()}, ToolPolicy: p.decide}, oneRound("dev_a", "dev_b", "dev_c"))
+	got := waitDone(t, m, submit(t, m, proto.Instruction{Input: "go"}))
+	if c := dev.calls(); !slices.Equal(c, []string{`c  {"n":9} `}) {
+		t.Fatalf("the device ran %v", c)
+	}
+	parts := toolMessage(t, got)
+	for _, i := range []int{0, 1} {
+		if !parts[i].IsError || !strings.Contains(parts[i].Text, "JSON object") {
+			t.Fatalf("result %d %+v", i, parts[i])
+		}
 	}
 }

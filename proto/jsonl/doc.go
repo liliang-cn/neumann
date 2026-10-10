@@ -37,7 +37,7 @@
 //	             {"result":"…","is_error":true} or {"retry":true}
 //	approve      task_id, call_id, decision (all required): answers a call held for approval
 //	             (an approval_needed event names it); decision is {"verdict":"allow"},
-//	             {"verdict":"deny","reason":"…"} or {"verdict":"edit","args":{…}} (Machine.Approve)
+//	             {"verdict":"deny","reason":"…"} or {"verdict":"edit","args":{…}}, args an object (Machine.Approve)
 //	status       → status: the machine's snapshot (neumann.Status)
 //	subscribe    from_seq (default 0) → from_seq; starts or restarts the event stream
 //	unsubscribe  stops the event stream

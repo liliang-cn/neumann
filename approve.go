@@ -18,6 +18,13 @@ import (
 // again. It must be fast and free of side effects: it runs while the task
 // holds its vCore, and a commit that fails discards what it decided. A panic
 // in it denies the call, with the panic as the reason.
+//
+// It has no timeout. A policy that blocks stalls its task's vCore, and so
+// every task of that group behind it; and since Start decides planned calls
+// that were never decided (a store written before a policy was configured)
+// while it recovers, a policy that blocks there stalls Start itself. Do not
+// call out to a person or a slow service from it: return RequireApproval
+// and decide with Approve instead.
 type ToolPolicy = core.Policy
 
 // ToolCallInfo is what a ToolPolicy is shown of a call: the task and call
@@ -49,8 +56,8 @@ func Allow() Decision { return Decision{Verdict: core.Allow} }
 func Deny(reason string) Decision { return Decision{Verdict: core.Deny, Reason: reason} }
 
 // RewriteArgs dispatches the call with args instead of the model's (a
-// tool_rewritten event records both). args must be valid JSON; anything else
-// denies the call.
+// tool_rewritten event records both). args must be a JSON object; anything
+// else (invalid JSON, null, an array) denies the call.
 func RewriteArgs(args []byte) Decision {
 	return Decision{Verdict: core.Rewrite, Args: slices.Clone(args)}
 }
@@ -64,7 +71,7 @@ func RequireApproval(reason string) Decision {
 
 // ApprovalDecision is an operator's answer to a held call; the zero value
 // allows it. Verdict ApproveDeny refuses it with Reason, ApproveEdit runs it
-// with Args (valid JSON) instead of the model's.
+// with Args (a JSON object) instead of the model's.
 type ApprovalDecision = core.ApprovalDecision
 
 // ApprovalVerdict is the kind of an ApprovalDecision.
@@ -90,7 +97,8 @@ var ErrNotAwaitingApproval = core.ErrNotAwaitingApproval
 //
 // Approve returns ErrNotAwaitingApproval when the task is not waiting for
 // approval or the call is not held, ErrNotFound for an unknown task, and an
-// error for a decision that cannot be applied (an edit without valid JSON).
+// error for a decision that cannot be applied (an edit whose arguments are
+// not a JSON object).
 func (m *Machine) Approve(ctx context.Context, taskID, callID string, d ApprovalDecision) error {
 	if err := d.Check(); err != nil {
 		return fmt.Errorf("neumann: approve %s/%s: %w", taskID, callID, err)

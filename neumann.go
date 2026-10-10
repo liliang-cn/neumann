@@ -77,7 +77,8 @@ type Config struct {
 
 	// ToolPolicy, when set, decides every tool call before its first
 	// dispatch is committed (design §9.7): allow it, deny it, rewrite its
-	// arguments, or hold its round for an operator (Approve). See ToolPolicy.
+	// arguments, or hold its round for an operator (Approve). See ToolPolicy:
+	// it has no timeout, and one that blocks stalls a vCore, or Start.
 	ToolPolicy ToolPolicy
 
 	// Limiters are the machine's rate limiters (design §7). A group names

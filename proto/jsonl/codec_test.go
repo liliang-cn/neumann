@@ -165,6 +165,8 @@ func TestFieldValidationPerKind(t *testing.T) {
 		{`{"kind":"approve","task_id":"t1","call_id":"c","decision":{"verdict":"maybe"}}`, CodeBadRequest, "verdict"},
 		{`{"kind":"approve","task_id":"t1","call_id":"c","decision":{"verdict":"edit"}}`, CodeBadRequest, "args"},
 		{`{"kind":"approve","task_id":"t1","call_id":"c","decision":{"verdict":"edit","args":null}}`, CodeBadRequest, "args"},
+		{`{"kind":"approve","task_id":"t1","call_id":"c","decision":{"verdict":"edit","args":[1]}}`, CodeBadRequest, "object"},
+		{`{"kind":"approve","task_id":"t1","call_id":"c","decision":{"verdict":"edit","args":"x"}}`, CodeBadRequest, "object"},
 		{`{"kind":"approve","task_id":"t1","call_id":"c","decision":{"verdict":"allow","args":{}}}`, CodeBadRequest, "args"},
 		{`{"kind":"approve","task_id":"t1","call_id":"c","decision":{"verdict":"allow","reason":"x"}}`, CodeBadRequest, "reason"},
 		{`{"kind":"approve","task_id":"t1","call_id":"c","decision":{"verdict":"allow","bogus":1}}`, CodeBadRequest, "bogus"},
