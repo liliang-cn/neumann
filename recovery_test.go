@@ -215,6 +215,10 @@ type crashScenario struct {
 	// needs it: each commit is a full fsync, and a few dozen runs at once
 	// slow every one of them past the quiesce limit.
 	wide int
+	// patience is how long a process of the sweep may take to go quiet, and
+	// the restarted one to finish; 0: 5s and 10s. Every commit is a full
+	// fsync: a scenario with many of them needs more on a busy disk.
+	patience time.Duration
 }
 
 func fixed(fn modelFn) func(*world) modelFn { return func(*world) modelFn { return fn } }
@@ -273,7 +277,7 @@ var (
 	// A small window: after the payment, page after page outgrows it, and
 	// the task compacts mid-task (twice in a clean run), the model keeping
 	// count of its rounds through the summaries.
-	compactScenario = crashScenario{name: "compact", model: fixed(pageModel), maxPays: 1, rounds: 6, mid: new(atomic.Int32), wide: 4,
+	compactScenario = crashScenario{name: "compact", model: fixed(pageModel), maxPays: 1, rounds: 6, mid: new(atomic.Int32), wide: 4, patience: 30 * time.Second,
 		caps: &model.Caps{Window: 640, MaxOut: 64, Tools: true}, ends: map[task.State]string{task.Done: "end_turn"}}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
@@ -390,18 +394,13 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 	return m
 }
 
-// quiesce waits until the dead machine has nothing left in flight.
-func quiesce(t *testing.T, m *neumann.Machine, store mem.Store, id string) {
-	t.Helper()
-	quiesceOr(t, m, store, id, func() bool { return false })
-}
-
-// quiesceOr is quiesce that also stops waiting once dead says the process
-// died while nothing was ready or held: a task left waiting for an approval
+// quiesceOr waits, up to patience, until the dead machine has nothing left
+// in flight, or until dead says the process died while nothing was ready or
+// held: a task left waiting for an approval
 // that could not be committed stays in the wait set for good.
-func quiesceOr(t *testing.T, m *neumann.Machine, store mem.Store, id string, dead func() bool) {
+func quiesceOr(t *testing.T, m *neumann.Machine, store mem.Store, id string, patience time.Duration, dead func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(patience)
 	for time.Now().Before(deadline) {
 		if st := m.Status(); dead() && st.Ready+st.Held == 0 {
 			return
@@ -498,7 +497,11 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		t.Fatalf("submit: %v", submitErr)
 	}
 	if submitErr == nil {
-		quiesceOr(t, m1, s1, id, func() bool { return w.approve && cs.crashed.Load() })
+		patience := 5 * time.Second
+		if sc.patience > 0 {
+			patience = sc.patience
+		}
+		quiesceOr(t, m1, s1, id, patience, func() bool { return w.approve && cs.crashed.Load() })
 	}
 	stop(t, m1)
 	opStop()
@@ -535,7 +538,11 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		sc.mid.Add(1)
 	}
 	m2 := newMachine(t, s2, w, sc.model(w))
-	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
+	finish := 10 * time.Second
+	if sc.patience > 0 {
+		finish = sc.patience
+	}
+	ctx, cancel := context.WithTimeout(bg, finish)
 	defer cancel()
 	events := m2.Events(ctx, 0)
 	if err := m2.Start(bg); err != nil {
