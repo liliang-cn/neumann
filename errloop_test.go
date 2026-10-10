@@ -658,8 +658,14 @@ func TestCancelAndDeadlineWhileWaiting(t *testing.T) {
 				if n := len(sc.of("A")); n != calls {
 					t.Fatalf("the model was called %d more times", n-calls)
 				}
-				if st := m.Status(); st.Ready+st.Waiting+st.Held != 0 {
-					t.Fatalf("left behind: %+v", st)
+				// The terminal event is published at its commit, before the
+				// holder (the vCore waiting for room) hands the task back.
+				deadline := time.Now().Add(5 * time.Second)
+				for st := m.Status(); st.Ready+st.Waiting+st.Held != 0; st = m.Status() {
+					if time.Now().After(deadline) {
+						t.Fatalf("left behind: %+v", st)
+					}
+					time.Sleep(time.Millisecond)
 				}
 			})
 		}
