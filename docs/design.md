@@ -148,7 +148,8 @@ type Store interface {
 1. **任何状态转换都通过 `Commit` 完成**，无论是 vCore 执行完一步，还是调度器处理工具完成、退避到点、Deadline、挂起、改优先级、迁移。
 2. **先提交，后动作。** 顺序永远是：算出新状态 → `Commit` 成功 → 才去改内存里的队列、通知订阅者、派发工具、给调用方返回成功。`Commit` 失败则这次转换不存在。
 3. **状态、调用记录、中断、事件在同一个事务里。** 客户端看到的任何事件，重启后都能在状态里找到对应的结果。
-4. 写入者单线程，组提交：写入者正忙时到达的 `CommitSet`（最多 128 个）合成下一个事务，不设等待窗口；每个调用方在自己所属的批次提交后才返回。
+4. **取消以提交为准。** 任务有未送达的取消中断时，`Commit` 只接受它的最终提交（终态，`StopReason` 等于该取消的原因），也不接受把它的调用写成 `dispatched`，都返回 `ErrCancelPending`；结果、晚到结果、新中断照常记录。所以先提交的取消赢，持有任务的一方即使还没收到取消信号，提交被拒时也就地做最终提交。
+5. 写入者单线程，组提交：写入者正忙时到达的 `CommitSet`（最多 128 个）合成下一个事务，不设等待窗口；每个调用方在自己所属的批次提交后才返回。
 
 两个实现：`mem.Memory`（不持久，测试用）和 `mem/sqlite`（纯 Go 驱动 `modernc.org/sqlite`，WAL，`synchronous=FULL`，macOS 上加 `fullfsync`，事务开始即取写锁）。两者都必须通过 `mem/storetest` 一致性套件，它把语义钉死在同一组用例上，包括每个字段的完整往返。SQLite 版：TCB 和调用记录用 gob 编码（模型可能给出不是合法 JSON 的工具参数，要逐字节保存）；单写入者（Open 对 `<path>.lock` 取独占 flock，第二个 Open 得到 `ErrLocked`；非 unix 平台不强制）；正在写一个事务时到达的提交排队进下一个事务（组提交，不加等待窗口）；每个提交集一个 savepoint，校验失败只回滚它自己。
 
@@ -429,7 +430,7 @@ type Adapter interface {
 2. 调用任务的 `CancelFunc`：在途的模型请求立即中断；在途的工具调用的 context 被取消。
 3. 任务的所有者做最终提交：
    - `planned` 的调用 → `cancelled`，从未派发；
-   - `dispatched` 且设备在取消后确认没有执行 → `cancelled`；
+   - `dispatched` 且这次发送没有到达设备、之前也没发过 → `cancelled`；之前发过的（重启后同一 `Key` 重发、或结果未知后的重试）按结果未知处理；有更早尝试的 `planned`（操作员要求重试）同样；
    - `dispatched` 且结果未知 → `unknown`，发 `reconcile_needed`（带 `cancelled: true`；任务已取消，不再等待核对，但记录留给操作员）；
    - `dispatched` 且结果已经回来 → `done`，结果不进寄存器；
    - 任务转 `Cancelled`，未送达的插话各一个 `steer_dropped`。
@@ -656,8 +657,8 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
    第一阶段留下的 8 处接缝已全部处理：`Running` 在调用前提交；调用记录在规划时记下 `Device`、`Effect`、`ReportUnknown`；tool 消息从调用记录组装；`dispatched` 但从未发出的调用会进入核对（预写日志固有）；准入计数在 `Start` 时从未完成任务数初始化；`Submit` / `Steer` 锁内预留、锁外提交，`Stop` 带截止时间地等它们；单条结果提交失败时 `tool_result` 随完成提交补发；`core`、`sched` 已移到 `internal/`。
    验证：`TestCrashAtEveryCommitPoint`（每个提交点注入一次崩溃，SQLite，压测 30 轮）、`TestKillNine`（真进程 SIGKILL，副作用只执行一次）。
 3. **取消、Deadline 与故障注入**：9.4、9.5；在每一个提交点前后注入崩溃。
-   已完成：`m.Cancel(ctx, id)` 提交取消中断（`Text` 是原因）后返回，结束的任务返回 `ErrFinished`、不存在的返回 `ErrNotFound`；调度器持有每个任务的 context 和 Deadline 定时器（`Budget.Deadline`，绝对时间，`Submit` 时给出），不论状态；没人在干活的任务（就绪、待核对、挂起，以后的退避、熔断等待）由取消方 `Sched.Cancel` 取出并做最终提交，vCore 或工具批次持有的任务只收到信号，交还时 `Requeue` 在同一把锁下拒收，由持有方最终提交——取消不会落在提交和交还之间；总线 `Run` 区分"没碰到设备"（`cancelled`）、"设备跑着时放弃"（`unknown` + 带 `cancelled` 标记的 `reconcile_needed`，任务不等）和结果，放弃之后设备的真实结果在最终提交之后记为 `late` 并发 `tool_late`，不进寄存器；模型调用期间被取消算一次 `Unconfirmed`，已回来的工具调用记为 `cancelled`、从不派发；Deadline 已过的任务不再开始任何指令，即使定时器还没跑；恢复时有未完成的取消中断就直接做最终提交，Deadline 重新挂上、已过的立即触发。
-   验证：`TestCrashAtEveryCommitPoint*`（支付、执行中取消、执行中超时三种任务，每个提交点之前和之后各崩一次，SQLite；"之后"= 提交已落盘、调用方没收到）、`TestAcceptedInputSurvivesACrash`（第 18 节 9）、`TestDeadlineFiresInEveryState`（第 18 节 10：就绪、等工具、待核对、执行中、已过期）、`TestCancelWhileToolsInFlight` / `TestCancelledPlannedCallsNeverRun` / `TestLateResultIsRecordedLate`（第 18 节 11）。
+   已完成：`Commit` 在有未送达取消时只接受取消的最终提交、拒绝 `dispatched`（`ErrCancelPending`，两个 Store 同一规则，一致性套件覆盖），取消信号到达前提交被拒的一方据此最终提交，先提交的取消一定赢；`m.Cancel(ctx, id)` 提交取消中断（`Text` 是原因）后返回，结束的任务返回 `ErrFinished`、不存在的返回 `ErrNotFound`；调度器持有每个任务的 context 和 Deadline 定时器（`Budget.Deadline`，绝对时间，`Submit` 时给出），不论状态；没人在干活的任务（就绪、待核对、挂起，以后的退避、熔断等待）由取消方 `Sched.Cancel` 取出并做最终提交，vCore 或工具批次持有的任务只收到信号，交还时 `Requeue` 在同一把锁下拒收，由持有方最终提交——取消不会落在提交和交还之间；总线 `Run` 区分"没碰到设备"（之前没发过的才是 `cancelled`）、"设备跑着时放弃"（`unknown` + 带 `cancelled` 标记的 `reconcile_needed`，任务不等）和结果，放弃之后设备的真实结果在最终提交之后记为 `late` 并发 `tool_late`，不进寄存器；模型调用期间被取消算一次 `Unconfirmed`，已回来的工具调用记为 `cancelled`、从不派发；Deadline 已过的任务不再开始任何指令、不再把任何调用交给总线（包括恢复和 `resolve` 的批次），即使定时器还没跑；晚到结果只在最终提交落盘后记录，`Stop` 等在途的晚到提交；恢复时有未完成的取消中断就直接做最终提交，Deadline 重新挂上、已过的立即触发。
+   验证：`TestCrashAtEveryCommitPoint*`（支付、执行中取消、执行中超时、模型调用期间取消已提交但未通知（要工具 / 给答案）、只读调用里超时后重启六种任务，每个提交点之前和之后各崩一次，SQLite；"之后"= 提交已落盘、调用方没收到）、`TestAcceptedInputSurvivesACrash`（第 18 节 9）、`TestDeadlineFiresInEveryState`（第 18 节 10：就绪、等工具、待核对、执行中、已过期）、`TestCancelWhileToolsInFlight` / `TestCancelledPlannedCallsNeverRun` / `TestLateResultIsRecordedLate`（第 18 节 11）。
 4. **自适应伸缩、限流器与迁移**：拥塞窗口、限流器、错误分类、熔断、迁移校验、第二个适配器。
 
 ## 18. 测试

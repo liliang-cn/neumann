@@ -63,6 +63,7 @@ type control struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	cancelled bool
+	deadline  time.Time
 	stopTimer func() bool // nil: no timer set
 }
 
@@ -164,6 +165,7 @@ func (s *Sched) controlLocked(id string) *control {
 // The timer keeps running across every state the task passes through, on a
 // vCore or off it, until the task ends.
 func (s *Sched) armLocked(t *task.TCB, c *control) {
+	c.deadline = t.Budget.Deadline
 	if c.stopTimer != nil || t.Budget.Deadline.IsZero() || s.closed {
 		return
 	}
@@ -204,6 +206,17 @@ func (s *Sched) Context(id string) context.Context {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.controlLocked(id).ctx
+}
+
+// Deadline is the deadline of a task the scheduler holds, zero for none: a
+// tool batch reads it to send nothing once it has passed.
+func (s *Sched) Deadline(id string) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c, ok := s.ctl[id]; ok {
+		return c.deadline
+	}
+	return time.Time{}
 }
 
 // Cancelled reports whether Cancel was called for a task still held here.

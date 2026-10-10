@@ -64,7 +64,26 @@ type world struct {
 	mu    sync.Mutex
 	keys  map[string][]string // call -> idempotency keys it was sent with
 	m     atomic.Pointer[neumann.Machine]
+	store mem.Store // the running process's store, guarded by mu
 	clock *sim.Clock
+
+	deadline  time.Time    // the task's, if it has one
+	afterDead atomic.Int32 // device calls that started once the deadline had passed
+}
+
+func (w *world) setStore(s mem.Store) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.store = s
+}
+
+// cancelBehindTheMachine commits a cancel straight to the store: durable, but
+// no owner has been signalled yet (the gap inside Machine.Cancel).
+func (w *world) cancelBehindTheMachine(id string) {
+	w.mu.Lock()
+	s := w.store
+	w.mu.Unlock()
+	s.Commit(bg, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: id, Kind: mem.InterruptCancel, Text: "cancelled"}}})
 }
 
 func newWorld() *world {
@@ -72,6 +91,9 @@ func newWorld() *world {
 }
 
 func (w *world) note(c bus.DeviceCall) {
+	if !w.deadline.IsZero() && !w.clock.Now().Before(w.deadline) {
+		w.afterDead.Add(1)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	call := c.Key[:strings.LastIndex(c.Key, "/")] // task/call, without /attempt
@@ -99,6 +121,12 @@ func (w *world) devices() []bus.Device {
 			}
 			<-ctx.Done()
 			return "paid", nil
+		}).
+		// xlook reads, and takes so long that the task's deadline passes.
+		Add(bus.ToolDef{Name: "xlook", Effect: bus.ReadOnly}, func(_ context.Context, c bus.DeviceCall) (string, error) {
+			w.note(c)
+			w.clock.Advance(time.Hour)
+			return "balance 10", nil
 		}).
 		// dpay pays and takes so long that the task's deadline passes.
 		Add(bus.ToolDef{Name: "dpay"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
@@ -134,17 +162,47 @@ func lookThenPay(tool string) modelFn {
 // crashScenario is one task the crash sweep runs, and how it may end.
 type crashScenario struct {
 	name     string
-	model    modelFn
+	model    func(w *world) modelFn
 	deadline time.Duration // from the world clock's start; 0 = none
 	ends     map[task.State]string
+	maxPays  int32
+}
+
+func fixed(fn modelFn) func(*world) modelFn { return func(*world) modelFn { return fn } }
+
+// cancelInTheGap is a model step during which the task is cancelled, the
+// cancel committed but its owner not yet told; the step then answers with
+// resp.
+func cancelInTheGap(resp model.Response) func(*world) modelFn {
+	return func(w *world) modelFn {
+		return func(req model.Request) (model.Response, error) {
+			if sim.ToolRounds(req) > 0 {
+				return sim.Reply("done"), nil
+			}
+			w.cancelBehindTheMachine("pay-1")
+			return resp, nil
+		}
+	}
 }
 
 var (
-	payScenario    = crashScenario{name: "pay", model: payModel, ends: map[task.State]string{task.Done: "end_turn"}}
-	cancelScenario = crashScenario{name: "cancel", model: lookThenPay("dev_cpay"),
+	payScenario    = crashScenario{name: "pay", model: fixed(payModel), maxPays: 1, ends: map[task.State]string{task.Done: "end_turn"}}
+	cancelScenario = crashScenario{name: "cancel", model: fixed(lookThenPay("dev_cpay")), maxPays: 1,
 		ends: map[task.State]string{task.Done: "end_turn", task.Cancelled: "cancelled"}}
-	deadlineScenario = crashScenario{name: "deadline", model: lookThenPay("dev_dpay"), deadline: 30 * time.Minute,
+	deadlineScenario = crashScenario{name: "deadline", model: fixed(lookThenPay("dev_dpay")), deadline: 30 * time.Minute, maxPays: 1,
 		ends: map[task.State]string{task.Done: "end_turn", task.Failed: "deadline"}}
+	// The cancel lands while the model is asked for a payment: the payment
+	// must never be sent.
+	gapToolsScenario = crashScenario{name: "gap_tools", model: cancelInTheGap(sim.CallTools("dev_pay")), maxPays: 0,
+		ends: map[task.State]string{task.Cancelled: "cancelled"}}
+	// The cancel lands while the model writes its answer: it must not finish
+	// over the cancel.
+	gapAnswerScenario = crashScenario{name: "gap_answer", model: cancelInTheGap(sim.Reply("done")),
+		ends: map[task.State]string{task.Cancelled: "cancelled"}}
+	// The deadline passes inside a read-only call: a restart finds that call
+	// re-sendable, and must not send it.
+	expireScenario = crashScenario{name: "expire", model: fixed(lookThenPay("dev_xlook")), deadline: 30 * time.Minute,
+		ends: map[task.State]string{task.Failed: "deadline"}}
 )
 
 func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Machine {
@@ -152,6 +210,7 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 	if fn == nil {
 		fn = payModel
 	}
+	w.setStore(store)
 	m, err := neumann.New(neumann.Config{
 		Model: &sim.Model{Fn: fn}, Store: store, Devices: w.devices(), Cores: 2, Clock: w.clock,
 		SteerFormat: func(s string) string { return s }, Logf: func(string, ...any) {},
@@ -194,6 +253,7 @@ type crashRun struct {
 	commits   int64 // made by the first machine
 	resolved  bool  // the second machine needed an operator
 	recovered bool  // the second machine finished a cancel the first one committed
+	unsent    bool  // a read-only call it may have re-sent was not, and is unknown
 }
 
 // runAndCrash runs sc on a machine that dies after n commits (after: right
@@ -209,13 +269,14 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	cs := &crashStore{Store: s1, after: after}
 	cs.left.Store(n)
-	m1 := newMachine(t, cs, w, sc.model)
+	m1 := newMachine(t, cs, w, sc.model(w))
 	if err := m1.Start(bg); err != nil {
 		t.Fatal(err)
 	}
 	in := proto.Instruction{Kind: proto.KindSubmit, TaskID: "pay-1", Input: "pay the bill"}
 	if sc.deadline > 0 {
-		in.Budget = &task.Budget{Deadline: w.clock.Now().Add(sc.deadline)}
+		w.deadline = w.clock.Now().Add(sc.deadline)
+		in.Budget = &task.Budget{Deadline: w.deadline}
 	}
 	id, submitErr := m1.Submit(bg, in)
 	if submitErr != nil && !errors.Is(submitErr, errCrashed) {
@@ -240,7 +301,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		return run // never accepted, never there: nothing to recover
 	}
 	id = in.TaskID
-	m2 := newMachine(t, s2, w, sc.model)
+	m2 := newMachine(t, s2, w, sc.model(w))
 	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
 	defer cancel()
 	events := m2.Events(ctx, 0)
@@ -293,8 +354,23 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	if got.State == task.Done && got.LastAnswer() != "done" {
 		t.Fatalf("crash after %d commits: answer %q", n, got.LastAnswer())
 	}
-	if p := w.pays.Load(); p > 1 {
+	if p := w.pays.Load(); p > sc.maxPays {
 		t.Fatalf("crash after %d commits (after=%v): the payment ran %d times", n, after, p)
+	}
+	if k := w.afterDead.Load(); k > 0 {
+		t.Fatalf("crash after %d commits (after=%v): %d calls started after the deadline", n, after, k)
+	}
+	recs, _ := s2.Calls(bg, id)
+	for _, r := range recs {
+		if r.Status == mem.CallUnknown && r.Effect == task.ReadOnly {
+			run.unsent = true
+		}
+		w.mu.Lock()
+		sent := len(w.keys[id+"/"+r.CallID])
+		w.mu.Unlock()
+		if r.Status == mem.CallCancelled && sent > 0 {
+			t.Fatalf("crash after %d commits (after=%v): call %s is recorded as never sent, but a device saw it %d times", n, after, r.CallID, sent)
+		}
 	}
 	w.mu.Lock()
 	for call, keys := range w.keys {
@@ -382,8 +458,13 @@ func checkEventsHaveState(t *testing.T, s mem.Store, id string) {
 // right after, each possible number of commits, and a fresh machine on the
 // same database always finishes the task without paying twice.
 func sweep(t *testing.T, sc crashScenario) (points int, resolved, recovered int) {
+	points, resolved, recovered, _ = sweepAll(t, sc)
+	return points, resolved, recovered
+}
+
+func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, unsent int) {
 	clean := runAndCrash(t, sc, 1<<30, false) // a clean run: how many commits there are
-	if clean.commits < 5 {
+	if clean.commits < 3 {
 		t.Fatalf("a clean run made only %d commits", clean.commits)
 	}
 	var mu sync.Mutex
@@ -402,11 +483,14 @@ func sweep(t *testing.T, sc crashScenario) (points int, resolved, recovered int)
 					if run.recovered {
 						recovered++
 					}
+					if run.unsent {
+						unsent++
+					}
 				})
 			}
 		})
 	}
-	return points, resolved, recovered
+	return points, resolved, recovered, unsent
 }
 
 func TestCrashAtEveryCommitPoint(t *testing.T) {
@@ -471,4 +555,26 @@ func TestNothingIsAcceptedBeforeStart(t *testing.T) {
 	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x"}); err != nil {
 		t.Fatalf("submit after start: %v", err)
 	}
+}
+
+// The same sweep with the cancel landing inside a model step, between its
+// commit and the signal to the step's vCore: once while the model asks for a
+// payment, once while it answers.
+func TestCrashAtEveryCommitPointWithACancelInTheGap(t *testing.T) {
+	for _, sc := range []crashScenario{gapToolsScenario, gapAnswerScenario} {
+		t.Run(sc.name, func(t *testing.T) {
+			points, _, recovered := sweep(t, sc)
+			t.Logf("%d crash points; recovery finished the cancel at %d of them", points, recovered)
+		})
+	}
+}
+
+// The same sweep with the deadline passing inside a read-only call, so that
+// a restart finds the call re-sendable after the deadline.
+func TestCrashAtEveryCommitPointPastTheDeadline(t *testing.T) {
+	points, _, recovered, unsent := sweepAll(t, expireScenario)
+	if unsent == 0 {
+		t.Fatal("no crash point left a re-sendable call behind a passed deadline")
+	}
+	t.Logf("%d crash points; recovery finished the deadline at %d; a re-send was held back at %d", points, recovered, unsent)
 }

@@ -17,7 +17,7 @@ import (
 // tools, the same commit records the calls as dispatched and the task as
 // waiting on I/O, and the returned batch is dispatched right after it: a tool
 // round does not queue for a vCore a second time just to hand calls over.
-func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []mem.CallRecord, error) {
+func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []Send, error) {
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
 		return mem.CommitSet{}, nil, fmt.Errorf("read interrupts: %w", err)
@@ -48,11 +48,20 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	if err := e.Commit(context.WithoutCancel(ctx), mem.CommitSet{Task: t}); err != nil {
 		t.State = task.Ready
 		t.Version--
+		if errors.Is(err, mem.ErrCancelPending) {
+			// Cancelled after the interrupts were read: nothing runs.
+			c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, ReasonCancelled)
+			return c, nil, err
+		}
 		return mem.CommitSet{}, nil, fmt.Errorf("%w: %v", errStartNotCommitted, err)
 	}
 	e.startCommitted(t.ID)
 	if e.halt().Err() != nil {
 		return mem.CommitSet{}, nil, nil // the step's halt check drops the task
+	}
+	if e.Sched.Cancelled(t.ID) {
+		// Signalled since the start commit: no request goes out.
+		return e.cancelledStep(ctx, t, c, base, model.Response{}, nil, false, false)
 	}
 	c.Events = append(c.Events, proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepModel.String(), Core: core}))
 	c.Applied = applySteers(t, pending, e.frameSteer)
@@ -66,8 +75,12 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
 	})
 	t.Used.Steps++
+	if err == nil {
+		t.Used.Add(resp.Usage)
+		c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
+	}
 	if e.halt().Err() == nil && e.Sched.Cancelled(t.ID) {
-		return e.cancelledStep(ctx, t, c, base, resp, err, tctx.Err() != nil)
+		return e.cancelledStep(ctx, t, c, base, resp, err, true, err != nil && tctx.Err() != nil)
 	}
 	if err != nil {
 		// Steers applied for this call were never answered: take them back so
@@ -81,8 +94,6 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		}
 		return e.fail(t, c, reason), nil, nil
 	}
-	t.Used.Add(resp.Usage)
-	c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
 
 	msg := resp.Message
 	msg.Parts = slices.Clone(msg.Parts) // the adapter's slice is not ours to write
@@ -100,7 +111,9 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		waitIO(t)
 		c.Calls = batch
 		c.Task = t
-		return c, batch, nil
+		// No re-read of the interrupts here: a cancel committed since then
+		// makes the store refuse this commit, and the step finalises.
+		return c, sends(batch), nil
 	}
 
 	t.Regs = append(t.Regs, msg)
@@ -111,6 +124,9 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	late, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
 		return c, nil, fmt.Errorf("read interrupts: %w", err)
+	}
+	if _, ok := cancelReason(late); ok {
+		return e.cancelledStep(ctx, t, c, base, resp, nil, true, false)
 	}
 	if late = withoutApplied(late, c.Applied); hasSteer(late) {
 		e.ready(t, task.StepModel)
@@ -141,21 +157,22 @@ func (e *Env) plan(t *task.TCB, msg *task.Message) []mem.CallRecord {
 }
 
 // cancelledStep is the final commit of a model step whose task was cancelled
-// while the model was called. The steers applied for the call go back to
-// pending, so the final commit reports them dropped. A call cut off by the
-// cancel (interrupted) may have reached the provider: it is unconfirmed. A
-// response that did come back counts its usage; its tool calls are recorded
-// cancelled and never dispatched; an answer is discarded.
-func (e *Env) cancelledStep(ctx context.Context, t *task.TCB, c mem.CommitSet, base int, resp model.Response, err error, interrupted bool) (mem.CommitSet, []mem.CallRecord, error) {
+// around its model call. The steers applied for the call go back to pending,
+// so the final commit reports them dropped. A call cut off by the cancel
+// (interrupted) may have reached the provider: it is unconfirmed; with no
+// call made (called false) nothing is. A response that did come back has
+// already counted its usage; its tool calls are recorded cancelled and never
+// dispatched; an answer is discarded.
+func (e *Env) cancelledStep(ctx context.Context, t *task.TCB, c mem.CommitSet, base int, resp model.Response, err error, called, interrupted bool) (mem.CommitSet, []Send, error) {
 	t.Regs = t.Regs[:base]
 	c.Applied = nil
-	if err != nil {
+	switch {
+	case !called:
+	case err != nil:
 		if interrupted {
 			t.Unconfirmed++
 		}
-	} else {
-		t.Used.Add(resp.Usage)
-		c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
+	default:
 		msg := resp.Message
 		msg.Parts = slices.Clone(msg.Parts)
 		msg.Role = task.RoleAssistant

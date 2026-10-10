@@ -357,7 +357,7 @@ func TestCompleteWithoutCheckoutPanics(t *testing.T) {
 			t.Fatalf("recovered %v", r)
 		}
 	}()
-	e.complete(bg, "ghost", nil, nil, nil)
+	e.complete(bg, "ghost", time.Time{}, nil, nil)
 }
 
 func TestBudgetEndsTheTask(t *testing.T) {

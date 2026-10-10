@@ -121,9 +121,17 @@ func (m *Memory) validate(c CommitSet) error {
 			return fmt.Errorf("%w: task %s is at %d, commit carries %d", ErrVersion, t.ID, old.Version, t.Version)
 		}
 	}
+	if t := c.Task; t != nil && !c.NewTask {
+		if in, ok := m.pendingCancel(t.ID); ok && !(t.State.Terminal() && t.StopReason == CancelReason(in)) {
+			return fmt.Errorf("%w: %s", ErrCancelPending, t.ID)
+		}
+	}
 	for _, r := range c.Calls {
 		if _, ok := m.tasks[r.TaskID]; !ok && !(c.NewTask && c.Task.ID == r.TaskID) {
 			return fmt.Errorf("%w: %s", ErrNotFound, r.TaskID)
+		}
+		if _, ok := m.pendingCancel(r.TaskID); ok && r.Status == CallDispatched {
+			return fmt.Errorf("%w: %s: call %s cannot be dispatched", ErrCancelPending, r.TaskID, r.CallID)
 		}
 	}
 	for _, seq := range c.Applied {
@@ -148,6 +156,16 @@ func (m *Memory) validate(c CommitSet) error {
 		}
 	}
 	return nil
+}
+
+// pendingCancel returns the first unapplied cancel interrupt of a task.
+func (m *Memory) pendingCancel(id string) (Interrupt, bool) {
+	for _, in := range m.interrupts[id] {
+		if !in.Applied && in.Kind == InterruptCancel {
+			return in, true
+		}
+	}
+	return Interrupt{}, false
 }
 
 func (m *Memory) upsertCall(r CallRecord) {

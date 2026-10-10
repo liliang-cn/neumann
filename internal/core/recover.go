@@ -66,7 +66,7 @@ func round(t *task.TCB, recs []mem.CallRecord) []mem.CallRecord {
 //   - Anything else (Ready, waiting for reconciliation) resumes as it is.
 //
 // A task with a committed cancel is finalised instead, whatever its state.
-func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]mem.CallRecord, error) {
+func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
 		return nil, err
@@ -149,7 +149,7 @@ func checkRound(t *task.TCB, rs []mem.CallRecord) error {
 // settles the round again, and returns the calls to dispatch. The caller
 // owns t (checked out of the wait set) and requeues it after a nil error;
 // on error t is unchanged.
-func (e *Env) Resolve(ctx context.Context, t *task.TCB, callID string, o Outcome) ([]mem.CallRecord, error) {
+func (e *Env) Resolve(ctx context.Context, t *task.TCB, callID string, o Outcome) ([]Send, error) {
 	if t.State != task.Waiting || t.Wait != task.WaitReconcile {
 		return nil, fmt.Errorf("task %s: %w", t.ID, ErrNotReconciling)
 	}
@@ -198,9 +198,9 @@ func (e *Env) Resolve(ctx context.Context, t *task.TCB, callID string, o Outcome
 // Any held call parks the task in Waiting(Reconcile) and nothing is sent.
 // Otherwise the calls to send go out and the task waits on I/O; with nothing
 // to send, the round's tool message is assembled and the task is ready.
-func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSet, []mem.CallRecord) {
+func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSet, []Send) {
 	var c mem.CommitSet
-	var send []mem.CallRecord
+	var send []Send
 	held := 0
 	for i := range rs {
 		r := &rs[i]
@@ -211,11 +211,12 @@ func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSe
 				held++
 			}
 		case mem.CallPlanned:
-			send = append(send, *r)
+			send = append(send, Send{CallRecord: *r})
 		case mem.CallDispatched:
 			switch {
 			case r.Effect == task.ReadOnly || r.Effect == task.Idempotent:
-				send = append(send, *r)
+				// Sent again under the same key: it may have run already.
+				send = append(send, Send{CallRecord: *r, SentBefore: true})
 			case r.ReportUnknown:
 				r.Status = mem.CallUnknown
 				r.Result = &task.ToolResult{Content: unknownReport, IsError: true}
@@ -240,8 +241,10 @@ func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSe
 	case len(send) > 0:
 		for i, r := range send {
 			if r.Status == mem.CallPlanned {
-				send[i] = dispatched(r)
-				c.Calls = upsert(c.Calls, send[i])
+				d := dispatched(r.CallRecord)
+				// A retry after an unknown attempt: that attempt may have run.
+				send[i] = Send{CallRecord: d, SentBefore: d.Attempt > 1}
+				c.Calls = upsert(c.Calls, d)
 			}
 		}
 		waitIO(t)
@@ -267,6 +270,6 @@ func upsert(list []mem.CallRecord, r mem.CallRecord) []mem.CallRecord {
 
 // Dispatch sends a committed batch of t's calls, exactly as a model step's
 // own batch is sent. The caller has already handed t to the scheduler.
-func (e *Env) Dispatch(taskID string, allow, deny []string, batch []mem.CallRecord) {
+func (e *Env) Dispatch(taskID string, allow, deny []string, batch []Send) {
 	e.dispatch(taskID, allow, deny, batch)
 }

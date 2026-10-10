@@ -52,6 +52,10 @@ type Env struct {
 
 	failMu     sync.Mutex
 	startFails map[string]int // consecutive failed start commits, per task
+
+	lateMu     sync.Mutex // guards lateClosed against lates.Add
+	lateClosed bool
+	lates      sync.WaitGroup // late results being recorded
 }
 
 // maxStartRetries bounds how often a step whose start could not be committed
@@ -132,7 +136,7 @@ func (e *Env) CloseDispatch() {
 func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	var (
 		c     mem.CommitSet
-		batch []mem.CallRecord
+		batch []Send
 		err   error
 	)
 	if e.halt().Err() != nil {
@@ -153,6 +157,13 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		e.Sched.Forget(t.ID)
 		return
 	}
+	if errors.Is(err, errCannotFinalise) {
+		// The task was cancelled, and its final commit could not be put
+		// together. Its cancel is committed: recovery finishes it.
+		e.Logf("neumann: task %s: %v; it is no longer scheduled", t.ID, err)
+		e.Sched.Forget(t.ID)
+		return
+	}
 	if errors.Is(err, errStartNotCommitted) {
 		// Nothing happened yet, so the step is retried a few times. A store
 		// that keeps failing is not going to record anything else either.
@@ -170,6 +181,10 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	}
 	// A commit that has started is allowed to finish.
 	if err := e.Commit(context.WithoutCancel(ctx), c); err != nil {
+		if errors.Is(err, mem.ErrCancelPending) {
+			e.cancelInstead(ctx, t, c) // a cancel committed first: nothing of c happened
+			return
+		}
 		e.Logf("neumann: commit for task %s failed; it is no longer scheduled: %v", t.ID, err)
 		e.Sched.Forget(t.ID)
 		return

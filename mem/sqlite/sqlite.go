@@ -274,6 +274,15 @@ func apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto.Event, err
 			return nil, fmt.Errorf("%w: task %s is at %d, commit carries %d", mem.ErrVersion, t.ID, version, t.Version)
 		}
 	}
+	if t := c.Task; t != nil && !c.NewTask {
+		in, ok, err := pendingCancel(ctx, tx, t.ID)
+		if err != nil {
+			return nil, err
+		}
+		if ok && !(t.State.Terminal() && t.StopReason == mem.CancelReason(in)) {
+			return nil, fmt.Errorf("%w: %s", mem.ErrCancelPending, t.ID)
+		}
+	}
 	for _, r := range c.Calls {
 		if c.NewTask && c.Task.ID == r.TaskID {
 			continue
@@ -282,6 +291,13 @@ func apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto.Event, err
 			return nil, err
 		} else if !exists {
 			return nil, fmt.Errorf("%w: %s", mem.ErrNotFound, r.TaskID)
+		}
+		if r.Status == mem.CallDispatched {
+			if _, ok, err := pendingCancel(ctx, tx, r.TaskID); err != nil {
+				return nil, err
+			} else if ok {
+				return nil, fmt.Errorf("%w: %s: call %s cannot be dispatched", mem.ErrCancelPending, r.TaskID, r.CallID)
+			}
 		}
 	}
 	for _, seq := range c.Applied {
@@ -383,6 +399,20 @@ func apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto.Event, err
 		}
 	}
 	return events, nil
+}
+
+// pendingCancel returns the first unapplied cancel interrupt of a task, as
+// of this point in the transaction: a cancel committed earlier in the same
+// group commit counts.
+func pendingCancel(ctx context.Context, tx *sql.Tx, id string) (mem.Interrupt, bool, error) {
+	in := mem.Interrupt{TaskID: id, Kind: mem.InterruptCancel}
+	err := tx.QueryRowContext(ctx,
+		"SELECT seq, text FROM interrupts WHERE task_id = ? AND applied = 0 AND kind = ? ORDER BY seq LIMIT 1",
+		id, mem.InterruptCancel).Scan(&in.Seq, &in.Text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return mem.Interrupt{}, false, nil
+	}
+	return in, err == nil, err
 }
 
 func taskRow(ctx context.Context, tx *sql.Tx, id string) (version int64, terminal, exists bool, err error) {

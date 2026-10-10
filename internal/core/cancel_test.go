@@ -483,3 +483,247 @@ func TestExpiredDeadlineStartsNothing(t *testing.T) {
 		t.Fatalf("task %s %q after %d model calls", got.State, got.StopReason, sm.Calls())
 	}
 }
+
+// A cancel committed between the step's read of its interrupts and its
+// Running commit: the store refuses the start, and the step finalises the
+// task without calling the model.
+func TestStoreRefusesTheStartOfACancelledTask(t *testing.T) {
+	e, store, sm := newTestEnv(t, reply)
+	inner := e.Commit
+	e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+		if c.Task != nil && c.Task.State == task.Running {
+			if err := inner(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "t1", Kind: mem.InterruptCancel, Text: ReasonCancelled}}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return inner(ctx, c)
+	}
+	e.Sched.Add(newTask(t, e, store, "q"))
+	e.step(bg, take(t, e), 0)
+	got := load(t, store)
+	if got.State != task.Cancelled || sm.Calls() != 0 || got.Unconfirmed != 0 {
+		t.Fatalf("task %s after %d model calls, unconfirmed %d", got.State, sm.Calls(), got.Unconfirmed)
+	}
+	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
+		t.Fatalf("scheduler still holds it: %d/%d/%d", r, w, h)
+	}
+}
+
+// A cancel that is already signalled when the call would start: no request
+// goes out, so none is unconfirmed.
+func TestCancelBeforeTheCallSendsNothing(t *testing.T) {
+	e, store, sm := newTestEnv(t, reply)
+	inner := e.Commit
+	e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+		if err := inner(ctx, c); err != nil {
+			return err
+		}
+		if c.Task != nil && c.Task.State == task.Running {
+			// The cancel lands right after the start commit.
+			if err := e.Cancel(bg, "t1", ReasonCancelled); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return nil
+	}
+	e.Sched.Add(newTask(t, e, store, "q"))
+	e.step(bg, take(t, e), 0)
+	got := load(t, store)
+	if got.State != task.Cancelled || sm.Calls() != 0 || got.Unconfirmed != 0 || got.Used.Steps != 0 {
+		t.Fatalf("task %s after %d model calls, unconfirmed %d, steps %d", got.State, sm.Calls(), got.Unconfirmed, got.Used.Steps)
+	}
+}
+
+// failCalls is a store whose call-log reads fail once armed.
+type failCalls struct {
+	*mem.Memory
+	fail atomic.Bool
+}
+
+func (f *failCalls) Calls(ctx context.Context, id string) ([]mem.CallRecord, error) {
+	if f.fail.Load() {
+		return nil, errors.New("disk on fire")
+	}
+	return f.Memory.Calls(ctx, id)
+}
+
+// When the final commit of a cancel cannot even be assembled, the task is
+// given up (recovery finishes the committed cancel); it is never turned into
+// a failure that names the read error.
+func TestCancelThatCannotBeAssembledIsLeftForRecovery(t *testing.T) {
+	fs := &failCalls{Memory: mem.NewMemory()}
+	var e *Env
+	cm := &ctxModel{fn: func(ctx context.Context, _ model.Request) (model.Response, error) {
+		if err := e.Cancel(bg, "t1", ReasonCancelled); err != nil {
+			t.Error(err)
+		}
+		fs.fail.Store(true)
+		<-ctx.Done()
+		return model.Response{}, ctx.Err()
+	}}
+	e, _, _ = newTestEnv(t, reply)
+	e.Store, e.Model = fs, cm
+	e.Commit = func(ctx context.Context, c mem.CommitSet) error { _, err := fs.Commit(ctx, c); return err }
+	tc := newTask(t, e, fs.Memory, "q")
+	e.Sched.Add(tc)
+	e.step(bg, take(t, e), 0)
+	got := load(t, fs.Memory)
+	if got.State.Terminal() {
+		t.Fatalf("task ended %s %q; it must be left for recovery", got.State, got.StopReason)
+	}
+	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
+		t.Fatalf("scheduler still holds it: %d/%d/%d", r, w, h)
+	}
+	fs.fail.Store(false)
+	if _, err := e.Recover(bg, got); err != nil {
+		t.Fatal(err)
+	}
+	if got := load(t, fs.Memory); got.State != task.Cancelled {
+		t.Fatalf("after recovery: %s", got.State)
+	}
+}
+
+// An operator's retry of a call whose outcome was unknown is cancelled
+// before it goes out: the earlier attempt may have run, so the call stays
+// unknown for the operator; it is not "never ran".
+func TestCancelledRetryStaysUnknown(t *testing.T) {
+	var runs atomic.Int32
+	e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
+	crashSite(t, store, mem.CallRecord{Tool: "dev_pay", Status: mem.CallDispatched, Attempt: 1})
+	tc := load(t, store)
+	if _, err := e.Recover(bg, tc); err != nil {
+		t.Fatal(err)
+	}
+	e.Sched.Add(tc)
+	held, ok := e.Sched.Checkout("t1")
+	if !ok {
+		t.Fatal("checkout")
+	}
+	batch, err := e.Resolve(bg, held, "c-1", Outcome{Retry: true})
+	if err != nil || len(batch) != 1 {
+		t.Fatalf("batch %+v err %v", batch, err)
+	}
+	if !e.HandBack(bg, held, batch) {
+		t.Fatal("hand-back refused")
+	}
+	if err := e.Cancel(bg, "t1", ReasonCancelled); err != nil {
+		t.Fatal(err)
+	}
+	e.Dispatch("t1", nil, nil, batch)
+	e.WaitBatches()
+	r := callsOf(t, store)["c-1"]
+	if r.Status != mem.CallUnknown || runs.Load() != 0 || load(t, store).State != task.Cancelled {
+		t.Fatalf("record %+v runs %d task %s", r, runs.Load(), load(t, store).State)
+	}
+	evs := eventsOfKind(store, proto.EvReconcileNeeded)
+	if len(evs) != 2 || !strings.Contains(string(evs[1].Data), `"cancelled":true`) {
+		t.Fatalf("reconcile_needed %+v", evs)
+	}
+}
+
+// A task whose deadline has passed sends nothing more, including a recovered
+// re-send whose deadline timer has not run yet; the re-sent call may have run
+// before the restart, so it is unknown.
+func TestExpiredDeadlineStopsARecoveredResend(t *testing.T) {
+	var runs atomic.Int32
+	e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
+	crashSite(t, store, mem.CallRecord{Tool: "dev_read", Status: mem.CallDispatched, Attempt: 1, Effect: task.ReadOnly})
+	tc := load(t, store)
+	tc.Budget.Deadline = time.Now().Add(-time.Second)
+	tc.Version++
+	if _, err := store.Commit(bg, mem.CommitSet{Task: tc}); err != nil {
+		t.Fatal(err)
+	}
+	tc = load(t, store)
+	batch, err := e.Recover(bg, tc)
+	if err != nil || len(batch) != 1 {
+		t.Fatalf("batch %+v err %v", batch, err)
+	}
+	e.Sched.Add(tc)
+	e.Dispatch("t1", nil, nil, batch)
+	e.WaitBatches()
+	got := load(t, store)
+	if r := callsOf(t, store)["c-1"]; r.Status != mem.CallUnknown || runs.Load() != 0 || got.State != task.Failed || got.StopReason != "deadline" {
+		t.Fatalf("record %+v runs %d task %s %q", r, runs.Load(), got.State, got.StopReason)
+	}
+}
+
+// Late results are bounded: when the cancel's final commit fails, a result
+// arriving later is dropped rather than waiting forever; and CloseLate waits
+// for a late commit already under way.
+func TestLateResultsAreBounded(t *testing.T) {
+	t.Run("final commit failed", func(t *testing.T) {
+		entered, gate := make(chan struct{}), make(chan struct{})
+		dev := builtin.New("dev").Add(bus.ToolDef{Name: "deaf"}, func(context.Context, bus.DeviceCall) (string, error) {
+			close(entered)
+			<-gate
+			return "paid", nil
+		})
+		e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.CallTools("dev_deaf"), nil }, dev)
+		inner := e.Commit
+		e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+			if c.Task != nil && c.Task.State == task.Cancelled {
+				return errors.New("disk on fire")
+			}
+			return inner(ctx, c)
+		}
+		e.Sched.Add(newTask(t, e, store, "q"))
+		e.step(bg, take(t, e), 0)
+		<-entered
+		if err := e.Cancel(bg, "t1", ReasonCancelled); err != nil {
+			t.Fatal(err)
+		}
+		e.WaitBatches()
+		close(gate)
+		time.Sleep(50 * time.Millisecond)
+		done := make(chan struct{})
+		go func() { e.CloseLate(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("CloseLate waited for a late result that can never be recorded")
+		}
+		if r := callsOf(t, store)["c-1"]; r.Status != mem.CallDispatched {
+			t.Fatalf("record %+v: nothing may be written after a failed final commit", r)
+		}
+	})
+	t.Run("close waits", func(t *testing.T) {
+		entered, gate := make(chan struct{}), make(chan struct{})
+		dev := builtin.New("dev").Add(bus.ToolDef{Name: "deaf"}, func(context.Context, bus.DeviceCall) (string, error) {
+			close(entered)
+			<-gate
+			return "paid", nil
+		})
+		e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.CallTools("dev_deaf"), nil }, dev)
+		inner := e.Commit
+		lateIn, lateGo := make(chan struct{}), make(chan struct{})
+		e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+			if len(c.Calls) == 1 && c.Calls[0].Status == mem.CallLate {
+				close(lateIn)
+				<-lateGo
+			}
+			return inner(ctx, c)
+		}
+		e.Sched.Add(newTask(t, e, store, "q"))
+		e.step(bg, take(t, e), 0)
+		<-entered
+		if err := e.Cancel(bg, "t1", ReasonCancelled); err != nil {
+			t.Fatal(err)
+		}
+		e.WaitBatches()
+		close(gate)
+		<-lateIn
+		done := make(chan struct{})
+		go func() { e.CloseLate(); close(done) }()
+		select {
+		case <-done:
+			t.Fatal("CloseLate returned with a late commit under way")
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(lateGo)
+		<-done
+		if r := callsOf(t, store)["c-1"]; r.Status != mem.CallLate {
+			t.Fatalf("record %+v", r)
+		}
+	})
+}

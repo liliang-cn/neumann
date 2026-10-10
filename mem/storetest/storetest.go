@@ -54,6 +54,8 @@ func Run(t *testing.T, newStore Factory) {
 		{"UnfinishedCoversEveryNonTerminalState", testUnfinishedCoversEveryNonTerminalState},
 		{"CancelInterruptIsAppliedSilently", testCancelInterruptIsAppliedSilently},
 		{"CancelledAndLateCallsRoundTrip", testCancelledAndLateCallsRoundTrip},
+		{"PendingCancelRefusesEverythingButItsFinalCommit", testPendingCancelRefusesEverythingButItsFinalCommit},
+		{"CancelDecidedByCommitOrder", testCancelDecidedByCommitOrder},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore) })
@@ -490,7 +492,7 @@ func testCancelInterruptIsAppliedSilently(t *testing.T, newStore Factory) {
 	if len(pending) != 2 || pending[1].Kind != mem.InterruptCancel || pending[1].Text != "deadline" {
 		t.Fatalf("pending %+v", pending)
 	}
-	tc.State, tc.StopReason, tc.Version = task.Cancelled, "cancelled", 2
+	tc.State, tc.StopReason, tc.Version = task.Failed, "deadline", 2
 	evs := mustCommit(t, s, mem.CommitSet{Task: tc, Events: []proto.Event{proto.NewEvent(proto.EvCancelled, "a", nil)}})
 	if len(evs) != 2 || evs[0].Kind != proto.EvCancelled || evs[1].Kind != proto.EvSteerDropped {
 		t.Fatalf("events %+v", evs)
@@ -523,5 +525,70 @@ func testCancelledAndLateCallsRoundTrip(t *testing.T, newStore Factory) {
 	got, _ := s.Calls(ctx, "a")
 	if !reflect.DeepEqual(got, []mem.CallRecord{planned, sent}) {
 		t.Fatalf("calls %+v", got)
+	}
+}
+
+// Once a cancel is committed, the only state change the store accepts for
+// the task is the cancel's own final commit (terminal, with the cancel's
+// reason as StopReason), and no call of it may be recorded as dispatched.
+// Results, late results and further interrupts are still recorded.
+func testPendingCancelRefusesEverythingButItsFinalCommit(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	planned := mem.CallRecord{TaskID: "a", CallID: "c-1", Index: 1, Tool: "dev_x", Status: mem.CallPlanned}
+	mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{planned}})
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptCancel, Text: "deadline"}}})
+
+	refused := func(what string, c mem.CommitSet) {
+		t.Helper()
+		if _, err := s.Commit(ctx, c); !errors.Is(err, mem.ErrCancelPending) {
+			t.Fatalf("%s: %v, want ErrCancelPending", what, err)
+		}
+	}
+	next := func(st task.State, reason string) *task.TCB {
+		n := tc.Clone()
+		n.State, n.StopReason, n.Version = st, reason, 2
+		return n
+	}
+	sent := planned
+	sent.Status, sent.Attempt, sent.Key = mem.CallDispatched, 1, "a/c-1/1"
+	refused("running", mem.CommitSet{Task: next(task.Running, "")})
+	refused("waiting with a dispatch", mem.CommitSet{Task: next(task.Waiting, ""), Calls: []mem.CallRecord{sent}})
+	refused("a dispatch alone", mem.CommitSet{Calls: []mem.CallRecord{sent}})
+	refused("done", mem.CommitSet{Task: next(task.Done, "end_turn")})
+	refused("another reason", mem.CommitSet{Task: next(task.Cancelled, "cancelled")})
+	if got, _ := s.Load(ctx, "a"); got.Version != 1 {
+		t.Fatalf("a refused commit changed the task: version %d", got.Version)
+	}
+	if got, _ := s.Calls(ctx, "a"); got[0].Status != mem.CallPlanned {
+		t.Fatalf("a refused commit changed the call: %+v", got[0])
+	}
+
+	done := planned
+	done.Status, done.Result = mem.CallDone, &task.ToolResult{Content: "x"}
+	mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{done}, Events: []proto.Event{proto.NewEvent(proto.EvToolResult, "a", nil)}})
+	mustCommit(t, s, steer("a", "s"))
+	mustCommit(t, s, mem.CommitSet{Task: next(task.Failed, "deadline")})
+	late := done
+	late.Status = mem.CallLate
+	mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{late}})
+}
+
+// Commits are decided in commit order: work committed before the cancel
+// stands, and the same work after it is refused.
+func testCancelDecidedByCommitOrder(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	tc.State, tc.Version = task.Running, 2
+	mustCommit(t, s, mem.CommitSet{Task: tc})
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptCancel, Text: "cancelled"}}})
+	tc.State, tc.Version = task.Ready, 3
+	if _, err := s.Commit(ctx, mem.CommitSet{Task: tc}); !errors.Is(err, mem.ErrCancelPending) {
+		t.Fatalf("after the cancel: %v", err)
+	}
+	if mem.CancelReason(mem.Interrupt{Kind: mem.InterruptCancel}) != "cancelled" {
+		t.Fatal("a cancel without a reason is a plain cancel")
 	}
 }

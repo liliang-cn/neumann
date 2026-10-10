@@ -289,6 +289,7 @@ func (m *Machine) Stop(ctx context.Context) error {
 			m.cores.Wait()
 			m.env.CloseDispatch() // a late Resolve cannot start a batch while we wait
 			m.env.WaitBatches()
+			m.env.CloseLate() // late results being recorded land before the store is let go
 			close(done)
 		}()
 		select {
@@ -548,7 +549,7 @@ func (m *Machine) Status() Status {
 type recoveredDispatch struct {
 	id          string
 	allow, deny []string
-	batch       []mem.CallRecord
+	batch       []core.Send
 }
 
 // recover settles every unfinished task and hands them to the scheduler. It
@@ -561,7 +562,7 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 	}
 	// Tasks are independent, so they recover concurrently and their commits
 	// share transactions (group commit) instead of paying one fsync each.
-	batches := make([][]mem.CallRecord, len(tasks))
+	batches := make([][]core.Send, len(tasks))
 	errs := make([]error, len(tasks))
 	sem := make(chan struct{}, 32)
 	var wg sync.WaitGroup
@@ -634,6 +635,11 @@ func (m *Machine) Resolve(ctx context.Context, taskID, callID string, o Outcome)
 		return fmt.Errorf("neumann: task %s: %w", taskID, ErrNotReconciling)
 	}
 	batch, err := m.env.Resolve(ctx, t, callID, o)
+	if errors.Is(err, mem.ErrCancelPending) {
+		// Cancelled first: the outcome is not recorded, and the task ends.
+		m.env.Finalise(ctx, t)
+		return fmt.Errorf("neumann: task %s was cancelled before the outcome was recorded: %w", taskID, ErrNotReconciling)
+	}
 	allow, deny := slices.Clone(t.Allow), slices.Clone(t.Deny)
 	// t is unchanged when err != nil. Cancelled while the operator held it:
 	// finalised instead, and the batch is never sent.

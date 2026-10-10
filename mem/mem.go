@@ -53,6 +53,15 @@ const (
 	InterruptCancel = "cancel"
 )
 
+// CancelReason is the StopReason that the final commit of the cancel in must
+// carry: its Text, or "cancelled" when it has none.
+func CancelReason(in Interrupt) string {
+	if in.Text == "" {
+		return "cancelled"
+	}
+	return in.Text
+}
+
 // Interrupt is an outside input to a task, durable before it is applied.
 type Interrupt struct {
 	TaskID  string `json:"task_id"`
@@ -77,6 +86,13 @@ type Interrupt struct {
 //   - When Task is terminal, every interrupt still unapplied is marked applied,
 //     and a steer_dropped event is added for each steer among them, in the
 //     same commit.
+//   - While a task has a pending cancel (committed before this commit), the
+//     only Task the store accepts for it is the cancel's final commit:
+//     terminal, with StopReason CancelReason of the first pending cancel. No
+//     call of the task may be recorded as dispatched. Either is refused with
+//     ErrCancelPending, so the cancel committed first wins over work that
+//     comes after it, whatever the holder of the task has seen. Results, late
+//     results and further interrupts are still recorded.
 //   - Events get their Seq and TaskSeq; Commit returns them. Both are dense:
 //     Seq counts 1, 2, 3… across all events and TaskSeq 1, 2, 3… per task,
 //     with no gap left by a rejected commit.
@@ -94,6 +110,9 @@ var (
 	ErrNotFound = errors.New("mem: task not found")
 	ErrFinished = errors.New("mem: task already finished")
 	ErrExists   = errors.New("mem: task already exists")
+	// ErrCancelPending refuses a commit that would let a task go on after a
+	// cancel of it was committed: its owner must finalise it instead.
+	ErrCancelPending = errors.New("mem: task has a pending cancel")
 )
 
 type Store interface {

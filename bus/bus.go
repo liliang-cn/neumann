@@ -302,11 +302,14 @@ func (b *Bus) Run(ctx context.Context, name string, args json.RawMessage, key st
 			late(finish(o))
 		}
 	}()
-	stopped := func() (task.ToolResult, Outcome) {
-		if ctx.Err() == nil {
+	// stopped reports a call the bus stopped waiting for. byCancel is read
+	// once by the caller, so the outcome and the late hand-off agree even
+	// when the timeout and a cancel land together.
+	stopped := func(byCancel bool) (task.ToolResult, Outcome) {
+		if !byCancel {
 			return task.ToolResult{Content: fmt.Sprintf("tool %s timed out after %v", name, timeout), IsError: true}, Returned
 		}
-		return task.ToolResult{Content: "cancelled while the tool ran: " + ctx.Err().Error(), IsError: true}, Abandoned
+		return task.ToolResult{Content: "cancelled while the tool ran: " + context.Canceled.Error(), IsError: true}, Abandoned
 	}
 	var o outcome
 	select {
@@ -320,13 +323,14 @@ func (b *Bus) Run(ctx context.Context, name string, args json.RawMessage, key st
 			mu.Unlock()
 		default:
 			gaveUp, toCancel = true, ctx.Err() != nil
+			byCancel := toCancel
 			mu.Unlock()
-			return stopped()
+			return stopped(byCancel)
 		}
 	}
 	// A device that merely echoes the context error is a timeout, not a result.
 	if cctx.Err() != nil && echo(o) {
-		return stopped()
+		return stopped(ctx.Err() != nil)
 	}
 	return finish(o), Returned
 }

@@ -2,9 +2,12 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/mem"
@@ -17,7 +20,7 @@ import (
 // A model step dispatches its own calls, and recovery dispatches through
 // settle; this instruction covers a task left Ready at StepTools with planned
 // calls, which no current path produces but a store may still hold.
-func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []mem.CallRecord, error) {
+func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []Send, error) {
 	recs, err := e.Store.Calls(ctx, t.ID)
 	if err != nil {
 		return mem.CommitSet{Events: []proto.Event{
@@ -49,7 +52,7 @@ func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	c.Calls = batch
 	waitIO(t)
 	c.Task = t
-	return c, batch, nil
+	return c, sends(batch), nil
 }
 
 // dispatched marks a planned call as handed to the bus: one more attempt,
@@ -73,7 +76,9 @@ func waitIO(t *task.TCB) {
 // it arrives; when all are in, the task is checked out of the wait set, given
 // its tool message, committed as ready, and requeued. The calls run under the
 // task's context: when the task is cancelled, the batch finalises it instead.
-func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallRecord) {
+// Once the task's deadline has passed, nothing more is sent: a call not yet
+// handed to the bus is not sent, as if cancelled before it went out.
+func (e *Env) dispatch(taskID string, allow, deny []string, batch []Send) {
 	e.dispatchMu.Lock()
 	if e.dispatchClosed {
 		e.dispatchMu.Unlock()
@@ -85,29 +90,37 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallReco
 	e.batches.Add(1)
 	e.dispatchMu.Unlock()
 	tctx, release := e.taskContext(taskID)
+	deadline := e.Sched.Deadline(taskID)
 	go func() {
 		defer e.batches.Done()
 		defer release()
 		commitCtx := context.WithoutCancel(e.halt())
-		finalised := make(chan struct{}) // closed once a cancel's final commit landed
+		over := make(chan struct{}) // closed once the batch has handed its task on
+		var landed atomic.Bool      // a cancel's final commit landed: late results may be recorded
+		defer close(over)
 		b := &outcomes{
 			results:  make([]task.ToolResult, len(batch)),
 			got:      make([]bool, len(batch)),
 			recorded: make([]bool, len(batch)),
-			notRun:   make([]bool, len(batch)),
+			notSent:  make([]bool, len(batch)),
 		}
 		var wg sync.WaitGroup
-		for i, r := range batch {
+		for i, s := range batch {
+			r := s.CallRecord
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				res, how := e.Bus.Run(tctx, r.Tool, r.Args, r.Key, allow, deny, e.lateFor(taskID, r, finalised))
+				if e.expired(deadline) {
+					b.notSent[i] = true // out of time: never handed to the bus
+					return
+				}
+				res, how := e.Bus.Run(tctx, r.Tool, r.Args, r.Key, allow, deny, e.lateFor(taskID, r, over, &landed))
 				if e.halt().Err() != nil {
 					return // halted: the record stays dispatched for recovery
 				}
 				switch how {
 				case bus.NotRun:
-					b.notRun[i] = true // cancelled before it reached the device
+					b.notSent[i] = true // cancelled before it reached the device
 					return
 				case bus.Abandoned:
 					return // cancelled while it ran: its outcome is unknown
@@ -124,7 +137,7 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallReco
 			}()
 		}
 		wg.Wait()
-		e.complete(commitCtx, taskID, batch, b, finalised)
+		landed.Store(e.complete(commitCtx, taskID, deadline, batch, b))
 	}()
 }
 
@@ -133,10 +146,13 @@ type outcomes struct {
 	results  []task.ToolResult
 	got      []bool // a result came back
 	recorded []bool // ...and its own commit landed
-	notRun   []bool // cancelled before it reached the device
+	notSent  []bool // this send never reached the device
 }
 
-func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecord, b *outcomes, finalised chan<- struct{}) {
+// complete hands the batch's task on: with its round finished, or, when the
+// task was cancelled or ran out of time meanwhile, finalised. It reports
+// whether a cancel's final commit landed.
+func (e *Env) complete(ctx context.Context, taskID string, deadline time.Time, batch []Send, b *outcomes) bool {
 	t, ok := e.Sched.Checkout(taskID)
 	if !ok {
 		// Ownership invariant: a dispatched batch's task is in the wait set
@@ -145,26 +161,27 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 	}
 	if e.halt().Err() != nil {
 		e.Sched.Forget(taskID) // records stay dispatched; recovery resumes them
-		return
+		return false
 	}
-	if e.Sched.Cancelled(taskID) {
+	if e.Sched.Cancelled(taskID) || e.expired(deadline) {
 		fates := make(map[string]fate, len(batch))
-		for i, r := range batch {
+		for i, s := range batch {
 			switch {
 			case b.got[i]:
 				res := b.results[i]
-				fates[r.CallID] = fate{result: &res, recorded: b.recorded[i]}
-			case b.notRun[i]:
-				fates[r.CallID] = fate{notRun: true}
+				fates[s.CallID] = fate{result: &res, recorded: b.recorded[i]}
+			case b.notSent[i]:
+				fates[s.CallID] = fate{notSent: true, sentBefore: s.SentBefore}
 			}
 		}
-		if e.finalise(ctx, t, mem.CommitSet{}, fates) {
-			close(finalised) // late results may be recorded now
+		fallback := ReasonCancelled
+		if e.expired(deadline) {
+			fallback = ReasonDeadline
 		}
-		return
+		return e.finalise(ctx, t, mem.CommitSet{}, fates, fallback)
 	}
 	if i := slices.Index(b.got, false); i >= 0 {
-		// Only a cancel or a halt leaves a call without a result.
+		// Only a cancel, a deadline or a halt leaves a call without a result.
 		panic(fmt.Sprintf("core: call %s/%s has no result and its task was not cancelled", taskID, batch[i].CallID))
 	}
 	// The final transition carries the finished records too (an idempotent
@@ -176,12 +193,13 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 	if err != nil {
 		e.Logf("neumann: read calls of task %s after tools failed; it is no longer scheduled: %v", taskID, err)
 		e.Sched.Forget(taskID)
-		return
+		return false
 	}
 	rs := round(t, recs)
 	done := make([]mem.CallRecord, len(batch))
 	var events []proto.Event
-	for i, r := range batch {
+	for i, s := range batch {
+		r := s.CallRecord
 		res := b.results[i]
 		r.Status = mem.CallDone
 		r.Result = &res
@@ -198,12 +216,18 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 	slices.SortFunc(rs, func(a, b mem.CallRecord) int { return a.Index - b.Index })
 	t.Regs = append(t.Regs, toolMessage(rs))
 	e.ready(t, task.StepModel)
-	if err := e.Commit(ctx, mem.CommitSet{Task: t, Calls: done, Events: events}); err != nil {
+	c := mem.CommitSet{Task: t, Calls: done, Events: events}
+	if err := e.Commit(ctx, c); err != nil {
+		if errors.Is(err, mem.ErrCancelPending) {
+			e.cancelInstead(ctx, t, c) // cancelled before the round was answered
+			return false
+		}
 		e.Logf("neumann: commit after tools for task %s failed; it is no longer scheduled: %v", taskID, err)
 		e.Sched.Forget(taskID)
-		return
+		return false
 	}
 	e.handBack(ctx, t, nil)
+	return false
 }
 
 // toolMessage is the tool message for a finished round, built from its call
