@@ -635,9 +635,12 @@ type Event struct {
     TaskID  string          `json:"task_id,omitempty"`
     Seq     int64           `json:"seq"`      // 全局序号
     TaskSeq int64           `json:"task_seq"` // 任务内序号
+    Time    time.Time       `json:"time,omitzero"` // 提交时刻，UTC
     Data    json.RawMessage `json:"data,omitempty"`
 }
 ```
+
+`Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
 任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`done`、`failed`、`cancelled`、`steer_dropped`。
 
@@ -668,6 +671,16 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 ## 14. 观测
 
 `m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态（当前实现：`Status.Groups` 每组给出模型、`Fallback`、`W` / `Target` / `Min` / `Max` / `Auto` / `epoch` / 冷却、存活与忙碌的 vCore 数、就绪数、等待数（其中等本组的）、最老就绪任务已等多久、熔断状态与下一次放探测的时刻；`Status.Cores` 是全部存活 vCore 数；`Status.Limiters` 给出各限流器的 `limit.Status`；`Status.Cache` 是总线 L2 的 `CacheStats`；`m.Queue()` 按类给出就绪数、其中后台数、等待数、最长等待）；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
+
+`observe` 包只用公开 API（`Events`、`EventLog`、`Status`、`Queue`、`Load`、`Calls`），任何宿主都能挂；不挂就没有任何开销。事件从主存按序号读，消费方慢只会落后，不会挡住机器；`Follow` 返回最后读到的 `Seq`，宿主存下来重启后接着读；`Head` 用 O(log n) 次单条读找到日志末尾，只想统计"从现在起"的就从那里开始。
+
+- `Metrics`：OpenTelemetry 指标，名字都在 `neumann.` 下，带单位，完整的表在包文档里。事件来的计数和直方图：任务接受 / 结束（按类、`stop_reason`）、模型调用与失败（按类、错误类别）、模型指令耗时、工具调用（按工具、结果：ok / error / cached / denied / unknown / late / cancelled）与耗时（`tool_call` → 结果）、token（prompt / completion / reasoning / cached）、重试、限流等待、`core_up` / `core_down`、熔断、迁移、`reconcile_needed`。采集时读 `Status` / `Queue` 的仪表：各组 vCore、`W`、`Target`、`epoch`、熔断状态，各类队列与最长等待，各限流器各维度用量与可用量，L2，未结束任务数，丢掉的增量，进程的 goroutine、堆（Linux 上还有 RSS）。基数有界：不按任务 id 打标签；工具名、类名和其他标签各有上限，超出的记为 `_other`（模型会编造工具名）。
+- 模型指令耗时的起点：`step` 事件和它的结果在同一个提交里，调用前的 `Running` 提交不带事件，所以日志里没有"请求发出"的时刻。起点取任务能运行的时刻：上一次提交、退避结束、或放行这次调用的 `throttled`；终点是结果的提交。包括就绪队列和限流器上的等待，空闲时就是调用本身。
+- `Tracer`：从事件重建 OpenTelemetry trace，一个任务一个 trace。根 span `task`（accepted → 终态，`failed` 为错误状态），子 span：每条模型 / 压缩指令一个（失败带错误类别），每轮工具一个 `tools`，其下每个调用一个 `tool <名字>`；重试、限流、迁移、恢复、核对是根 span 上的事件；终态之后提交的（`steer_dropped`、`tool_late`）是根下零长度的 span，这样 trace 不取决于何时 flush。时间全用 `Event.Time`，id 由任务 id 和打开该 span 的事件的 `Seq` 经 SHA-256 得到（trace id = `SHA-256("neumann/trace/"+任务)` 前 16 字节），所以从 0 补读重建的 trace 与在线导出的逐字段相同；从中途接着读时，根 span 从第一个看到的事件开始并标 `neumann.partial`，id 不变。直接把 span 交给 `SpanExporter`（OTLP、内存），不经过 TracerProvider：后者自己生成 id 和时间。
+- `Log`：slog，每个值得一提的事件一行，消息是事件种类，`seq`、`task`、`class` 等是可以 grep 的键值，`at` 是提交时刻。生命周期 info；重试、限流、熔断、迁移被拒、插话丢弃、晚到结果 warn；`failed`、`reconcile_needed` error；`step`、`usage`、工具调用和结果 debug。`LogResources` 定期写一行资源。
+- `NewHandler`：只读的 HTTP 视图，`GET /status`、`/queue`、`/tasks/{id}`（TCB + 调用记录）、`/events?from_seq=N`（Server-Sent Events，先补读再在线，`Last-Event-ID` 续读，`task=` 过滤），可选 `/metrics`（OTel 的 Prometheus 导出器）和 `/debug/pprof/`（默认关；自己实现，不引入 `net/http/pprof`，它会注册到 `DefaultServeMux`）。没有任何会改状态的端点，其他方法 405。`/tasks`、`/events` 带任务内容（提示词、工具参数和结果），只能给操作员看；可以要求 bearer token。指标、trace、活动日志都不带任务内容。
+
+`cmd/neumann`：`-observe-addr`（空 = 关）在那里挂 `NewHandler`，`-metrics` 加 `/metrics`，`-pprof` 加 pprof，`NEUMANN_OBSERVE_TOKEN` 设了就要求 token；设了标准的 `OTEL_EXPORTER_OTLP_ENDPOINT` 时 trace 和指标经 OTLP/HTTP 导出，`service.name` 为 `neumann`。观测从启动时的日志末尾开始；退出时先等机器停、观测读到日志末尾，再 flush 导出器，每步有时限。
 
 ## 15. 公开 API
 
@@ -720,6 +733,7 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
     openai/  anthropic/
   proto/            Instruction、Event
     jsonl/          JSON Lines 编解码与 stdio 服务（Server）
+  observe/          只用公开 API 的观测：OTel 指标与 trace、slog 活动日志、只读 HTTP 视图
   sim/              确定性模拟器：假时钟、脚本模型、脚本设备、故障注入点
   cmd/neumann/      stdio 前端
 ```
