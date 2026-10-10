@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"time"
 
@@ -59,6 +60,10 @@ func (e *Env) backoffMax() time.Duration {
 func (e *Env) backoffDelay(attempt int, floor time.Duration) time.Duration {
 	step, ceil := e.backoffBase(), e.backoffMax()
 	for i := 1; i < attempt && step < ceil; i++ {
+		if step > ceil/2 {
+			step = ceil // doubling would pass the cap, or overflow
+			break
+		}
 		step *= 2
 	}
 	step = min(step, ceil)
@@ -72,6 +77,9 @@ func (e *Env) backoffDelay(attempt int, floor time.Duration) time.Duration {
 func fullJitter(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0
+	}
+	if d == math.MaxInt64 {
+		return time.Duration(rand.Int64N(int64(d)))
 	}
 	return time.Duration(rand.Int64N(int64(d) + 1))
 }

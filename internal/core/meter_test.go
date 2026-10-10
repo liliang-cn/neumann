@@ -1,6 +1,7 @@
 package core
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -94,7 +95,17 @@ func TestBackoffDelay(t *testing.T) {
 	if got := e.backoffDelay(1, 5*time.Second); got != 5*time.Second {
 		t.Fatalf("retry-after floor: %v", got)
 	}
+	e.BackoffBase, e.BackoffMax = time.Duration(math.MaxInt64/3), time.Duration(math.MaxInt64)
+	for _, attempt := range []int{2, 3, 64} {
+		if got := e.backoffDelay(attempt, 0); got <= 0 {
+			t.Fatalf("attempt %d near the largest duration: %v", attempt, got)
+		}
+	}
+	e.BackoffBase, e.BackoffMax = 0, 0
 	e.Jitter = nil
+	if d := fullJitter(time.Duration(math.MaxInt64)); d < 0 {
+		t.Fatalf("full jitter of the largest duration: %v", d)
+	}
 	for range 100 {
 		if d := e.backoffDelay(3, 0); d < 0 || d > 4*time.Second {
 			t.Fatalf("full jitter out of range: %v", d)
