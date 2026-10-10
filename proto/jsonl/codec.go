@@ -19,6 +19,7 @@ const (
 // Instruction kinds the frontend adds to proto's submit, steer and cancel.
 const (
 	KindResolve     = "resolve"
+	KindApprove     = "approve" // answer a call held for approval: Machine.Approve
 	KindStatus      = "status"
 	KindSubscribe   = "subscribe"
 	KindUnsubscribe = "unsubscribe"
@@ -33,7 +34,7 @@ const (
 
 // KnownKinds are the instructions this frontend executes.
 var KnownKinds = []string{
-	proto.KindSubmit, proto.KindSteer, proto.KindCancel, KindResolve,
+	proto.KindSubmit, proto.KindSteer, proto.KindCancel, KindResolve, KindApprove,
 	KindStatus, KindSubscribe, KindUnsubscribe,
 	KindClass, KindCores, KindAutoScale, KindGroupReset, KindQueue,
 }
@@ -59,6 +60,10 @@ const (
 	CodeFailed         = "failed"          // anything else: the message says what
 )
 
+// CodeNotAwaiting fails an approve whose task or call is not held for
+// approval.
+const CodeNotAwaiting = "not_awaiting_approval"
+
 // Outcome is an operator's answer to a call held for reconciliation: Retry
 // sends the call again; otherwise Result is what the call returned and
 // IsError marks a failure.
@@ -66,6 +71,15 @@ type Outcome struct {
 	Result  string `json:"result,omitempty"`
 	IsError bool   `json:"is_error,omitempty"`
 	Retry   bool   `json:"retry,omitempty"`
+}
+
+// Decision is an operator's answer to a call held for approval: verdict
+// "allow" runs it as it is, "deny" refuses it (reason goes to the model),
+// "edit" runs it with args instead of the model's.
+type Decision struct {
+	Verdict string          `json:"verdict"`
+	Reason  string          `json:"reason,omitempty"`
+	Args    json.RawMessage `json:"args,omitempty"`
 }
 
 // Request is one input line: an instruction, plus the optional id the reply
@@ -79,6 +93,8 @@ type Request struct {
 	FromSeq *int64   `json:"from_seq,omitempty"` // subscribe; absent means 0, every event
 	Cores   *int     `json:"cores,omitempty"`    // cores
 	On      *bool    `json:"on,omitempty"`       // autoscale
+
+	Decision *Decision `json:"decision,omitempty"` // approve
 }
 
 // Error is why an instruction failed. Count and Limit are set for CodeBusy,
@@ -157,6 +173,7 @@ var fields = map[string][]string{
 	proto.KindSteer:  {"task_id", "input"},
 	proto.KindCancel: {"task_id"},
 	KindResolve:      {"task_id", "call_id", "outcome"},
+	KindApprove:      {"task_id", "call_id", "decision"},
 	KindStatus:       {},
 	KindSubscribe:    {"from_seq"},
 	KindUnsubscribe:  {},
@@ -255,6 +272,8 @@ func (r *Request) field(name string) any {
 		return &r.CallID
 	case "outcome":
 		return &r.Outcome
+	case "decision":
+		return &r.Decision
 	case "from_seq":
 		return &r.FromSeq
 	}
@@ -299,6 +318,35 @@ func (r *Request) validate() *Error {
 		}
 		if r.Outcome.Retry && (r.Outcome.Result != "" || r.Outcome.IsError) {
 			return errorf(CodeBadRequest, `outcome: "retry" sends the call again and cannot carry a "result" or "is_error"`)
+		}
+	case KindApprove:
+		if err := need("task_id", r.TaskID); err != nil {
+			return err
+		}
+		if err := need("call_id", r.CallID); err != nil {
+			return err
+		}
+		d := r.Decision
+		if d == nil {
+			return errorf(CodeBadRequest, `approve needs "decision": {"verdict":"allow"}, {"verdict":"deny","reason":"…"} or {"verdict":"edit","args":{…}}`)
+		}
+		switch d.Verdict {
+		case "allow", "deny":
+			if d.Args != nil {
+				return errorf(CodeBadRequest, `decision: only "edit" carries "args"`)
+			}
+			if d.Verdict == "allow" && d.Reason != "" {
+				return errorf(CodeBadRequest, `decision: only "deny" carries a "reason"`)
+			}
+		case "edit":
+			if len(d.Args) == 0 || string(d.Args) == "null" {
+				return errorf(CodeBadRequest, `decision: "edit" needs "args", the arguments the call runs with`)
+			}
+			if d.Reason != "" {
+				return errorf(CodeBadRequest, `decision: only "deny" carries a "reason"`)
+			}
+		default:
+			return errorf(CodeBadRequest, `decision: "verdict" must be "allow", "deny" or "edit"`)
 		}
 	case KindClass:
 		if err := need("task_id", r.TaskID); err != nil {

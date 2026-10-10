@@ -21,6 +21,7 @@ type Machine interface {
 	Steer(ctx context.Context, taskID, text string) error
 	Cancel(ctx context.Context, taskID string) error
 	Resolve(ctx context.Context, taskID, callID string, o neumann.Outcome) error
+	Approve(ctx context.Context, taskID, callID string, d neumann.ApprovalDecision) error
 	Events(ctx context.Context, fromSeq int64) <-chan proto.Event
 	Status() neumann.Status
 	Stop(ctx context.Context) error
@@ -166,6 +167,9 @@ func (s *Server) handle(ctx context.Context, l line) (*Reply, *subscription) {
 		r.TaskID = req.TaskID
 		o := req.Outcome
 		err = s.Machine.Resolve(ctx, req.TaskID, req.CallID, neumann.Outcome{Retry: o.Retry, Result: o.Result, IsError: o.IsError})
+	case KindApprove:
+		r.TaskID = req.TaskID
+		err = s.Machine.Approve(ctx, req.TaskID, req.CallID, approval(req.Decision))
 	case KindStatus:
 		r.Status, err = json.Marshal(s.Machine.Status())
 	case KindClass:
@@ -196,6 +200,17 @@ func (s *Server) handle(ctx context.Context, l line) (*Reply, *subscription) {
 	return &r, sub
 }
 
+// approval is the machine's form of a decision Decode has checked.
+func approval(d *Decision) neumann.ApprovalDecision {
+	switch d.Verdict {
+	case "deny":
+		return neumann.ApprovalDecision{Verdict: neumann.ApproveDeny, Reason: d.Reason}
+	case "edit":
+		return neumann.ApprovalDecision{Verdict: neumann.ApproveEdit, Args: d.Args}
+	}
+	return neumann.ApprovalDecision{Verdict: neumann.ApproveAllow}
+}
+
 // errorFor maps the machine's errors to reply codes.
 func errorFor(err error) *Error {
 	e := &Error{Code: CodeFailed, Message: err.Error()}
@@ -212,6 +227,8 @@ func errorFor(err error) *Error {
 		e.Code = CodeBusy
 	case errors.Is(err, neumann.ErrNotReconciling):
 		e.Code = CodeNotReconciling
+	case errors.Is(err, neumann.ErrNotAwaitingApproval):
+		e.Code = CodeNotAwaiting
 	case errors.Is(err, neumann.ErrNotFound):
 		e.Code = CodeNotFound
 	case errors.Is(err, neumann.ErrFinished):

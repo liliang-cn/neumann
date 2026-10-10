@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -609,4 +610,82 @@ func TestStalledReaderDoesNotBlockSubmits(t *testing.T) {
 		}
 		i++
 	}
+}
+
+// A call held for approval is answered over the wire: the approval_needed
+// event names it, approve with each verdict decides, and a call that is not
+// held is refused with not_awaiting_approval.
+func TestApproveOverTheWire(t *testing.T) {
+	var mu sync.Mutex
+	var ran []string
+	dev := builtin.New("bank").Add(bus.ToolDef{Name: "pay"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
+		mu.Lock()
+		ran = append(ran, string(c.Args))
+		mu.Unlock()
+		return "paid " + string(c.Args), nil
+	})
+	payTwice := func(req model.Request) (model.Response, error) {
+		if sim.ToolRounds(req) == 0 {
+			return sim.CallTools("bank_pay", "bank_pay", "bank_pay"), nil
+		}
+		return sim.Reply("done"), nil
+	}
+	policy := func(_ context.Context, info neumann.ToolCallInfo) neumann.Decision {
+		return neumann.RequireApproval("a payment of " + string(info.Args))
+	}
+	h := start(t, neumann.Config{Devices: []bus.Device{dev}, ToolPolicy: policy}, payTwice)
+	mustOK(t, h.do(`{"kind":"subscribe"}`, nil), KindSubscribe)
+	mustFail(t, h.do(`{"kind":"approve","task_id":"nope","call_id":"c-1","decision":{"verdict":"allow"}}`, nil), CodeNotFound)
+	var evs []out
+	mustOK(t, h.do(`{"kind":"submit","task_id":"p","input":"pay"}`, &evs), proto.KindSubmit)
+	held := map[string]map[string]any{}
+	for len(held) < 3 {
+		o := h.next()
+		if o.Kind != proto.EvApprovalNeeded {
+			continue
+		}
+		var d map[string]any
+		json.Unmarshal(o.Data, &d)
+		held[d["call_id"].(string)] = d
+	}
+	if d := held["c-2"]; d["tool"] != "bank_pay" || d["device"] != "bank" || d["effect"] != "side_effect" || d["args"] != `{"n":1}` || d["reason"] != `a payment of {"n":1}` {
+		t.Fatalf("approval_needed %v", d)
+	}
+	var st struct {
+		Approval int `json:"approval"`
+	}
+	r := h.do(`{"kind":"status"}`, nil)
+	json.Unmarshal(r.Status, &st)
+	if st.Approval != 1 {
+		t.Fatalf("status %s", r.Status)
+	}
+	mustFail(t, h.do(`{"kind":"approve","task_id":"p","call_id":"c-9","decision":{"verdict":"allow"}}`, nil), CodeNotAwaiting)
+	mustFail(t, h.do(`{"kind":"resolve","task_id":"p","call_id":"c-1","outcome":{"result":"x"}}`, nil), CodeNotReconciling)
+	r = h.do(`{"id":"a1","kind":"approve","task_id":"p","call_id":"c-1","decision":{"verdict":"allow"}}`, &evs)
+	mustOK(t, r, KindApprove)
+	if r.TaskID != "p" || string(r.ID) != `"a1"` {
+		t.Fatalf("approve reply %+v", r)
+	}
+	mustFail(t, h.do(`{"kind":"approve","task_id":"p","call_id":"c-1","decision":{"verdict":"deny"}}`, nil), CodeNotAwaiting)
+	mustOK(t, h.do(`{"kind":"approve","task_id":"p","call_id":"c-2","decision":{"verdict":"deny","reason":"twice is enough"}}`, &evs), KindApprove)
+	mustOK(t, h.do(`{"kind":"approve","task_id":"p","call_id":"c-3","decision":{"verdict":"edit","args":{"n":30}}}`, &evs), KindApprove)
+	evs = h.eventsUntil(evs, 1)
+	if last := evs[len(evs)-1]; last.Kind != proto.EvDone {
+		t.Fatalf("task ended with %+v", last)
+	}
+	all, _ := h.m.EventLog(bg, 0, 0)
+	kinds := map[string]int{}
+	for _, ev := range all {
+		kinds[ev.Kind]++
+	}
+	if kinds[proto.EvApproved] != 2 || kinds[proto.EvToolDenied] != 1 || kinds[proto.EvToolResult] != 2 {
+		t.Fatalf("events %v", kinds)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	slices.Sort(ran)
+	if fmt.Sprint(ran) != `[{"n":0} {"n":30}]` {
+		t.Fatalf("the device ran %v", ran)
+	}
+	mustFail(t, h.do(`{"kind":"approve","task_id":"p","call_id":"c-3","decision":{"verdict":"allow"}}`, nil), CodeNotAwaiting)
 }
