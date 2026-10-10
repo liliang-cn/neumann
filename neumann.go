@@ -259,6 +259,9 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 		return "", fmt.Errorf("neumann: unknown class %q", class)
 	}
 	id := in.TaskID
+	if strings.Contains(id, "/") {
+		return "", fmt.Errorf("neumann: task id %q must not contain '/'", id)
+	}
 	if id == "" {
 		id = uuid.NewString()
 	}
@@ -302,8 +305,10 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 }
 
 // Steer queues a message for a task. It returns nil only after the steer is
-// committed; it is then either delivered before the task's next model call or
-// reported by a steer_dropped event.
+// committed; it is then either sent to the model by the task's next model call
+// or reported by a steer_dropped event (the task ended first: budget, model
+// failure). A steer that arrives while the final answer is being produced stays
+// pending, and the task takes one more model step to answer it.
 func (m *Machine) Steer(ctx context.Context, taskID, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("neumann: steer needs text")

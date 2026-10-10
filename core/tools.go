@@ -81,8 +81,9 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallReco
 func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecord, results []task.ToolResult) {
 	t, ok := e.Sched.Checkout(taskID)
 	if !ok {
-		e.Logf("neumann: task %s was not waiting when its tools finished", taskID)
-		return
+		// Ownership invariant: a dispatched batch's task is in the wait set
+		// until this call checks it out. Anything else is a bug.
+		panic(fmt.Sprintf("core: task %s was not waiting when its tools finished", taskID))
 	}
 	if e.halt().Err() != nil {
 		e.Sched.Forget(taskID) // records stay dispatched; recovery resumes them

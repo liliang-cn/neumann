@@ -30,8 +30,9 @@ type Env struct {
 	Logf   func(format string, args ...any)
 
 	// Halt interrupts work that is already running: model calls, tool calls.
-	// Once it is done, nothing further is committed and the task keeps its
-	// last committed state. nil means context.Background(), never halted.
+	// A commit that already passed its halt check may still land; nothing is
+	// committed for work that Halt interrupted, and that task keeps its last
+	// committed state. nil means context.Background(), never halted.
 	Halt context.Context
 
 	batches sync.WaitGroup

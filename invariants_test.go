@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -296,7 +297,12 @@ func TestSteerIsDeliveredOrReportedDropped(t *testing.T) { // invariant 5, soak
 		defer rmu.Unlock()
 		return time.Duration(rng.IntN(2000)) * time.Microsecond
 	}
-	m, _ := start(t, neumann.Config{Cores: 2}, func(model.Request) (model.Response, error) {
+	var smu sync.Mutex
+	seen := map[string][]string{} // task name -> every user text a model call received
+	m, _ := start(t, neumann.Config{Cores: 2}, func(req model.Request) (model.Response, error) {
+		smu.Lock()
+		seen[sim.FirstUser(req)] = append(seen[sim.FirstUser(req)], sim.UserTexts(req)...)
+		smu.Unlock()
 		time.Sleep(jitter())
 		return sim.Reply("ok"), nil
 	})
@@ -306,7 +312,7 @@ func TestSteerIsDeliveredOrReportedDropped(t *testing.T) { // invariant 5, soak
 		id := submit(t, m, proto.Instruction{Input: fmt.Sprintf("task-%d", i)})
 		time.Sleep(jitter())
 		err := m.Steer(bg, id, steer)
-		got := waitDone(t, m, id)
+		waitDone(t, m, id)
 		if err != nil {
 			if !errors.Is(err, neumann.ErrFinished) {
 				t.Fatalf("steer: %v", err)
@@ -314,7 +320,9 @@ func TestSteerIsDeliveredOrReportedDropped(t *testing.T) { // invariant 5, soak
 			finished++
 			continue
 		}
-		isDelivered := hasUserText(got, steer)
+		smu.Lock()
+		isDelivered := slices.Contains(seen[fmt.Sprintf("task-%d", i)], steer)
+		smu.Unlock()
 		isDropped := len(droppedEvents(t, m, id)) > 0
 		if isDelivered == isDropped {
 			t.Errorf("%s: delivered=%v dropped=%v, want exactly one", steer, isDelivered, isDropped)

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -19,27 +20,33 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		return mem.CommitSet{}, fmt.Errorf("read interrupts: %w", err)
 	}
 	base := len(t.Regs)
-	c := mem.CommitSet{Events: []proto.Event{
-		proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepModel.String(), Core: core}),
-	}}
+	var c mem.CommitSet
 	if t.Budget.MaxSteps > 0 && t.Used.Steps >= t.Budget.MaxSteps {
+		// Not an instruction: no model call happens, so no step event.
 		return e.finish(t, c, "budget"), nil
 	}
+	c.Events = append(c.Events, proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepModel.String(), Core: core}))
 	c.Applied = applySteers(t, pending)
 
-	resp, err := e.Model.Call(ctx, model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs})
+	resp, err := e.callModel(ctx, model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs})
 	t.Used.Steps++
 	if err != nil {
 		// Steers applied for this call were never answered: take them back so
 		// the terminal commit reports them dropped.
 		t.Regs = t.Regs[:base]
 		c.Applied = nil
-		return e.fail(t, c, "model: "+err.Error()), nil
+		reason := "model: " + err.Error()
+		var p *panicError
+		if errors.As(err, &p) {
+			reason = err.Error()
+		}
+		return e.fail(t, c, reason), nil
 	}
 	t.Used.Add(resp.Usage)
 	c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
 
 	msg := resp.Message
+	msg.Parts = slices.Clone(msg.Parts) // the adapter's slice is not ours to write
 	msg.Role = task.RoleAssistant
 	if len(msg.ToolCalls()) > 0 {
 		for i := range msg.Parts {
@@ -65,18 +72,34 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 
 	t.Regs = append(t.Regs, msg)
 	// A steer committed while the model was answering turns this answer into
-	// a turn: the task goes on instead of finishing over it.
+	// a turn: the task goes on instead of finishing over it. The steer stays
+	// pending: the next model step applies it at its start and sends it, or
+	// that step's terminal commit reports it dropped.
 	late, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
 		return c, fmt.Errorf("read interrupts: %w", err)
 	}
 	if late = withoutApplied(late, c.Applied); hasSteer(late) {
-		c.Applied = append(c.Applied, applySteers(t, late)...)
 		e.ready(t, task.StepModel)
 		c.Task = t
 		return c, nil
 	}
 	return e.finish(t, c, "end_turn"), nil
+}
+
+// panicError is a model adapter's panic, recovered into a failure of its task.
+type panicError struct{ v any }
+
+func (p *panicError) Error() string { return fmt.Sprintf("model panicked: %v", p.v) }
+
+// callModel calls the adapter; a panic in it fails the task, not the process.
+func (e *Env) callModel(ctx context.Context, req model.Request) (resp model.Response, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			resp, err = model.Response{}, &panicError{v: r}
+		}
+	}()
+	return e.Model.Call(ctx, req)
 }
 
 // applySteers appends each pending steer as a user message and returns the

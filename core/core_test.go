@@ -204,30 +204,146 @@ func TestSteerIsAppliedBeforeTheModelCall(t *testing.T) {
 	}
 }
 
-func TestSteerDuringFinalCallContinuesTheTask(t *testing.T) {
+// lateSteerEnv scripts a first model call during which a steer is committed;
+// second decides what the next call does.
+func lateSteerEnv(t *testing.T, second modelFn) (*Env, *mem.Memory, *[][]string) {
+	t.Helper()
 	var store *mem.Memory
+	var seen [][]string
 	calls := 0
-	e, s, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+	e, s, _ := newTestEnv(t, func(req model.Request) (model.Response, error) {
 		calls++
+		seen = append(seen, sim.UserTexts(req))
 		if calls == 1 {
 			if _, err := store.Commit(bg, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "t1", Kind: mem.InterruptSteer, Text: "one more"}}}); err != nil {
 				return model.Response{}, err
 			}
 			return sim.Reply("first"), nil
 		}
-		return sim.Reply("second"), nil
+		return second(req)
 	})
 	store = s
+	return e, s, &seen
+}
+
+func droppedCount(t *testing.T, store *mem.Memory, text string) int {
+	t.Helper()
+	evs, _ := store.Events(bg, 0, 0)
+	n := 0
+	for _, ev := range evs {
+		if ev.Kind == "steer_dropped" && strings.Contains(string(ev.Data), text) {
+			n++
+		}
+	}
+	return n
+}
+
+func TestSteerDuringFinalCallContinuesTheTask(t *testing.T) {
+	e, s, seen := lateSteerEnv(t, func(model.Request) (model.Response, error) { return sim.Reply("second"), nil })
 	e.step(bg, newTask(t, e, s, "q"), 0)
 	got := load(t, s)
-	if got.State != task.Ready || got.PC != task.StepModel || len(got.Regs) != 3 ||
-		got.Regs[1].TextContent() != "first" || got.Regs[2].TextContent() != "one more" {
+	if got.State != task.Ready || got.PC != task.StepModel || len(got.Regs) != 2 ||
+		got.Regs[0].TextContent() != "q" || got.Regs[1].TextContent() != "first" {
 		t.Fatalf("after first call: %+v", got)
+	}
+	if p, _ := s.Interrupts(bg, "t1", true); len(p) != 1 || p[0].Text != "one more" {
+		t.Fatalf("steer should still be pending: %+v", p)
 	}
 	e.step(bg, take(t, e), 0)
 	if got := load(t, s); got.State != task.Done || got.LastAnswer() != "second" {
 		t.Fatalf("final %+v", got)
 	}
+	if want := []string{"q", "one more"}; !slices.Equal((*seen)[1], want) {
+		t.Fatalf("second call saw %v", (*seen)[1])
+	}
+	if n := droppedCount(t, s, "one more"); n != 0 {
+		t.Fatalf("%d steer_dropped events", n)
+	}
+}
+
+func TestLateSteerIsDroppedWhenTheNextStepHitsTheBudget(t *testing.T) {
+	e, s, _ := lateSteerEnv(t, func(model.Request) (model.Response, error) { return sim.Reply("second"), nil })
+	tc := newTask(t, e, s, "q")
+	tc.Budget.MaxSteps = 1
+	e.step(bg, tc, 0)
+	e.step(bg, take(t, e), 0)
+	got := load(t, s)
+	if got.State != task.Done || got.StopReason != "budget" || hasUserText(got, "one more") {
+		t.Fatalf("task %+v", got)
+	}
+	if n := droppedCount(t, s, "one more"); n != 1 {
+		t.Fatalf("%d steer_dropped events, want 1", n)
+	}
+}
+
+func TestLateSteerIsDroppedWhenTheNextCallFails(t *testing.T) {
+	e, s, _ := lateSteerEnv(t, func(model.Request) (model.Response, error) { return model.Response{}, errors.New("down") })
+	e.step(bg, newTask(t, e, s, "q"), 0)
+	e.step(bg, take(t, e), 0)
+	got := load(t, s)
+	if got.State != task.Failed || hasUserText(got, "one more") {
+		t.Fatalf("task %+v", got)
+	}
+	if n := droppedCount(t, s, "one more"); n != 1 {
+		t.Fatalf("%d steer_dropped events, want 1", n)
+	}
+}
+
+func hasUserText(tc *task.TCB, text string) bool {
+	for _, m := range tc.Regs {
+		if m.Role == task.RoleUser && m.TextContent() == text {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBudgetStopIsNotAModelStep(t *testing.T) {
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.Reply("x"), nil })
+	tc := newTask(t, e, store, "q")
+	tc.Budget.MaxSteps = 1
+	tc.Used.Steps = 1
+	e.step(bg, tc, 0)
+	if got := load(t, store); got.StopReason != "budget" {
+		t.Fatalf("task %+v", got)
+	}
+	if hasKind(store, "step") {
+		t.Fatalf("a budget stop counted as an instruction: %s", kinds(store))
+	}
+}
+
+func TestModelStepDoesNotModifyTheAdapterResponse(t *testing.T) {
+	shared := sim.CallTools("dev_echo")
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return shared, nil }, echoDev())
+	e.step(bg, newTask(t, e, store, "go"), 0)
+	if got := load(t, store).Regs[1].ToolCalls(); len(got) != 1 || got[0].CallID != "c-1" {
+		t.Fatalf("task calls %+v", got)
+	}
+	if id := shared.Message.Parts[0].CallID; id != "" {
+		t.Fatalf("adapter response was modified: CallID %q", id)
+	}
+}
+
+func TestModelPanicFailsTheTask(t *testing.T) {
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { panic("boom") })
+	e.step(bg, newTask(t, e, store, "q"), 0)
+	got := load(t, store)
+	if got.State != task.Failed || got.StopReason != "model panicked: boom" {
+		t.Fatalf("task %+v", got)
+	}
+	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
+		t.Fatalf("counts %d %d %d", r, w, h)
+	}
+}
+
+func TestCompleteWithoutCheckoutPanics(t *testing.T) {
+	e, _, _ := newTestEnv(t, nil)
+	defer func() {
+		if r := recover(); r == nil || !strings.Contains(r.(string), "ghost") {
+			t.Fatalf("recovered %v", r)
+		}
+	}()
+	e.complete(bg, "ghost", nil, nil)
 }
 
 func TestBudgetEndsTheTask(t *testing.T) {

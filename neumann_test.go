@@ -14,6 +14,7 @@ import (
 	"github.com/liliang-cn/neumann"
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/bus/builtin"
+	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/sim"
@@ -386,6 +387,10 @@ func TestStopTimeoutHaltsWork(t *testing.T) {
 	if err != nil || got.State != task.Waiting {
 		t.Fatalf("task %+v err %v", got, err)
 	}
+	recs, err := m.Calls(bg, id)
+	if err != nil || len(recs) != 1 || recs[0].Status != mem.CallDispatched || recs[0].Attempt != 1 || recs[0].Result != nil {
+		t.Fatalf("call records %+v err %v", recs, err)
+	}
 	before, _ := m.EventLog(bg, 0, 0)
 	time.Sleep(100 * time.Millisecond)
 	after, _ := m.EventLog(bg, 0, 0)
@@ -423,5 +428,12 @@ func TestFinishedTaskFreesItsSlot(t *testing.T) {
 	}
 	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "b"}); err != nil {
 		t.Fatalf("second submit: %v", err)
+	}
+}
+
+func TestSubmitRejectsTaskIDWithSlash(t *testing.T) {
+	m, _ := start(t, neumann.Config{}, func(model.Request) (model.Response, error) { return sim.Reply("ok"), nil })
+	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "q", TaskID: "a/b"}); err == nil {
+		t.Fatal("task id with / accepted")
 	}
 }

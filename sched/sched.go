@@ -1,7 +1,8 @@
 // Package sched owns every task that is not on a vCore: the ready queues (one
 // per class, interactive before background, FIFO by ReadySince, with aging)
-// and the wait set. Ownership of a TCB passes only through Next, Checkout and
-// Requeue (design §8).
+// and the wait set. Ownership of a TCB passes only through Add, Next, Checkout,
+// Requeue and Forget (design §8). Forget gives a held task up for good: it is
+// used after a failed commit and on the halt paths.
 package sched
 
 import (
