@@ -1,0 +1,9 @@
+.PHONY: check test
+
+check:
+	test -z "$$(gofmt -l .)"
+	go vet ./...
+	go test -race ./...
+
+test:
+	go test ./...
