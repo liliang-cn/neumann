@@ -214,18 +214,37 @@ func (b *Bus) Call(ctx context.Context, name string, args json.RawMessage, key s
 		res, err := r.dev.Call(cctx, DeviceCall{Tool: r.tool, Args: args, Key: key})
 		ch <- outcome{res, err}
 	}()
-	select {
-	case o := <-ch:
-		if o.err != nil {
-			return task.ToolResult{Content: o.err.Error(), IsError: true}
-		}
-		return o.res
-	case <-cctx.Done():
+	stopped := func() task.ToolResult {
 		if ctx.Err() == nil {
 			return task.ToolResult{Content: fmt.Sprintf("tool %s timed out after %v", name, timeout), IsError: true}
 		}
 		return task.ToolResult{Content: "cancelled while the tool ran: " + ctx.Err().Error(), IsError: true}
 	}
+	finish := func(o outcome) task.ToolResult {
+		if o.err != nil {
+			return task.ToolResult{Content: o.err.Error(), IsError: true}
+		}
+		return o.res
+	}
+	var o outcome
+	select {
+	case o = <-ch:
+	case <-cctx.Done():
+		// A device that finished at the same moment as the timeout wins: its
+		// side effect happened, so reporting a timeout would invite a retry.
+		select {
+		case o = <-ch:
+		default:
+			return stopped()
+		}
+	}
+	// A device that merely echoes the context error is a timeout, not a result.
+	if ce := cctx.Err(); ce != nil {
+		if (o.err != nil && errors.Is(o.err, ce)) || (o.res.IsError && o.res.Content == ce.Error()) {
+			return stopped()
+		}
+	}
+	return finish(o)
 }
 
 func (b *Bus) Close() error {

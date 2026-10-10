@@ -231,7 +231,7 @@ func TestQueuedCallHonoursCancel(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	res := b.Call(cctx, "dev_hold", nil, "", nil, nil)
-	if !res.IsError || time.Since(start) > 200*time.Millisecond {
+	if !res.IsError || !strings.Contains(res.Content, "cancelled before the tool ran") || time.Since(start) > 200*time.Millisecond {
 		t.Fatalf("got %+v after %v", res, time.Since(start))
 	}
 	close(hold)
