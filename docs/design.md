@@ -229,7 +229,8 @@ type CallRecord struct {
 2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`）。`Running` 在模型调用之前提交，含义是"请求可能已经发出"：提交之后、调用之前被停机打断时，会多算一次未确认。这一步要送达的插话在 `Running` 提交之后才合并，崩溃不会留下"上下文里有、中断表里却还未送达"的插话。预算按 `Used.Steps + Unconfirmed` 计，反复崩溃的任务不会越过预算重发。
 3. 调用记录按 4.2 的表处理。
 4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；所有未结束任务重设 Deadline 定时器。`Waiting(Backoff)` 和 `Waiting(Group)` 提交为 `Ready`（`ReadySince` 不变，`Retries` 保留）：退避定时器和熔断状态都不持久，重启后各组从闭合开始，退避从下一次失败重新起算。
-5. 各执行组的 `W` 回到 `Initial`，vCore 按恢复出的就绪队列启动（6.1：有积压才启动，`Min` 只是空闲回收的下限）；限流器从空状态开始，由服务商响应头重新校准（7.3）。
+5. `Class` 已不在配置里的任务（换了配置重启），在第 2、3 步之前移到 `Config.Default` 的组：先做 6.3 的能力校验，通过则提交 `Class` 改变（状态不变）和 `migrated`（`reason = "class_removed"`）；不通过则提交一个原因为 `class_removed` 的取消中断和 `migrate_refused`（带不满足的那一条），随后按取消做最终提交（调用照 9.5 处理），任务 `Failed`，`StopReason = "class_removed"`。不留没有 vCore 会取的任务。
+6. 各执行组的 `W` 回到 `Initial`，vCore 按恢复出的就绪队列启动（6.1：有积压才启动，`Min` 只是空闲回收的下限）；限流器从空状态开始，由服务商响应头重新校准（7.3）。
 
 ### 4.6 计量
 
@@ -351,11 +352,11 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 实现中的决定（`internal/core/migrate.go`）：
 
 - 触发点：`execModel` 发现本组熔断中（取到任务时、或 `Admit` 不放行时），以及调用以 `QuotaExhausted` 失败、熔断刚打开时。三处都走同一个 `groupGone`。
-- 目标沿 `Fallback` 链找：跳过熔断中的组，取第一个通过校验的。链上的组全在熔断中：留在 `Waiting(Group)` 等本组，不算迁移失败；有没熔断但校验不过的：按**本组**的 `OnMigrateFail`，`wait` 时停进 `Waiting(Group)` 并发 `migrate_refused`（`{from, to, check, detail}`），`fail` 时 `failed` 事件带 `check`、`detail`。
+- 目标沿 `Fallback` 链找：跳过熔断中的组，取第一个通过校验的。链上的组全在熔断中：留在 `Waiting(Group)` 等本组，不算迁移失败；之后任何一个组恢复（`group_up`、`GroupReset`），除了唤醒它自己的 `Waiting(Group)` 任务，也唤醒 `Fallback` 链经过它的那些组里未 `PinClass` 的等待任务，让它们重新走一遍迁移判断（本组若是额度熔断，永远不会半开，不这样就永远等下去）；停进来与恢复交错时，交还后再看一次链上有没有组已恢复。校验不过而停下的任务不在交还后重试，等下一次 `group_up`；有没熔断但校验不过的：按**本组**的 `OnMigrateFail`，`wait` 时停进 `Waiting(Group)` 并发 `migrate_refused`（`{from, to, check, detail}`），`fail` 时 `failed` 事件带 `check`、`detail`。
 - 能力取自 `model.CapsOf(适配器)`（在 panic 保护下读，适配器 panic 即校验不过，`check = "caps"`）：适配器实现 `model.CapsReporter`（`Caps() Caps{Window, MaxOut, Tools, MaxTools}`）就用它；没实现的按"支持工具、数量不限、窗口未知"，窗口未知（0）不拒绝。OpenAI 兼容适配器：`ContextWindow` 默认 0（网关背后模型不定），`MaxTools` 默认 128，`NoTools`；Anthropic：`ContextWindow` 默认 200000，`MaxTools` 默认不限，`NoTools`。
 - 估算用 `task.EstimateTokens`：JSON 字节数 / 4 + 1，与 7.2 默认预占同一个估算；按目标服务商实际会收到的消息算（去掉外来 reasoning）。输出预留：任务的 `MaxOut`，否则目标的 `Caps.MaxOut` / `OutputCap`，否则 4096。
 - 第 3 条（能否在目标组上切块压缩）依赖 `StepCompact`，它还没有实现：放不下就按校验失败处理（`check = "context"`），不迁移后再压缩。
-- reasoning 由 vCore 在组请求时过滤（`forProvider`）：`Provider` 非空且不等于目标适配器 `Provider()` 的 reasoning 块不发，块全被去掉的消息不发；寄存器原样保留，迁回原服务商时还在。两个适配器本来也按 `Provider` 丢弃外来 reasoning（Anthropic 丢 thinking，OpenAI 兼容不渲染 reasoning），过滤在 vCore 做是为了对任何适配器成立。
+- reasoning 由 vCore 在组请求时过滤（`forProvider`）：`Provider` 非空且不等于目标适配器 `Provider()` 的 reasoning 块不发，块全被去掉的消息不发，它两边同角色的消息并成一条（角色仍然交替，严格的服务商不会收到非法序列）；寄存器原样保留，迁回原服务商时还在。两个适配器本来也按 `Provider` 丢弃外来 reasoning（Anthropic 丢 thinking，OpenAI 兼容不渲染 reasoning），过滤在 vCore 做是为了对任何适配器成立。
 - 迁移提交：`State = Ready`、`PC = StepModel`、`ReadySince` 不变、`Retries` 不变、`migrated`（`{from, to, reason: "group_down"}`）；交还后进新组的就绪队列，触发新组扩容。准入计数随之从旧类移到新类。
 - 手动迁移 `m.SetClass(ctx, id, class)`：同样的校验，不通过返回 `*MigrateError`（`Check`、`Detail`），什么都不提交；`PinClass` 只禁止自动迁移，不拦操作员。只能在指令之间移动：任务在就绪队列、`Waiting(Group / Backoff / Reconcile)`、`Suspended` 时取出、提交、交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试。等旧组的 `Waiting(Group)` 改为 `Ready`，其他状态不变（退避保留 `WakeAt`）；`migrated` 的 `reason` 为 `manual`。
 
@@ -741,6 +742,7 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
    评审后修正：`WaitingFor` 在锁内复制排序键（数据竞争）；截断重做的上限受限流器约束、放不大就直接 `truncated`、有回答后清零；无提示的 429 计入重试；适配器钩子的 panic 不再拖垮进程；退避步长防溢出。`TestCrashAtEveryCommitPointWithTheGroupDown`：额度耗尽后崩溃，重启从 `Waiting(Group)` 恢复。
    弹性 vCore 与多执行组（阶段 4 完成）：`Config.Groups`（单组字段保留为简写，窗口固定在 `Cores`）；每组的 `Scaler` 接进 vCore 循环（6.1 的实现说明），窗口通过 vCore 数真正约束并发；`IdleRetire` 空闲回收到 `Min`；`core_up` / `core_down` 带原因；`m.SetCores` / `m.AutoScale`；熔断时按 `Fallback` 链迁移，能力校验（`model.Caps`、`task.EstimateTokens`），失败按 `OnMigrateFail`；`m.SetClass` 手动迁移；`PinClass`；发往新服务商的请求不带外来 reasoning；多个组共享限流器；每组 `MaxQueued`；`m.Queue()`、`Status` 的每组 vCore 与队列；L2 接进机器（终态提交后 `ForgetTask`、派发用 `RunCached`、命中的 `tool_result` 带 `cached`、`Status.Cache`）；stdio 前端接上 `class` / `cores` / `autoscale` / `group_reset` / `queue`。
    验证：`TestCoresTrackProviderCapacity`（第 18 节 13，机器层，K = 4）、`TestOneEpochOfOverloadsHalvesTheWindowOnce`（14）、`TestTwoGroupsShareALimiter`（15）、`TestMigrationToTheFallbackGroup` / `TestMigrationRefusedByEachCheck`（17：成功、三种校验 × `wait` / `fail`、`PinClass`）、`TestCoresRetireOnlyBetweenInstructions`（19）、`TestSetClassMovesATask`、`TestSetCoresAndAutoScale`、`TestIdleCoresRetireDownToMin`、`TestStopShutsEveryCoreDown`（`shutdown`，goroutine 数回落）、`TestGroupConfigIsValidated`、`TestGroupMaxQueued`、`TestCachedToolResultThroughTheMachine`、`TestCrashAtEveryCommitPointWithAMigration`（两组，任务中途迁移，每个提交点前后各崩一次）。
+   评审后修正：后备组恢复时唤醒链上停着的任务（`TestParkedTaskMigratesWhenItsFallbackReturns`：本组额度熔断；`TestParkedBacklogMovesWhenTheFallbackComesBack`：本组临时错误熔断，积压在后备组恢复后立刻迁走，不再每个半开周期一个）；类已删除的恢复任务移到默认组或以 `class_removed` 失败（`TestRecoveredTaskOfARemovedClass`）；`forProvider` 去掉空消息后合并同角色邻居。
    没做：`StepCompact`（迁移的第 3 条校验因此总是"放不下"）、`suspend` / `resume` / `priority`。
 
 ## 18. 测试
