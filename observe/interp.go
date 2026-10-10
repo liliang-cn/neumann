@@ -1,7 +1,9 @@
 package observe
 
 import (
+	"cmp"
 	"encoding/json"
+	"slices"
 	"time"
 
 	"github.com/liliang-cn/neumann/proto"
@@ -24,7 +26,6 @@ type data struct {
 	Cached     bool   `json:"cached"`
 	Resolved   bool   `json:"resolved"`
 	Unknown    bool   `json:"unknown"`
-	Denied     bool   `json:"denied"`
 	Cancelled  bool   `json:"cancelled"`
 	Retry      bool   `json:"retry"`
 	Task       string `json:"task"`
@@ -40,6 +41,11 @@ type data struct {
 	Wait       string `json:"wait"`
 	Reset      bool   `json:"reset"`
 	MaxOut     int    `json:"max_out"`
+	By         string `json:"by"`        // tool_denied: policy or operator
+	Device     string `json:"device"`    // approval_needed
+	Effect     string `json:"effect"`    // approval_needed
+	Recovered  bool   `json:"recovered"` // approval_needed announced again by a restart
+	Edited     bool   `json:"edited"`    // approved with new arguments
 	task.Usage
 }
 
@@ -65,16 +71,27 @@ const (
 	outResolved  = "resolved"
 )
 
+// Verdicts of a call held for approval (design §9.7), as metric labels and
+// span attributes: what an operator answered, or cancelled when its task
+// ended first.
+const (
+	verdictAllow = "allow"
+	verdictEdit  = "edit"
+	verdictDeny  = "deny"
+)
+
 type factKind int
 
 const (
-	factTaskStart factKind = iota // accepted, or the first event of a task seen mid-way
-	factTaskEnd                   // done, failed, cancelled
-	factStep                      // an instruction (model, compact, tools) finished
-	factToolEnd                   // a tool call ended: a result, an unknown outcome, a late result, a cancel
-	factBatchEnd                  // every call of a tool round ended
-	factMark                      // anything else worth noting on the task (span event)
-	factAfter                     // an event committed after its task ended (steer_dropped, tool_late)
+	factTaskStart      factKind = iota // accepted, or the first event of a task seen mid-way
+	factTaskEnd                        // done, failed, cancelled
+	factStep                           // an instruction (model, compact, tools) finished
+	factToolEnd                        // a tool call ended: a result, an unknown outcome, a late result, a cancel
+	factBatchEnd                       // every call of a tool round ended
+	factMark                           // anything else worth noting on the task (span event)
+	factAfter                          // an event committed after its task ended (steer_dropped, tool_late)
+	factApprovalNeeded                 // a call was held for an operator, announced for the first time
+	factApprovalEnd                    // a held call was decided, or its task ended first (outcome: the verdict)
 )
 
 // fact is what one event means once the events before it are known: the
@@ -115,6 +132,13 @@ type openCall struct {
 	batch *openBatch
 }
 
+// openApproval is a call held for an operator, from its first announcement.
+type openApproval struct {
+	seq  int64 // the approval_needed that announced it first
+	tool string
+	at   time.Time
+}
+
 type openBatch struct {
 	seq     int64
 	at      time.Time
@@ -133,6 +157,7 @@ type taskState struct {
 	ready, call time.Time
 	step        *openStep
 	open        map[string]*openCall // calls without an outcome yet
+	held        map[string]*openApproval
 	calls       map[string]*openCall // every call seen, for late results
 	batch       *openBatch
 	usage       task.Usage
@@ -175,7 +200,7 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 		return fact{kind: k, ev: ev, d: d, task: ev.TaskID, class: t.class}
 	}
 	if t == nil {
-		t = &taskState{start: ev.Time, ready: ev.Time, open: map[string]*openCall{}, calls: map[string]*openCall{}}
+		t = &taskState{start: ev.Time, ready: ev.Time, open: map[string]*openCall{}, calls: map[string]*openCall{}, held: map[string]*openApproval{}}
 		in.tasks[ev.TaskID] = t
 		if ev.Kind == proto.EvAccepted {
 			t.class, t.priority = d.Class, d.Priority
@@ -233,8 +258,6 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 		switch {
 		case d.Unknown:
 			out = outUnknown
-		case d.Denied:
-			out = outDenied
 		case d.Resolved:
 			out = outResolved
 		case d.IsError:
@@ -246,6 +269,31 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 	case proto.EvReconcileNeeded:
 		emit(f(factMark))
 		in.endCall(ev, d, t, d.CallID, outUnknown, emit)
+	case proto.EvToolDenied:
+		// Refused before it ran, by the policy or by an operator: its
+		// result, as far as the model is concerned.
+		emit(f(factMark))
+		if d.By == "operator" {
+			in.endApproval(ev, d, t, d.CallID, verdictDeny, emit)
+		}
+		in.endCall(ev, d, t, d.CallID, outDenied, emit)
+	case proto.EvApprovalNeeded:
+		emit(f(factMark))
+		if t.held[d.CallID] == nil {
+			// A restart announces a held call again: it is still the same
+			// wait, counted once and timed from its first announcement.
+			t.held[d.CallID] = &openApproval{seq: ev.Seq, tool: d.Tool, at: ev.Time}
+			n := f(factApprovalNeeded)
+			n.name, n.seq, n.start = d.Tool, ev.Seq, ev.Time
+			emit(n)
+		}
+	case proto.EvApproved:
+		emit(f(factMark))
+		verdict := verdictAllow
+		if d.Edited {
+			verdict = verdictEdit
+		}
+		in.endApproval(ev, d, t, d.CallID, verdict, emit)
 	case proto.EvModelRetry:
 		emit(f(factMark))
 	case proto.EvMigrated:
@@ -349,6 +397,17 @@ func (in *interp) endCall(ev proto.Event, d data, t *taskState, id, out string, 
 	}
 }
 
+// endApproval ends the wait of a held call with verdict.
+func (in *interp) endApproval(ev proto.Event, d data, t *taskState, id, verdict string, emit func(fact)) {
+	a := t.held[id]
+	if a == nil {
+		return // held before this interpreter began following
+	}
+	delete(t.held, id)
+	emit(fact{kind: factApprovalEnd, ev: ev, d: d, task: ev.TaskID, class: t.class, seq: a.seq, name: a.tool,
+		outcome: verdict, start: a.at, end: ev.Time, timed: true})
+}
+
 func (in *interp) endBatch(ev proto.Event, t *taskState, end time.Time, emit func(fact)) {
 	b := t.batch
 	t.batch = nil
@@ -356,6 +415,10 @@ func (in *interp) endBatch(ev proto.Event, t *taskState, end time.Time, emit fun
 }
 
 func (in *interp) endTask(ev proto.Event, d data, t *taskState, emit func(fact)) {
+	// Calls still held for approval when the task ends were never decided.
+	for _, id := range heldInOrder(t) {
+		in.endApproval(ev, d, t, id, outCancelled, emit)
+	}
 	// Calls still open when the task ends never got a result: cancelled.
 	for id := range sortedOpen(t) {
 		in.endCall(ev, d, t, id, outCancelled, emit)
@@ -375,13 +438,23 @@ func (in *interp) endTask(ev proto.Event, d data, t *taskState, emit func(fact))
 	}
 	emit(f)
 	delete(in.tasks, ev.TaskID)
-	t.ended, t.open, t.batch, t.step = true, nil, nil, nil
+	t.ended, t.open, t.batch, t.step, t.held = true, nil, nil, nil, nil
 	in.ended[ev.TaskID] = t
 	in.order = append(in.order, ev.TaskID)
 	if len(in.order) > endedTasks {
 		delete(in.ended, in.order[0])
 		in.order = in.order[1:]
 	}
+}
+
+// heldInOrder is a task's held calls in the order they were announced.
+func heldInOrder(t *taskState) []string {
+	ids := make([]string, 0, len(t.held))
+	for id := range t.held {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b string) int { return cmp.Compare(t.held[a].seq, t.held[b].seq) })
+	return ids
 }
 
 // sortedOpen yields a task's open calls in the order they were made, so the

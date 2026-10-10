@@ -42,7 +42,10 @@ type TracerOptions struct {
 //     error with the error text for a failed task. Attributes: task id,
 //     class, priority, outcome, stop reason, steps, confirmed tokens.
 //     Retries, throttling, migrations, refusals, recovery, reconcile and
-//     operator resolutions are events on it.
+//     operator resolutions are events on it, and so are the tool policy's
+//     and the operators' decisions: tool_denied, tool_rewritten,
+//     approval_needed (again after a restart, marked neumann.recovered) and
+//     approved.
 //   - "model" / "compact": one per model instruction, child of the task.
 //     It spans from when the task could run (its previous commit, after any
 //     backoff, or when the limiters let its call go) to the commit of the
@@ -52,7 +55,12 @@ type TracerOptions struct {
 //   - "tools": one per round of tool calls, child of the task, from the
 //     commit that made the calls to the last result.
 //   - "tool <name>": one per call, child of its round, from the call to its
-//     result. Status error for an error result or an unknown outcome.
+//     result. Status error for an error result, an unknown outcome, or a
+//     denial (outcome denied, ending at tool_denied).
+//   - "approval <tool>": one per call held for an operator (design §9.7),
+//     child of the task, from its first approval_needed to its decision,
+//     with neumann.verdict allow, edit, deny, or cancelled when the task
+//     ended first.
 //   - "steer_dropped", "tool_late": events committed after the task ended,
 //     zero-length children of the task.
 //
@@ -209,6 +217,13 @@ func (t *Tracer) fact(f fact) {
 			attrs = append(attrs, tokenAttrs(*u)...)
 		}
 		t.emit(f.task, spanID(f.task, "step", f.seq), TaskSpanID(f.task), name, f.start, f.end, st, attrs, nil)
+	case factApprovalEnd:
+		// The wait for an operator, from the call's first announcement.
+		t.emit(f.task, spanID(f.task, "approval", f.seq), TaskSpanID(f.task), "approval "+f.name, f.start, f.end, sdktrace.Status{},
+			[]attribute.KeyValue{
+				attribute.String("neumann.task.id", f.task), attribute.String("neumann.tool", f.name),
+				attribute.String("neumann.call.id", f.d.CallID), attribute.String("neumann.verdict", f.outcome),
+			}, nil)
 	case factBatchEnd:
 		t.emit(f.task, spanID(f.task, "batch", f.seq), TaskSpanID(f.task), "tools", f.start, f.end, sdktrace.Status{},
 			[]attribute.KeyValue{attribute.String("neumann.task.id", f.task), attribute.Int64("neumann.seq", f.seq)}, nil)
@@ -300,6 +315,18 @@ func markAttrs(f fact) []attribute.KeyValue {
 		}
 	case proto.EvRecovered:
 		add("neumann.from", d.From)
+	case proto.EvToolDenied, proto.EvToolRewritten, proto.EvApprovalNeeded, proto.EvApproved:
+		// Never the arguments, nor a reason: a policy may quote them.
+		add("neumann.call.id", d.CallID)
+		add("neumann.tool", d.Tool)
+		add("neumann.by", d.By)
+		add("neumann.effect", d.Effect)
+		if d.Recovered {
+			a = append(a, attribute.Bool("neumann.recovered", true))
+		}
+		if d.Edited {
+			a = append(a, attribute.Bool("neumann.edited", true))
+		}
 	}
 	return a
 }

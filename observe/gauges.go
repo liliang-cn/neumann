@@ -37,6 +37,7 @@ func (m *Metrics) gauges(meter metric.Meter) error {
 	seq := ig("neumann.observe.seq", "{event}", "Seq of the last event this observer read.")
 	unfinished := ig("neumann.tasks.unfinished", "{task}", "Tasks admitted and not yet terminal.")
 	held := ig("neumann.tasks.held", "{task}", "Tasks on a vCore or being completed by a tool batch.")
+	awaiting := ig("neumann.tasks.awaiting_approval", "{task}", "Tasks whose tool round waits for an operator's approval (Waiting(Approval)).")
 	live := ig("neumann.vcores.live", "{vcore}", "vCores alive, by class.")
 	busy := ig("neumann.vcores.busy", "{vcore}", "vCores executing an instruction, by class.")
 	window := fg("neumann.group.window", "{request}", "Congestion window W, by class.")
@@ -48,6 +49,7 @@ func (m *Metrics) gauges(meter metric.Meter) error {
 	background := ig("neumann.queue.background", "{task}", "Background tasks in the ready queue, by class.")
 	waiting := ig("neumann.queue.waiting", "{task}", "Tasks in the wait set, by class.")
 	forGroup := ig("neumann.queue.waiting_group", "{task}", "Tasks waiting for their group to come back, by class.")
+	forApproval := ig("neumann.queue.waiting_approval", "{task}", "Tasks waiting for an operator's approval, by class.")
 	longest := fg("neumann.queue.longest_wait", "s", "How long the oldest ready task has been ready, by class.")
 	used := ig("neumann.limiter.used", "{unit}", "What a limiter's window holds, by limiter and dimension.")
 	available := ig("neumann.limiter.available", "{unit}", "What a reservation could take now, by limiter and dimension.")
@@ -72,6 +74,7 @@ func (m *Metrics) gauges(meter metric.Meter) error {
 		st, q := m.src.Status(), m.src.Queue()
 		o.ObserveInt64(unfinished, int64(st.Unfinished))
 		o.ObserveInt64(held, int64(st.Held))
+		o.ObserveInt64(awaiting, int64(st.Approval))
 		for _, g := range st.Groups {
 			c := metric.WithAttributes(attribute.String("class", g.Class))
 			o.ObserveInt64(live, int64(g.Live), c)
@@ -94,6 +97,7 @@ func (m *Metrics) gauges(meter metric.Meter) error {
 			o.ObserveInt64(background, int64(cq.Background), c)
 			o.ObserveInt64(waiting, int64(cq.Waiting), c)
 			o.ObserveInt64(forGroup, int64(cq.ForGroup), c)
+			o.ObserveInt64(forApproval, int64(cq.Approval), c)
 			o.ObserveFloat64(longest, cq.Longest.Seconds(), c)
 		}
 		for _, l := range st.Limiters {

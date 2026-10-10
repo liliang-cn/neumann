@@ -51,7 +51,9 @@ type Metrics struct {
 	toolCalls                                  metric.Int64Counter
 	vcores, transitions, migrations, refused   metric.Int64Counter
 	reconcile, steers                          metric.Int64Counter
+	denied, rewritten, needed, decided         metric.Int64Counter
 	taskDur, modelDur, toolDur, throttle       metric.Float64Histogram
+	approvalWait                               metric.Float64Histogram
 }
 
 // NewMetrics creates the instruments on mp's meter. src gives the gauges
@@ -107,6 +109,11 @@ func NewMetrics(src Source, mp metric.MeterProvider, o MetricsOptions) (*Metrics
 	m.refused = counter("neumann.migrations.refused", "{refusal}", "Migrations refused by the capability check, by from, to and check.")
 	m.reconcile = counter("neumann.reconcile.needed", "{call}", "Calls of unknown outcome held for an operator, by class and whether the task was cancelled.")
 	m.steers = counter("neumann.steers.dropped", "{steer}", "Steers never delivered because the task ended, by class.")
+	m.denied = counter("neumann.tool.denied", "{call}", "Tool calls refused before they ran, by tool and by whom (policy, operator).")
+	m.rewritten = counter("neumann.tool.rewritten", "{call}", "Tool calls whose arguments the tool policy replaced, by tool.")
+	m.needed = counter("neumann.approvals.needed", "{call}", "Tool calls held for an operator's approval, by class and tool; a restart's announcement again is not counted.")
+	m.decided = counter("neumann.approvals.decided", "{call}", "Held tool calls decided, by class and verdict (allow, edit, deny, or cancelled when the task ended first).")
+	m.approvalWait = hist("neumann.approval.wait", "Wait of a held tool call, from its first approval_needed to its decision or its task's end, by class and verdict.")
 	m.taskDur = hist("neumann.task.duration", "Task lifetime, accepted to terminal, by class and outcome.")
 	m.modelDur = hist("neumann.model.duration", "Model instruction latency, from the moment the task could run (its previous commit, after any backoff, or when the limiters let its call go) to the commit of the step's result, by class, pc and outcome.")
 	m.toolDur = hist("neumann.tool.duration", "Tool call latency, tool_call to its result, by tool and outcome.")
@@ -212,6 +219,10 @@ func (m *Metrics) Observe(ev proto.Event) {
 		m.reconcile.Add(bg, 1, m.attrs("class", class, "cancelled", strconv.FormatBool(d.Cancelled)))
 	case proto.EvSteerDropped:
 		m.steers.Add(bg, 1, m.attrs("class", class))
+	case proto.EvToolDenied:
+		m.denied.Add(bg, 1, m.attrs("tool", d.Tool, "by", d.By))
+	case proto.EvToolRewritten:
+		m.rewritten.Add(bg, 1, m.attrs("tool", d.Tool))
 	case proto.EvRecovered:
 		m.recovered.Add(bg, 1, m.attrs("class", class, "from", d.From))
 	}
@@ -246,6 +257,13 @@ func (m *Metrics) fact(f fact) {
 		}
 		if s, ok := timed(f.start, f.end); ok {
 			m.modelDur.Record(bg, s, m.attrs("class", f.class, "pc", f.name, "outcome", f.outcome))
+		}
+	case factApprovalNeeded:
+		m.needed.Add(bg, 1, m.attrs("class", f.class, "tool", f.name))
+	case factApprovalEnd:
+		m.decided.Add(bg, 1, m.attrs("class", f.class, "verdict", f.outcome))
+		if s, ok := timed(f.start, f.end); ok {
+			m.approvalWait.Record(bg, s, m.attrs("class", f.class, "verdict", f.outcome))
 		}
 	case factToolEnd:
 		tool := f.name

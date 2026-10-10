@@ -14,15 +14,17 @@ import (
 // the kind carries), and "at" is the commit time. Levels:
 //
 //   - info: lifecycle — accepted, done, cancelled, migrated, recovered,
-//     resolved, group_up, core_up, core_down, and kinds this package does
-//     not know;
+//     resolved, approved, tool_rewritten, group_up, core_up, core_down, and
+//     kinds this package does not know;
 //   - warn: model_retry, throttled, group_down, migrate_refused,
-//     steer_dropped, tool_late;
+//     steer_dropped, tool_late, tool_denied, and approval_needed (an
+//     operator must answer it: Machine.Approve);
 //   - error: failed, reconcile_needed;
 //   - debug: step, usage, tool_call, tool_result, answer.
 //
 // Lines carry no task content: no prompts, answers, tool arguments or
-// results. A failed task's error text is logged; it is the provider's or
+// results, nor the reasons a tool policy or an operator gave (they may quote
+// the arguments). A failed task's error text is logged; it is the provider's or
 // the machine's, not the user's.
 type Log struct {
 	l  *slog.Logger
@@ -39,7 +41,12 @@ func NewLog(l *slog.Logger) *Log {
 
 // Observe logs ev if it is notable at the logger's level.
 func (g *Log) Observe(ev proto.Event) {
-	class, d := g.in.feed(ev, func(fact) {})
+	var decided *fact // the approval this event decided
+	class, d := g.in.feed(ev, func(f fact) {
+		if f.kind == factApprovalEnd {
+			decided = &f
+		}
+	})
 	level, ok := levelOf(ev.Kind)
 	if !ok || !g.l.Enabled(context.Background(), level) {
 		return
@@ -78,6 +85,21 @@ func (g *Log) Observe(ev proto.Event) {
 		if d.Cancelled {
 			a = append(a, slog.Bool("cancelled", true))
 		}
+	case proto.EvToolDenied, proto.EvToolRewritten, proto.EvApprovalNeeded, proto.EvApproved:
+		str("call", d.CallID)
+		str("tool", d.Tool)
+		str("by", d.By)
+		str("device", d.Device)
+		str("effect", d.Effect)
+		if d.Recovered {
+			a = append(a, slog.Bool("recovered", true))
+		}
+		if f := decided; f != nil {
+			a = append(a, slog.String("verdict", f.outcome))
+			if s, ok := timed(f.start, f.end); ok {
+				a = append(a, slog.Duration("waited", time.Duration(s*float64(time.Second))))
+			}
+		}
 	case proto.EvModelRetry:
 		str("error_class", d.Class)
 		a = append(a, slog.Int("attempt", d.Attempt), slog.Int64("delay_ms", d.DelayMS))
@@ -114,7 +136,8 @@ func levelOf(kind string) (slog.Level, bool) {
 	switch kind {
 	case proto.EvStep, proto.EvUsage, proto.EvToolCall, proto.EvToolResult, proto.EvAnswer:
 		return slog.LevelDebug, true
-	case proto.EvModelRetry, proto.EvThrottled, proto.EvGroupDown, proto.EvMigrateRefused, proto.EvSteerDropped, proto.EvToolLate:
+	case proto.EvModelRetry, proto.EvThrottled, proto.EvGroupDown, proto.EvMigrateRefused, proto.EvSteerDropped, proto.EvToolLate,
+		proto.EvToolDenied, proto.EvApprovalNeeded:
 		return slog.LevelWarn, true
 	case proto.EvFailed, proto.EvReconcileNeeded:
 		return slog.LevelError, true

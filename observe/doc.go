@@ -49,7 +49,7 @@
 //	neumann.model.duration       histogram  s            class, pc, outcome              see below
 //	neumann.model.retries        counter    {retry}      class, error_class, wait        model_retry
 //	neumann.model.tokens         counter    {token}      class, type                     usage: prompt, completion, reasoning, cached
-//	neumann.tool.calls           counter    {call}       tool, outcome                   tool_result, reconcile_needed, tool_late, task end
+//	neumann.tool.calls           counter    {call}       tool, outcome                   tool_result, tool_denied, reconcile_needed, tool_late, task end
 //	neumann.tool.duration        histogram  s            tool, outcome                   tool_call → its result
 //	neumann.limiter.throttled    histogram  s            class                           throttled (waits over 50ms)
 //	neumann.vcore.changes        counter    {change}     class, direction, reason        core_up (up) / core_down (down)
@@ -58,14 +58,23 @@
 //	neumann.migrations.refused   counter    {refusal}    from, to, check                 migrate_refused
 //	neumann.reconcile.needed     counter    {call}       class, cancelled                reconcile_needed
 //	neumann.steers.dropped       counter    {steer}      class                           steer_dropped
+//	neumann.tool.denied          counter    {call}       tool, by                        tool_denied (by policy or operator)
+//	neumann.tool.rewritten       counter    {call}       tool                            tool_rewritten
+//	neumann.approvals.needed     counter    {call}       class, tool                     approval_needed (first announcement only)
+//	neumann.approvals.decided    counter    {call}       class, verdict                  approved, tool_denied by operator, task end
+//	neumann.approval.wait        histogram  s            class, verdict                  first approval_needed → its decision
 //
 // outcome of a model step: ok, error, cancelled; error_class is the
 // model_retry class (rate_limited, quota_exhausted, overload, transient,
 // truncated, ...) or, for a call that failed its task, the stop reason. A
-// tool call's outcome: ok, error, cached (served by L2), denied, unknown
+// tool call's outcome: ok, error, cached (served by L2), denied (tool_denied:
+// refused by the tool policy or an operator, never run), unknown
 // (reconcile_needed, or reported unknown at recovery), resolved, late,
-// cancelled (no result when its task ended). A task's: done, failed,
-// cancelled.
+// cancelled (no result when its task ended, a call still held for approval
+// among them). A task's: done, failed, cancelled. A held call's verdict
+// (design §9.7): allow, edit, deny, or cancelled when its task ended first;
+// a restart that announces a held call again neither counts it again nor
+// restarts its wait.
 //
 // neumann.model.duration: the core commits a step's event together with its
 // result, and the commit that starts a call (Running) carries no event, so
@@ -81,6 +90,7 @@
 //	neumann.observe.seq           gauge    {event}       —                  seq of the last event read
 //	neumann.tasks.unfinished      gauge    {task}        —
 //	neumann.tasks.held            gauge    {task}        —                  on a vCore or a tool batch
+//	neumann.tasks.awaiting_approval gauge  {task}        —                  Status.Approval
 //	neumann.vcores.live           gauge    {vcore}       class
 //	neumann.vcores.busy           gauge    {vcore}       class
 //	neumann.group.window          gauge    {request}     class              congestion window W
@@ -92,6 +102,7 @@
 //	neumann.queue.background      gauge    {task}        class
 //	neumann.queue.waiting         gauge    {task}        class
 //	neumann.queue.waiting_group   gauge    {task}        class
+//	neumann.queue.waiting_approval gauge   {task}        class              Waiting(Approval)
 //	neumann.queue.longest_wait    gauge    s             class              oldest ready task's wait
 //	neumann.limiter.used          gauge    {unit}        limiter, dimension
 //	neumann.limiter.available     gauge    {unit}        limiter, dimension
