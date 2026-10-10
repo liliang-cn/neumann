@@ -23,7 +23,7 @@ func TestCheckoutWaitGivesUpOnceTheTaskIsHandedBackElsewhere(t *testing.T) {
 	awaiting := func(t *task.TCB) bool { return t.State == task.Waiting && t.Wait == task.WaitApproval }
 	got := make(chan bool, 1)
 	go func() {
-		_, ok := s.CheckoutWait(context.Background(), "t1", awaiting)
+		_, ok := s.CheckoutWait(context.Background(), "t1", s.Backs("t1"), awaiting)
 		got <- ok
 	}()
 	time.Sleep(20 * time.Millisecond) // the waiter is asleep on the condition

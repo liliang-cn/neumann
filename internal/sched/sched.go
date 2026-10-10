@@ -490,13 +490,16 @@ func (s *Sched) CheckoutIf(id string, ok func(*task.TCB) bool) (*task.TCB, bool)
 // yet, or another operator. While the task is held, it waits for the
 // hand-back (or for ctx to end). A task that is neither held nor in the wait
 // set, or that ok refuses once it is there, is not taken. Nor is one that was
-// handed back in a state ok refuses and taken again before the waiter woke (a
-// vCore running its next instruction): the waiter gives up rather than wait
-// through that instruction. One handed back in a state ok accepts and taken
-// again by another waiter (operators deciding calls of one round at once) is
-// waited for again. For a hand-back it slept through, ok is shown a TCB with
-// only ID, Class, State and Wait set.
-func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) bool) (*task.TCB, bool) {
+// handed back in a state ok refuses and taken again before the waiter saw it
+// (a vCore running its next instruction): the waiter gives up rather than
+// wait through that instruction. One handed back in a state ok accepts and
+// taken again by another waiter (operators deciding calls of one round at
+// once) is waited for again. since is Backs, read before the caller decided
+// to wait (before it read the task's state from the store): a hand-back after
+// it counts even when it happened before CheckoutWait was entered. For a
+// hand-back it did not see, ok is shown a TCB with only ID, Class, State and
+// Wait set.
+func (s *Sched) CheckoutWait(ctx context.Context, id string, since uint64, ok func(*task.TCB) bool) (*task.TCB, bool) {
 	stop := context.AfterFunc(ctx, func() {
 		s.mu.Lock()
 		s.cond.Broadcast()
@@ -506,10 +509,7 @@ func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c0 := s.ctl[id]
-	var backs uint64
-	if c0 != nil {
-		backs = c0.backs
-	}
+	backs := since
 	for {
 		if t, found := s.waiting[id]; found {
 			if !ok(t) {
@@ -534,6 +534,17 @@ func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) 
 		}
 		s.cond.Wait()
 	}
+}
+
+// Backs counts the hand-backs of a task so far, for CheckoutWait; 0 for a
+// task the scheduler does not know.
+func (s *Sched) Backs(id string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c, ok := s.ctl[id]; ok {
+		return c.backs
+	}
+	return 0
 }
 
 // Take is CheckoutIf that also looks in the ready queues: an operator moving
