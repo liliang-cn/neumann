@@ -320,7 +320,7 @@ func TestApprovalAllowDenyEdit(t *testing.T) {
 		t.Fatalf("c-3 %+v", r)
 	}
 	approved := dataOf(t, m, id, proto.EvApproved)
-	if len(approved) != 2 || approved["c-1"] == nil || approved["c-3"]["args"] != `{"n":7}` || approved["c-3"]["original"] != `{"n":2}` {
+	if len(approved) != 2 || approved["c-1"] == nil || approved["c-3"]["args"] != `{"n":7}` || approved["c-3"]["edited"] != true || approved["c-3"]["original"] != `{"n":2}` {
 		t.Fatalf("approved %v", approved)
 	}
 	if d := dataOf(t, m, id, proto.EvToolDenied)["c-2"]; d["by"] != "operator" || d["reason"] != "not today" {

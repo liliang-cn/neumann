@@ -78,7 +78,8 @@ const (
 	// arguments ({call_id, tool, original, args}). approval_needed: a call is
 	// held for an operator ({call_id, tool, device, effect, args, reason};
 	// recovered: true when a restart announces it again). approved: an
-	// operator let a held call run ({call_id}; an edit adds original and args).
+	// operator let a held call run ({call_id}; an edit adds edited: true,
+	// original and args).
 	EvToolDenied     = "tool_denied"
 	EvToolRewritten  = "tool_rewritten"
 	EvApprovalNeeded = "approval_needed"

@@ -317,7 +317,7 @@ func (e *Env) Approve(ctx context.Context, t *task.TCB, callID string, d Approva
 			r.OrigArgs = r.Args
 		}
 		r.Args, r.Approval = bytes.Clone(d.Args), mem.ApprovalEdited
-		ev = proto.NewEvent(proto.EvApproved, t.ID, map[string]any{"call_id": callID, "original": string(orig), "args": string(r.Args)})
+		ev = proto.NewEvent(proto.EvApproved, t.ID, map[string]any{"call_id": callID, "edited": true, "original": string(orig), "args": string(r.Args)})
 	case ApproveDeny:
 		reason := d.Reason
 		if reason == "" {
