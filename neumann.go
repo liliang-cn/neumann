@@ -265,6 +265,9 @@ func (m *Machine) Stop(ctx context.Context) error {
 	if already {
 		return nil
 	}
+	// No instruction is fetched from here on. Close only stops fetching:
+	// tool batches and admitted submits can still hand tasks back.
+	m.sched.Close()
 	// Submits, steers and resolves admitted before the flag finish their
 	// commits, within the deadline. One that finishes later is durable all
 	// the same, and recovery picks it up on the next start.
@@ -274,7 +277,6 @@ func (m *Machine) Stop(ctx context.Context) error {
 	case <-admitted:
 	case <-ctx.Done():
 	}
-	m.sched.Close()
 	var err error
 	if m.started {
 		done := make(chan struct{})
