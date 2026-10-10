@@ -389,18 +389,27 @@ func oldRoundPad(t *testing.T, goal string, w model.Caps) int {
 		return sim.Reply("x"), nil
 	}}})
 	waitDone(t, probe, submit(t, probe, proto.Instruction{Input: goal}))
-	for pad := 10000; pad < 40000; pad += 4 {
+	measure := func(pad int) (asModel, asChunk int64) {
 		call := padCall(0, pad).Message
 		call.Parts[0].CallID = "c-1"
 		round := []task.Message{call, {Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: string(call.Parts[0].Args)}}}}
-		asModel := task.EstimateTokens("", tools, append([]task.Message{task.Text(task.RoleUser, goal)}, round...)) + int64(w.MaxOut)
-		asChunk := task.EstimateTokens(task.CompactSystem, nil, task.CompactMessages(round)) + int64(w.MaxOut)
-		if asModel > int64(w.Window) {
-			break
+		asModel = task.EstimateTokens("", tools, append([]task.Message{task.Text(task.RoleUser, goal)}, round...)) + int64(w.MaxOut)
+		asChunk = task.EstimateTokens(task.CompactSystem, nil, task.CompactMessages(round)) + int64(w.MaxOut)
+		return asModel, asChunk
+	}
+	// Both grow with the pad: find the smallest pad whose chunk is too
+	// large, then check that its model request still fits.
+	lo, hi := 0, 8*w.Window
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if _, c := measure(mid); c > int64(w.Window) {
+			hi = mid
+		} else {
+			lo = mid + 1
 		}
-		if asChunk > int64(w.Window) {
-			return pad
-		}
+	}
+	if m, _ := measure(lo); m <= int64(w.Window) {
+		return lo
 	}
 	t.Fatal("no pad fits a model request and not a compaction request")
 	return 0

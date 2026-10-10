@@ -210,6 +210,11 @@ type crashScenario struct {
 	caps     *model.Caps   // what the model reports (its window); nil: tools, unknown window
 	rounds   int           // > 0: the task compacts, and its history must hold this many tool rounds
 	mid      *atomic.Int32 // counts runs whose first process died inside a compaction call (Running at StepCompact)
+	// wide bounds how many of the sweep's runs share the disk at once; 0:
+	// as many as run in parallel. A scenario with many commits per run
+	// needs it: each commit is a full fsync, and a few dozen runs at once
+	// slow every one of them past the quiesce limit.
+	wide int
 }
 
 func fixed(fn modelFn) func(*world) modelFn { return func(*world) modelFn { return fn } }
@@ -268,7 +273,7 @@ var (
 	// A small window: after the payment, page after page outgrows it, and
 	// the task compacts mid-task (twice in a clean run), the model keeping
 	// count of its rounds through the summaries.
-	compactScenario = crashScenario{name: "compact", model: fixed(pageModel), maxPays: 1, rounds: 6, mid: new(atomic.Int32),
+	compactScenario = crashScenario{name: "compact", model: fixed(pageModel), maxPays: 1, rounds: 6, mid: new(atomic.Int32), wide: 4,
 		caps: &model.Caps{Window: 640, MaxOut: 64, Tools: true}, ends: map[task.State]string{task.Done: "end_turn"}}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
@@ -790,11 +795,19 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 		t.Fatalf("the clean run retried %v", clean.retries)
 	}
 	var mu sync.Mutex
+	var wide chan struct{}
+	if sc.wide > 0 {
+		wide = make(chan struct{}, sc.wide)
+	}
 	for _, after := range []bool{false, true} {
 		t.Run(fmt.Sprintf("after=%v", after), func(t *testing.T) {
 			for n := int64(0); n <= clean.commits; n++ {
 				t.Run(fmt.Sprintf("crash_%d", n), func(t *testing.T) {
 					t.Parallel()
+					if wide != nil {
+						wide <- struct{}{}
+						defer func() { <-wide }()
+					}
 					run := runAndCrash(t, sc, n, after)
 					mu.Lock()
 					defer mu.Unlock()
