@@ -12,6 +12,7 @@ import (
 
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/bus/builtin"
+	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
@@ -724,6 +725,142 @@ func TestLateResultsAreBounded(t *testing.T) {
 		<-done
 		if r := callsOf(t, store)["c-1"]; r.Status != mem.CallLate {
 			t.Fatalf("record %+v", r)
+		}
+	})
+}
+
+// backClock steps back right after the reading it is armed for: a wall
+// clock corrected backwards between two reads.
+type backClock struct {
+	*sim.Clock
+	armed atomic.Bool
+	to    time.Time
+}
+
+func (c *backClock) Now() time.Time {
+	now := c.Clock.Now()
+	if c.armed.CompareAndSwap(true, false) {
+		c.Clock.Set(c.to)
+	}
+	return now
+}
+
+// A batch that held a call back because the deadline had passed finalises
+// the task, even when the clock has stepped back behind the deadline by the
+// time the batch ends: the decision follows what the batch did, not a second
+// reading of the clock.
+func TestHeldBackCallFinalisesWhateverTheClockSaysLater(t *testing.T) {
+	var runs atomic.Int32
+	start := time.Date(2026, 10, 10, 8, 0, 0, 0, time.UTC)
+	clk := &backClock{Clock: sim.NewClock(start), to: start}
+	e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
+	e.Clock = clk
+	e.Sched = sched.New(clk, sched.DefaultAging)
+	crashSite(t, store, mem.CallRecord{Tool: "dev_read", Status: mem.CallDispatched, Attempt: 1, Effect: task.ReadOnly})
+	tc := load(t, store)
+	tc.Budget.Deadline = start.Add(time.Hour)
+	tc.Version++
+	if _, err := store.Commit(bg, mem.CommitSet{Task: tc}); err != nil {
+		t.Fatal(err)
+	}
+	tc = load(t, store)
+	batch, err := e.Recover(bg, tc)
+	if err != nil || len(batch) != 1 {
+		t.Fatalf("batch %+v err %v", batch, err)
+	}
+	e.Sched.Add(tc)
+	clk.Clock.Set(start.Add(2 * time.Hour)) // past the deadline when the batch looks...
+	clk.armed.Store(true)                   // ...and back before it right after
+	e.Dispatch("t1", nil, nil, batch)
+	e.WaitBatches()
+	got := load(t, store)
+	if r := callsOf(t, store)["c-1"]; got.State != task.Failed || got.StopReason != "deadline" || r.Status != mem.CallUnknown || runs.Load() != 0 {
+		t.Fatalf("task %s %q, record %s, runs %d", got.State, got.StopReason, r.Status, runs.Load())
+	}
+}
+
+// userCancelOnDeadlineCommit makes a user's Cancel land just as a deadline
+// final commit is about to be written: committed, then signalled, while the
+// task's holder has it.
+func userCancelOnDeadlineCommit(t *testing.T, e *Env) *atomic.Int32 {
+	var refusals atomic.Int32
+	inner := e.Commit
+	e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+		if c.Task != nil && c.Task.State == task.Failed && c.Task.StopReason == ReasonDeadline {
+			if err := inner(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "t1", Kind: mem.InterruptCancel, Text: ReasonCancelled}}}); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := e.Sched.Cancel("t1"); ok {
+				t.Error("Sched.Cancel took a task its holder has")
+			}
+			err := inner(ctx, c)
+			if errors.Is(err, mem.ErrCancelPending) {
+				refusals.Add(1)
+			}
+			return err
+		}
+		return inner(ctx, c)
+	}
+	return &refusals
+}
+
+// A deadline finalisation and a user's Cancel race: whichever is committed
+// first decides, and the task always ends. Here the user's lands first, so
+// the task ends Cancelled, both when a tool batch held a call back for the
+// deadline and when the next step found it.
+func TestDeadlineFinalisationLosingToACancelStillEnds(t *testing.T) {
+	t.Run("batch", func(t *testing.T) {
+		clk := sim.NewClock(time.Date(2026, 10, 10, 8, 0, 0, 0, time.UTC))
+		var runs atomic.Int32
+		dev := builtin.New("dev").Add(bus.ToolDef{Name: "pay"}, func(context.Context, bus.DeviceCall) (string, error) {
+			runs.Add(1)
+			return "paid", nil
+		})
+		e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+			clk.Advance(2 * time.Hour) // the deadline passes while the model answers
+			return sim.CallTools("dev_pay"), nil
+		}, dev)
+		e.Clock = clk
+		e.Sched = sched.New(clk, sched.DefaultAging) // no deadline handler: only the clock knows
+		refusals := userCancelOnDeadlineCommit(t, e)
+		tc := newTask(t, e, store, "q")
+		tc.Budget.Deadline = clk.Now().Add(time.Hour)
+		tc.Version = 2
+		if _, err := store.Commit(bg, mem.CommitSet{Task: tc}); err != nil {
+			t.Fatal(err)
+		}
+		e.Sched.Add(tc)
+		e.step(bg, take(t, e), 0)
+		e.WaitBatches()
+		got := load(t, store)
+		if refusals.Load() != 1 || got.State != task.Cancelled || got.StopReason != "cancelled" || runs.Load() != 0 {
+			t.Fatalf("refusals %d, task %s %q, device ran %d", refusals.Load(), got.State, got.StopReason, runs.Load())
+		}
+		if r := callsOf(t, store)["c-1"]; r.Status != mem.CallCancelled {
+			t.Fatalf("record %+v", r)
+		}
+		if r, w, h := e.Sched.Counts(); r+w+h != 0 {
+			t.Fatalf("scheduler still holds it: %d/%d/%d", r, w, h)
+		}
+	})
+	t.Run("step", func(t *testing.T) {
+		clk := sim.NewClock(time.Date(2026, 10, 10, 8, 0, 0, 0, time.UTC))
+		e, store, sm := newTestEnv(t, reply)
+		e.Clock = clk
+		e.Sched = sched.New(clk, sched.DefaultAging)
+		refusals := userCancelOnDeadlineCommit(t, e)
+		tc := newTask(t, e, store, "q")
+		tc.Budget.Deadline = clk.Now().Add(time.Hour)
+		tc.Version = 2
+		if _, err := store.Commit(bg, mem.CommitSet{Task: tc}); err != nil {
+			t.Fatal(err)
+		}
+		e.Sched.Add(tc)
+		clk.Advance(2 * time.Hour)
+		e.step(bg, take(t, e), 0)
+		got := load(t, store)
+		if refusals.Load() != 1 || got.State != task.Cancelled || sm.Calls() != 0 {
+			t.Fatalf("refusals %d, task %s %q, model calls %d", refusals.Load(), got.State, got.StopReason, sm.Calls())
 		}
 	})
 }

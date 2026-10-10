@@ -200,11 +200,29 @@ func (e *Env) cancelSet(ctx context.Context, t *task.TCB, c mem.CommitSet, fates
 // gives it up. It reports whether that commit landed; if it did not, the task
 // is no longer scheduled, and recovery finishes the committed cancel after a
 // restart.
+//
+// A cancel committed after the final commit was assembled (a user's Cancel
+// racing a deadline found by the clock) makes the store refuse it: the
+// commit is assembled once more, from that cancel's reason, and committed
+// again. It cannot be refused a second time: the first pending cancel stays
+// the same until a terminal commit applies it.
 func (e *Env) finalise(ctx context.Context, t *task.TCB, c mem.CommitSet, fates map[string]fate, fallback string) bool {
 	e.startCommitted(t.ID) // forget any failed starts
-	c, err := e.cancelSet(ctx, t, c, fates, fallback)
-	if err == nil {
-		err = e.Commit(ctx, c)
+	orig := t.Clone()
+	base := mem.CommitSet{Calls: slices.Clone(c.Calls), Events: slices.Clone(c.Events)}
+	try := func() error {
+		fc, err := e.cancelSet(ctx, t, c, fates, fallback)
+		if err == nil {
+			err = e.Commit(ctx, fc)
+		}
+		return err
+	}
+	err := try()
+	if errors.Is(err, mem.ErrCancelPending) {
+		*t, c = *orig, base
+		if err = try(); errors.Is(err, mem.ErrCancelPending) {
+			panic(fmt.Sprintf("core: final commit of task %s refused twice: %v", t.ID, err))
+		}
 	}
 	if err != nil {
 		e.Logf("neumann: final commit of cancelled task %s failed; it is no longer scheduled: %v", t.ID, err)

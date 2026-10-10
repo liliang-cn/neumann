@@ -7,7 +7,6 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/mem"
@@ -103,6 +102,7 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []Send) {
 			got:      make([]bool, len(batch)),
 			recorded: make([]bool, len(batch)),
 			notSent:  make([]bool, len(batch)),
+			late:     make([]bool, len(batch)),
 		}
 		var wg sync.WaitGroup
 		for i, s := range batch {
@@ -111,7 +111,7 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []Send) {
 			go func() {
 				defer wg.Done()
 				if e.expired(deadline) {
-					b.notSent[i] = true // out of time: never handed to the bus
+					b.notSent[i], b.late[i] = true, true // out of time: never handed to the bus
 					return
 				}
 				res, how := e.Bus.Run(tctx, r.Tool, r.Args, r.Key, allow, deny, e.lateFor(taskID, r, over, &landed))
@@ -137,7 +137,7 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []Send) {
 			}()
 		}
 		wg.Wait()
-		landed.Store(e.complete(commitCtx, taskID, deadline, batch, b))
+		landed.Store(e.complete(commitCtx, taskID, batch, b))
 	}()
 }
 
@@ -147,12 +147,15 @@ type outcomes struct {
 	got      []bool // a result came back
 	recorded []bool // ...and its own commit landed
 	notSent  []bool // this send never reached the device
+	late     []bool // ...because the deadline had passed
 }
 
 // complete hands the batch's task on: with its round finished, or, when the
-// task was cancelled or ran out of time meanwhile, finalised. It reports
+// task was cancelled or ran out of time meanwhile, finalised. Which of the two
+// follows from what the batch did (a call without a result), never from a
+// second reading of the clock, which may have stepped back since. It reports
 // whether a cancel's final commit landed.
-func (e *Env) complete(ctx context.Context, taskID string, deadline time.Time, batch []Send, b *outcomes) bool {
+func (e *Env) complete(ctx context.Context, taskID string, batch []Send, b *outcomes) bool {
 	t, ok := e.Sched.Checkout(taskID)
 	if !ok {
 		// Ownership invariant: a dispatched batch's task is in the wait set
@@ -163,7 +166,7 @@ func (e *Env) complete(ctx context.Context, taskID string, deadline time.Time, b
 		e.Sched.Forget(taskID) // records stay dispatched; recovery resumes them
 		return false
 	}
-	if e.Sched.Cancelled(taskID) || e.expired(deadline) {
+	if e.Sched.Cancelled(taskID) || slices.Contains(b.got, false) {
 		fates := make(map[string]fate, len(batch))
 		for i, s := range batch {
 			switch {
@@ -175,14 +178,10 @@ func (e *Env) complete(ctx context.Context, taskID string, deadline time.Time, b
 			}
 		}
 		fallback := ReasonCancelled
-		if e.expired(deadline) {
+		if slices.Contains(b.late, true) {
 			fallback = ReasonDeadline
 		}
 		return e.finalise(ctx, t, mem.CommitSet{}, fates, fallback)
-	}
-	if i := slices.Index(b.got, false); i >= 0 {
-		// Only a cancel, a deadline or a halt leaves a call without a result.
-		panic(fmt.Sprintf("core: call %s/%s has no result and its task was not cancelled", taskID, batch[i].CallID))
 	}
 	// The final transition carries the finished records too (an idempotent
 	// upsert of what the per-result commits recorded), so the model can never
