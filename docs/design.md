@@ -246,7 +246,7 @@ type CallRecord struct {
 
 ### 4.6 计量
 
-- `Used` 只累计**已确认**的用量，也就是从服务商响应里读到的。`Used.Steps` 是**有回答的**模型调用数：最终答案、要工具的一轮、被截断后重做的那一次都算；以任何错误类别失败的调用（限流、过载、临时、永久、额度耗尽、`Unknown`、panic、被取消打断）都不算。失败的调用由 `MaxModelRetries` 约束，所以限流风暴不会让任务以 `budget` 结束。
+- `Used` 只累计**已确认**的用量，也就是从服务商响应里读到的。`Used.Steps` 是**有回答的**模型调用数：最终答案、要工具的一轮、被截断后重做的那一次、压缩调用（5.3）都算；以任何错误类别失败的调用（限流、过载、临时、永久、超出上下文、额度耗尽、`Unknown`、panic、被取消打断）都不算。失败的调用由 `MaxModelRetries` 约束，所以限流风暴不会让任务以 `budget` 结束。
 - 请求已发出但没拿到响应（响应丢失、调用被取消打断、进程崩溃），服务商可能已经处理并计费，本地无法知道。这种情况只计入 `Unconfirmed`，不计入 `Steps`（不重复计数），不估算 token。
 - 预算按 `Used.Steps + Unconfirmed` 计。`step` 事件是每次调用尝试一个（失败的也有），所以 `step` 事件数 = 适配器调用次数 = `Used.Steps` + 失败的调用数（每个失败的调用对应一个非截断的 `model_retry`，或一个 `model_error` 的 `failed`，或一个取消）。
 - `Status` 和 `usage` 事件给出的是已确认用量和未确认请求数，两者分开报告。
@@ -333,7 +333,7 @@ type GroupConfig struct {
 }
 ```
 
-`New` 时校验：类名非空、不重复、不含 `/`；每组有 `Model`；`Limits` 里的名字都在 `Config.Limiters` 里；`Fallback` 指向存在的组，沿 `Fallback` 链走不会回到起点（无环）；`OnMigrateFail` 只能是 `wait` / `fail`；`Max > 0` 时不小于 `Min`。`Config.Default` 是不带 `Class` 提交的任务的类，空则取第一个组。
+`New` 时校验：类名非空、不重复、不含 `/`；每组有 `Model`；`0 ≤ CompactKeep < CompactAt ≤ 1`（0 取默认）；`Limits` 里的名字都在 `Config.Limiters` 里；`Fallback` 指向存在的组，沿 `Fallback` 链走不会回到起点（无环）；`OnMigrateFail` 只能是 `wait` / `fail`；`Max > 0` 时不小于 `Min`。`Config.Default` 是不带 `Class` 提交的任务的类，空则取第一个组。
 
 单组简写：`Config.Groups` 为空时，`Model`、`Class`（默认 `default`）、`Cores`（默认 4）、`Limits` 构成一个组，窗口用 `SetCores(Cores)` 固定：至多 `Cores` 个 vCore、有活才启动，和以前的固定 vCore 数一致；`AutoScale(class, true)` 可让它自适应。简写字段与 `Groups` 同时出现是配置错误。
 
