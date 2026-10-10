@@ -18,6 +18,9 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -29,6 +32,10 @@ import (
 )
 
 var ErrClosed = errors.New("sqlite: store closed")
+
+// ErrLocked is returned by Open when another Store (in this or another
+// process) already owns the database file.
+var ErrLocked = errors.New("sqlite: database is locked by another owner")
 
 // maxBatch bounds how many queued commit sets share one transaction.
 const maxBatch = 128
@@ -68,7 +75,8 @@ CREATE TABLE IF NOT EXISTS task_seqs (
 );`
 
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	lock *os.File // sidecar flock held for the Store's lifetime; nil where unsupported
 
 	mu     sync.RWMutex // guards closed against sends on reqs
 	closed bool
@@ -86,20 +94,52 @@ type request struct {
 }
 
 // Open opens (creating if needed) the database at path. Commits are durable
-// when Commit returns: the database runs in WAL mode with synchronous=FULL.
+// when Commit returns: the database runs in WAL mode with synchronous=FULL
+// (and F_FULLFSYNC on macOS, where plain fsync does not flush the drive
+// cache). Transactions take the write lock when they begin, so a batch never
+// fails upgrading a read lock.
+//
+// A Store owns its database: Open takes an exclusive advisory lock on
+// path+".lock" and fails with ErrLocked while another Store holds it. Where
+// the platform has no flock this is not enforced. ":memory:" and "" are
+// rejected, since every pooled connection would get a database of its own.
 func Open(path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(10000)"
-	db, err := sql.Open("sqlite", dsn)
+	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file::memory:") {
+		return nil, fmt.Errorf("sqlite: open %q: need a file path (an in-memory database is per connection)", path)
+	}
+	lock, err := lockFile(path + ".lock")
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: open %s: %w", path, err)
 	}
+	fail := func(err error) (*Store, error) {
+		if lock != nil {
+			unlockFile(lock)
+		}
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		return fail(fmt.Errorf("sqlite: open %s: %w", path, err))
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("sqlite: create schema: %w", err)
+		return fail(fmt.Errorf("sqlite: create schema: %w", err))
 	}
-	s := &Store{db: db, reqs: make(chan *request, maxBatch), done: make(chan struct{})}
+	s := &Store{db: db, lock: lock, reqs: make(chan *request, maxBatch), done: make(chan struct{})}
 	go s.writer()
 	return s, nil
+}
+
+// dsn builds the connection string. The path goes into a file: URI, so every
+// byte that is special there ('?', '#', '%', space...) is percent-escaped;
+// '/' is kept literal so absolute paths stay absolute.
+func dsn(path string) string {
+	esc := strings.ReplaceAll(url.PathEscape(path), "%2F", "/")
+	q := "_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(10000)"
+	if runtime.GOOS == "darwin" {
+		q += "&_pragma=fullfsync(1)"
+	}
+	return "file:" + esc + "?" + q
 }
 
 // Close waits for queued commits to be written, then closes the database.
@@ -113,7 +153,13 @@ func (s *Store) Close() error {
 	close(s.reqs)
 	s.mu.Unlock()
 	<-s.done
-	return s.db.Close()
+	err := s.db.Close()
+	if s.lock != nil {
+		if lerr := unlockFile(s.lock); err == nil {
+			err = lerr
+		}
+	}
+	return err
 }
 
 // Commit applies c atomically and returns its events with sequence numbers.
@@ -198,6 +244,7 @@ func (s *Store) write(batch []*request) {
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		tx.Rollback() // never leave an open transaction on the pooled connection
 		fail(fmt.Errorf("sqlite: commit: %w", err))
 	}
 }

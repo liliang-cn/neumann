@@ -150,7 +150,7 @@ type Store interface {
 3. **状态、调用记录、中断、事件在同一个事务里。** 客户端看到的任何事件，重启后都能在状态里找到对应的结果。
 4. 写入者单线程，组提交：5 毫秒内（或满 64 个）到达的 `CommitSet` 合成一个事务；每个调用方在自己所属的批次提交后才返回。
 
-两个实现：`mem.Memory`（不持久，测试用）和 `mem/sqlite`（纯 Go 驱动 `modernc.org/sqlite`，WAL，`synchronous=FULL`）。两者都必须通过 `mem/storetest` 一致性套件，它把语义钉死在同一组用例上，包括每个字段的完整往返。SQLite 版：TCB 和调用记录用 gob 编码（模型可能给出不是合法 JSON 的工具参数，要逐字节保存）；单写入者，正在写一个事务时到达的提交排队进下一个事务（组提交，不加等待窗口）；每个提交集一个 savepoint，校验失败只回滚它自己。
+两个实现：`mem.Memory`（不持久，测试用）和 `mem/sqlite`（纯 Go 驱动 `modernc.org/sqlite`，WAL，`synchronous=FULL`，macOS 上加 `fullfsync`，事务开始即取写锁）。两者都必须通过 `mem/storetest` 一致性套件，它把语义钉死在同一组用例上，包括每个字段的完整往返。SQLite 版：TCB 和调用记录用 gob 编码（模型可能给出不是合法 JSON 的工具参数，要逐字节保存）；单写入者（Open 对 `<path>.lock` 取独占 flock，第二个 Open 得到 `ErrLocked`；非 unix 平台不强制）；正在写一个事务时到达的提交排队进下一个事务（组提交，不加等待窗口）；每个提交集一个 savepoint，校验失败只回滚它自己。
 
 ### 4.2 调用记录：工具的预写日志
 
