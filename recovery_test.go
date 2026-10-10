@@ -80,6 +80,8 @@ type world struct {
 	approve bool            // the machines hold dev_pay for an operator's approval (approvalPolicy)
 	decided map[string]bool // calls whose policy decision the restarted machine found committed
 	reasked atomic.Int32    // ...and that it asked the policy about again
+
+	caps *model.Caps // what the scenario's model reports; nil: tools, unknown window
 }
 
 // approvalPolicy holds every payment for an operator and allows the rest. A
@@ -153,6 +155,11 @@ func (w *world) devices() []bus.Device {
 			w.clock.Advance(time.Hour)
 			return "balance 10", nil
 		}).
+		// page reads a long page: a few rounds of it outgrow a small window.
+		Add(bus.ToolDef{Name: "page", Effect: bus.ReadOnly}, func(_ context.Context, c bus.DeviceCall) (string, error) {
+			w.note(c)
+			return strings.Repeat("a long page of text. ", 20), nil
+		}).
 		// dpay pays and takes so long that the task's deadline passes.
 		Add(bus.ToolDef{Name: "dpay"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
 			w.note(c)
@@ -200,6 +207,9 @@ type crashScenario struct {
 	// each process gives as soon as it sees approval_needed; it counts the
 	// runs in which the restarted machine gave it.
 	approved *atomic.Int32
+	caps     *model.Caps   // what the model reports (its window); nil: tools, unknown window
+	rounds   int           // > 0: the task compacts, and its history must hold this many tool rounds
+	mid      *atomic.Int32 // counts runs whose first process died inside a compaction call (Running at StepCompact)
 }
 
 func fixed(fn modelFn) func(*world) modelFn { return func(*world) modelFn { return fn } }
@@ -255,10 +265,30 @@ var (
 	// a crash before the approval, between it and the dispatch, or after.
 	approvalScenario = crashScenario{name: "approval", model: fixed(payModel), maxPays: 1, approved: new(atomic.Int32),
 		ends: map[task.State]string{task.Done: "end_turn"}}
+	// A small window: after the payment, page after page outgrows it, and
+	// the task compacts mid-task (twice in a clean run), the model keeping
+	// count of its rounds through the summaries.
+	compactScenario = crashScenario{name: "compact", model: fixed(pageModel), maxPays: 1, rounds: 6, mid: new(atomic.Int32),
+		caps: &model.Caps{Window: 640, MaxOut: 64, Tools: true}, ends: map[task.State]string{task.Done: "end_turn"}}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
 	}, maxPays: 1, retries: "quota_exhausted", class: "little", moved: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
 )
+
+// pageModel pays, then reads five pages, then answers; a compaction request
+// it summarises (sim.Summarize), and it counts rounds through summaries.
+func pageModel(req model.Request) (model.Response, error) {
+	if sim.IsCompaction(req) {
+		return sim.Summarize(req), nil
+	}
+	switch n := sim.Rounds(req); {
+	case n == 0:
+		return sim.CallTools("dev_pay", "dev_look"), nil
+	case n < 6:
+		return sim.CallTools("dev_page"), nil
+	}
+	return sim.Reply("done"), nil
+}
 
 // bigModel pays, then is out of quota for good.
 func bigModel(req model.Request) (model.Response, error) {
@@ -344,6 +374,9 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 			{Class: "little", Model: &sim.Model{Name: "little", Fn: w.little}, Initial: 2},
 		}
 	}
+	if w.caps != nil {
+		cfg.Model = &sim.Model{Fn: fn, Info: w.caps}
+	}
 	m, err := neumann.New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -407,6 +440,7 @@ type crashRun struct {
 	unsent    bool     // a read-only call it may have re-sent was not, and is unknown
 	fromGroup bool     // the second machine recovered the task from Waiting(Group)
 	retries   []string // the classes of the model_retry events, in order
+	compacted int      // compacted events, both processes
 }
 
 // runAndCrash runs sc on a machine that dies after n commits (after: right
@@ -417,6 +451,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	w := newWorld()
 	w.little = sc.little
 	w.approve = sc.approved != nil
+	w.caps = sc.caps
 	if sc.flaky {
 		w.flaky = true
 		defer w.tick()()
@@ -490,6 +525,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 			}
 		}
 		w.mu.Unlock()
+	}
+	if tc, err := s2.Load(bg, id); err == nil && sc.mid != nil && tc.State == task.Running && tc.PC == task.StepCompact {
+		sc.mid.Add(1)
 	}
 	m2 := newMachine(t, s2, w, sc.model(w))
 	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
@@ -601,8 +639,14 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	w.mu.Unlock()
 	checkEventsHaveState(t, s2, id)
+	if sc.rounds > 0 {
+		checkCompacted(t, m2, got, recs, sc.rounds)
+	}
 	all, _ := s2.Events(bg, 0, 0)
 	for _, ev := range all {
+		if ev.Kind == proto.EvCompacted && ev.TaskID == id {
+			run.compacted++
+		}
 		if ev.Kind == proto.EvModelRetry {
 			var d struct {
 				Class string `json:"class"`
@@ -612,6 +656,45 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		}
 	}
 	return run
+}
+
+// checkCompacted checks a finished task that compacted along the way: its
+// registers and its full history keep every tool call paired with its one
+// result, the history holds every round with no summary in it and the
+// task's request first, and every call in the log is in the history.
+func checkCompacted(t *testing.T, m *neumann.Machine, got *task.TCB, recs []mem.CallRecord, rounds int) {
+	t.Helper()
+	if err := task.CheckPairing(got.Regs); err != nil {
+		t.Fatalf("registers: %v", err)
+	}
+	h, err := m.History(bg, got.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := task.CheckPairing(h); err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	calls := map[string]bool{}
+	tools := 0
+	for _, msg := range h {
+		if msg.Summary {
+			t.Fatal("a summary in the history")
+		}
+		if msg.Role == task.RoleTool {
+			tools++
+		}
+		for _, p := range msg.ToolCalls() {
+			calls[p.CallID] = true
+		}
+	}
+	if tools != rounds || h[0].TextContent() != "pay the bill" {
+		t.Fatalf("history holds %d tool rounds, want %d; starts %q", tools, rounds, h[0].TextContent())
+	}
+	for _, r := range recs {
+		if !calls[r.CallID] {
+			t.Fatalf("call %s is in the log, not in the history", r.CallID)
+		}
+	}
 }
 
 // checkEventsHaveState is the other half of design §18 test 7: every event in
@@ -699,6 +782,9 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 	clean := runAndCrash(t, sc, 1<<30, false) // a clean run: how many commits there are
 	if clean.commits < 3 {
 		t.Fatalf("a clean run made only %d commits", clean.commits)
+	}
+	if sc.rounds > 0 && clean.compacted < 2 {
+		t.Fatalf("a clean run compacted %d times", clean.compacted)
 	}
 	if strings.Join(clean.retries, ",") != sc.retries {
 		t.Fatalf("the clean run retried %v", clean.retries)
@@ -877,4 +963,22 @@ func TestCrashAtEveryCommitPointWithAnApproval(t *testing.T) {
 		t.Fatal("no crash point left the approved payment's outcome unknown")
 	}
 	t.Logf("%d crash points; approved after the restart at %d; the operator resolved the payment at %d", points, after, held)
+}
+
+// The same sweep with the task compacting mid-task against a small window,
+// after its payment: a crash before and after every commit, including the
+// Running commit of a compaction call and the commit that swaps the rounds
+// out, still finishes the task once, paying once, with its registers and
+// its history paired and whole: a compaction is redone, never half applied.
+func TestCrashAtEveryCommitPointWithACompaction(t *testing.T) {
+	compactScenario.mid.Store(0)
+	points, held, _ := sweep(t, compactScenario)
+	if held == 0 {
+		t.Fatal("no crash point left the payment's outcome unknown")
+	}
+	mid := compactScenario.mid.Load()
+	if mid == 0 {
+		t.Fatal("no crash point fell inside a compaction call")
+	}
+	t.Logf("%d crash points; the operator was needed at %d; the process died inside a compaction call at %d", points, held, mid)
 }
