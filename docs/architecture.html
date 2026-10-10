@@ -7,13 +7,13 @@
 <style>
 :root{
   --bg:#0a0f1e;--panel:#111934;--panel2:#16204a;--line:#2a3a6e;--trace:#1c2a55;
-  --text:#e8edff;--mute:#8d9ac6;--cyan:#4fd1ff;--a:#b78cff;--b:#38e3a4;
-  --warn:#ffb547;--bad:#ff5d6c;--ok:#5be38f;
+  --text:#e8edff;--mute:#8d9ac6;--cyan:#4fd1ff;--warn:#ffb547;--bad:#ff5d6c;
+  --a:#b78cff;--b:#38e3a4;--c:#ff8fb8;--d:#ffd46b;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 "PingFang SC","Hiragino Sans GB","Noto Sans CJK SC",system-ui,sans-serif}
-.wrap{max-width:1320px;margin:0 auto;padding:22px 16px 40px}
-h1{font-size:26px;margin:0 0 4px;letter-spacing:.5px}
+.wrap{max-width:1340px;margin:0 auto;padding:22px 16px 40px}
+h1{font-size:26px;margin:0 0 4px}
 h1 span{color:var(--cyan)}
 .sub{color:var(--mute);margin:0 0 14px}
 .bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 14px;margin-bottom:12px}
@@ -21,36 +21,51 @@ h1 span{color:var(--cyan)}
 .bar button:hover{border-color:var(--cyan)}
 #step{color:var(--mute);font-variant-numeric:tabular-nums;min-width:52px}
 #cap{flex:1;min-width:240px;font-size:16px}
-svg{width:100%;height:auto;display:block;background:radial-gradient(1200px 600px at 60% 40%,#121c40 0%,var(--bg) 70%);border:1px solid var(--line);border-radius:14px}
+svg{width:100%;height:auto;display:block;background:radial-gradient(1200px 640px at 60% 40%,#121c40 0%,var(--bg) 70%);border:1px solid var(--line);border-radius:14px}
 .box{fill:var(--panel);stroke:var(--line);stroke-width:1.5}
 .title{fill:var(--text);font-size:17px;font-weight:600}
 .note{fill:var(--mute);font-size:12.5px}
 .grp{fill:none;stroke:#2c3d78;stroke-width:1.5;stroke-dasharray:6 6}
-.grpt{fill:#6f7fb8;font-size:13px;letter-spacing:1px}
+.grpt{fill:#7182bf;font-size:13px;letter-spacing:1px}
 .trace{fill:none;stroke:var(--trace);stroke-width:2.2}
 .bus{fill:#13204a;stroke:#3552a8;stroke-width:1.5}
 .busline{stroke:#3a5bc0;stroke-width:1.2;opacity:.55}
-.core .ring{fill:none;stroke:#2a3a6e;stroke-width:5}
-.core .spin{fill:none;stroke:var(--cyan);stroke-width:5;stroke-linecap:round;stroke-dasharray:40 150;opacity:0}
-.core.active .spin{opacity:1;animation:spin 1.1s linear infinite;transform-origin:center;transform-box:fill-box}
-.core.active rect.box{stroke:var(--cyan);filter:url(#glow)}
-.core.failed rect.box{stroke:var(--bad)}
-.core.failed .ring{stroke:var(--bad)}
-.core .pc{fill:var(--mute);font-size:12px}
-.core.active .pc{fill:var(--cyan)}
+.gauge{fill:var(--cyan);font-size:13.5px;font-weight:600;font-variant-numeric:tabular-nums}
+.gauge.cool{fill:var(--warn)}
+.gauge.down{fill:var(--bad)}
+/* vCore 槽位 */
+.slot{transition:opacity .5s}
+.slot .frame{fill:none;stroke:#2a3a6e;stroke-width:1.3;stroke-dasharray:4 4}
+.slot .body{opacity:0;transition:opacity .5s}
+.slot.up .body{opacity:1}
+.slot.up .frame{opacity:0}
+.slot .body rect{fill:var(--panel);stroke:var(--line);stroke-width:1.5}
+.slot .name{fill:var(--text);font-size:13px;font-weight:600}
+.slot .pc{fill:var(--mute);font-size:11px}
+.slot .ring{fill:none;stroke:#2a3a6e;stroke-width:3.5}
+.slot .spin{fill:none;stroke:var(--cyan);stroke-width:3.5;stroke-linecap:round;stroke-dasharray:22 80;opacity:0}
+.slot.active .spin{opacity:1;animation:spin 1s linear infinite;transform-origin:center;transform-box:fill-box}
+.slot.active .body rect{stroke:var(--cyan);filter:url(#glow)}
+.slot.retiring .body rect{stroke:var(--warn);stroke-dasharray:5 4}
+.slot.paused .body rect{stroke:var(--bad)}
+.slot.paused .pc{fill:var(--bad)}
+.slot.active .pc{fill:var(--cyan)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .dev.busy rect.box{stroke:var(--warn);animation:pulse 1s ease-in-out infinite}
 @keyframes pulse{50%{stroke-width:4}}
-.flash rect.box,.flash path.box{animation:flash .9s ease-out}
+.flash .box{animation:flash .9s ease-out}
 @keyframes flash{0%{stroke:var(--cyan);stroke-width:5;fill:#1b3570}100%{}}
+.cloud.down .box{stroke:var(--bad);stroke-width:3}
+.cloud .tag{font-size:12.5px;font-weight:600}
 .chip{transition:transform .7s cubic-bezier(.4,.1,.2,1),opacity .4s}
 .chip rect{stroke-width:1.5}
 .chip text{font-size:13px;font-weight:700;fill:#0a0f1e}
 .chip .inbox{fill:var(--warn);stroke:#0a0f1e;stroke-width:2;opacity:0;transition:opacity .3s}
 .chip.mail .inbox{opacity:1}
+.chip.backoff rect{stroke:var(--warn);stroke-width:3;stroke-dasharray:4 3}
 .pkt circle{filter:url(#glow)}
 .pkt text{font-size:12.5px;font-weight:600;paint-order:stroke;stroke:#0a0f1e;stroke-width:4px}
-.crash{opacity:0;transition:opacity .4s}
+.crash{opacity:0;transition:opacity .4s;pointer-events:none}
 .crash.on{opacity:1}
 .legend{display:flex;gap:18px;flex-wrap:wrap;color:var(--mute);font-size:13px;margin-top:10px}
 .legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px}
@@ -63,12 +78,12 @@ td:first-child{color:var(--cyan);white-space:nowrap}
 <body>
 <div class="wrap">
   <h1><span>neumann</span> · 按冯·诺依曼计算机组织的常驻 Agent</h1>
-  <p class="sub">核心不停地取指、执行、写回，一条指令就是一次模型调用；工具挂在总线上，调用是异步 I/O，完成后用中断唤醒任务；任务状态每步写回主存。</p>
+  <p class="sub">虚拟核心（vCore）不停地取指、执行、写回，一条指令就是一次模型调用。每个模型服务商一组 vCore，数量按服务商的承受能力自动伸缩；工具挂在总线上异步执行；任务状态每步写回主存。</p>
   <div class="bar">
     <button id="prev">◀</button><button id="play">❚❚ 暂停</button><button id="next">▶</button>
-    <span id="step">1/12</span><span id="cap"></span>
+    <span id="step"></span><span id="cap"></span>
   </div>
-  <svg id="board" viewBox="0 0 1280 760" role="img" aria-label="neumann 运行时架构动画">
+  <svg id="board" viewBox="0 0 1300 820" role="img" aria-label="neumann 运行时架构动画">
     <defs>
       <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
         <feGaussianBlur stdDeviation="3" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
@@ -76,51 +91,51 @@ td:first-child{color:var(--cyan);white-space:nowrap}
       <linearGradient id="cloud" x1="0" x2="1"><stop offset="0" stop-color="#1b2b63"/><stop offset="1" stop-color="#23367a"/></linearGradient>
     </defs>
 
-    <!-- 进程边界 -->
-    <rect x="200" y="30" width="815" height="715" rx="18" class="grp"/>
-    <text x="222" y="56" class="grpt">NEUMANN 进程</text>
-    <rect x="365" y="210" width="640" height="160" rx="14" class="grp" style="stroke:#26386f"/>
-    <text x="378" y="228" class="grpt">CPU</text>
-    <rect x="235" y="540" width="660" height="120" rx="14" class="grp" style="stroke:#26386f"/>
-    <text x="248" y="556" class="grpt">存储层次</text>
-    <text x="1040" y="505" class="grpt">设备</text>
+    <rect x="195" y="30" width="850" height="770" rx="18" class="grp"/>
+    <text x="215" y="54" class="grpt">NEUMANN 进程</text>
+    <rect x="360" y="228" width="668" height="232" rx="14" class="grp" style="stroke:#26386f"/>
+    <rect x="235" y="600" width="660" height="110" rx="14" class="grp" style="stroke:#26386f"/>
+    <text x="248" y="594" class="grpt">存储层次</text>
+    <text x="1075" y="574" class="grpt">设备</text>
 
     <g id="traces"></g>
 
-    <!-- 系统总线 -->
-    <rect x="230" y="438" width="1030" height="34" rx="8" class="bus"/>
-    <line x1="240" y1="449" x2="1250" y2="449" class="busline"/>
-    <line x1="240" y1="455" x2="1250" y2="455" class="busline"/>
-    <line x1="240" y1="461" x2="1250" y2="461" class="busline"/>
-    <text x="560" y="497" class="grpt">系统总线 · 仲裁 · 异步派发</text>
+    <rect x="225" y="505" width="1060" height="30" rx="8" class="bus"/>
+    <line x1="235" y1="514" x2="1275" y2="514" class="busline"/>
+    <line x1="235" y1="520" x2="1275" y2="520" class="busline"/>
+    <line x1="235" y1="526" x2="1275" y2="526" class="busline"/>
+    <text x="560" y="556" class="grpt">系统总线 · 仲裁 · 设备队列</text>
 
     <g id="nodes"></g>
+    <g id="slots"></g>
     <g id="chips"></g>
     <g id="pkts"></g>
 
     <g id="crash" class="crash">
-      <rect x="365" y="210" width="640" height="160" rx="14" fill="#ff5d6c" opacity=".08"/>
-      <text x="685" y="200" text-anchor="middle" fill="#ff5d6c" font-size="18" font-weight="700">kill -9</text>
+      <rect x="360" y="228" width="668" height="232" rx="14" fill="#ff5d6c" opacity=".08"/>
+      <text x="694" y="222" text-anchor="middle" fill="#ff5d6c" font-size="18" font-weight="700">kill -9</text>
     </g>
   </svg>
   <div class="legend">
-    <span><i style="background:var(--a)"></i>任务 A：要调一个慢的 MCP 工具</span>
-    <span><i style="background:var(--b)"></i>任务 B：普通任务</span>
-    <span><i style="background:var(--cyan)"></i>核心执行中 / 缓存命中</span>
-    <span><i style="background:var(--warn)"></i>I/O 在途 / 收件箱里有插话</span>
-    <span><i style="background:var(--bad)"></i>崩溃</span>
+    <span><i style="background:var(--a)"></i>A：指定大核组，要调慢工具</span>
+    <span><i style="background:var(--b)"></i>B</span>
+    <span><i style="background:var(--c)"></i>C</span>
+    <span><i style="background:var(--d)"></i>D：B、C、D 走默认的小核组</span>
+    <span><i style="border:1px dashed #5a6ba8"></i>虚线槽位：窗口允许时随时扩出 vCore</span>
+    <span><i style="background:var(--warn)"></i>I/O 在途 / 退避 / 收件箱有插话 / 冷却</span>
+    <span><i style="background:var(--bad)"></i>熔断 / 崩溃</span>
   </div>
 
   <table>
     <tr><th>计算机</th><th>neumann</th></tr>
-    <tr><td>核心 / 指令</td><td>goroutine 循环 / 一次模型调用，或一批工具调用的派发</td></tr>
-    <tr><td>进程 / 寄存器</td><td>任务（TCB）/ 这一步发给模型的上下文</td></tr>
-    <tr><td>系统总线 / 设备</td><td>Bus（仲裁、页表）/ MCP server、skills、builtin</td></tr>
-    <tr><td>DMA + 中断</td><td>工具调用异步执行，核心不等；完成后中断唤醒任务</td></tr>
-    <tr><td>L1 缓存</td><td>服务商 prompt cache：系统提示词和排好序的工具列表逐字节不变</td></tr>
-    <tr><td>L2 缓存</td><td>只读工具的结果缓存，命中返回真实结果</td></tr>
-    <tr><td>主存 / 磁盘</td><td>SQLite，每步写回 TCB / 长期记忆，上下文过长时换出成摘要</td></tr>
-    <tr><td>MMU</td><td>每个任务的工具权限表，派发时检查</td></tr>
+    <tr><td>vCore / 指令</td><td>无状态的 goroutine，随时增减 / 一次模型调用，或一批工具调用的派发</td></tr>
+    <tr><td>大小核</td><td>核心组：一个服务商一组；任务按亲和性调度，熔断时迁往 Fallback 组</td></tr>
+    <tr><td>拥塞窗口</td><td>每组 vCore 上限 W：成功一个窗口加 1，收到 429 减半，空闲 30 秒的 vCore 退役</td></tr>
+    <tr><td>进程 / 寄存器</td><td>任务（TCB）/ 服务商无关的中立消息格式，由适配器翻译</td></tr>
+    <tr><td>调度</td><td>每组就绪队列分交互、后台两级，按就绪时间轮转，后台任务等 30 秒自动提级；满了 Submit 返回 ErrBusy</td></tr>
+    <tr><td>DMA + 中断</td><td>工具调用异步执行，不占 vCore；完成后进中断队列，唤醒任务</td></tr>
+    <tr><td>L1 / L2</td><td>服务商 prompt cache（前缀逐字节不变）/ 只读工具结果缓存</td></tr>
+    <tr><td>主存 / 磁盘</td><td>SQLite 组提交，每步写回 / 长期记忆，作为工具挂在总线上</td></tr>
   </table>
 </div>
 
@@ -138,249 +153,283 @@ function text(parent, x, y, s, cls, anchor) {
   t.textContent = s;
   return t;
 }
-
-// ---------- 节点 ----------
 const nodes = $("nodes");
-function box(id, x, y, w, h, title, note, extra) {
-  const g = el("g", { id, class: extra || "" }, nodes);
+function box(id, x, y, w, h, title, note, cls) {
+  const g = el("g", { id, class: cls || "" }, nodes);
   el("rect", { x, y, width: w, height: h, rx: 12, class: "box" }, g);
   text(g, x + w / 2, y + (note ? h / 2 - 2 : h / 2 + 6), title, "title");
   if (note) text(g, x + w / 2, y + h / 2 + 18, note, "note");
   return g;
 }
-box("client", 30, 330, 140, 70, "调用方", "Go API · stdio");
-box("port", 220, 330, 120, 70, "I/O 端口", "Instruction / Event");
-box("irq", 380, 70, 180, 80, "中断控制器", "插话 · 取消 · I/O 完成");
+
+// ---------- 固定节点 ----------
+box("client", 30, 360, 140, 70, "调用方", "Go API · stdio");
+box("port", 210, 360, 120, 70, "I/O 端口", "Instruction / Event");
+box("irq", 370, 60, 170, 80, "中断控制器", "插话 · 取消 · I/O 完成");
 const sched = el("g", { id: "sched" }, nodes);
-el("rect", { x: 600, y: 60, width: 390, height: 110, rx: 12, class: "box" }, sched);
-text(sched, 650, 86, "调度器", "title");
-text(sched, 655, 109, "就绪", "note");
-text(sched, 655, 151, "等待", "note");
-el("line", { x1: 690, y1: 122, x2: 975, y2: 122, stroke: "#2a3a6e", "stroke-dasharray": "4 5" }, sched);
+el("rect", { x: 570, y: 50, width: 450, height: 150, rx: 12, class: "box" }, sched);
+text(sched, 618, 74, "调度器", "title");
+text(sched, 590, 104, "big 就绪", "note", "start");
+text(sched, 590, 144, "little 就绪", "note", "start");
+text(sched, 590, 184, "等待", "note", "start");
+[118, 158].forEach(y => el("line", { x1: 590, y1: y, x2: 1005, y2: y, stroke: "#22305e", "stroke-dasharray": "4 5" }, sched));
 
-const CORES = [460, 660, 860];
-CORES.forEach((cx, i) => {
-  const g = el("g", { id: "c" + i, class: "core" }, nodes);
-  el("rect", { x: cx - 80, y: 240, width: 160, height: 115, rx: 12, class: "box" }, g);
-  text(g, cx - 34, 268, "core " + i, "title");
-  el("circle", { cx: cx + 48, cy: 263, r: 13, class: "ring" }, g);
-  el("circle", { cx: cx + 48, cy: 263, r: 13, class: "spin" }, g);
-  const pc = text(g, cx, 292, "空闲", "pc");
-  pc.id = "pc" + i;
-});
-
-const llm = el("g", { id: "llm" }, nodes);
-el("path", { d: "M1075 330 a32 32 0 0 1 4 -63 a42 42 0 0 1 78 -14 a34 34 0 0 1 62 22 a28 28 0 0 1 -6 55 z", fill: "url(#cloud)", class: "box" }, llm);
-text(llm, 1148, 296, "LLM", "title");
-text(llm, 1148, 316, "L1 = prompt cache", "note");
-const l1 = text(llm, 1148, 360, "", "note");
-l1.id = "l1";
+function cloud(id, cy, name, note) {
+  const g = el("g", { id, class: "cloud", transform: `translate(${1160 - 1148},${cy - 292})` }, nodes);
+  el("path", { d: "M1075 330 a32 32 0 0 1 4 -63 a42 42 0 0 1 78 -14 a34 34 0 0 1 62 22 a28 28 0 0 1 -6 55 z", fill: "url(#cloud)", class: "box" }, g);
+  text(g, 1148, 296, name, "title");
+  text(g, 1148, 314, note, "note");
+  const tag = text(g, 1148, 245, "", "tag");
+  tag.id = id + "-tag";
+}
+cloud("llmBig", 300, "Claude", "big · L1 prompt cache");
+cloud("llmLittle", 415, "Flash", "little · L1 prompt cache");
 
 const mmu = el("g", { id: "mmu" }, nodes);
-el("rect", { x: 372, y: 428, width: 106, height: 54, rx: 8, class: "box", style: "fill:#1a2758" }, mmu);
-text(mmu, 425, 452, "页表 MMU", "title").setAttribute("style", "font-size:14px");
-text(mmu, 425, 470, "权限检查", "note");
+el("rect", { x: 245, y: 495, width: 100, height: 50, rx: 8, class: "box", style: "fill:#1a2758" }, mmu);
+text(mmu, 295, 517, "页表 MMU", "title").setAttribute("style", "font-size:14px");
+text(mmu, 295, 535, "权限检查", "note");
+box("l2", 250, 615, 170, 80, "L2 缓存", "只读工具结果");
+box("mem", 460, 615, 200, 80, "主存", "SQLite · 组提交");
+box("disk", 700, 615, 170, 80, "磁盘", "长期记忆 · 换页");
+box("builtin", 1075, 590, 190, 52, "builtin", "Go 函数", "dev");
+box("mcp", 1075, 658, 190, 52, "MCP server", "慢工具", "dev");
+box("skills", 1075, 726, 190, 52, "skills", "SKILL.md", "dev");
 
-box("l2", 250, 565, 170, 80, "L2 缓存", "只读工具结果");
-box("mem", 460, 565, 200, 80, "主存", "SQLite · 每步写回");
-box("disk", 700, 565, 170, 80, "磁盘", "长期记忆 · 换页");
-box("builtin", 1050, 520, 190, 56, "builtin", "Go 函数", "dev");
-box("mcp", 1050, 592, 190, 56, "MCP server", "慢工具", "dev");
-box("skills", 1050, 664, 190, 56, "skills", "SKILL.md", "dev");
+// ---------- 核心组与 vCore 槽位 ----------
+const GROUPS = {
+  big:    { label: "big 组 · Claude", y: 262, x0: 400, n: 3, labelY: 247, gaugeY: 247, cloud: "llmBig", cy: 300 },
+  little: { label: "little 组 · Flash", y: 377, x0: 445, n: 6, labelY: 362, gaugeY: 362, cloud: "llmLittle", cy: 415 },
+};
+const SW = 76, SH = 62;
+const slotsG = $("slots");
+for (const [g, G] of Object.entries(GROUPS)) {
+  text(slotsG, 374, G.labelY, G.label, "grpt", "start");
+  const ga = text(slotsG, 1014, G.gaugeY, "", "gauge", "end");
+  ga.id = "gauge-" + g;
+  G.slots = [];
+  for (let i = 0; i < G.n; i++) {
+    const x = G.x0 + i * 92, y = G.y;
+    const s = el("g", { class: "slot", id: `s-${g}-${i}` }, slotsG);
+    el("rect", { x, y, width: SW, height: SH, rx: 10, class: "frame" }, s);
+    const b = el("g", { class: "body" }, s);
+    el("rect", { x, y, width: SW, height: SH, rx: 10 }, b);
+    text(b, x + 24, y + 19, "v" + i, "name");
+    el("circle", { cx: x + 58, cy: y + 15, r: 8, class: "ring" }, b);
+    el("circle", { cx: x + 58, cy: y + 15, r: 8, class: "spin" }, b);
+    const pc = text(b, x + SW / 2, y + 36, "空闲", "pc");
+    pc.id = `pc-${g}-${i}`;
+    G.slots.push({ x, y, cx: x + SW / 2 });
+  }
+}
+text(slotsG, 1000, 448, "… 窗口允许时继续扩", "note", "end");
 
 // ---------- 走线 ----------
-const P = {}; // 路由：点序列
+const P = {};
 const add = (k, pts) => { P[k] = pts; P[k + "~"] = pts.slice().reverse(); };
-add("client>port", [[170, 365], [220, 365]]);
-add("port>sched", [[340, 352], [360, 352], [360, 195], [790, 195], [790, 170]]);
-add("port>irq", [[340, 378], [352, 378], [352, 120], [380, 120]]);
-add("irq>sched", [[560, 110], [600, 110]]);
-CORES.forEach((cx, i) => {
-  add("sched>c" + i, [[790, 170], [790, 195], [cx, 195], [cx, 240]]);
-  add("c" + i + ">llm", [[cx + 40, 240], [cx + 40, 218], [1040, 218], [1040, 290], [1075, 290]]);
-  add("c" + i + ">mem", [[cx - 40, 355], [cx - 40, 525], [560, 525], [560, 565]]);
-  add("c" + i + ">mmu", [[cx, 355], [cx, 412], [425, 412], [425, 428]]);
-});
-add("mmu>mcp", [[478, 455], [1030, 455], [1030, 620], [1050, 620]]);
-add("mmu>l2", [[425, 482], [425, 535], [335, 535], [335, 565]]);
-add("mcp>irq", [[1050, 630], [1022, 630], [1022, 462], [344, 462], [344, 135], [380, 135]]);
-add("mem>sched", [[640, 645], [640, 690], [985, 690], [985, 170]]);
-add("mem>port", [[480, 645], [480, 715], [280, 715], [280, 400]]);
-// 静态：设备总线支线
+add("client>port", [[170, 395], [210, 395]]);
+add("port>sched", [[330, 382], [348, 382], [348, 214], [795, 214], [795, 200]]);
+add("port>irq", [[330, 408], [340, 408], [340, 110], [370, 110]]);
+add("irq>sched", [[540, 100], [570, 100]]);
+for (const [g, G] of Object.entries(GROUPS)) {
+  G.slots.forEach((s, i) => {
+    const top = s.y, bot = s.y + SH, cx = s.cx;
+    add(`sched>${g}${i}`, [[795, 200], [795, 214], [cx, 214], [cx, top]]);
+    add(`${g}${i}>llm`, [[cx + 20, top], [cx + 20, top - 9], [1048, top - 9], [1048, G.cy], [1088, G.cy]]);
+    const mx = g === "big" ? cx - 8 : cx - 8;
+    add(`${g}${i}>mem`, [[mx, bot], [mx, 582], [560, 582], [560, 615]]);
+    const tx = g === "big" ? cx : cx + 8;
+    add(`${g}${i}>mmu`, [[tx, bot], [tx, 488], [295, 488], [295, 495]]);
+  });
+}
+add("mmu>mcp", [[345, 520], [1058, 520], [1058, 684], [1075, 684]]);
+add("mmu>l2", [[295, 545], [295, 603], [335, 603], [335, 615]]);
+add("mcp>irq", [[1075, 694], [1050, 694], [1050, 530], [355, 530], [355, 128], [370, 128]]);
+add("mem>sched", [[640, 695], [640, 728], [1036, 728], [1036, 180], [1020, 180]]);
+add("mem>port", [[480, 695], [480, 775], [270, 775], [270, 430]]);
 const traces = $("traces");
-function poly(pts, cls) { el("polyline", { points: pts.map(p => p.join(",")).join(" "), class: cls || "trace" }, traces); }
+const poly = pts => el("polyline", { points: pts.map(p => p.join(",")).join(" "), class: "trace" }, traces);
 Object.keys(P).filter(k => !k.endsWith("~")).forEach(k => poly(P[k]));
-poly([[1030, 455], [1030, 692], [1050, 692]]);
-poly([[1030, 548], [1050, 548]]);
-poly([[785, 472], [785, 565]]);
+poly([[1058, 520], [1058, 752], [1075, 752]]);
+poly([[1058, 616], [1075, 616]]);
+poly([[785, 535], [785, 615]]);
 
 // ---------- 任务卡片 ----------
-const chips = $("chips");
-function chip(id, color) {
-  const g = el("g", { id: "chip" + id, class: "chip" }, chips);
-  el("rect", { x: -20, y: -12, width: 40, height: 24, rx: 7, fill: color, stroke: "#0a0f1e" }, g);
+const COLORS = { A: "var(--a)", B: "var(--b)", C: "var(--c)", D: "var(--d)" };
+const chipsG = $("chips");
+for (const id of "ABCD") {
+  const g = el("g", { id: "chip" + id, class: "chip" }, chipsG);
+  el("rect", { x: -19, y: -12, width: 38, height: 24, rx: 7, fill: COLORS[id], stroke: "#0a0f1e" }, g);
   text(g, 0, 5, id, "");
-  el("circle", { cx: 18, cy: -11, r: 6, class: "inbox" }, g);
-  return g;
+  el("circle", { cx: 17, cy: -11, r: 6, class: "inbox" }, g);
 }
-chip("A", "var(--a)"); chip("B", "var(--b)");
-const SLOT = {
-  hidden: { A: [100, 365], B: [100, 365] },
-  ready: { A: [725, 104], B: [780, 104] },
-  wait: { A: [725, 146], B: [780, 146] },
-  mem: { A: [520, 625], B: [600, 625] },
-  done: { A: [100, 440], B: [100, 474] },
-};
+function where(id, loc) {
+  const [kind, a, b] = loc.split(":");
+  if (kind === "hidden") return [100, 395];
+  if (kind === "ready") return [728 + (+b) * 50, a === "big" ? 98 : 138];
+  if (kind === "wait") return [728 + (+a) * 50, 178];
+  if (kind === "core") { const s = GROUPS[a].slots[+b]; return [s.cx, s.y + 49]; }
+  if (kind === "mem") return [{ A: 500, B: 540, C: 580, D: 620 }[id], 682];
+  if (kind === "done") return [{ A: 55, B: 100, C: 145, D: 190 }[id], 466];
+}
 function place(id, loc) {
+  const [x, y] = where(id, loc);
   const g = $("chip" + id);
-  let xy;
-  if (loc.startsWith("c")) { const cx = CORES[+loc[1]]; xy = [cx, 325]; }
-  else xy = SLOT[loc][id];
-  g.style.transform = `translate(${xy[0]}px,${xy[1]}px)`;
+  g.style.transform = `translate(${x}px,${y}px)`;
   g.style.opacity = loc === "hidden" ? 0 : 1;
 }
+const mark = (id, cls, on) => $("chip" + id).classList.toggle(cls, on);
 
 // ---------- 状态 ----------
-function setCore(i, st, pc) {
-  const g = $("c" + i);
-  g.classList.toggle("active", st === "active");
-  g.classList.toggle("failed", st === "failed");
-  $("pc" + i).textContent = pc || (st === "failed" ? "停止" : "空闲");
+const W = { big: 1, little: 1 };
+function gauge(g, w, extra, cls) {
+  W[g] = w;
+  const alive = GROUPS[g].slots.filter((_, i) => $(`s-${g}-${i}`).classList.contains("up")).length;
+  const el2 = $("gauge-" + g);
+  el2.textContent = `W = ${w}` + (extra ? ` · ${extra}` : "");
+  el2.setAttribute("class", "gauge" + (cls ? " " + cls : ""));
+}
+function slot(g, i, st, pc) {
+  const s = $(`s-${g}-${i}`);
+  s.classList.toggle("up", st !== "off");
+  ["active", "retiring", "paused"].forEach(c => s.classList.toggle(c, st === c));
+  $(`pc-${g}-${i}`).textContent = pc || ({ off: "", up: "空闲", active: "执行中", retiring: "退役中", paused: "暂停" }[st]);
 }
 function flash(id) { const g = $(id); g.classList.remove("flash"); void g.getBBox(); g.classList.add("flash"); }
 function busy(id, on) { $(id).classList.toggle("busy", on); }
-function mail(id, on) { $("chip" + id).classList.toggle("mail", on); }
-function l1hit(on) { $("l1").textContent = on ? "✓ 前缀命中" : ""; $("l1").style.fill = "var(--cyan)"; }
+function cloudTag(id, s, color) { const t = $(id + "-tag"); t.textContent = s; t.setAttribute("fill", color || "var(--cyan)"); }
+function cloudDown(id, on) { $(id).classList.toggle("down", on); }
 function crash(on) { $("crash").classList.toggle("on", on); }
 
 function reset() {
-  place("A", "hidden"); place("B", "hidden");
-  [0, 1, 2].forEach(i => setCore(i, "idle"));
-  busy("mcp", false); mail("A", false); l1hit(false); crash(false);
+  for (const id of "ABCD") { place(id, "hidden"); mark(id, "mail", false); mark(id, "backoff", false); }
+  for (const [g, G] of Object.entries(GROUPS)) G.slots.forEach((_, i) => slot(g, i, i === 0 ? "up" : "off"));
+  gauge("big", 1); gauge("little", 1);
+  busy("mcp", false); cloudTag("llmBig", ""); cloudTag("llmLittle", ""); cloudDown("llmBig", false); crash(false);
 }
 
 // ---------- 数据包 ----------
-const pkts = $("pkts");
+let stopped = false;
 function packet(route, label, color) {
   const pts = P[route];
-  const segs = [];
-  let total = 0;
-  for (let i = 1; i < pts.length; i++) {
-    const d = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
-    segs.push(d); total += d;
-  }
-  const g = el("g", { class: "pkt" }, pkts);
+  const segs = []; let total = 0;
+  for (let i = 1; i < pts.length; i++) { const d = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]); segs.push(d); total += d; }
+  const g = el("g", { class: "pkt" }, $("pkts"));
   el("circle", { r: 7, fill: color || "var(--cyan)" }, g);
-  const t = text(g, 0, -13, label, "");
-  t.setAttribute("fill", color || "var(--cyan)");
-  const dur = Math.max(650, total / 0.75);
+  const t = text(g, 0, -13, label, ""); t.setAttribute("fill", color || "var(--cyan)");
+  const dur = Math.max(600, total / 0.8);
   return new Promise(res => {
     const t0 = performance.now();
     function frame(now) {
       if (stopped) { g.remove(); return res(); }
-      let k = Math.min(1, (now - t0) / dur) * total;
-      let i = 0;
+      let k = Math.min(1, (now - t0) / dur) * total, i = 0;
       while (i < segs.length - 1 && k > segs[i]) { k -= segs[i]; i++; }
       const f = segs[i] ? Math.min(1, k / segs[i]) : 1;
-      const x = pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f;
-      const y = pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f;
-      g.setAttribute("transform", `translate(${x},${y})`);
-      if (now - t0 < dur) requestAnimationFrame(frame);
-      else { setTimeout(() => { g.remove(); res(); }, 120); }
+      g.setAttribute("transform", `translate(${pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f},${pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f})`);
+      if (now - t0 < dur) requestAnimationFrame(frame); else setTimeout(() => { g.remove(); res(); }, 100);
     }
     requestAnimationFrame(frame);
   });
 }
+const both = (...ps) => Promise.all(ps);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ---------- 场景 ----------
-const A = "var(--a)", B = "var(--b)", W = "var(--warn)";
+const cA = COLORS.A, cB = COLORS.B, cC = COLORS.C, cD = COLORS.D, cW = "var(--warn)", cR = "var(--bad)";
 const STEPS = [
-  { cap: "调用方提交任务 A，进入就绪队列", run: [
-    () => packet("client>port", "submit A", A),
-    () => packet("port>sched", "A", A),
-    () => place("A", "ready") ] },
-  { cap: "core 0 取指 A，执行一次模型调用；系统提示词和排好序的工具列表逐字节不变，命中 L1", run: [
-    () => packet("sched>c0", "A", A),
-    () => { place("A", "c0"); setCore(0, "active", "模型调用"); },
-    () => packet("c0>llm", "regs(A)", A),
-    () => { flash("llm"); l1hit(true); } ] },
-  { cap: "模型返回工具调用；core 0 把 A 的 TCB 写回主存", run: [
-    () => { l1hit(false); return packet("c0>llm~", "tool_calls", A); },
-    () => setCore(0, "active", "写回"),
-    () => packet("c0>mem", "save A", A),
-    () => flash("mem") ] },
-  { cap: "经页表检查后交给总线异步派发；A 进入等待集合，core 0 立刻空出来", run: [
-    () => setCore(0, "active", "派发工具"),
-    () => packet("c0>mmu", "call", A),
+  { cap: "四个任务进来：A 指定大核组，B、C、D 走默认的小核组。两组现在都只有 Min = 1 个 vCore", run: [
+    () => packet("client>port", "submit ×4"),
+    () => packet("port>sched", "A B C D"),
+    () => { place("A", "ready:big:0"); place("B", "ready:little:0"); place("C", "ready:little:1"); place("D", "ready:little:2"); } ] },
+  { cap: "小核组：B 上 v0；C、D 还在排队、核心全忙、最近没有 429，窗口 1→3，立刻扩出 v1、v2 接走", run: [
+    () => packet("sched>little0", "B", cB),
+    () => { place("B", "core:little:0"); slot("little", 0, "active", "模型调用"); },
+    () => { gauge("little", 2); slot("little", 1, "up"); },
+    () => packet("sched>little1", "C", cC),
+    () => { place("C", "core:little:1"); slot("little", 1, "active", "模型调用"); gauge("little", 3); slot("little", 2, "up"); },
+    () => packet("sched>little2", "D", cD),
+    () => { place("D", "core:little:2"); slot("little", 2, "active", "模型调用"); },
+    () => both(packet("little0>llm", "regs(B)", cB), packet("little1>llm", "regs(C)", cC), packet("little2>llm", "regs(D)", cD)),
+    () => flash("llmLittle") ] },
+  { cap: "大核组：v0 取指 A，调一次模型；模型要调一个慢的 MCP 工具", run: [
+    () => packet("sched>big0", "A", cA),
+    () => { place("A", "core:big:0"); slot("big", 0, "active", "模型调用"); },
+    () => packet("big0>llm", "regs(A)", cA),
+    () => { flash("llmBig"); cloudTag("llmBig", "L1 命中"); },
+    () => packet("big0>llm~", "tool_calls", cA) ] },
+  { cap: "A 的调用经页表交给总线异步派发，A 进等待集合，大核 v0 立刻空出来", run: [
+    () => { cloudTag("llmBig", ""); slot("big", 0, "active", "派发工具"); return packet("big0>mmu", "call", cA); },
     () => flash("mmu"),
-    () => packet("mmu>mcp", "slow_query", A),
-    () => { busy("mcp", true); place("A", "wait"); setCore(0, "idle"); } ] },
-  { cap: "慢工具还在跑，core 0 没有等它，接着执行任务 B", run: [
-    () => packet("client>port", "submit B", B),
-    () => packet("port>sched", "B", B),
-    () => place("B", "ready"),
-    () => packet("sched>c0", "B", B),
-    () => { place("B", "c0"); setCore(0, "active", "模型调用"); },
-    () => packet("c0>llm", "regs(B)", B),
-    () => flash("llm") ] },
-  { cap: "用户对 A 插话：A 的工具还在途，插话先进 A 的收件箱，不打断调用和结果的配对", run: [
-    () => packet("client>port", "steer A", W),
-    () => packet("port>irq", "steer", W),
+    () => packet("mmu>mcp", "slow_query", cA),
+    () => { busy("mcp", true); place("A", "wait:0"); slot("big", 0, "up"); } ] },
+  { cap: "Flash 返回 429：小核组窗口减半 3→1.5，冷却 10 秒；挨 429 的 C 转入退避，v1 多余了，马上退役", run: [
+    () => packet("little1>llm~", "429", cR),
+    () => { gauge("little", 1.5, "冷却 10s", "cool"); place("C", "wait:1"); mark("C", "backoff", true); slot("little", 1, "retiring"); },
+    () => sleep(700),
+    () => slot("little", 1, "off") ] },
+  { cap: "v2 也多余，但它要先把 D 这一步执行完、写回主存才退役，从不在指令中途杀掉；B 在 v0 上完成", run: [
+    () => { slot("little", 2, "retiring", "执行完再退役"); return both(packet("little2>llm~", "ok", cD), packet("little0>llm~", "answer", cB)); },
+    () => both(packet("little2>mem", "save D", cD), packet("little0>mem", "save B", cB)),
+    () => { flash("mem"); place("D", "ready:little:0"); place("B", "done"); slot("little", 0, "up"); },
+    () => slot("little", 2, "off") ] },
+  { cap: "用户对 A 插话：A 的工具还在途，插话先进收件箱，不打断调用和结果的配对", run: [
+    () => packet("client>port", "steer A", cW),
+    () => packet("port>irq", "steer", cW),
     () => flash("irq"),
-    () => packet("irq>sched", "inbox(A)", W),
-    () => mail("A", true) ] },
-  { cap: "MCP 返回结果，总线发中断，A 回到就绪队列", run: [
+    () => packet("irq>sched", "inbox(A)", cW),
+    () => mark("A", "mail", true) ] },
+  { cap: "MCP 完成，中断唤醒 A，回到大核就绪队列；可 Claude 这时连续 5 次出错，大核组熔断", run: [
     () => busy("mcp", false),
-    () => packet("mcp>irq", "I/O done", A),
-    () => flash("irq"),
-    () => packet("irq>sched", "wake A", A),
-    () => place("A", "ready") ] },
-  { cap: "core 1 取指 A：先送达插话，再调模型。换了核心，前缀不变，L1 照样命中", run: [
-    () => packet("sched>c1", "A", A),
-    () => { place("A", "c1"); mail("A", false); setCore(1, "active", "送达插话 · 模型调用"); },
-    () => packet("c1>llm", "regs(A)+steer", A),
-    () => { flash("llm"); l1hit(true); } ] },
-  { cap: "A 再调一个只读工具：L2 命中，直接返回真实结果，不再走到设备", run: [
-    () => { l1hit(false); setCore(1, "active", "派发工具"); return packet("c1>mmu", "call", A); },
-    () => packet("mmu>l2", "lookup", A),
-    () => flash("l2"),
-    () => packet("mmu>l2~", "hit", "var(--cyan)") ] },
-  { cap: "A 得到最终答案：写回主存，发出 done 事件；B 也在 core 0 上写回", run: [
-    () => setCore(1, "active", "写回"),
-    () => Promise.all([packet("c1>mem", "save A", A), packet("c0>mem", "save B", B)]),
-    () => { flash("mem"); place("B", "mem"); setCore(0, "idle"); },
-    () => packet("mem>port", "done A", A),
-    () => packet("client>port~", "answer", A),
-    () => { place("A", "done"); setCore(1, "idle"); } ] },
-  { cap: "进程被 kill -9：所有核心停下，B 只剩主存里的状态", run: [
-    () => { crash(true); [0, 1, 2].forEach(i => setCore(i, "failed")); },
-    () => new Promise(r => setTimeout(r, 1200)) ] },
-  { cap: "重启：从主存加载未完成的 B，core 2 接着执行。崩溃恢复和上下文切换是同一件事", run: [
-    () => { crash(false); [0, 1, 2].forEach(i => setCore(i, "idle")); },
-    () => packet("mem>sched", "unfinished: B", B),
-    () => place("B", "ready"),
-    () => packet("sched>c2", "B", B),
-    () => { place("B", "c2"); setCore(2, "active", "模型调用"); },
-    () => packet("c2>llm", "regs(B)", B),
-    () => { flash("llm"); l1hit(true); } ] },
+    () => packet("mcp>irq", "I/O done", cA),
+    () => packet("irq>sched", "wake A", cA),
+    () => place("A", "ready:big:0"),
+    () => packet("big0>llm~", "503 ×5", cR),
+    () => { cloudDown("llmBig", true); cloudTag("llmBig", "熔断 · 30s 后半开", "var(--bad)"); gauge("big", 1, "熔断", "down"); slot("big", 0, "paused"); } ] },
+  { cap: "A 迁往 Fallback 小核组：排队位置保留（排在 D 前面），丢掉 Claude 私有的 thinking 块，这一步 L1 不命中", run: [
+    () => { place("A", "ready:little:0"); place("D", "ready:little:1"); },
+    () => sleep(500),
+    () => packet("sched>little0", "A", cA),
+    () => { place("A", "core:little:0"); mark("A", "mail", false); slot("little", 0, "active", "送达插话"); },
+    () => packet("little0>llm", "regs(A) 中立格式", cA),
+    () => { flash("llmLittle"); cloudTag("llmLittle", "L1 未命中（迁移）", "var(--warn)"); } ] },
+  { cap: "冷却结束，每成功一个窗口加 1：W 1.5→2→3。C 退避到点回到队列，扩出 v1、v2 接走 C、D", run: [
+    () => { cloudTag("llmLittle", ""); gauge("little", 2); mark("C", "backoff", false); place("C", "ready:little:1"); place("D", "ready:little:0"); },
+    () => { slot("little", 1, "up"); return packet("sched>little1", "D", cD); },
+    () => { place("D", "core:little:1"); slot("little", 1, "active", "模型调用"); gauge("little", 3); slot("little", 2, "up"); },
+    () => packet("sched>little2", "C", cC),
+    () => { place("C", "core:little:2"); slot("little", 2, "active", "模型调用"); },
+    () => both(packet("little1>llm", "regs(D)", cD), packet("little2>llm", "regs(C)", cC)) ] },
+  { cap: "A 得到最终答案：写回主存，done 事件发给调用方", run: [
+    () => packet("little0>llm~", "answer", cA),
+    () => packet("little0>mem", "save A", cA),
+    () => { flash("mem"); slot("little", 0, "up"); },
+    () => packet("mem>port", "done A", cA),
+    () => packet("client>port~", "answer", cA),
+    () => place("A", "done") ] },
+  { cap: "kill -9：所有 vCore 消失，C、D 只剩主存里的状态", run: [
+    () => { crash(true); for (const [g, G] of Object.entries(GROUPS)) G.slots.forEach((_, i) => slot(g, i, "off")); place("C", "mem"); place("D", "mem"); gauge("big", 0, "进程已停止", "down"); gauge("little", 0, "进程已停止", "down"); },
+    () => sleep(1300) ] },
+  { cap: "重启：每组按 Min 拉起 vCore，W 回到初始值 2；从主存重建队列（顺序与崩溃前一致），C、D 接着执行", run: [
+    () => { crash(false); cloudDown("llmBig", false); cloudTag("llmBig", ""); gauge("big", 2); gauge("little", 2); slot("big", 0, "up"); slot("little", 0, "up"); },
+    () => packet("mem>sched", "unfinished: D, C", cD),
+    () => { place("D", "ready:little:0"); place("C", "ready:little:1"); },
+    () => packet("sched>little0", "D", cD),
+    () => { place("D", "core:little:0"); slot("little", 0, "active", "模型调用"); slot("little", 1, "up"); },
+    () => packet("sched>little1", "C", cC),
+    () => { place("C", "core:little:1"); slot("little", 1, "active", "模型调用"); },
+    () => both(packet("little0>llm", "regs(D)", cD), packet("little1>llm", "regs(C)", cC)) ] },
 ];
 
 // ---------- 播放 ----------
-let cur = 0, playing = true, stopped = false, runId = 0;
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function replayTo(n) {
-  // 快速把状态推进到第 n 步之前（跳过动画）
-  stopped = true; await sleep(20); stopped = false;
+let cur = 0, playing = true, runId = 0;
+async function silently(f) { stopped = true; try { await f(); } catch (e) {} stopped = false; }
+async function fastForward(n) {
+  stopped = true; await sleep(30); stopped = false;
   reset();
   for (let s = 0; s < n; s++) for (const f of STEPS[s].run) {
-    if (f.toString().includes("packet(")) await runSilently(f);
-    else f();
+    const src = f.toString();
+    if (src.includes("packet(") || src.includes("sleep(")) await silently(f); else f();
   }
-}
-async function runSilently(f) {
-  stopped = true;
-  try { await f(); } catch (e) {}
-  stopped = false;
 }
 async function playStep(n) {
   const id = ++runId;
@@ -393,23 +442,21 @@ async function playStep(n) {
     await sleep(140);
   }
   if (id !== runId) return;
-  await sleep(1300);
+  await sleep(1500);
   if (playing && id === runId) {
-    if (n + 1 >= STEPS.length) { await sleep(1200); reset(); playStep(0); }
-    else playStep(n + 1);
+    if (n + 1 >= STEPS.length) { await sleep(1200); reset(); playStep(0); } else playStep(n + 1);
   }
 }
 async function jump(n) {
   runId++;
   n = (n + STEPS.length) % STEPS.length;
-  await replayTo(n);
+  await fastForward(n);
   playStep(n);
 }
 $("play").onclick = () => {
   playing = !playing;
   $("play").textContent = playing ? "❚❚ 暂停" : "▶ 播放";
-  if (playing) playStep(cur);
-  else runId++;
+  if (playing) jump(cur); else runId++;
 };
 $("next").onclick = () => jump(cur + 1);
 $("prev").onclick = () => jump(cur - 1);
