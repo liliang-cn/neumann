@@ -4,7 +4,8 @@
 // as a tree at the end. It runs a few tasks, prints the URLs to look at, and
 // exits once the tasks are done unless -serve keeps it up.
 //
-//	go run ./examples/observe -serve
+//	go run ./examples/observe -serve            # a free port, printed at start
+//	go run ./examples/observe -serve -addr 127.0.0.1:43517
 //	curl -s http://127.0.0.1:43517/status
 //	curl -N 'http://127.0.0.1:43517/events?from_seq=0'
 package main
@@ -38,7 +39,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:43517", "where to serve the observe view")
+	addr := flag.String("addr", "127.0.0.1:0", "where to serve the observe view (port 0: any free port)")
 	serve := flag.Bool("serve", false, "keep serving after the tasks are done, until interrupted")
 	tasks := flag.Int("tasks", 4, "tasks to run")
 	flag.Parse()
