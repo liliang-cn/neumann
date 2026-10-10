@@ -148,7 +148,7 @@ pieces. The committed `answer` event is the record.
 ## Concepts
 
 ```
-  Submit · Steer · Cancel · Resolve
+  Submit · Steer · Cancel · Resolve · Approve
                  │
 ┌────────────────┼─────────────────────── Machine ─────────────────────┐
 │                ▼                                                     │
@@ -206,7 +206,8 @@ pieces. The committed `answer` event is the record.
 - **Events** (`proto.Event`): published only after they are committed, with a
   global `Seq` and a per-task `TaskSeq`. Task events include `accepted`,
   `step`, `tool_call`, `tool_result`, `usage`, `answer`, `done`, `failed`,
-  `cancelled`, `model_retry`, `reconcile_needed`; machine events (no task)
+  `cancelled`, `model_retry`, `reconcile_needed`, `tool_denied`,
+  `approval_needed`, `approved`; machine events (no task)
   include `core_up`, `core_down`, `group_down`, `group_up`, `throttled`.
 
 [docs/overview.md](docs/overview.md) walks through these mechanisms in more
@@ -399,6 +400,36 @@ err = m.Resolve(ctx, taskID, callID, neumann.Outcome{Retry: true}) // send again
 A tool can opt out of being held with `ToolDef.ReportUnknown`: the model is
 told the outcome is unknown instead.
 
+**Tool policy and approval.** `Config.ToolPolicy` decides every tool call
+before its first dispatch is committed: allow it, deny it (the model gets an
+error result, a `tool_denied` event records it), rewrite its arguments, or
+hold it for a person. The decision is committed with the call, so a restart
+never asks again. The policy runs on the vCore and has no timeout: keep it
+fast and side-effect free, and hand anything slow to a person:
+
+```go
+cfg.ToolPolicy = func(_ context.Context, c neumann.ToolCallInfo) neumann.Decision {
+	if c.Effect == bus.SideEffect {
+		return neumann.RequireApproval("moves money")
+	}
+	return neumann.Allow()
+}
+```
+
+A held call parks its whole round in `Waiting(Approval)`, nothing sent, and an
+`approval_needed` event names it. Answer each held call; the last answer
+dispatches the round:
+
+```go
+err := m.Approve(ctx, taskID, callID, neumann.ApprovalDecision{Verdict: neumann.ApproveAllow})
+err = m.Approve(ctx, taskID, callID, neumann.ApprovalDecision{Verdict: neumann.ApproveDeny, Reason: "not today"})
+err = m.Approve(ctx, taskID, callID, neumann.ApprovalDecision{Verdict: neumann.ApproveEdit, Args: json.RawMessage(`{"amount":59}`)})
+```
+
+A cancel, a deadline or `Stop` while the round waits sends nothing; a restart
+keeps it waiting and announces the held calls again. `examples/approval` runs
+it offline.
+
 **Groups.** `m.SetCores(class, n)` pins a group's window at `n` vCores;
 `m.AutoScale(class, true)` lets it adapt again. `m.SetClass(ctx, id, class)`
 moves a task to another group between instructions (`ErrTaskBusy` means try
@@ -426,7 +457,7 @@ NEUMANN_API_KEY=... go run ./cmd/neumann -provider openai -base-url https://host
 {"type":"event","kind":"cancelled","task_id":"t1","seq":2,"task_seq":2,"data":{"stop_reason":"cancelled"}}
 ```
 
-An `"ok":true` reply to `submit`, `steer`, `cancel`, `resolve` or `class`
+An `"ok":true` reply to `submit`, `steer`, `cancel`, `resolve`, `approve` or `class`
 means the instruction is committed. The other kinds (`status`, `queue`,
 `cores`, `autoscale`, `group_reset`, `unsubscribe`) and the error codes are
 documented in package `proto/jsonl`. Run `go run ./cmd/neumann -help` for
