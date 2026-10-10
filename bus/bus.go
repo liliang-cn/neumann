@@ -1,5 +1,3 @@
-// Package bus is the system bus: every tool the machine can call is a device
-// attached here, addressed by a full name, behind a per-device queue.
 package bus
 
 import (
@@ -28,6 +26,9 @@ const (
 	Idempotent = task.Idempotent
 )
 
+// ToolDef is one tool as a device declares it. Name is the tool's own name;
+// the model sees FullName(device, Name). Schema is the JSON Schema of its
+// arguments.
 type ToolDef struct {
 	Name        string
 	Description string
@@ -53,6 +54,11 @@ type DeviceCall struct {
 	Key  string
 }
 
+// Device is anything that serves tools: Tools lists them once, when the
+// device is attached; Call runs one. Call is invoked concurrently, up to the
+// bus's per-device bound. A Go error from Call becomes an error result for the
+// model; so does a panic or a timeout, which the bus enforces itself. Close
+// releases the device when the machine stops.
 type Device interface {
 	Name() string
 	Tools(ctx context.Context) ([]ToolDef, error)
@@ -60,6 +66,7 @@ type Device interface {
 	Close() error
 }
 
+// DefaultTimeout bounds a tool call whose ToolDef sets no Timeout.
 const DefaultTimeout = 120 * time.Second
 
 type route struct {
@@ -69,6 +76,9 @@ type route struct {
 	slot chan struct{} // shared by all tools of one device
 }
 
+// Bus routes tool calls to devices: by full name, through the page table,
+// the L2 cache and each device's queue. The machine owns one; build it with
+// New.
 type Bus struct {
 	routes map[string]route
 	specs  []task.ToolSpec
@@ -427,6 +437,7 @@ func (b *Bus) RunCached(ctx context.Context, name string, args json.RawMessage, 
 	return res, Returned, false
 }
 
+// Close closes every attached device and returns their errors joined.
 func (b *Bus) Close() error {
 	var errs []error
 	for _, d := range b.devs {

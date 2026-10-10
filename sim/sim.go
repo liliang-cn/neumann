@@ -1,5 +1,3 @@
-// Package sim holds deterministic stand-ins for the world outside the machine,
-// for tests.
 package sim
 
 import (
@@ -28,6 +26,7 @@ type Model struct {
 	calls int
 }
 
+// Provider is Name, or "sim".
 func (m *Model) Provider() string {
 	if m.Name != "" {
 		return m.Name
@@ -43,6 +42,8 @@ func (m *Model) Caps() model.Caps {
 	return model.Caps{Tools: true}
 }
 
+// Call counts the call, returns ctx's error if it has ended, and otherwise
+// whatever Fn decides.
 func (m *Model) Call(ctx context.Context, req model.Request) (model.Response, error) {
 	m.mu.Lock()
 	m.calls++

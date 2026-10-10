@@ -1,5 +1,3 @@
-// Package model is the seam between the machine and a model provider. Every
-// call through an Adapter is one instruction on a vCore.
 package model
 
 import (
@@ -17,6 +15,9 @@ import (
 	"github.com/liliang-cn/neumann/task"
 )
 
+// Request is one model call in provider-neutral form: the system prompt, the
+// tools the task may call (sorted, byte-identical on every call of a task, so
+// a provider can cache the prefix) and the messages so far.
 type Request struct {
 	System   string
 	Tools    []task.ToolSpec
@@ -39,6 +40,12 @@ type Response struct {
 	Rate *RateInfo
 }
 
+// Adapter is a model provider. Provider names it, for example
+// "openai:gpt-4o", in events and to decide which provider's reasoning blocks
+// a request may carry. Call makes one request; it must honour ctx and should
+// return a *Error for every failure it can classify. The optional interfaces
+// below (Streamer, CapsReporter, OutputCap, Classifier, Metered,
+// RateReporter, Warmer) are discovered by type assertion.
 type Adapter interface {
 	Provider() string
 	Call(ctx context.Context, req Request) (Response, error)

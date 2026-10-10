@@ -1,4 +1,3 @@
-// Package proto is the machine's wire format: instructions in, events out.
 package proto
 
 import (
@@ -52,7 +51,7 @@ const (
 	EvModelRetry = "model_retry"
 
 	// Machine events, with no task: a model call waited for room in its
-	// limiters ({task, waited_ms}); an execution group's breaker opened
+	// limiters ({task, class, waited_ms}); an execution group's breaker opened
 	// ({class, cause}) or closed ({class}) (design §6.2, §7.2).
 	EvThrottled = "throttled"
 	EvGroupDown = "group_down"

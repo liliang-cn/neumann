@@ -13,6 +13,11 @@
 //
 // A task's entries live until its TTLs run out, the caps evict them or the
 // task is forgotten. The machine calls Forget when a task ends.
+//
+// A host does not use this package directly: the machine's bus starts with an
+// L2 of the default caps, and a tool opts in by declaring ReadOnly and
+// Cacheable (with an optional CacheTTL) in its bus.ToolDef. Hits and misses
+// show in neumann.Status.Cache.
 package cache
 
 import (
@@ -39,6 +44,7 @@ const (
 // elements, map slot, the entry itself. An estimate, so the byte cap is one.
 const entryOverhead = 160
 
+// Config bounds an L2; zero values take the defaults.
 type Config struct {
 	MaxEntriesPerTask int              // 0 = DefaultMaxEntriesPerTask
 	MaxBytes          int64            // 0 = DefaultMaxBytes
@@ -61,6 +67,7 @@ type Stats struct {
 	MaxBytes          int64
 }
 
+// L2 is the per-task read-only result cache. It is safe for concurrent use.
 type L2 struct {
 	maxEntries int
 	maxBytes   int64
@@ -91,6 +98,7 @@ type entry struct {
 	local   *list.Element
 }
 
+// New returns an empty cache with cfg's bounds.
 func New(cfg Config) *L2 {
 	c := &L2{maxEntries: cfg.MaxEntriesPerTask, maxBytes: cfg.MaxBytes, now: cfg.Now, tasks: map[string]*taskCache{}}
 	if c.maxEntries <= 0 {
@@ -237,6 +245,7 @@ func (c *L2) Forget(taskID string) {
 	delete(c.tasks, taskID)
 }
 
+// Stats is a snapshot of the cache's counters and size.
 func (c *L2) Stats() Stats {
 	c.mu.Lock()
 	defer c.mu.Unlock()

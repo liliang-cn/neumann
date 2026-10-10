@@ -3,6 +3,17 @@
 // a child process over stdio ([Stdio]), a streamable HTTP endpoint ([HTTP]),
 // or any SDK transport ([New]).
 //
+// # Getting started
+//
+//	notes := mcp.Stdio("notes", "npx", []string{"-y", "some-mcp-server"})
+//	if err := notes.Connect(ctx); err != nil { // optional: fail fast at start-up
+//		return err
+//	}
+//	m, err := neumann.New(neumann.Config{Model: adapter, Devices: []bus.Device{notes}})
+//
+// Over HTTP, [HTTP]("name", url, [WithHeader]("Authorization", "Bearer "+token)).
+// examples/mcp is a complete program that runs offline.
+//
 // # Connecting
 //
 // A device connects lazily, on the first Tools or Call; [Device.Connect]

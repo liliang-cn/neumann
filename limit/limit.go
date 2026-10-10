@@ -2,6 +2,24 @@
 // per minute, input and output tokens, daily budgets — each one a dimension
 // of a Limiter.
 //
+// # Getting started
+//
+// Most hosts never call this package directly: they describe limiters in
+// neumann.Config.Limiters and name them in each execution group's Limits.
+// Every model request of that group then waits until it fits in all of them:
+//
+//	neumann.Config{
+//		Limiters: []limit.Config{{Name: "org", Limits: map[string]limit.Rate{
+//			"requests": {Per: time.Minute, Limit: 50},
+//			"tokens":   {Per: time.Minute, Limit: 40000},
+//		}}},
+//		Groups: []neumann.GroupConfig{{Class: "default", Model: adapter, Limits: []string{"org"}}},
+//	}
+//
+// Standalone, [New] builds a Limiter, [Limiter.Reserve] (or [ReserveAll]
+// across several) waits for room, and the [Reservation] is settled with what
+// was actually used, or cancelled.
+//
 // A Limiter is not an execution group. A provider's quota scope rarely lines
 // up with one model: an organisation shares its token budget across models,
 // while one model can be bound by requests, input tokens and output tokens at

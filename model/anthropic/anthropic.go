@@ -1,5 +1,3 @@
-// Package anthropic adapts Anthropic's native Messages API (POST /messages)
-// to the machine's provider-neutral messages.
 package anthropic
 
 import (
@@ -24,6 +22,8 @@ const Version = "2023-06-01"
 // DefaultMaxTokens is the output budget New sets. The API requires one.
 const DefaultMaxTokens = 8192
 
+// Adapter talks to one model through Anthropic's Messages API. Build it with
+// New; set the exported fields before the machine starts.
 type Adapter struct {
 	BaseURL   string // up to and including the version, e.g. https://api.anthropic.com/v1
 	APIKey    string
@@ -49,6 +49,8 @@ var (
 	_ model.Warmer  = (*Adapter)(nil)
 )
 
+// New returns an adapter for modelName at baseURL (up to and including the
+// version, e.g. https://api.anthropic.com/v1), sending apiKey as x-api-key.
 func New(baseURL, apiKey, modelName string) *Adapter {
 	return &Adapter{
 		BaseURL:   strings.TrimRight(baseURL, "/"),
@@ -119,6 +121,9 @@ func (u wireUsage) usage() task.Usage {
 	}
 }
 
+// Call sends one non-streaming POST /messages request. A failure it can
+// explain is a *model.Error classified as design §11 describes; a call whose
+// ctx ended reports that.
 func (a *Adapter) Call(ctx context.Context, req model.Request) (model.Response, error) {
 	resp, err := a.post(ctx, req, false)
 	if err != nil {

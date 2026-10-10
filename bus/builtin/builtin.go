@@ -1,4 +1,3 @@
-// Package builtin is a device made of Go functions.
 package builtin
 
 import (
@@ -13,12 +12,16 @@ import (
 // model, not a failure of the device.
 type Func func(ctx context.Context, call bus.DeviceCall) (string, error)
 
+// Device is a bus.Device whose tools are Go functions. Build it with New and
+// Add before it is attached; it is safe for concurrent calls after that.
 type Device struct {
 	name string
 	defs []bus.ToolDef
 	fns  map[string]Func
 }
 
+// New returns an empty device. name is the prefix the model sees on each of
+// its tools (<name>_<tool>) and must not be empty.
 func New(name string) *Device {
 	return &Device{name: name, fns: map[string]Func{}}
 }
@@ -37,6 +40,9 @@ func (d *Device) Tools(context.Context) ([]bus.ToolDef, error) {
 	return append([]bus.ToolDef(nil), d.defs...), nil
 }
 
+// Call runs the named tool's Func. A Func's error becomes an error result
+// for the model; only an unknown tool name is a Go error, which the bus also
+// turns into an error result.
 func (d *Device) Call(ctx context.Context, c bus.DeviceCall) (task.ToolResult, error) {
 	fn, ok := d.fns[c.Tool]
 	if !ok {

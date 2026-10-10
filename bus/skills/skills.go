@@ -8,6 +8,14 @@
 // reads a resource file only when the instructions point to one. That keeps
 // every skill's full text out of the context until it is needed.
 //
+// To start, point a device at one or more roots and attach it:
+//
+//	dev, err := skills.New("skills", "./skills", os.ExpandEnv("$HOME/.skills"))
+//	m, err := neumann.New(neumann.Config{Model: adapter, Devices: []bus.Device{dev}})
+//
+// [Device.Problems] lists skills that were skipped and why; examples/skills
+// is a complete program.
+//
 // Three tools, all ReadOnly:
 //
 //   - list: the catalogue. Byte-stable for a given set of skills, so it is
