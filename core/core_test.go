@@ -461,3 +461,50 @@ func TestCompleteCommitFailureForgetsTheTask(t *testing.T) {
 		t.Fatalf("counts %d %d %d", r, w, h)
 	}
 }
+
+func TestHaltDuringModelCallCommitsNothing(t *testing.T) {
+	halt, cancel := context.WithCancel(bg)
+	defer cancel()
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+		cancel() // the machine gave up while the call was in flight
+		return sim.Reply("too late"), nil
+	})
+	e.Halt = halt
+	before := newTask(t, e, store, "q").Version
+	e.Sched.Add(load(t, store))
+	e.step(bg, take(t, e), 0)
+	got := load(t, store)
+	if got.Version != before || got.State != task.Ready || hasKind(store, "step") {
+		t.Fatalf("a halted step committed: %+v events %s", got, kinds(store))
+	}
+	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
+		t.Fatalf("counts %d %d %d", r, w, h)
+	}
+}
+
+func TestHaltDuringToolCallSkipsResultCommits(t *testing.T) {
+	halt, cancel := context.WithCancel(bg)
+	defer cancel()
+	started := make(chan struct{})
+	dev := builtin.New("dev").Add(bus.ToolDef{Name: "wait"}, func(ctx context.Context, _ bus.DeviceCall) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	})
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.CallTools("dev_wait"), nil }, dev)
+	e.Halt = halt
+	e.step(bg, newTask(t, e, store, "go"), 0)
+	e.step(bg, take(t, e), 0)
+	<-started
+	cancel()
+	e.WaitBatches()
+	if got := load(t, store); got.State != task.Waiting {
+		t.Fatalf("task %+v", got)
+	}
+	if hasKind(store, "tool_result") {
+		t.Fatalf("result committed after halt: %s", kinds(store))
+	}
+	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
+		t.Fatalf("counts %d %d %d", r, w, h)
+	}
+}

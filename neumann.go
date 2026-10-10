@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,7 @@ type Config struct {
 
 var (
 	ErrBusy     = errors.New("neumann: at capacity")
+	ErrStopped  = errors.New("neumann: machine stopped")
 	ErrFinished = mem.ErrFinished
 	ErrNotFound = mem.ErrNotFound
 )
@@ -70,8 +72,15 @@ type Machine struct {
 	env   *core.Env
 	hub   *hub
 
-	admit  sync.Mutex
-	active int // unfinished tasks
+	// admit guards active and stopped. active counts unfinished tasks; a task
+	// whose commit failed is forgotten by its vCore and keeps its slot (a bug
+	// path only, in phase 1).
+	admit   sync.Mutex
+	active  int
+	stopped bool
+
+	haltCtx    context.Context
+	haltCancel context.CancelFunc
 
 	life    sync.Mutex
 	started bool
@@ -111,7 +120,9 @@ func New(cfg Config) (*Machine, error) {
 	if err != nil {
 		return nil, err
 	}
+	haltCtx, haltCancel := context.WithCancel(context.Background())
 	m := &Machine{
+		haltCtx: haltCtx, haltCancel: haltCancel,
 		cfg:   cfg,
 		store: cfg.Store,
 		sched: sched.New(cfg.Clock, cfg.AgingAfter),
@@ -120,7 +131,7 @@ func New(cfg Config) (*Machine, error) {
 	}
 	m.env = &core.Env{
 		Store: m.store, Sched: m.sched, Bus: b, Model: cfg.Model, Clock: cfg.Clock,
-		Commit: m.commit, Logf: cfg.Logf,
+		Commit: m.commit, Logf: cfg.Logf, Halt: haltCtx,
 	}
 	return m, nil
 }
@@ -146,11 +157,19 @@ func (m *Machine) commit(ctx context.Context, c mem.CommitSet) error {
 	return nil
 }
 
-// Start launches the vCores. The machine runs until Stop or until ctx ends.
+// Start launches the vCores. ctx bounds only fetching: cancelling it stops
+// vCores taking new instructions, but the machine keeps running in-flight
+// work and holds its resources until Stop. A stopped machine cannot restart.
 // Phase 1 keeps nothing across processes, so there is nothing to recover.
 func (m *Machine) Start(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
+	m.admit.Lock()
+	stopped := m.stopped
+	m.admit.Unlock()
+	if stopped {
+		return ErrStopped
+	}
 	if m.started {
 		return errors.New("neumann: already started")
 	}
@@ -167,28 +186,45 @@ func (m *Machine) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops fetching, waits for in-flight instructions and tool batches to
-// commit, and closes the devices. If ctx ends first it cancels what is left.
+// Stop shuts the machine down. It first refuses new work and closes the
+// scheduler, then waits for the vCores and in-flight tool batches to commit
+// and hand their tasks back. If ctx ends first it halts what is left (running
+// calls are cancelled and their results are not committed; those tasks keep
+// their last committed state) and waits at most 2s more. In every case it
+// then closes the event hub and the devices. It returns ctx.Err() when the
+// deadline was hit and is idempotent: later calls return nil.
 func (m *Machine) Stop(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
-	if !m.started {
-		return m.bus.Close()
+	m.admit.Lock()
+	already := m.stopped
+	m.stopped = true
+	m.admit.Unlock()
+	if already {
+		return nil
 	}
 	m.sched.Close()
-	done := make(chan struct{})
-	go func() {
-		m.cores.Wait()
-		m.env.WaitBatches()
-		close(done)
-	}()
 	var err error
-	select {
-	case <-done:
-	case <-ctx.Done():
-		err = ctx.Err()
+	if m.started {
+		done := make(chan struct{})
+		go func() {
+			m.cores.Wait()
+			m.env.WaitBatches()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			err = ctx.Err()
+			m.haltCancel()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+			}
+		}
+		m.cancel()
 	}
-	m.cancel()
+	m.haltCancel()
 	m.hub.close()
 	return errors.Join(err, m.bus.Close())
 }
@@ -202,6 +238,9 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 	if strings.TrimSpace(in.Input) == "" {
 		return "", errors.New("neumann: submit needs input")
 	}
+	if in.Priority < 0 || in.Priority > 1 {
+		return "", fmt.Errorf("neumann: priority %d out of range 0..1", in.Priority)
+	}
 	class := in.Class
 	if class == "" {
 		class = m.cfg.Class
@@ -213,6 +252,7 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 	if id == "" {
 		id = uuid.NewString()
 	}
+	allow, deny := slices.Clone(in.Allow), slices.Clone(in.Deny)
 	t := &task.TCB{
 		ID:         id,
 		State:      task.Ready,
@@ -221,10 +261,10 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 		Priority:   in.Priority,
 		ReadySince: m.cfg.Clock.Now(),
 		System:     m.cfg.System,
-		Tools:      m.bus.Specs(in.Allow, in.Deny),
+		Tools:      m.bus.Specs(allow, deny),
 		Regs:       []task.Message{task.Text(task.RoleUser, in.Input)},
-		Allow:      in.Allow,
-		Deny:       in.Deny,
+		Allow:      allow,
+		Deny:       deny,
 		Version:    1,
 	}
 	if in.Budget != nil {
@@ -235,6 +275,9 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 	// concurrent submits cannot all slip past the limit together.
 	m.admit.Lock()
 	defer m.admit.Unlock()
+	if m.stopped {
+		return "", ErrStopped
+	}
 	if m.active >= m.cfg.MaxQueued {
 		return "", &CapacityError{Count: m.active, Limit: m.cfg.MaxQueued}
 	}
@@ -252,6 +295,15 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 // committed; it is then either delivered before the task's next model call or
 // reported by a steer_dropped event.
 func (m *Machine) Steer(ctx context.Context, taskID, text string) error {
+	if strings.TrimSpace(text) == "" {
+		return errors.New("neumann: steer needs text")
+	}
+	m.admit.Lock()
+	stopped := m.stopped
+	m.admit.Unlock()
+	if stopped {
+		return ErrStopped
+	}
 	_, err := m.store.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{
 		{TaskID: taskID, Kind: mem.InterruptSteer, Text: text},
 	}})

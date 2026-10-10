@@ -29,6 +29,11 @@ type Env struct {
 	Commit func(ctx context.Context, c mem.CommitSet) error
 	Logf   func(format string, args ...any)
 
+	// Halt interrupts work that is already running: model calls, tool calls.
+	// Once it is done, nothing further is committed and the task keeps its
+	// last committed state. nil means context.Background(), never halted.
+	Halt context.Context
+
 	batches sync.WaitGroup
 }
 
@@ -37,17 +42,25 @@ type stepData struct {
 	Core int    `json:"core"`
 }
 
+func (e *Env) halt() context.Context {
+	if e.Halt == nil {
+		return context.Background()
+	}
+	return e.Halt
+}
+
 // RunVCore is one vCore. It returns when the scheduler closes or ctx ends,
 // and only ever between two instructions. Cancelling ctx stops fetching; an
 // instruction already started runs to its commit, so a shutdown never loses
-// or fails the task it was holding.
+// or fails the task it was holding. Cancelling Halt interrupts running
+// instructions instead: their results are discarded, not committed.
 func (e *Env) RunVCore(ctx context.Context, class string, core int) {
 	for {
 		t, ok := e.Sched.Next(ctx, class)
 		if !ok {
 			return
 		}
-		e.step(context.WithoutCancel(ctx), t, core)
+		e.step(e.halt(), t, core)
 	}
 }
 
@@ -61,6 +74,10 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		batch []mem.CallRecord
 		err   error
 	)
+	if e.halt().Err() != nil {
+		e.Sched.Forget(t.ID)
+		return
+	}
 	switch t.PC {
 	case task.StepModel:
 		c, err = e.execModel(ctx, t, core)
@@ -69,10 +86,17 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	default:
 		err = fmt.Errorf("instruction %s is not implemented", t.PC)
 	}
+	if e.halt().Err() != nil {
+		// Halted mid-instruction: the result is not committed, so the task
+		// keeps its last committed state for recovery to resume from.
+		e.Sched.Forget(t.ID)
+		return
+	}
 	if err != nil {
 		c, batch = e.fail(t, c, err.Error()), nil
 	}
-	if err := e.Commit(ctx, c); err != nil {
+	// A commit that has started is allowed to finish.
+	if err := e.Commit(context.WithoutCancel(ctx), c); err != nil {
 		e.Logf("neumann: commit for task %s failed; it is no longer scheduled: %v", t.ID, err)
 		e.Sched.Forget(t.ID)
 		return
@@ -81,7 +105,7 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	allow := append([]string(nil), t.Allow...)
 	deny := append([]string(nil), t.Deny...)
 	e.Sched.Requeue(t) // t now belongs to the scheduler
-	if len(batch) > 0 {
+	if len(batch) > 0 && e.halt().Err() == nil {
 		e.dispatch(id, allow, deny, batch)
 	}
 }

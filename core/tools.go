@@ -52,7 +52,8 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallReco
 	e.batches.Add(1)
 	go func() {
 		defer e.batches.Done()
-		ctx := context.Background() // phase 3 replaces this with the task's cancel context
+		ctx := e.halt() // phase 3 adds the task's own cancel context
+		commitCtx := context.WithoutCancel(ctx)
 		results := make([]task.ToolResult, len(batch))
 		var wg sync.WaitGroup
 		for i, r := range batch {
@@ -60,17 +61,20 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallReco
 			go func() {
 				defer wg.Done()
 				res := e.Bus.Call(ctx, r.Tool, r.Args, r.Key, allow, deny)
+				if ctx.Err() != nil {
+					return // halted: the record stays dispatched for recovery
+				}
 				results[i] = res
 				r.Status = mem.CallDone
 				r.Result = &res
 				ev := proto.NewEvent(proto.EvToolResult, taskID, map[string]any{"call_id": r.CallID, "is_error": res.IsError})
-				if err := e.Commit(ctx, mem.CommitSet{Calls: []mem.CallRecord{r}, Events: []proto.Event{ev}}); err != nil {
+				if err := e.Commit(commitCtx, mem.CommitSet{Calls: []mem.CallRecord{r}, Events: []proto.Event{ev}}); err != nil {
 					e.Logf("neumann: commit of result %s/%s failed: %v", taskID, r.CallID, err)
 				}
 			}()
 		}
 		wg.Wait()
-		e.complete(ctx, taskID, batch, results)
+		e.complete(commitCtx, taskID, batch, results)
 	}()
 }
 
@@ -78,6 +82,10 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 	t, ok := e.Sched.Checkout(taskID)
 	if !ok {
 		e.Logf("neumann: task %s was not waiting when its tools finished", taskID)
+		return
+	}
+	if e.halt().Err() != nil {
+		e.Sched.Forget(taskID) // records stay dispatched; recovery resumes them
 		return
 	}
 	// The final transition carries the finished records too (an idempotent

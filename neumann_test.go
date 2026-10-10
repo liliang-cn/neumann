@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -212,8 +213,205 @@ func TestEventsReplayFromAnySeq(t *testing.T) {
 			}
 		}
 		cancel()
-		if len(got) != len(all)-int(from) || got[0].Seq != from+1 {
-			t.Fatalf("from %d: got %d events starting at %d", from, len(got), got[0].Seq)
+		if len(got) != len(all)-int(from) || len(got) == 0 || got[0].Seq != from+1 {
+			t.Fatalf("from %d: got %d events %+v", from, len(got), got)
 		}
+	}
+}
+
+func TestSubmitCopiesPageTables(t *testing.T) {
+	m, _ := start(t, neumann.Config{Devices: []bus.Device{echoDev()}}, func(model.Request) (model.Response, error) { return sim.Reply("ok"), nil })
+	allow := []string{"dev_*"}
+	deny := []string{"dev_x"}
+	id := submit(t, m, proto.Instruction{Input: "q", Allow: allow, Deny: deny})
+	allow[0], deny[0] = "mutated", "mutated"
+	got := waitDone(t, m, id)
+	if !slices.Equal(got.Allow, []string{"dev_*"}) || !slices.Equal(got.Deny, []string{"dev_x"}) {
+		t.Fatalf("allow %v deny %v", got.Allow, got.Deny)
+	}
+}
+
+func TestSubmitAndSteerValidation(t *testing.T) {
+	m, _ := start(t, neumann.Config{}, func(model.Request) (model.Response, error) { return sim.Reply("x"), nil })
+	for _, p := range []int{-1, 2} {
+		if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x", Priority: p}); err == nil {
+			t.Errorf("priority %d accepted", p)
+		}
+	}
+	id := submit(t, m, proto.Instruction{Input: "q", Priority: 1})
+	if err := m.Steer(bg, id, "  \n"); err == nil {
+		t.Error("blank steer accepted")
+	}
+}
+
+func TestStoppedMachine(t *testing.T) {
+	m, err := neumann.New(neumann.Config{Model: &sim.Model{Fn: func(model.Request) (model.Response, error) { return sim.Reply("x"), nil }}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Stop(bg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Stop(bg); err != nil {
+		t.Fatalf("second stop: %v", err)
+	}
+	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x"}); !errors.Is(err, neumann.ErrStopped) {
+		t.Fatalf("submit after stop: %v", err)
+	}
+	if err := m.Steer(bg, "t", "x"); !errors.Is(err, neumann.ErrStopped) {
+		t.Fatalf("steer after stop: %v", err)
+	}
+	if err := m.Start(bg); err == nil {
+		t.Fatal("start after stop succeeded")
+	}
+}
+
+func TestStopBeforeStart(t *testing.T) {
+	m, err := neumann.New(neumann.Config{Model: &sim.Model{Fn: func(model.Request) (model.Response, error) { return sim.Reply("x"), nil }}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Stop(bg); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Stop(bg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x"}); !errors.Is(err, neumann.ErrStopped) {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := m.Start(bg); err == nil {
+		t.Fatal("start after stop succeeded")
+	}
+	select {
+	case _, ok := <-m.Events(bg, 0):
+		if ok {
+			t.Fatal("unexpected event")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("events did not end after stop")
+	}
+}
+
+func toolModel(fn func() model.Response) modelFn {
+	return func(req model.Request) (model.Response, error) {
+		for _, msg := range req.Messages {
+			if msg.Role == task.RoleTool {
+				return sim.Reply("finished"), nil
+			}
+		}
+		return fn(), nil
+	}
+}
+
+func TestStopDrainsInFlightToolBatch(t *testing.T) {
+	entered := make(chan string, 1)
+	gate, release := newGate()
+	defer release()
+	sm := &sim.Model{Fn: toolModel(func() model.Response { return sim.CallTools("dev_slow") })}
+	m, err := neumann.New(neumann.Config{Model: sm, Devices: []bus.Device{gateDev(entered, gate)}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	id := submit(t, m, proto.Instruction{Input: "go"})
+	<-entered
+
+	ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+	defer cancel()
+	sawResult := make(chan bool, 1)
+	go func() {
+		for ev := range m.Events(ctx, 0) {
+			if ev.TaskID == id && ev.Kind == proto.EvToolResult {
+				sawResult <- true
+				return
+			}
+		}
+		sawResult <- false
+	}()
+	go func() { time.Sleep(100 * time.Millisecond); release() }()
+	if err := m.Stop(ctx); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if !<-sawResult {
+		t.Fatal("subscriber never saw the tool result")
+	}
+	got, err := m.Load(bg, id)
+	// Stop closes the scheduler, so the model step after the tools is not
+	// fetched: the task rests at its committed, resumable ready state.
+	if err != nil || got.State != task.Ready || got.PC != task.StepModel || got.Regs[len(got.Regs)-1].Role != task.RoleTool {
+		t.Fatalf("task %+v err %v", got, err)
+	}
+}
+
+func TestStopTimeoutHaltsWork(t *testing.T) {
+	entered := make(chan string, 1)
+	gate, release := newGate()
+	defer release()
+	sm := &sim.Model{Fn: toolModel(func() model.Response { return sim.CallTools("dev_slow") })}
+	m, err := neumann.New(neumann.Config{Model: sm, Devices: []bus.Device{gateDev(entered, gate)}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	id := submit(t, m, proto.Instruction{Input: "go"})
+	<-entered
+	ctx, cancel := context.WithTimeout(bg, 50*time.Millisecond)
+	defer cancel()
+	t0 := time.Now()
+	if err := m.Stop(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stop: %v", err)
+	}
+	if d := time.Since(t0); d > 3*time.Second {
+		t.Fatalf("stop took %v", d)
+	}
+	got, err := m.Load(bg, id)
+	if err != nil || got.State != task.Waiting {
+		t.Fatalf("task %+v err %v", got, err)
+	}
+	before, _ := m.EventLog(bg, 0, 0)
+	time.Sleep(100 * time.Millisecond)
+	after, _ := m.EventLog(bg, 0, 0)
+	if len(before) != len(after) {
+		t.Fatalf("events grew after stop: %d -> %d", len(before), len(after))
+	}
+}
+
+func TestEventsEndAfterStop(t *testing.T) {
+	m, _ := start(t, neumann.Config{}, func(model.Request) (model.Response, error) { return sim.Reply("ok"), nil })
+	waitDone(t, m, submit(t, m, proto.Instruction{Input: "q"}))
+	ch := m.Events(bg, 0)
+	if err := m.Stop(bg); err != nil {
+		t.Fatal(err)
+	}
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		case <-timeout:
+			t.Fatal("events stream did not end after stop")
+		}
+	}
+}
+
+func TestFinishedTaskFreesItsSlot(t *testing.T) {
+	m, _ := start(t, neumann.Config{MaxQueued: 1}, func(model.Request) (model.Response, error) { return sim.Reply("ok"), nil })
+	waitDone(t, m, submit(t, m, proto.Instruction{Input: "a"}))
+	deadline := time.Now().Add(2 * time.Second)
+	for m.Status().Unfinished != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "b"}); err != nil {
+		t.Fatalf("second submit: %v", err)
 	}
 }
