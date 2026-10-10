@@ -22,6 +22,12 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	if err != nil {
 		return mem.CommitSet{}, nil, fmt.Errorf("read interrupts: %w", err)
 	}
+	if reason, ok := e.stopping(t, pending); ok {
+		// Cancelled, or out of time, before this instruction began: nothing
+		// runs.
+		c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, reason)
+		return c, nil, err
+	}
 	base := len(t.Regs)
 	var c mem.CommitSet
 	// Unconfirmed requests count too: they may have reached the provider, and
@@ -52,10 +58,17 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	c.Applied = applySteers(t, pending, e.frameSteer)
 
 	stepNo := t.Used.Steps + 1
-	resp, err := e.callModel(ctx, model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs}, func(d model.Delta) {
+	// The call runs under the task's own context: a cancel or deadline ends
+	// it at once, whoever holds the task.
+	tctx, release := e.taskContext(t.ID)
+	defer release()
+	resp, err := e.callModel(tctx, model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs}, func(d model.Delta) {
 		e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
 	})
 	t.Used.Steps++
+	if e.halt().Err() == nil && e.Sched.Cancelled(t.ID) {
+		return e.cancelledStep(ctx, t, c, base, resp, err, tctx.Err() != nil)
+	}
 	if err != nil {
 		// Steers applied for this call were never answered: take them back so
 		// the terminal commit reports them dropped.
@@ -76,22 +89,12 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	msg.Role = task.RoleAssistant
 	if len(msg.ToolCalls()) > 0 {
 		var batch []mem.CallRecord
-		for i := range msg.Parts {
-			p := &msg.Parts[i]
-			if p.Kind != task.PartToolCall {
-				continue
-			}
-			t.CallSeq++
-			p.CallID = fmt.Sprintf("c-%d", t.CallSeq)
-			device, effect, report := e.Bus.Recovery(p.Name)
-			batch = append(batch, dispatched(mem.CallRecord{
-				TaskID: t.ID, CallID: p.CallID, Index: t.CallSeq, Tool: p.Name, Args: p.Args, Status: mem.CallPlanned,
-				Device: device, Effect: effect, ReportUnknown: report,
-			}))
+		for _, r := range e.plan(t, &msg) {
+			batch = append(batch, dispatched(r))
 			// Args go into the event as a string: a model can emit malformed
 			// JSON, and marshalling it as raw JSON would fail.
 			c.Events = append(c.Events, proto.NewEvent(proto.EvToolCall, t.ID,
-				map[string]any{"call_id": p.CallID, "tool": p.Name, "args": string(p.Args)}))
+				map[string]any{"call_id": r.CallID, "tool": r.Tool, "args": string(r.Args)}))
 		}
 		t.Regs = append(t.Regs, msg)
 		waitIO(t)
@@ -115,6 +118,57 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		return c, nil, nil
 	}
 	return e.finish(t, c, "end_turn"), nil, nil
+}
+
+// plan gives each tool call in msg its id and returns their planned call
+// records, with what recovery needs to know about each tool.
+func (e *Env) plan(t *task.TCB, msg *task.Message) []mem.CallRecord {
+	var recs []mem.CallRecord
+	for i := range msg.Parts {
+		p := &msg.Parts[i]
+		if p.Kind != task.PartToolCall {
+			continue
+		}
+		t.CallSeq++
+		p.CallID = fmt.Sprintf("c-%d", t.CallSeq)
+		device, effect, report := e.Bus.Recovery(p.Name)
+		recs = append(recs, mem.CallRecord{
+			TaskID: t.ID, CallID: p.CallID, Index: t.CallSeq, Tool: p.Name, Args: p.Args, Status: mem.CallPlanned,
+			Device: device, Effect: effect, ReportUnknown: report,
+		})
+	}
+	return recs
+}
+
+// cancelledStep is the final commit of a model step whose task was cancelled
+// while the model was called. The steers applied for the call go back to
+// pending, so the final commit reports them dropped. A call cut off by the
+// cancel (interrupted) may have reached the provider: it is unconfirmed. A
+// response that did come back counts its usage; its tool calls are recorded
+// cancelled and never dispatched; an answer is discarded.
+func (e *Env) cancelledStep(ctx context.Context, t *task.TCB, c mem.CommitSet, base int, resp model.Response, err error, interrupted bool) (mem.CommitSet, []mem.CallRecord, error) {
+	t.Regs = t.Regs[:base]
+	c.Applied = nil
+	if err != nil {
+		if interrupted {
+			t.Unconfirmed++
+		}
+	} else {
+		t.Used.Add(resp.Usage)
+		c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
+		msg := resp.Message
+		msg.Parts = slices.Clone(msg.Parts)
+		msg.Role = task.RoleAssistant
+		if len(msg.ToolCalls()) > 0 {
+			for _, r := range e.plan(t, &msg) {
+				r.Status = mem.CallCancelled
+				c.Calls = append(c.Calls, r)
+			}
+			t.Regs = append(t.Regs, msg)
+		}
+	}
+	c, cerr := e.cancelSet(ctx, t, c, nil, ReasonCancelled)
+	return c, nil, cerr
 }
 
 // errStartNotCommitted marks a step whose start could not be recorded.

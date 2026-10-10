@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/liliang-cn/neumann/task"
@@ -175,6 +176,35 @@ func (b *Bus) Recovery(name string) (device string, effect Effect, reportUnknown
 	return "", SideEffect, false
 }
 
+// Outcome is how a call ended, for a caller that must know whether the
+// device ran: a cancelled task records a call that never reached its device
+// as cancelled, and one that did as unknown.
+type Outcome int
+
+const (
+	// Returned: the result is the call's own: what the device returned, the
+	// bus's refusal (not permitted, unknown tool), or its timeout.
+	Returned Outcome = iota
+	// NotRun: ctx ended before the device was invoked; it did not run.
+	NotRun
+	// Abandoned: ctx ended while the device was running, and the bus stopped
+	// waiting. Whether the call took effect is unknown; whatever the device
+	// returns later goes to the late callback.
+	Abandoned
+)
+
+func (o Outcome) String() string {
+	switch o {
+	case Returned:
+		return "returned"
+	case NotRun:
+		return "not_run"
+	case Abandoned:
+		return "abandoned"
+	}
+	return "unknown"
+}
+
 // Call runs one tool call, waiting in the device's queue for a free slot. It
 // never returns a Go error: every failure becomes an error result, because
 // each call the model made must get exactly one result.
@@ -185,15 +215,25 @@ func (b *Bus) Recovery(name string) (device string, effect Effect, reportUnknown
 // slot until its call actually returns, so the per-device bound counts real
 // work. A device panic becomes an error result.
 func (b *Bus) Call(ctx context.Context, name string, args json.RawMessage, key string, allow, deny []string) task.ToolResult {
+	res, _ := b.Run(ctx, name, args, key, allow, deny, nil)
+	return res
+}
+
+// Run is Call that also says how the call ended. When ctx ends while the
+// device runs (Abandoned) and the device later returns a result of its own,
+// not merely an echo of the cancellation, late receives it on the device's
+// goroutine after its slot is released. A timeout is a result (Returned), and
+// what the device returns after it is dropped.
+func (b *Bus) Run(ctx context.Context, name string, args json.RawMessage, key string, allow, deny []string, late func(task.ToolResult)) (task.ToolResult, Outcome) {
 	if !Permitted(name, allow, deny) {
-		return task.ToolResult{Content: "tool " + name + " is not permitted for this task", IsError: true}
+		return task.ToolResult{Content: "tool " + name + " is not permitted for this task", IsError: true}, Returned
 	}
 	r, ok := b.routes[name]
 	if !ok {
-		return task.ToolResult{Content: "unknown tool " + name, IsError: true}
+		return task.ToolResult{Content: "unknown tool " + name, IsError: true}, Returned
 	}
-	cancelled := func() task.ToolResult {
-		return task.ToolResult{Content: "cancelled before the tool ran: " + ctx.Err().Error(), IsError: true}
+	cancelled := func() (task.ToolResult, Outcome) {
+		return task.ToolResult{Content: "cancelled before the tool ran: " + ctx.Err().Error(), IsError: true}, NotRun
 	}
 	if ctx.Err() != nil {
 		return cancelled()
@@ -219,28 +259,54 @@ func (b *Bus) Call(ctx context.Context, name string, args json.RawMessage, key s
 		res task.ToolResult
 		err error
 	}
-	ch := make(chan outcome, 1)
-	go func() {
-		defer func() { <-r.slot }()
-		defer func() {
-			if p := recover(); p != nil {
-				ch <- outcome{res: task.ToolResult{Content: fmt.Sprintf("tool %s panicked: %v", name, p), IsError: true}}
-			}
-		}()
-		res, err := r.dev.Call(cctx, DeviceCall{Tool: r.tool, Args: args, Key: key})
-		ch <- outcome{res, err}
-	}()
-	stopped := func() task.ToolResult {
-		if ctx.Err() == nil {
-			return task.ToolResult{Content: fmt.Sprintf("tool %s timed out after %v", name, timeout), IsError: true}
-		}
-		return task.ToolResult{Content: "cancelled while the tool ran: " + ctx.Err().Error(), IsError: true}
-	}
 	finish := func(o outcome) task.ToolResult {
 		if o.err != nil {
 			return task.ToolResult{Content: o.err.Error(), IsError: true}
 		}
 		return o.res
+	}
+	// echo: the device only repeated the cancellation or timeout back.
+	echo := func(o outcome) bool {
+		for _, e := range []error{context.Canceled, context.DeadlineExceeded} {
+			if (o.err != nil && errors.Is(o.err, e)) || (o.res.IsError && o.res.Content == e.Error()) {
+				return true
+			}
+		}
+		return false
+	}
+	var (
+		mu       sync.Mutex // orders the device's hand-over against the bus giving up
+		gaveUp   bool
+		toCancel bool // it gave up because ctx ended, not on the timeout
+	)
+	ch := make(chan outcome, 1)
+	go func() {
+		o := func() (o outcome) {
+			defer func() {
+				if p := recover(); p != nil {
+					o = outcome{res: task.ToolResult{Content: fmt.Sprintf("tool %s panicked: %v", name, p), IsError: true}}
+				}
+			}()
+			res, err := r.dev.Call(cctx, DeviceCall{Tool: r.tool, Args: args, Key: key})
+			return outcome{res, err}
+		}()
+		<-r.slot
+		mu.Lock()
+		if !gaveUp {
+			ch <- o
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
+		if late != nil && toCancel && !echo(o) {
+			late(finish(o))
+		}
+	}()
+	stopped := func() (task.ToolResult, Outcome) {
+		if ctx.Err() == nil {
+			return task.ToolResult{Content: fmt.Sprintf("tool %s timed out after %v", name, timeout), IsError: true}, Returned
+		}
+		return task.ToolResult{Content: "cancelled while the tool ran: " + ctx.Err().Error(), IsError: true}, Abandoned
 	}
 	var o outcome
 	select {
@@ -248,19 +314,21 @@ func (b *Bus) Call(ctx context.Context, name string, args json.RawMessage, key s
 	case <-cctx.Done():
 		// A device that finished at the same moment as the timeout wins: its
 		// side effect happened, so reporting a timeout would invite a retry.
+		mu.Lock()
 		select {
 		case o = <-ch:
+			mu.Unlock()
 		default:
+			gaveUp, toCancel = true, ctx.Err() != nil
+			mu.Unlock()
 			return stopped()
 		}
 	}
 	// A device that merely echoes the context error is a timeout, not a result.
-	if ce := cctx.Err(); ce != nil {
-		if (o.err != nil && errors.Is(o.err, ce)) || (o.res.IsError && o.res.Content == ce.Error()) {
-			return stopped()
-		}
+	if cctx.Err() != nil && echo(o) {
+		return stopped()
 	}
-	return finish(o)
+	return finish(o), Returned
 }
 
 func (b *Bus) Close() error {

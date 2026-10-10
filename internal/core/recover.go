@@ -64,7 +64,30 @@ func round(t *task.TCB, recs []mem.CallRecord) []mem.CallRecord {
 //     unconfirmed; the step is done again.
 //   - Waiting on I/O: the current round is settled call by call (settle).
 //   - Anything else (Ready, waiting for reconciliation) resumes as it is.
+//
+// A task with a committed cancel is finalised instead, whatever its state.
 func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]mem.CallRecord, error) {
+	pending, err := e.Store.Interrupts(ctx, t.ID, true)
+	if err != nil {
+		return nil, err
+	}
+	if reason, ok := cancelReason(pending); ok {
+		// A cancel was committed and its final commit was not: finish it.
+		// Nothing is sent again; whatever was in flight is unknown.
+		from := t.State.String()
+		if t.State == task.Waiting {
+			from += "_" + t.Wait.String()
+		}
+		if t.State == task.Running {
+			t.Unconfirmed++ // a request may have been sent
+		}
+		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": from, "cancel": reason})
+		c, err := e.cancelSet(ctx, t, mem.CommitSet{Events: []proto.Event{ev}}, nil, ReasonCancelled)
+		if err != nil {
+			return nil, err
+		}
+		return nil, e.Commit(ctx, c)
+	}
 	switch {
 	case t.State == task.Running:
 		t.Unconfirmed++

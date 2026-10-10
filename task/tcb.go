@@ -119,9 +119,13 @@ func (w *WaitReason) UnmarshalText(b []byte) error {
 	return err
 }
 
-// Budget bounds a task. Phase 1 enforces MaxSteps only.
+// Budget bounds a task.
 type Budget struct {
 	MaxSteps int `json:"max_steps,omitempty"` // model instructions; 0 = unlimited
+	// Deadline is an absolute time: once it passes, the task is cancelled
+	// whatever state it is in and ends Failed with StopReason "deadline"
+	// (design §9.4). Zero means none. It survives a restart.
+	Deadline time.Time `json:"deadline,omitzero"`
 }
 
 // Usage is confirmed usage: only what a provider's response reported.

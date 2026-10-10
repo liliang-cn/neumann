@@ -7,10 +7,11 @@ import (
 	"github.com/liliang-cn/neumann/task"
 )
 
-// Instruction kinds. Phase 1 implements submit and steer.
+// Instruction kinds.
 const (
 	KindSubmit = "submit"
 	KindSteer  = "steer"
+	KindCancel = "cancel"
 )
 
 // Instruction is everything the machine accepts from outside.
@@ -31,6 +32,7 @@ const (
 	EvStep         = "step"
 	EvToolCall     = "tool_call"
 	EvToolResult   = "tool_result"
+	EvToolLate     = "tool_late" // a result that arrived after its task was cancelled
 	EvUsage        = "usage"
 	EvAnswer       = "answer"
 	EvDone         = "done"

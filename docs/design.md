@@ -430,11 +430,14 @@ type Adapter interface {
 3. 任务的所有者做最终提交：
    - `planned` 的调用 → `cancelled`，从未派发；
    - `dispatched` 且设备在取消后确认没有执行 → `cancelled`；
-   - `dispatched` 且结果未知 → `unknown`，发 `reconcile_needed`（任务已取消，不再等待核对，但记录留给操作员）；
+   - `dispatched` 且结果未知 → `unknown`，发 `reconcile_needed`（带 `cancelled: true`；任务已取消，不再等待核对，但记录留给操作员）；
+   - `dispatched` 且结果已经回来 → `done`，结果不进寄存器；
    - 任务转 `Cancelled`，未送达的插话各一个 `steer_dropped`。
 4. 取消之后才到达的工具结果，调用记录标为 `late` 并保存结果，不进入寄存器，发 `tool_late` 事件。
 
 挂起和熔断等待中的任务取消时没有在途调用，直接由调度器做最终提交。
+
+与任务自己的结束同时到达的取消：任务按它自己的提交结束，取消中断随终态提交被标为已送达，不产生效果。
 
 ### 9.6 操作员控制
 
@@ -653,6 +656,8 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
    第一阶段留下的 8 处接缝已全部处理：`Running` 在调用前提交；调用记录在规划时记下 `Device`、`Effect`、`ReportUnknown`；tool 消息从调用记录组装；`dispatched` 但从未发出的调用会进入核对（预写日志固有）；准入计数在 `Start` 时从未完成任务数初始化；`Submit` / `Steer` 锁内预留、锁外提交，`Stop` 带截止时间地等它们；单条结果提交失败时 `tool_result` 随完成提交补发；`core`、`sched` 已移到 `internal/`。
    验证：`TestCrashAtEveryCommitPoint`（每个提交点注入一次崩溃，SQLite，压测 30 轮）、`TestKillNine`（真进程 SIGKILL，副作用只执行一次）。
 3. **取消、Deadline 与故障注入**：9.4、9.5；在每一个提交点前后注入崩溃。
+   已完成：`m.Cancel(ctx, id)` 提交取消中断（`Text` 是原因）后返回，结束的任务返回 `ErrFinished`、不存在的返回 `ErrNotFound`；调度器持有每个任务的 context 和 Deadline 定时器（`Budget.Deadline`，绝对时间，`Submit` 时给出），不论状态；没人在干活的任务（就绪、待核对、挂起，以后的退避、熔断等待）由取消方 `Sched.Cancel` 取出并做最终提交，vCore 或工具批次持有的任务只收到信号，交还时 `Requeue` 在同一把锁下拒收，由持有方最终提交——取消不会落在提交和交还之间；总线 `Run` 区分"没碰到设备"（`cancelled`）、"设备跑着时放弃"（`unknown` + 带 `cancelled` 标记的 `reconcile_needed`，任务不等）和结果，放弃之后设备的真实结果在最终提交之后记为 `late` 并发 `tool_late`，不进寄存器；模型调用期间被取消算一次 `Unconfirmed`，已回来的工具调用记为 `cancelled`、从不派发；Deadline 已过的任务不再开始任何指令，即使定时器还没跑；恢复时有未完成的取消中断就直接做最终提交，Deadline 重新挂上、已过的立即触发。
+   验证：`TestCrashAtEveryCommitPoint*`（支付、执行中取消、执行中超时三种任务，每个提交点之前和之后各崩一次，SQLite；"之后"= 提交已落盘、调用方没收到）、`TestAcceptedInputSurvivesACrash`（第 18 节 9）、`TestDeadlineFiresInEveryState`（第 18 节 10：就绪、等工具、待核对、执行中、已过期）、`TestCancelWhileToolsInFlight` / `TestCancelledPlannedCallsNeverRun` / `TestLateResultIsRecordedLate`（第 18 节 11）。
 4. **自适应伸缩、限流器与迁移**：拥塞窗口、限流器、错误分类、熔断、迁移校验、第二个适配器。
 
 ## 18. 测试

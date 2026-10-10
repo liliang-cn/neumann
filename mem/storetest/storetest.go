@@ -52,6 +52,8 @@ func Run(t *testing.T, newStore Factory) {
 		{"FullTaskRoundTrip", testFullTaskRoundTrip},
 		{"FullCallRecordRoundTrip", testFullCallRecordRoundTrip},
 		{"UnfinishedCoversEveryNonTerminalState", testUnfinishedCoversEveryNonTerminalState},
+		{"CancelInterruptIsAppliedSilently", testCancelInterruptIsAppliedSilently},
+		{"CancelledAndLateCallsRoundTrip", testCancelledAndLateCallsRoundTrip},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore) })
@@ -412,7 +414,7 @@ func fullTask(id string) *task.TCB {
 			{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: "boom", IsError: true}}},
 		},
 		Allow: []string{"dev_"}, Deny: []string{"dev_y"},
-		Budget:      task.Budget{MaxSteps: 9},
+		Budget:      task.Budget{MaxSteps: 9, Deadline: time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)},
 		Used:        task.Usage{Steps: 3, PromptTokens: 100, CompletionTokens: 20, ReasoningTokens: 5, CachedTokens: 64},
 		CallSeq:     1,
 		Unconfirmed: 2,
@@ -473,5 +475,53 @@ func testUnfinishedCoversEveryNonTerminalState(t *testing.T, newStore Factory) {
 	}
 	if !reflect.DeepEqual(got, []task.State{task.Ready, task.Running, task.Waiting, task.Suspended}) {
 		t.Fatalf("unfinished states %v", got)
+	}
+}
+
+// A cancel interrupt carries its reason in Text, survives until the terminal
+// commit, and is then applied without a steer_dropped event.
+func testCancelInterruptIsAppliedSilently(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, steer("a", "s"))
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptCancel, Text: "deadline"}}})
+	pending, _ := s.Interrupts(ctx, "a", true)
+	if len(pending) != 2 || pending[1].Kind != mem.InterruptCancel || pending[1].Text != "deadline" {
+		t.Fatalf("pending %+v", pending)
+	}
+	tc.State, tc.StopReason, tc.Version = task.Cancelled, "cancelled", 2
+	evs := mustCommit(t, s, mem.CommitSet{Task: tc, Events: []proto.Event{proto.NewEvent(proto.EvCancelled, "a", nil)}})
+	if len(evs) != 2 || evs[0].Kind != proto.EvCancelled || evs[1].Kind != proto.EvSteerDropped {
+		t.Fatalf("events %+v", evs)
+	}
+	if pending, _ := s.Interrupts(ctx, "a", true); len(pending) != 0 {
+		t.Fatalf("still pending %+v", pending)
+	}
+	if _, err := s.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptCancel}}}); !errors.Is(err, mem.ErrFinished) {
+		t.Fatalf("cancel of a finished task: %v, want ErrFinished", err)
+	}
+}
+
+// A cancelled task's calls end cancelled or unknown in its final commit, and a
+// result that arrives after it is recorded as late on the terminal task.
+func testCancelledAndLateCallsRoundTrip(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	planned := mem.CallRecord{TaskID: "a", CallID: "c-1", Index: 1, Tool: "dev_x", Status: mem.CallPlanned, Device: "dev"}
+	sent := mem.CallRecord{TaskID: "a", CallID: "c-2", Index: 2, Tool: "dev_y", Status: mem.CallDispatched, Attempt: 1, Key: "a/c-2/1", Device: "dev"}
+	mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{planned, sent}})
+	planned.Status, sent.Status = mem.CallCancelled, mem.CallUnknown
+	tc.State, tc.Version = task.Cancelled, 2
+	mustCommit(t, s, mem.CommitSet{Task: tc, Calls: []mem.CallRecord{planned, sent}})
+	sent.Status, sent.Result = mem.CallLate, &task.ToolResult{Content: "paid"}
+	evs := mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{sent}, Events: []proto.Event{proto.NewEvent(proto.EvToolLate, "a", nil)}})
+	if len(evs) != 1 || evs[0].Kind != proto.EvToolLate {
+		t.Fatalf("events %+v", evs)
+	}
+	got, _ := s.Calls(ctx, "a")
+	if !reflect.DeepEqual(got, []mem.CallRecord{planned, sent}) {
+		t.Fatalf("calls %+v", got)
 	}
 }

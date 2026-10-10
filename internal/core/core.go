@@ -86,6 +86,15 @@ type stepData struct {
 	Core int    `json:"core"`
 }
 
+// taskContext is what work for a task runs under: it ends when the task is
+// cancelled (its scheduler context) or when the machine halts. release frees
+// it.
+func (e *Env) taskContext(id string) (ctx context.Context, release func()) {
+	ctx, cancel := context.WithCancel(e.Sched.Context(id))
+	stop := context.AfterFunc(e.halt(), cancel)
+	return ctx, func() { stop(); cancel() }
+}
+
 func (e *Env) halt() context.Context {
 	if e.Halt == nil {
 		return context.Background()
@@ -149,7 +158,7 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		// that keeps failing is not going to record anything else either.
 		if e.startFailed(t.ID) <= maxStartRetries {
 			e.Logf("neumann: task %s: %v; retrying", t.ID, err)
-			e.Sched.Requeue(t)
+			e.handBack(ctx, t, nil)
 			return
 		}
 		e.Logf("neumann: task %s: %v; giving up, it is no longer scheduled", t.ID, err)
@@ -168,7 +177,10 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	id := t.ID
 	allow := append([]string(nil), t.Allow...)
 	deny := append([]string(nil), t.Deny...)
-	e.Sched.Requeue(t) // t now belongs to the scheduler
+	if !e.handBack(ctx, t, batch) {
+		return // cancelled meanwhile and finalised: the batch is never sent
+	}
+	// t now belongs to the scheduler
 	if len(batch) > 0 && e.halt().Err() == nil {
 		e.dispatch(id, allow, deny, batch)
 	}

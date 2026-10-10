@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
@@ -22,6 +23,14 @@ func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		return mem.CommitSet{Events: []proto.Event{
 			proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepTools.String(), Core: core}),
 		}}, nil, fmt.Errorf("read calls: %w", err)
+	}
+	pending, err := e.Store.Interrupts(ctx, t.ID, true)
+	if err != nil {
+		return mem.CommitSet{}, nil, fmt.Errorf("read interrupts: %w", err)
+	}
+	if reason, ok := e.stopping(t, pending); ok {
+		c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, reason)
+		return c, nil, err
 	}
 	c := mem.CommitSet{Events: []proto.Event{
 		proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepTools.String(), Core: core}),
@@ -62,7 +71,8 @@ func waitIO(t *task.TCB) {
 
 // dispatch runs a committed batch off the vCore. Each result is committed as
 // it arrives; when all are in, the task is checked out of the wait set, given
-// its tool message, committed as ready, and requeued.
+// its tool message, committed as ready, and requeued. The calls run under the
+// task's context: when the task is cancelled, the batch finalises it instead.
 func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallRecord) {
 	e.dispatchMu.Lock()
 	if e.dispatchClosed {
@@ -74,38 +84,59 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallReco
 	}
 	e.batches.Add(1)
 	e.dispatchMu.Unlock()
+	tctx, release := e.taskContext(taskID)
 	go func() {
 		defer e.batches.Done()
-		ctx := e.halt() // phase 3 adds the task's own cancel context
-		commitCtx := context.WithoutCancel(ctx)
-		results := make([]task.ToolResult, len(batch))
-		recorded := make([]bool, len(batch)) // per-result commit succeeded
+		defer release()
+		commitCtx := context.WithoutCancel(e.halt())
+		finalised := make(chan struct{}) // closed once a cancel's final commit landed
+		b := &outcomes{
+			results:  make([]task.ToolResult, len(batch)),
+			got:      make([]bool, len(batch)),
+			recorded: make([]bool, len(batch)),
+			notRun:   make([]bool, len(batch)),
+		}
 		var wg sync.WaitGroup
 		for i, r := range batch {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				res := e.Bus.Call(ctx, r.Tool, r.Args, r.Key, allow, deny)
-				if ctx.Err() != nil {
+				res, how := e.Bus.Run(tctx, r.Tool, r.Args, r.Key, allow, deny, e.lateFor(taskID, r, finalised))
+				if e.halt().Err() != nil {
 					return // halted: the record stays dispatched for recovery
 				}
-				results[i] = res
+				switch how {
+				case bus.NotRun:
+					b.notRun[i] = true // cancelled before it reached the device
+					return
+				case bus.Abandoned:
+					return // cancelled while it ran: its outcome is unknown
+				}
+				b.results[i], b.got[i] = res, true
 				r.Status = mem.CallDone
 				r.Result = &res
 				ev := proto.NewEvent(proto.EvToolResult, taskID, map[string]any{"call_id": r.CallID, "is_error": res.IsError})
 				if err := e.Commit(commitCtx, mem.CommitSet{Calls: []mem.CallRecord{r}, Events: []proto.Event{ev}}); err != nil {
 					e.Logf("neumann: commit of result %s/%s failed: %v", taskID, r.CallID, err)
 				} else {
-					recorded[i] = true
+					b.recorded[i] = true
 				}
 			}()
 		}
 		wg.Wait()
-		e.complete(commitCtx, taskID, batch, results, recorded)
+		e.complete(commitCtx, taskID, batch, b, finalised)
 	}()
 }
 
-func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecord, results []task.ToolResult, recorded []bool) {
+// outcomes is what a tool batch learned about each of its calls.
+type outcomes struct {
+	results  []task.ToolResult
+	got      []bool // a result came back
+	recorded []bool // ...and its own commit landed
+	notRun   []bool // cancelled before it reached the device
+}
+
+func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecord, b *outcomes, finalised chan<- struct{}) {
 	t, ok := e.Sched.Checkout(taskID)
 	if !ok {
 		// Ownership invariant: a dispatched batch's task is in the wait set
@@ -115,6 +146,26 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 	if e.halt().Err() != nil {
 		e.Sched.Forget(taskID) // records stay dispatched; recovery resumes them
 		return
+	}
+	if e.Sched.Cancelled(taskID) {
+		fates := make(map[string]fate, len(batch))
+		for i, r := range batch {
+			switch {
+			case b.got[i]:
+				res := b.results[i]
+				fates[r.CallID] = fate{result: &res, recorded: b.recorded[i]}
+			case b.notRun[i]:
+				fates[r.CallID] = fate{notRun: true}
+			}
+		}
+		if e.finalise(ctx, t, mem.CommitSet{}, fates) {
+			close(finalised) // late results may be recorded now
+		}
+		return
+	}
+	if i := slices.Index(b.got, false); i >= 0 {
+		// Only a cancel or a halt leaves a call without a result.
+		panic(fmt.Sprintf("core: call %s/%s has no result and its task was not cancelled", taskID, batch[i].CallID))
 	}
 	// The final transition carries the finished records too (an idempotent
 	// upsert of what the per-result commits recorded), so the model can never
@@ -131,11 +182,11 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 	done := make([]mem.CallRecord, len(batch))
 	var events []proto.Event
 	for i, r := range batch {
-		res := results[i]
+		res := b.results[i]
 		r.Status = mem.CallDone
 		r.Result = &res
 		done[i] = r
-		if !recorded[i] {
+		if !b.recorded[i] {
 			// Its own commit failed, so its tool_result event was never
 			// published; it goes out with the transition that records it.
 			events = append(events, proto.NewEvent(proto.EvToolResult, taskID, map[string]any{"call_id": r.CallID, "is_error": res.IsError}))
@@ -152,7 +203,7 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 		e.Sched.Forget(taskID)
 		return
 	}
-	e.Sched.Requeue(t)
+	e.handBack(ctx, t, nil)
 }
 
 // toolMessage is the tool message for a finished round, built from its call

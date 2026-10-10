@@ -12,6 +12,10 @@ import (
 	"github.com/liliang-cn/neumann/task"
 )
 
+// CallStatus is where a call is in its life. A cancelled task's final commit
+// leaves no call planned or dispatched: one that never reached its device is
+// cancelled, one that did is unknown; a result that arrives after that commit
+// is kept on the record as late and never reaches the model.
 type CallStatus string
 
 const (
@@ -42,7 +46,12 @@ type CallRecord struct {
 	Result        *task.ToolResult `json:"result,omitempty"`
 }
 
-const InterruptSteer = "steer"
+// Interrupt kinds. A steer's Text is the message; a cancel's Text is its
+// reason, the StopReason the task ends with ("cancelled" or "deadline").
+const (
+	InterruptSteer  = "steer"
+	InterruptCancel = "cancel"
+)
 
 // Interrupt is an outside input to a task, durable before it is applied.
 type Interrupt struct {

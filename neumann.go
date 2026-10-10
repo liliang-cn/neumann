@@ -62,10 +62,13 @@ func DefaultSteerFormat(text string) string {
 		"Take it into account together with that request.]\n" + text
 }
 
-// Clock is the machine's notion of now: scheduling order and aging read it.
+// Clock is the machine's notion of now: scheduling order, aging and
+// deadlines read it. A Clock that also has AfterFunc(d, f) (stop func() bool)
+// runs the deadline timers too, so a fake clock can make them fire; any other
+// gets real timers set for the time it says is left.
 type Clock interface{ Now() time.Time }
 
-// ErrNotStarted is returned by Submit, Steer and Resolve before Start.
+// ErrNotStarted is returned by Submit, Steer, Cancel and Resolve before Start.
 var ErrNotStarted = errors.New("neumann: machine not started")
 
 var (
@@ -161,6 +164,8 @@ func New(cfg Config) (*Machine, error) {
 		Store: m.store, Sched: m.sched, Bus: b, Model: cfg.Model, Clock: cfg.Clock,
 		Commit: m.commit, Logf: cfg.Logf, SteerFormat: cfg.SteerFormat, Delta: m.deltas.publish, Halt: haltCtx,
 	}
+	m.sched.SetContext(haltCtx)
+	m.sched.OnDeadline(m.deadline)
 	return m, nil
 }
 
@@ -377,6 +382,47 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 	return id, nil
 }
 
+// Cancel stops a task (design §9.5). It returns once the cancel is committed:
+// from then on the task ends Cancelled, with StopReason "cancelled", even
+// across a restart. A model call in flight for it is interrupted at once and
+// in-flight tool calls see their context cancelled. The final commit marks
+// calls that never reached their device cancelled; a call that did is marked
+// unknown with a reconcile_needed event, and the task does not wait for it. A
+// result that arrives after that is kept on its call record as late (a
+// tool_late event) and never reaches the model. Each undelivered steer is
+// reported by a steer_dropped event.
+//
+// Cancel returns ErrFinished for a task that has already ended and
+// ErrNotFound for an unknown one. A task that ends on its own while the cancel
+// is being committed ends as it ended.
+func (m *Machine) Cancel(ctx context.Context, taskID string) error {
+	if err := m.enter(false); err != nil {
+		return err
+	}
+	defer m.inflight.Done()
+	return m.env.Cancel(ctx, taskID, core.ReasonCancelled)
+}
+
+// deadline runs when a task's deadline passes (design §9.4): a cancel whose
+// reason is the deadline, so the task ends Failed with StopReason "deadline".
+// It runs on a timer's goroutine, during recovery as well, and does nothing
+// once the machine is stopping: the cancel is then left to the next start,
+// which finds the deadline passed and fires it at once.
+func (m *Machine) deadline(id string) {
+	m.admit.Lock()
+	if m.stopped {
+		m.admit.Unlock()
+		return
+	}
+	m.inflight.Add(1)
+	m.admit.Unlock()
+	defer m.inflight.Done()
+	err := m.env.Cancel(m.haltCtx, id, core.ReasonDeadline)
+	if err != nil && !errors.Is(err, ErrFinished) && !errors.Is(err, ErrNotFound) && m.haltCtx.Err() == nil {
+		m.cfg.Logf("neumann: deadline of task %s: %v", id, err)
+	}
+}
+
 // enter admits one outside request: it fails once the machine is stopped and,
 // for a new task, when the machine is full (reserving the task's slot
 // otherwise). The caller must call m.inflight.Done when its commit is over.
@@ -532,6 +578,7 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 	}
 	wg.Wait()
 	var sends []recoveredDispatch
+	unfinished := 0
 	for i, t := range tasks {
 		if errs[i] != nil {
 			return nil, fmt.Errorf("neumann: recover task %s: %w", t.ID, errs[i])
@@ -539,12 +586,19 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 		if len(batches[i]) > 0 {
 			sends = append(sends, recoveredDispatch{t.ID, slices.Clone(t.Allow), slices.Clone(t.Deny), batches[i]})
 		}
+		if !t.State.Terminal() { // a committed cancel was finished
+			unfinished++
+		}
 	}
+	// Counted before the tasks are scheduled: a deadline that has passed
+	// fires as soon as its task is, and its final commit counts itself out.
+	m.admit.Lock()
+	m.active = unfinished
+	m.admit.Unlock()
 	for _, t := range tasks {
-		m.sched.Add(t)
+		m.sched.Add(t) // a finished one is forgotten; deadlines are armed again
 	}
 	m.admit.Lock()
-	m.active = len(tasks)
 	m.accepting = true
 	m.admit.Unlock()
 	if len(tasks) > 0 {
@@ -581,9 +635,14 @@ func (m *Machine) Resolve(ctx context.Context, taskID, callID string, o Outcome)
 	}
 	batch, err := m.env.Resolve(ctx, t, callID, o)
 	allow, deny := slices.Clone(t.Allow), slices.Clone(t.Deny)
-	m.sched.Requeue(t) // unchanged when err != nil
+	// t is unchanged when err != nil. Cancelled while the operator held it:
+	// finalised instead, and the batch is never sent.
+	queued := m.env.HandBack(ctx, t, batch)
 	if err != nil {
 		return err
+	}
+	if !queued {
+		return nil
 	}
 	if len(batch) > 0 {
 		m.env.Dispatch(taskID, allow, deny, batch)
