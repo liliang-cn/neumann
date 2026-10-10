@@ -352,7 +352,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 实现中的决定（`internal/core/migrate.go`）：
 
 - 触发点：`execModel` 发现本组熔断中（取到任务时、或 `Admit` 不放行时），以及调用以 `QuotaExhausted` 失败、熔断刚打开时。三处都走同一个 `groupGone`。
-- 目标沿 `Fallback` 链找：跳过熔断中的组，取第一个通过校验的。链上的组全在熔断中：留在 `Waiting(Group)` 等本组，不算迁移失败；之后任何一个组恢复（`group_up`、`GroupReset`），除了唤醒它自己的 `Waiting(Group)` 任务，也唤醒 `Fallback` 链经过它的那些组里未 `PinClass` 的等待任务，让它们重新走一遍迁移判断（本组若是额度熔断，永远不会半开，不这样就永远等下去）；停进来与恢复交错时，交还后再看一次链上有没有组已恢复。校验不过而停下的任务不在交还后重试，等下一次 `group_up`；有没熔断但校验不过的：按**本组**的 `OnMigrateFail`，`wait` 时停进 `Waiting(Group)` 并发 `migrate_refused`（`{from, to, check, detail}`），`fail` 时 `failed` 事件带 `check`、`detail`。
+- 目标沿 `Fallback` 链找：跳过熔断中的组，取第一个通过校验的。链上的组全在熔断中：留在 `Waiting(Group)` 等本组，不算迁移失败；之后任何一个组恢复（`group_up`、`GroupReset`），除了唤醒它自己的 `Waiting(Group)` 任务，也唤醒 `Fallback` 链经过它的那些组里未 `PinClass` 的等待任务，让它们重新走一遍迁移判断（本组若是额度熔断，永远不会半开，不这样就永远等下去）；停进来与恢复交错时，交还后再看一次链上有没有组已恢复。校验不过而停下的任务（发过 `migrate_refused`）不在交还后重试，后备组再恢复也不唤醒它（后备组能接什么没变，唤醒只会再拒一次）：它等本组的 `group_up` / `GroupReset`，或操作员 `SetClass`（这个标记只在内存里，重启后任务本来就直接就绪、重新判断）；有没熔断但校验不过的：按**本组**的 `OnMigrateFail`，`wait` 时停进 `Waiting(Group)` 并发 `migrate_refused`（`{from, to, check, detail}`），`fail` 时 `failed` 事件带 `check`、`detail`。
 - 能力取自 `model.CapsOf(适配器)`（在 panic 保护下读，适配器 panic 即校验不过，`check = "caps"`）：适配器实现 `model.CapsReporter`（`Caps() Caps{Window, MaxOut, Tools, MaxTools}`）就用它；没实现的按"支持工具、数量不限、窗口未知"，窗口未知（0）不拒绝。OpenAI 兼容适配器：`ContextWindow` 默认 0（网关背后模型不定），`MaxTools` 默认 128，`NoTools`；Anthropic：`ContextWindow` 默认 200000，`MaxTools` 默认不限，`NoTools`。
 - 估算用 `task.EstimateTokens`：JSON 字节数 / 4 + 1，与 7.2 默认预占同一个估算；按目标服务商实际会收到的消息算（去掉外来 reasoning）。输出预留：任务的 `MaxOut`，否则目标的 `Caps.MaxOut` / `OutputCap`，否则 4096。
 - 第 3 条（能否在目标组上切块压缩）依赖 `StepCompact`，它还没有实现：放不下就按校验失败处理（`check = "context"`），不迁移后再压缩。

@@ -98,6 +98,26 @@ func (e *Env) afterPark(ctx context.Context, id string, g *Group, movable bool) 
 	e.armKick(g, -1)
 }
 
+// setRefused records whether a task parked after a fallback refused it.
+func (e *Env) setRefused(id string, refused bool) {
+	e.refusedMu.Lock()
+	defer e.refusedMu.Unlock()
+	if !refused {
+		delete(e.refused, id)
+		return
+	}
+	if e.refused == nil {
+		e.refused = map[string]bool{}
+	}
+	e.refused[id] = true
+}
+
+func (e *Env) isRefused(id string) bool {
+	e.refusedMu.Lock()
+	defer e.refusedMu.Unlock()
+	return e.refused[id]
+}
+
 // fallbackUp reports whether a group along g's fallback chain is up.
 func (e *Env) fallbackUp(g *Group) bool {
 	seen := map[string]bool{g.Class: true}
@@ -196,9 +216,12 @@ func (e *Env) onKick(g *Group) {
 }
 
 // wakeGroup makes every task waiting for the group Ready again, and every
-// task waiting for a group whose fallback chain reaches it, unless pinned to
-// its class: those parked because their fallback was down too, and are woken
-// to try the move again (design §6.3). One that cannot move parks again.
+// task waiting for a group whose fallback chain reaches it that parked
+// because every group along its chain was down: it is woken to try the move
+// again (design §6.3). A task pinned to its class is not, and neither is one
+// a fallback refused (migrate_refused): what it can take does not change when
+// it comes back, so that task waits for its own group, or an operator's
+// SetClass.
 func (e *Env) wakeGroup(ctx context.Context, g *Group) {
 	e.stopKick(g)
 	for _, id := range e.Sched.WaitingFor(g.Class, task.WaitGroup) {
@@ -209,7 +232,7 @@ func (e *Env) wakeGroup(ctx context.Context, g *Group) {
 			continue
 		}
 		for _, id := range e.Sched.WaitingFor(h.Class, task.WaitGroup) {
-			e.wakeIf(ctx, id, task.WaitGroup, func(t *task.TCB) bool { return !t.PinClass })
+			e.wakeIf(ctx, id, task.WaitGroup, func(t *task.TCB) bool { return !t.PinClass && !e.isRefused(t.ID) })
 		}
 	}
 }
@@ -230,6 +253,7 @@ func (e *Env) wakeIf(ctx context.Context, id string, why task.WaitReason, ok fun
 	if !found {
 		return false
 	}
+	e.setRefused(id, false)
 	if e.halt().Err() != nil {
 		e.Sched.Forget(id)
 		return false

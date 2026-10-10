@@ -1104,3 +1104,49 @@ func TestRecoveredTaskOfARemovedClass(t *testing.T) {
 		})
 	}
 }
+
+// A task parked because its fallback was up but could not take it
+// (migrate_refused) is not woken again each time the fallback comes back:
+// nothing about the fallback's caps changed, so it waits for its own group.
+func TestRefusedTaskIsNotWokenByItsFallback(t *testing.T) {
+	var quota atomic.Bool
+	quota.Store(true)
+	big := &adapter{name: "big", fn: func(context.Context, model.Request) (model.Response, error) {
+		if quota.Load() {
+			return model.Response{}, sim.QuotaExhausted()
+		}
+		return sim.Reply("big done"), nil
+	}}
+	little := &adapter{name: "little", caps: &model.Caps{}, fn: reply("little done")}
+	m := startWith(t, neumann.Config{Devices: []bus.Device{echoDev()}, Groups: []neumann.GroupConfig{
+		{Class: "big", Model: big, Fallback: "little"},
+		{Class: "little", Model: little},
+	}})
+	id := submit(t, m, proto.Instruction{Input: "q"})
+	waitFor(t, func() bool { tc, _ := m.Load(bg, id); return tc.State == task.Waiting && tc.Wait == task.WaitGroup })
+	refusals := func() int {
+		n := 0
+		for _, ev := range eventsOf(t, m, id) {
+			if ev.Kind == proto.EvMigrateRefused {
+				n++
+			}
+		}
+		return n
+	}
+	for range 3 {
+		if err := m.GroupReset(bg, "little"); err != nil {
+			t.Fatal(err)
+		}
+		quiet(t, m)
+	}
+	if n := refusals(); n != 1 {
+		t.Fatalf("%d migrate_refused events after the fallback came back three times", n)
+	}
+	quota.Store(false)
+	if err := m.GroupReset(bg, "big"); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitDone(t, m, id); got.State != task.Done || got.Class != "big" {
+		t.Fatalf("task ended %s in %q", got.State, got.Class)
+	}
+}

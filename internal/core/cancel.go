@@ -220,6 +220,7 @@ func (e *Env) cancelSet(ctx context.Context, t *task.TCB, c mem.CommitSet, fates
 // the same until a terminal commit applies it.
 func (e *Env) finalise(ctx context.Context, t *task.TCB, c mem.CommitSet, fates map[string]fate, fallback string) bool {
 	e.startCommitted(t.ID) // forget any failed starts
+	e.setRefused(t.ID, false)
 	orig := t.Clone()
 	base := mem.CommitSet{Calls: slices.Clone(c.Calls), Events: slices.Clone(c.Events)}
 	try := func() error {

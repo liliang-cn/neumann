@@ -196,6 +196,7 @@ func (e *Env) SetClass(ctx context.Context, t *task.TCB, class string) error {
 		return err
 	}
 	*t = *moved
+	e.setRefused(t.ID, false)
 	return nil
 }
 

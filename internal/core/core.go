@@ -74,6 +74,9 @@ type Env struct {
 	failMu     sync.Mutex
 	startFails map[string]int // consecutive failed start commits, per task
 
+	refusedMu sync.Mutex
+	refused   map[string]bool // parked after migrate_refused: a fallback coming back does not wake them
+
 	lateMu     sync.Mutex // guards lateClosed against lates.Add
 	lateClosed bool
 	lates      sync.WaitGroup // late results being recorded
@@ -221,7 +224,9 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	movable := false // parked though it may still move: every group along its fallback chain was down
 	if t.State == task.Waiting && t.Wait == task.WaitGroup {
 		parked = e.groupOf(t.Class)
-		movable = !t.PinClass && !slices.ContainsFunc(c.Events, func(ev proto.Event) bool { return ev.Kind == proto.EvMigrateRefused })
+		refused := slices.ContainsFunc(c.Events, func(ev proto.Event) bool { return ev.Kind == proto.EvMigrateRefused })
+		movable = !t.PinClass && !refused
+		e.setRefused(t.ID, refused) // before the hand-back: a group_up right after it must see it
 	}
 	if !e.handBack(ctx, t, batch) {
 		return // cancelled meanwhile and finalised: the batch is never sent
