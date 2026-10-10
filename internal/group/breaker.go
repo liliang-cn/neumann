@@ -67,8 +67,11 @@ type BreakerConfig struct {
 //     QuotaExhausted opens it at once (CauseQuota).
 //   - Open (transient): after OpenFor the next Allow half-opens it and
 //     returns that one request as the probe.
-//   - HalfOpen: every other Allow is refused until the probe reports. Success
-//     closes (group_up); Transient reopens for another OpenFor.
+//   - HalfOpen: every other Allow is refused until the probe reports. Success,
+//     or any answer that is not a transient failure (Answered: rate limited,
+//     overloaded, rejected), closes (group_up) — the provider is reachable.
+//     Transient reopens for another OpenFor. A probe that never reports (its
+//     task was cancelled mid-call) is replaced after OpenFor.
 //   - Open (quota): never half-opens. Only Reset (the operator's group_reset)
 //     closes it.
 //
@@ -87,6 +90,7 @@ type Breaker struct {
 	cause    Cause
 	failures int
 	openedAt time.Time
+	probeAt  time.Time // when the pending half-open probe went out
 }
 
 // NewBreaker builds a closed breaker from cfg.
@@ -114,7 +118,12 @@ func (b *Breaker) Allow() (ok, probe bool) {
 		return true, false
 	case Open:
 		if b.cause == CauseTransient && !b.clock.Now().Before(b.openedAt.Add(b.openFor)) {
-			b.state = HalfOpen
+			b.state, b.probeAt = HalfOpen, b.clock.Now()
+			return true, true
+		}
+	case HalfOpen:
+		if !b.clock.Now().Before(b.probeAt.Add(b.openFor)) {
+			b.probeAt = b.clock.Now() // the probe was lost; send another
 			return true, true
 		}
 	}
@@ -130,6 +139,19 @@ func (b *Breaker) Success() Transition {
 	case Closed:
 		b.failures = 0
 	case HalfOpen:
+		return b.closeLocked()
+	}
+	return Transition{}
+}
+
+// Answered records a call the provider answered with something other than
+// success or a transient failure (rate limited, overloaded, rejected). It
+// settles a half-open probe — the provider is reachable — and leaves a closed
+// breaker's consecutive-failure count alone.
+func (b *Breaker) Answered() Transition {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == HalfOpen {
 		return b.closeLocked()
 	}
 	return Transition{}
@@ -184,7 +206,7 @@ func (b *Breaker) openLocked(c Cause) Transition {
 func (b *Breaker) closeLocked() Transition {
 	t := Transition{Changed: true, From: b.state, To: Closed}
 	b.state, b.cause, b.failures = Closed, "", 0
-	b.openedAt = time.Time{}
+	b.openedAt, b.probeAt = time.Time{}, time.Time{}
 	return t
 }
 

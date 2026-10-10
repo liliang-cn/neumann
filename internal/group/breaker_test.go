@@ -191,3 +191,73 @@ func TestBreakerCustomThresholdAndResetWhenClosed(t *testing.T) {
 		t.Fatal("resetting a closed breaker is not a transition")
 	}
 }
+
+// halfOpen drives a fresh breaker to half-open with its probe handed out.
+func halfOpen(t *testing.T) (*Breaker, *fakeClock) {
+	t.Helper()
+	clk := newFakeClock()
+	b := NewBreaker(BreakerConfig{Clock: clk})
+	for range DefaultBreakerThreshold {
+		b.Transient()
+	}
+	clk.Advance(DefaultBreakerOpenFor)
+	if ok, probe := b.Allow(); !ok || !probe {
+		t.Fatal("no probe after OpenFor")
+	}
+	return b, clk
+}
+
+// A probe the provider answered with anything but a transient failure proves
+// it reachable; the breaker must not wait forever for a Success.
+func TestBreakerProbeAnsweredOtherwiseCloses(t *testing.T) {
+	for _, o := range []Outcome{RateLimited, Overload, Permanent} {
+		clk := newFakeClock()
+		g := New(Config{Clock: clk})
+		for range DefaultBreakerThreshold {
+			g.Report(g.Window.Begin(), Transient)
+		}
+		clk.Advance(DefaultBreakerOpenFor)
+		tk, ok, probe := g.Admit()
+		if !ok || !probe {
+			t.Fatalf("%v: no probe", o)
+		}
+		if e := g.Report(tk, o); !e.Breaker.Up() {
+			t.Fatalf("%v: probe answer did not close the breaker: %+v", o, e.Breaker)
+		}
+		if ok, _ := g.Breaker.Allow(); !ok {
+			t.Fatalf("%v: closed breaker refuses", o)
+		}
+	}
+}
+
+// A probe that never reports (its task was cancelled mid-call) must not wedge
+// the group: after another OpenFor a new probe goes out.
+func TestBreakerLostProbeIsReplaced(t *testing.T) {
+	b, clk := halfOpen(t)
+	clk.Advance(DefaultBreakerOpenFor - time.Second)
+	if ok, _ := b.Allow(); ok {
+		t.Fatal("a second request went out while the probe is pending")
+	}
+	clk.Advance(time.Second)
+	if ok, probe := b.Allow(); !ok || !probe {
+		t.Fatal("a lost probe was never replaced")
+	}
+	if ok, _ := b.Allow(); ok {
+		t.Fatal("the replacement probe must be the only one")
+	}
+}
+
+// Permanent and rate-limited answers while closed neither count toward the
+// breaker nor reset its count.
+func TestBreakerAnsweredLeavesClosedCountAlone(t *testing.T) {
+	b := NewBreaker(BreakerConfig{Clock: newFakeClock()})
+	for range DefaultBreakerThreshold - 1 {
+		b.Transient()
+	}
+	if tr := b.Answered(); tr.Changed {
+		t.Fatalf("answered changed a closed breaker: %+v", tr)
+	}
+	if tr := b.Transient(); !tr.Down() {
+		t.Fatal("answered reset the consecutive count")
+	}
+}

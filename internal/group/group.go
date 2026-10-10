@@ -118,11 +118,14 @@ type Effect struct {
 // the §11 table:
 //
 //	Succeeded       window grows (unless cooling down); breaker count resets / probe closes
-//	RateLimited     nothing — quota is the rate limiter's job; it is not a success either
+//	RateLimited     window untouched (quota is the rate limiter's job)
 //	QuotaExhausted  breaker opens, never half-opens until Reset
-//	Overload        window halves once per epoch; breaker untouched
+//	Overload        window halves once per epoch
 //	Transient       counts toward the breaker; window untouched
 //	Permanent       nothing
+//
+// RateLimited, Overload and Permanent are answers: they settle a half-open
+// probe (the provider is reachable) and leave a closed breaker's count alone.
 func (g *Group) Report(t Ticket, o Outcome) Effect {
 	var e Effect
 	switch o {
@@ -131,13 +134,16 @@ func (g *Group) Report(t Ticket, o Outcome) Effect {
 		e.Breaker = g.Breaker.Success()
 	case RateLimited:
 		g.Window.RateLimited(t)
+		e.Breaker = g.Breaker.Answered()
 	case QuotaExhausted:
 		e.Breaker = g.Breaker.QuotaExhausted()
 	case Overload:
 		e.Halved = g.Window.Overload(t)
+		e.Breaker = g.Breaker.Answered()
 	case Transient:
 		e.Breaker = g.Breaker.Transient()
 	case Permanent:
+		e.Breaker = g.Breaker.Answered()
 	}
 	return e
 }
