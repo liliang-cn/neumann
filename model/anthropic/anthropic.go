@@ -32,7 +32,14 @@ type Adapter struct {
 	// ThinkingBudget turns on extended thinking with this many tokens when
 	// positive. It must be below MaxTokens.
 	ThinkingBudget int
-	HTTP           *http.Client
+	// What the model can take (model.Caps), read before a task is moved
+	// onto this adapter's group. ContextWindow 0 is DefaultContextWindow; a
+	// negative value is unknown. NoTools marks a model that cannot call
+	// tools. MaxTools 0 is no limit: the API documents none.
+	ContextWindow int
+	NoTools       bool
+	MaxTools      int
+	HTTP          *http.Client
 	// Now is the clock rate-limit resets are read against; nil: time.Now.
 	Now func() time.Time
 }
@@ -64,6 +71,22 @@ func (a *Adapter) MaxOut() int {
 		return a.MaxTokens
 	}
 	return DefaultMaxTokens
+}
+
+// DefaultContextWindow is the context window of current Claude models.
+const DefaultContextWindow = 200000
+
+// Caps reports ContextWindow, the output cap, NoTools and MaxTools
+// (model.CapsReporter).
+func (a *Adapter) Caps() model.Caps {
+	w := a.ContextWindow
+	switch {
+	case w == 0:
+		w = DefaultContextWindow
+	case w < 0:
+		w = 0
+	}
+	return model.Caps{Window: w, MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: max(a.MaxTools, 0)}
 }
 
 // WithProtocol switches the adapter's wire protocol and returns it.

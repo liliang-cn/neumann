@@ -51,6 +51,38 @@ type OutputCap interface {
 	MaxOut() int
 }
 
+// Caps is what an adapter's model can take (design §6.3, §11): the machine
+// reads it before it moves a task onto the adapter's group.
+type Caps struct {
+	Window   int  // context window in tokens, input and output together; 0 = unknown, never refused
+	MaxOut   int  // the output cap a request is sent with when it carries none; 0 = unknown
+	Tools    bool // the model takes tool definitions and calls tools
+	MaxTools int  // most tool definitions one request may carry; 0 = no limit
+}
+
+// CapsReporter is an adapter that says what its model can take.
+type CapsReporter interface {
+	Caps() Caps
+}
+
+// CapsOf is what a can take: its own Caps when it reports them, otherwise
+// tools with no limit and an unknown window, so that an adapter that says
+// nothing is never refused a task. MaxOut falls back to OutputCap.
+func CapsOf(a Adapter) Caps {
+	var c Caps
+	if r, ok := a.(CapsReporter); ok {
+		c = r.Caps()
+	} else {
+		c.Tools = true
+	}
+	if c.MaxOut <= 0 {
+		if oc, ok := a.(OutputCap); ok {
+			c.MaxOut = oc.MaxOut()
+		}
+	}
+	return c
+}
+
 // Metered is an adapter that knows how its provider counts a request against
 // its limits (design §7.2): Reserve is what to take from each limiter
 // dimension before the request is sent, Settle what the request actually

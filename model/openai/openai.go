@@ -23,7 +23,15 @@ type Adapter struct {
 	APIKey    string
 	Model     string
 	MaxTokens int // 0: let the provider decide
-	HTTP      *http.Client
+	// What the model behind the endpoint can take (model.Caps), read before
+	// a task is moved onto this adapter's group. ContextWindow 0 is unknown:
+	// a gateway fronts many models, so there is no default. NoTools marks a
+	// model that cannot call tools. MaxTools 0 is DefaultMaxTools, the
+	// OpenAI API's limit; a negative value is no limit.
+	ContextWindow int
+	NoTools       bool
+	MaxTools      int
+	HTTP          *http.Client
 	// Now is the clock rate-limit resets are read against; nil: time.Now.
 	Now func() time.Time
 }
@@ -46,6 +54,22 @@ func (a *Adapter) Provider() string { return "openai:" + a.Model }
 // MaxOut is the output cap sent when a request carries none: MaxTokens, or 0
 // when the provider decides (model.OutputCap).
 func (a *Adapter) MaxOut() int { return max(a.MaxTokens, 0) }
+
+// DefaultMaxTools is the most tools one chat-completions request may carry.
+const DefaultMaxTools = 128
+
+// Caps reports ContextWindow, the output cap, NoTools and MaxTools
+// (model.CapsReporter).
+func (a *Adapter) Caps() model.Caps {
+	n := a.MaxTools
+	switch {
+	case n == 0:
+		n = DefaultMaxTools
+	case n < 0:
+		n = 0
+	}
+	return model.Caps{Window: max(a.ContextWindow, 0), MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: n}
+}
 
 // maxTokens is the request's own cap when it has one, else MaxTokens; 0 sends
 // no max_tokens at all.

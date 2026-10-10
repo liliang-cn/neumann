@@ -403,7 +403,7 @@ func testNonSteerInterruptDroppedSilently(t *testing.T, newStore Factory) {
 // may keep an empty slice as nil) and a UTC time without a monotonic reading.
 func fullTask(id string) *task.TCB {
 	return &task.TCB{
-		ID: id, State: task.Running, PC: task.StepTools, Wait: task.WaitIO, Class: "big", Priority: 1,
+		ID: id, State: task.Running, PC: task.StepTools, Wait: task.WaitIO, Class: "big", PinClass: true, Priority: 1,
 		ReadySince: time.Date(2026, 10, 10, 8, 30, 0, 0, time.UTC),
 		System:     "sys",
 		Tools:      []task.ToolSpec{{Name: "dev_x", Description: "x", Schema: json.RawMessage(`{"type":"object"}`)}},

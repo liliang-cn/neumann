@@ -161,6 +161,7 @@ type TCB struct {
 	PC         PC         `json:"pc"`
 	Wait       WaitReason `json:"wait"`
 	Class      string     `json:"class"`
+	PinClass   bool       `json:"pin_class,omitempty"` // never moved to a fallback group when its own is down (design §6.3)
 	Priority   int        `json:"priority"`
 	ReadySince time.Time  `json:"ready_since"`
 	System     string     `json:"system,omitempty"`

@@ -18,12 +18,30 @@ import (
 // concurrent tasks can share one script and stay deterministic per task.
 type Model struct {
 	Fn func(req model.Request) (model.Response, error)
+	// Name is the Provider; empty is "sim".
+	Name string
+	// Info is what Caps reports; nil takes tools, any number, with an
+	// unknown window.
+	Info *model.Caps
 
 	mu    sync.Mutex
 	calls int
 }
 
-func (m *Model) Provider() string { return "sim" }
+func (m *Model) Provider() string {
+	if m.Name != "" {
+		return m.Name
+	}
+	return "sim"
+}
+
+// Caps is *Info, or a model that takes tools with an unknown window.
+func (m *Model) Caps() model.Caps {
+	if m.Info != nil {
+		return *m.Info
+	}
+	return model.Caps{Tools: true}
+}
 
 func (m *Model) Call(ctx context.Context, req model.Request) (model.Response, error) {
 	m.mu.Lock()
