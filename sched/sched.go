@@ -161,7 +161,8 @@ func (s *Sched) Checkout(id string) (*task.TCB, bool) {
 	return t, true
 }
 
-// Forget drops a held task whose commit failed: it is no longer scheduled.
+// Forget gives up a held task for good: after a failed commit, or on a halt
+// path. It is no longer scheduled.
 func (s *Sched) Forget(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
