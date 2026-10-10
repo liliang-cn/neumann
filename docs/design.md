@@ -172,8 +172,8 @@ type CallRecord struct {
 
 生命周期：
 
-1. 模型返回工具调用时，`execModel` 的提交里写入这些调用，状态 `planned`。
-2. `execTools` **先提交** 状态 `dispatched`、`Attempt + 1`，任务转 `Waiting(IO)`，**然后**才把调用交给总线。
+1. 模型返回工具调用时，`execModel` 的同一次提交里写入这些调用，状态直接是 `dispatched`（`Attempt = 1`），任务转 `Waiting(IO)`；提交成功、任务交还调度器之后，同一个 vCore 立刻把调用交给总线。一轮工具不需要再排一次队等 vCore：实测在 cpa 上，派发曾因此等了 8 秒。
+2. `planned` 状态留给"已规划、从未派发"的调用（重启恢复时出现）；`execTools` 处理这种任务：**先提交** `dispatched`、`Attempt + 1`，任务转 `Waiting(IO)`，**然后**派发。
 3. 每个调用完成后，调度器提交 `done` 和结果，同一事务里带上 `tool_result` 事件。
 4. 全部 `done` 时，调度器提交：按调用顺序把结果追加成 tool 消息，任务转 `Ready`、`PC = StepModel`。这次提交把所有 `done` 记录和任务一起再写一遍（幂等），保证模型看到的每个结果都在调用记录里，即使第 3 步的某次单条提交失败过。
 
@@ -197,6 +197,8 @@ type CallRecord struct {
 - `Submit`：提交新 TCB 和 `accepted` 事件后返回任务 id。返回成功 = 已持久化。
 - `Steer` 等：作为一条中断写入中断表并提交后返回。返回成功 = 已持久化，之后一定会被送达，或以 `steer_dropped` 报告。
 - 任务已结束时返回 `ErrFinished`；不存在时返回 `ErrNotFound`。
+
+插话送达时以一条用户消息出现，内容经 `Config.SteerFormat` 渲染。默认格式会注明"这是你工作期间用户发来的，请和原请求一并考虑"：实测裸发"Also tell me the weather there."时，模型只答了天气，丢掉了刚查到的人口。
 
 中断表与 TCB 分开，正是为了让外部输入可以在任务被某个 vCore 持有时立刻持久化，而不违反单一所有者（第 8 节）。持有任务的一方在下一次提交里把它取用的中断标记为 `applied`，与它造成的状态变化在同一事务里。
 
@@ -261,7 +263,7 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
 
 ### 5.2 execTools
 
-提交调用记录 `dispatched` 和任务 `Waiting(IO)`；提交成功后派发。vCore 不等结果。
+只用于调用处于 `planned`、从未派发的任务（重启恢复）。提交调用记录 `dispatched` 和任务 `Waiting(IO)`；提交成功后派发。vCore 不等结果。正常路径上，模型那一步已经派发了自己的调用（4.2 第 1 步）。
 
 ### 5.3 execCompact
 
@@ -480,7 +482,11 @@ type Adapter interface {
 
 `context.Canceled` 永远不是可重试错误。永久错误的判断优先于报错文字里的"timeout"之类字样。
 
-第一版两个适配器：OpenAI 兼容（`/chat/completions`）和 Anthropic 原生（`/v1/messages`）。缓存标记由适配器负责：OpenAI 兼容服务自动缓存；Anthropic 在工具定义末尾和消息序列倒数第二条打 `cache_control`。请求按固定顺序组装（系统提示词 → 排好序的工具 → 消息），前两部分在任务生命周期内逐字节不变。
+第一版两个适配器：OpenAI 兼容（`/chat/completions`）和 Anthropic 原生（`/v1/messages`）。
+
+传输层：默认 HTTP/2，所有 vCore 的请求共用一条 TLS 连接多路复用，TLS 会话可恢复；HTTP/3（QUIC）可选，QUIC 拨号失败时永久回退到 HTTP/2——只有拨号阶段的失败才回退，请求发出后的超时不重发。`Start` 时后台预热连接。实测 cpa（家用宽带）：预热后的单次往返约 75ms，16 个并发请求 HTTP/2 比 HTTP/1.1 快约 40%，HTTP/3 与 HTTP/2 持平；一次模型调用约 3.5s，协议层的空间约占 2%。
+
+OpenAI 兼容适配器把服务商返回的 tool_call 原样存进 `Part.Opaque`，回传给同一服务商时逐字节重放（Gemini 的 thought signature 就在这里）；发给其他服务商时用机器自己的 id 重新渲染。缓存标记由适配器负责：OpenAI 兼容服务自动缓存；Anthropic 在工具定义末尾和消息序列倒数第二条打 `cache_control`。请求按固定顺序组装（系统提示词 → 排好序的工具 → 消息），前两部分在任务生命周期内逐字节不变。
 
 ## 12. 协议
 
