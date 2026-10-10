@@ -98,9 +98,10 @@ type Machine struct {
 	// admit guards active and stopped. active counts unfinished tasks; a task
 	// whose commit failed is forgotten by its vCore and keeps its slot (a bug
 	// path only, in phase 1).
-	admit   sync.Mutex
-	active  int
-	stopped bool
+	admit    sync.Mutex
+	active   int
+	stopped  bool
+	inflight sync.WaitGroup // Submit and Steer calls admitted and still committing
 
 	haltCtx    context.Context
 	haltCancel context.CancelFunc
@@ -249,6 +250,7 @@ func (m *Machine) Stop(ctx context.Context) error {
 	if already {
 		return nil
 	}
+	m.inflight.Wait() // submits and steers admitted before the flag finish their commits
 	m.sched.Close()
 	var err error
 	if m.started {
@@ -329,24 +331,43 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 		t.Budget = *in.Budget
 	}
 
-	// Admission is decided, committed and recorded under one lock, so
-	// concurrent submits cannot all slip past the limit together.
-	m.admit.Lock()
-	defer m.admit.Unlock()
-	if m.stopped {
-		return "", ErrStopped
-	}
-	if m.active >= m.cfg.MaxQueued {
-		return "", &CapacityError{Count: m.active, Limit: m.cfg.MaxQueued}
-	}
-	accepted := proto.NewEvent(proto.EvAccepted, id, map[string]any{"class": class, "priority": in.Priority})
-	if _, err := m.store.Commit(ctx, mem.CommitSet{Task: t, NewTask: true, Events: []proto.Event{accepted}}); err != nil {
+	// The slot is reserved under the lock, so concurrent submits cannot all
+	// slip past the limit together; the commit happens outside it, so submits
+	// do not queue behind each other's disk writes. Stop waits for reserved
+	// submits to finish before it closes anything.
+	if err := m.enter(true); err != nil {
 		return "", err
 	}
-	m.active++
+	defer m.inflight.Done()
+	accepted := proto.NewEvent(proto.EvAccepted, id, map[string]any{"class": class, "priority": in.Priority})
+	if _, err := m.store.Commit(ctx, mem.CommitSet{Task: t, NewTask: true, Events: []proto.Event{accepted}}); err != nil {
+		m.admit.Lock()
+		m.active--
+		m.admit.Unlock()
+		return "", err
+	}
 	m.sched.Add(t)
 	m.hub.notify()
 	return id, nil
+}
+
+// enter admits one outside request: it fails once the machine is stopped and,
+// for a new task, when the machine is full (reserving the task's slot
+// otherwise). The caller must call m.inflight.Done when its commit is over.
+func (m *Machine) enter(newTask bool) error {
+	m.admit.Lock()
+	defer m.admit.Unlock()
+	if m.stopped {
+		return ErrStopped
+	}
+	if newTask {
+		if m.active >= m.cfg.MaxQueued {
+			return &CapacityError{Count: m.active, Limit: m.cfg.MaxQueued}
+		}
+		m.active++
+	}
+	m.inflight.Add(1)
+	return nil
 }
 
 // Steer queues a message for a task. It returns nil only after the steer is
@@ -358,12 +379,10 @@ func (m *Machine) Steer(ctx context.Context, taskID, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("neumann: steer needs text")
 	}
-	// Held across the commit, as in Submit, so no steer commits after Stop.
-	m.admit.Lock()
-	defer m.admit.Unlock()
-	if m.stopped {
-		return ErrStopped
+	if err := m.enter(false); err != nil {
+		return err
 	}
+	defer m.inflight.Done()
 	_, err := m.store.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{
 		{TaskID: taskID, Kind: mem.InterruptSteer, Text: text},
 	}})

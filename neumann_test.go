@@ -620,3 +620,55 @@ func TestStartReportsAModelThatCannotStream(t *testing.T) {
 		t.Fatalf("logs %q", logs)
 	}
 }
+
+// slowStore delays every commit, to show that submits do not wait for each
+// other's commits.
+type slowStore struct {
+	mem.Store
+	delay time.Duration
+}
+
+func (s slowStore) Commit(ctx context.Context, c mem.CommitSet) ([]proto.Event, error) {
+	time.Sleep(s.delay)
+	return s.Store.Commit(ctx, c)
+}
+
+func TestSubmitsCommitConcurrently(t *testing.T) {
+	gate, release := newGate()
+	defer release()
+	m, _ := start(t, neumann.Config{Cores: 1, Store: slowStore{mem.NewMemory(), 50 * time.Millisecond}},
+		func(model.Request) (model.Response, error) { <-gate; return sim.Reply("x"), nil })
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := range 10 {
+		wg.Add(1)
+		go func() { defer wg.Done(); submit(t, m, proto.Instruction{Input: fmt.Sprintf("t%d", i)}) }()
+	}
+	wg.Wait()
+	if d := time.Since(start); d > 300*time.Millisecond {
+		t.Fatalf("10 submits over a 50ms store took %v: they were serialised", d)
+	}
+}
+
+// failingStore rejects new tasks, to check that a failed submit frees its slot.
+type failingStore struct{ mem.Store }
+
+func (s failingStore) Commit(ctx context.Context, c mem.CommitSet) ([]proto.Event, error) {
+	if c.NewTask {
+		return nil, errors.New("disk full")
+	}
+	return s.Store.Commit(ctx, c)
+}
+
+func TestFailedSubmitFreesItsSlot(t *testing.T) {
+	m, _ := start(t, neumann.Config{MaxQueued: 1, Store: failingStore{mem.NewMemory()}},
+		func(model.Request) (model.Response, error) { return sim.Reply("x"), nil })
+	for range 3 {
+		if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "q"}); err == nil || errors.Is(err, neumann.ErrBusy) {
+			t.Fatalf("got %v, want the store error each time", err)
+		}
+	}
+	if st := m.Status(); st.Unfinished != 0 {
+		t.Fatalf("unfinished %d after failed submits", st.Unfinished)
+	}
+}
