@@ -1010,8 +1010,23 @@ func TestParkedBacklogMovesWhenTheFallbackComesBack(t *testing.T) {
 		ids = append(ids, submit(t, m, proto.Instruction{Input: "b", Class: "big"}))
 	}
 	waitFor(t, func() bool { return groupOf(t, m, "big").Breaker == "open" })
-	clk.Advance(2 * time.Second) // the backoffs run out: every task parks
-	quiet(t, m)
+	// The backoffs of the calls that failed before the breaker opened run
+	// out, and every task parks.
+	parked := func() bool {
+		for _, id := range ids {
+			if tc := loadTask(t, m, id); tc.State != task.Waiting || tc.Wait != task.WaitGroup {
+				return false
+			}
+		}
+		return true
+	}
+	for range 10 {
+		quiet(t, m)
+		if parked() {
+			break
+		}
+		clk.Advance(2 * time.Second)
+	}
 	for _, id := range ids {
 		if tc := loadTask(t, m, id); tc.State != task.Waiting || tc.Wait != task.WaitGroup || tc.Class != "big" {
 			t.Fatalf("%s is %s/%s in %q before the fallback is back", id, tc.State, tc.Wait, tc.Class)
