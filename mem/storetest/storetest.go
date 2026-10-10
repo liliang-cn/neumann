@@ -420,6 +420,10 @@ func fullTask(id string) *task.TCB {
 		Used:        task.Usage{Steps: 3, PromptTokens: 100, CompletionTokens: 20, ReasoningTokens: 5, CachedTokens: 64},
 		CallSeq:     1,
 		Unconfirmed: 2,
+		WakeAt:      time.Date(2026, 10, 10, 8, 31, 0, 0, time.UTC),
+		Retries:     3,
+		MaxOut:      16384,
+		Truncations: 1,
 		StopReason:  "",
 		Version:     1,
 	}

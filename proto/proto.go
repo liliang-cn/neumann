@@ -45,6 +45,17 @@ const (
 	EvRecovered       = "recovered"
 	EvReconcileNeeded = "reconcile_needed"
 	EvResolved        = "resolved"
+
+	// A model call failed or was cut off and the task will try again:
+	// {class, attempt, delay_ms, wait, error} (design §11, §13).
+	EvModelRetry = "model_retry"
+
+	// Machine events, with no task: a model call waited for room in its
+	// limiters ({task, waited_ms}); an execution group's breaker opened
+	// ({class, cause}) or closed ({class}) (design §6.2, §7.2).
+	EvThrottled = "throttled"
+	EvGroupDown = "group_down"
+	EvGroupUp   = "group_up"
 )
 
 // Event is something that happened, published only after it was committed.

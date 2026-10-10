@@ -170,7 +170,19 @@ type TCB struct {
 	// Unconfirmed counts model requests that were sent but whose response was
 	// never received (a crash or halt during the call). The provider may have
 	// processed and billed them; their tokens are unknown, so not in Used.
-	Unconfirmed int    `json:"unconfirmed,omitempty"`
+	Unconfirmed int `json:"unconfirmed,omitempty"`
+	// WakeAt is when a task in Waiting(Backoff) is due to run again. Only a
+	// running machine honours it: after a restart the task is Ready at once.
+	WakeAt time.Time `json:"wake_at,omitzero"`
+	// Retries counts consecutive model calls that failed with an error worth
+	// retrying (overload, transient); a success resets it. Rate limits do not
+	// count. At the machine's limit the task fails with "model_error".
+	Retries int `json:"retries,omitempty"`
+	// MaxOut is the output cap the task's model calls send; 0 is the
+	// adapter's default. A turn cut off before it produced anything raises it
+	// fourfold, at most twice (Truncations), design §13.
+	MaxOut      int    `json:"max_out,omitempty"`
+	Truncations int    `json:"truncations,omitempty"`
 	StopReason  string `json:"stop_reason,omitempty"`
 	Version     int64  `json:"version"`
 }

@@ -6,13 +6,16 @@
 //
 // The scheduler also holds what may reach a task regardless of who owns it
 // (design §8 rule 3, §9.4): its context, which Cancel ends so that a model
-// call or tool call in flight stops at once, and its deadline timer.
+// call or tool call in flight stops at once, and its deadline timer. And it
+// owns the timer of a task in Waiting(Backoff): due at WakeAt, it calls the
+// wake handler, which checks the task out and commits it Ready.
 package sched
 
 import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +58,7 @@ type Sched struct {
 	base       context.Context
 	ctl        map[string]*control
 	onDeadline func(id string)
+	onWake     func(id string)
 }
 
 // control is what reaches a task whoever owns it: its context, whether it has
@@ -65,6 +69,7 @@ type control struct {
 	cancelled bool
 	deadline  time.Time
 	stopTimer func() bool // nil: no timer set
+	stopWake  func() bool // the backoff timer while the task is in Waiting(Backoff)
 }
 
 func New(clock Clock, aging time.Duration) *Sched {
@@ -105,6 +110,25 @@ func (s *Sched) OnDeadline(f func(id string)) {
 	s.onDeadline = f
 }
 
+// OnWake sets what runs when a task in Waiting(Backoff) reaches its WakeAt.
+// Like OnDeadline, f runs on a timer's goroutine, holds no lock and owns
+// nothing: the task is still in the wait set, and f must check it out (it
+// may be gone by then). Set it before the first Add.
+func (s *Sched) OnWake(f func(id string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onWake = f
+}
+
+// AfterFunc runs f after d on the scheduler's clock: on its timers when it
+// has them, real ones otherwise. stop cancels it.
+func (s *Sched) AfterFunc(d time.Duration, f func()) (stop func() bool) {
+	if tm, ok := s.clock.(Timers); ok {
+		return tm.AfterFunc(d, f)
+	}
+	return time.AfterFunc(d, f).Stop
+}
+
 // Add hands a task the caller owns to the scheduler. It reports false, as
 // Requeue does, when the task was cancelled meanwhile.
 func (s *Sched) Add(t *task.TCB) bool { return s.Requeue(t) }
@@ -133,10 +157,13 @@ func (s *Sched) Requeue(t *task.TCB) bool {
 		s.ready[t.Class] = append(s.ready[t.Class], t)
 		s.loc[t.ID] = inReady
 	case task.Waiting, task.Suspended:
-		// A task in backoff will have its wake-up timer here as well; Cancel
-		// takes it like any other wait that no batch will come back for.
+		// Cancel takes a task in backoff like any other wait that no batch
+		// will come back for, and stops its wake-up timer.
 		s.waiting[t.ID] = t
 		s.loc[t.ID] = inWaiting
+		if t.State == task.Waiting && t.Wait == task.WaitBackoff {
+			s.armWakeLocked(t, c)
+		}
 	case task.Done, task.Failed, task.Cancelled:
 		// terminal: forgotten
 		s.dropLocked(t.ID)
@@ -186,6 +213,30 @@ func (s *Sched) armLocked(t *task.TCB, c *control) {
 	}
 }
 
+// armWakeLocked sets the wake-up timer of a task entering Waiting(Backoff).
+func (s *Sched) armWakeLocked(t *task.TCB, c *control) {
+	s.disarmWakeLocked(c)
+	if s.closed {
+		return
+	}
+	id := t.ID
+	c.stopWake = s.AfterFunc(t.WakeAt.Sub(s.clock.Now()), func() {
+		s.mu.Lock()
+		f := s.onWake
+		s.mu.Unlock()
+		if f != nil {
+			f(id)
+		}
+	})
+}
+
+func (s *Sched) disarmWakeLocked(c *control) {
+	if c != nil && c.stopWake != nil {
+		c.stopWake()
+		c.stopWake = nil
+	}
+}
+
 // dropLocked releases what the scheduler held for a task that is gone.
 func (s *Sched) dropLocked(id string) {
 	c, ok := s.ctl[id]
@@ -195,6 +246,7 @@ func (s *Sched) dropLocked(id string) {
 	if c.stopTimer != nil {
 		c.stopTimer()
 	}
+	s.disarmWakeLocked(c)
 	c.cancel()
 	delete(s.ctl, id)
 }
@@ -268,6 +320,7 @@ func (s *Sched) Cancel(id string) (*task.TCB, bool) {
 		delete(s.waiting, id)
 		delete(s.loc, id)
 		s.out[id] = true
+		s.disarmWakeLocked(c)
 		return t, true
 	}
 	return nil, false
@@ -353,7 +406,32 @@ func (s *Sched) CheckoutIf(id string, ok func(*task.TCB) bool) (*task.TCB, bool)
 	delete(s.waiting, id)
 	delete(s.loc, id)
 	s.out[id] = true
+	s.disarmWakeLocked(s.ctl[id])
 	return t, true
+}
+
+// WaitingFor lists the tasks of class in the wait set for reason w, oldest
+// ReadySince first. A list, not the tasks: each must still be checked out.
+func (s *Sched) WaitingFor(class string, w task.WaitReason) []string {
+	s.mu.Lock()
+	var ts []*task.TCB
+	for _, t := range s.waiting {
+		if t.Class == class && t.State == task.Waiting && t.Wait == w {
+			ts = append(ts, t)
+		}
+	}
+	s.mu.Unlock()
+	slices.SortFunc(ts, func(a, b *task.TCB) int {
+		if c := a.ReadySince.Compare(b.ReadySince); c != 0 {
+			return c
+		}
+		return strings.Compare(a.ID, b.ID)
+	})
+	ids := make([]string, len(ts))
+	for i, t := range ts {
+		ids[i] = t.ID
+	}
+	return ids
 }
 
 // Forget gives up a held task for good: after a failed commit, or on a halt
@@ -366,7 +444,8 @@ func (s *Sched) Forget(id string) {
 	s.dropLocked(id)
 }
 
-// Close makes every Next return false and stops every deadline timer. Requeue
+// Close makes every Next return false and stops every deadline and backoff
+// timer. Requeue
 // keeps working, so in-flight work can still hand its tasks back.
 func (s *Sched) Close() {
 	s.mu.Lock()
@@ -376,6 +455,7 @@ func (s *Sched) Close() {
 		if c.stopTimer != nil {
 			c.stopTimer()
 		}
+		s.disarmWakeLocked(c)
 	}
 	s.cond.Broadcast()
 }
