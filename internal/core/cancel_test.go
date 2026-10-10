@@ -234,6 +234,11 @@ func TestCancelWhileToolsInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.WaitBatches()
+	// The bus gives up on the device at the cancel and does not wait for it
+	// to return: the device sees its context end on its own goroutine.
+	for deadline := time.Now().Add(5 * time.Second); sawCancel.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
 	got := load(t, store)
 	if got.State != task.Cancelled || sawCancel.Load() != 1 {
 		t.Fatalf("task %s, device saw cancel %d times", got.State, sawCancel.Load())
