@@ -73,6 +73,7 @@ type control struct {
 	deadline  time.Time
 	stopTimer func() bool // nil: no timer set
 	stopWake  func() bool // the backoff timer while the task is in Waiting(Backoff)
+	backs     uint64      // hand-backs so far: CheckoutWait sees a task come back and leave again
 }
 
 func New(clock Clock, aging time.Duration) *Sched {
@@ -176,6 +177,10 @@ func (s *Sched) Requeue(t *task.TCB) bool {
 func (s *Sched) requeue(t *task.TCB) (ok, ready bool, class string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.requeueLocked(t)
+}
+
+func (s *Sched) requeueLocked(t *task.TCB) (ok, ready bool, class string) {
 	if _, dup := s.loc[t.ID]; dup {
 		panic(fmt.Sprintf("sched: task %s is already queued or waiting", t.ID))
 	}
@@ -206,6 +211,7 @@ func (s *Sched) requeue(t *task.TCB) (ok, ready bool, class string) {
 	if !t.State.Terminal() {
 		s.armLocked(t, c)
 	}
+	c.backs++
 	delete(s.out, t.ID)
 	s.cond.Broadcast()
 	return true, ready, class
@@ -476,8 +482,10 @@ func (s *Sched) CheckoutIf(id string, ok func(*task.TCB) bool) (*task.TCB, bool)
 // CheckoutWait is CheckoutIf for a task that may be held elsewhere for a
 // moment: a holder that has committed the task's wait but not handed it back
 // yet, or another operator. While the task is held, it waits for the
-// hand-back (or for ctx to end); a task that is neither held nor in the wait
-// set, or that ok refuses once it is there, is not taken.
+// hand-back (or for ctx to end), and only that one: a task that is neither
+// held nor in the wait set, that ok refuses once it is there, or that was
+// handed back and taken again (by a vCore, for its next instruction) before
+// the waiter woke, is not taken.
 func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) bool) (*task.TCB, bool) {
 	stop := context.AfterFunc(ctx, func() {
 		s.mu.Lock()
@@ -487,6 +495,11 @@ func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) 
 	defer stop()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	c0 := s.ctl[id]
+	var backs uint64
+	if c0 != nil {
+		backs = c0.backs
+	}
 	for {
 		if t, found := s.waiting[id]; found {
 			if !ok(t) {
@@ -498,7 +511,7 @@ func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) 
 			s.disarmWakeLocked(s.ctl[id])
 			return t, true
 		}
-		if !s.out[id] || ctx.Err() != nil {
+		if c := s.ctl[id]; !s.out[id] || ctx.Err() != nil || c == nil || c != c0 || c.backs != backs {
 			return nil, false
 		}
 		s.cond.Wait()
