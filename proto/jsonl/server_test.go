@@ -34,6 +34,7 @@ type out struct {
 	TaskID  string          `json:"task_id"`
 	FromSeq *int64          `json:"from_seq"`
 	Status  json.RawMessage `json:"status"`
+	Queue   json.RawMessage `json:"queue"`
 	Error   *Error          `json:"error"`
 	Seq     int64           `json:"seq"`
 	TaskSeq int64           `json:"task_seq"`

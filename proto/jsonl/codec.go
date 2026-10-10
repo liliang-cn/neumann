@@ -22,18 +22,26 @@ const (
 	KindStatus      = "status"
 	KindSubscribe   = "subscribe"
 	KindUnsubscribe = "unsubscribe"
+
+	// Operator controls (design §9.6).
+	KindClass      = "class"       // move a task to another group: Machine.SetClass
+	KindCores      = "cores"       // pin a group's window: Machine.SetCores
+	KindAutoScale  = "autoscale"   // let a group's window adapt again, or freeze it: Machine.AutoScale
+	KindGroupReset = "group_reset" // close a group's breaker: Machine.GroupReset
+	KindQueue      = "queue"       // the queues by class: Machine.Queue
 )
 
 // KnownKinds are the instructions this frontend executes.
 var KnownKinds = []string{
 	proto.KindSubmit, proto.KindSteer, proto.KindCancel, KindResolve,
 	KindStatus, KindSubscribe, KindUnsubscribe,
+	KindClass, KindCores, KindAutoScale, KindGroupReset, KindQueue,
 }
 
 // UnsupportedKinds are operator controls the design names (§9.6) that the
 // machine does not offer yet. They are answered with CodeUnsupported, not
 // CodeUnknownKind, so a client can tell "not yet" from "never heard of it".
-var UnsupportedKinds = []string{"suspend", "resume", "priority", "class", "cores", "group_reset"}
+var UnsupportedKinds = []string{"suspend", "resume", "priority"}
 
 // Error codes of a failed reply.
 const (
@@ -43,6 +51,8 @@ const (
 	CodeNotFound       = "not_found"       // no such task
 	CodeFinished       = "finished"        // the task has already ended
 	CodeNotReconciling = "not_reconciling" // resolve: the task or call is not held for an operator
+	CodeTaskBusy       = "task_busy"       // class: the task is executing an instruction or waiting for its tools; try again
+	CodeIncompatible   = "incompatible"    // class: the target group cannot take the task; check says which check failed
 	CodeBusy           = "busy"            // submit: the machine is at capacity; count and limit say how full
 	CodeStopped        = "stopped"         // the machine is stopping
 	CodeNotStarted     = "not_started"     // the machine has not finished starting
@@ -67,14 +77,18 @@ type Request struct {
 	CallID  string   `json:"call_id,omitempty"`  // resolve
 	Outcome *Outcome `json:"outcome,omitempty"`  // resolve
 	FromSeq *int64   `json:"from_seq,omitempty"` // subscribe; absent means 0, every event
+	Cores   *int     `json:"cores,omitempty"`    // cores
+	On      *bool    `json:"on,omitempty"`       // autoscale
 }
 
-// Error is why an instruction failed. Count and Limit are set for CodeBusy.
+// Error is why an instruction failed. Count and Limit are set for CodeBusy,
+// Check for CodeIncompatible.
 type Error struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	Count   int    `json:"count,omitempty"`
 	Limit   int    `json:"limit,omitempty"`
+	Check   string `json:"check,omitempty"`
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
@@ -93,6 +107,7 @@ type Reply struct {
 	TaskID  string          `json:"task_id,omitempty"`
 	FromSeq *int64          `json:"from_seq,omitempty"` // subscribe: where the stream starts
 	Status  json.RawMessage `json:"status,omitempty"`   // status: the machine's snapshot
+	Queue   json.RawMessage `json:"queue,omitempty"`    // queue: the queues by class
 	Error   *Error          `json:"error,omitempty"`
 }
 
@@ -138,13 +153,18 @@ func Marshal(v any) ([]byte, error) {
 // kind. Anything else is refused by name: a misspelt "taskid" is an error,
 // not a field that is silently ignored.
 var fields = map[string][]string{
-	proto.KindSubmit: {"task_id", "input", "class", "priority", "budget", "allow", "deny"},
+	proto.KindSubmit: {"task_id", "input", "class", "pin_class", "priority", "budget", "allow", "deny"},
 	proto.KindSteer:  {"task_id", "input"},
 	proto.KindCancel: {"task_id"},
 	KindResolve:      {"task_id", "call_id", "outcome"},
 	KindStatus:       {},
 	KindSubscribe:    {"from_seq"},
 	KindUnsubscribe:  {},
+	KindClass:        {"task_id", "class"},
+	KindCores:        {"class", "cores"},
+	KindAutoScale:    {"class", "on"},
+	KindGroupReset:   {"class"},
+	KindQueue:        {},
 }
 
 // Decode parses and validates one input line. On error the returned Request
@@ -217,6 +237,12 @@ func (r *Request) field(name string) any {
 		return &r.Input
 	case "class":
 		return &r.Class
+	case "pin_class":
+		return &r.PinClass
+	case "cores":
+		return &r.Cores
+	case "on":
+		return &r.On
 	case "priority":
 		return &r.Priority
 	case "budget":
@@ -273,6 +299,27 @@ func (r *Request) validate() *Error {
 		}
 		if r.Outcome.Retry && (r.Outcome.Result != "" || r.Outcome.IsError) {
 			return errorf(CodeBadRequest, `outcome: "retry" sends the call again and cannot carry a "result" or "is_error"`)
+		}
+	case KindClass:
+		if err := need("task_id", r.TaskID); err != nil {
+			return err
+		}
+		return need("class", r.Class)
+	case KindGroupReset:
+		return need("class", r.Class)
+	case KindCores:
+		if err := need("class", r.Class); err != nil {
+			return err
+		}
+		if r.Cores == nil || *r.Cores < 1 {
+			return errorf(CodeBadRequest, `cores needs "cores", a count of at least 1`)
+		}
+	case KindAutoScale:
+		if err := need("class", r.Class); err != nil {
+			return err
+		}
+		if r.On == nil {
+			return errorf(CodeBadRequest, `autoscale needs "on": true or false`)
 		}
 	case KindSubscribe:
 		if r.FromSeq != nil && *r.FromSeq < 0 {

@@ -24,6 +24,12 @@ type Machine interface {
 	Events(ctx context.Context, fromSeq int64) <-chan proto.Event
 	Status() neumann.Status
 	Stop(ctx context.Context) error
+
+	SetClass(ctx context.Context, taskID, class string) error
+	SetCores(class string, n int) error
+	AutoScale(class string, on bool) error
+	GroupReset(ctx context.Context, class string) error
+	Queue() neumann.QueueStatus
 }
 
 var _ Machine = (*neumann.Machine)(nil)
@@ -162,6 +168,17 @@ func (s *Server) handle(ctx context.Context, l line) (*Reply, *subscription) {
 		err = s.Machine.Resolve(ctx, req.TaskID, req.CallID, neumann.Outcome{Retry: o.Retry, Result: o.Result, IsError: o.IsError})
 	case KindStatus:
 		r.Status, err = json.Marshal(s.Machine.Status())
+	case KindClass:
+		r.TaskID = req.TaskID
+		err = s.Machine.SetClass(ctx, req.TaskID, req.Class)
+	case KindCores:
+		err = s.Machine.SetCores(req.Class, *req.Cores)
+	case KindAutoScale:
+		err = s.Machine.AutoScale(req.Class, *req.On)
+	case KindGroupReset:
+		err = s.Machine.GroupReset(ctx, req.Class)
+	case KindQueue:
+		r.Queue, err = json.Marshal(s.Machine.Queue())
 	case KindSubscribe:
 		from := int64(0)
 		if req.FromSeq != nil {
@@ -183,9 +200,14 @@ func (s *Server) handle(ctx context.Context, l line) (*Reply, *subscription) {
 func errorFor(err error) *Error {
 	e := &Error{Code: CodeFailed, Message: err.Error()}
 	var ce *neumann.CapacityError
+	var me *neumann.MigrateError
 	switch {
 	case errors.As(err, &ce):
 		e.Code, e.Count, e.Limit = CodeBusy, ce.Count, ce.Limit
+	case errors.As(err, &me):
+		e.Code, e.Check = CodeIncompatible, me.Check
+	case errors.Is(err, neumann.ErrTaskBusy):
+		e.Code = CodeTaskBusy
 	case errors.Is(err, neumann.ErrBusy):
 		e.Code = CodeBusy
 	case errors.Is(err, neumann.ErrNotReconciling):

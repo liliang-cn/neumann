@@ -25,11 +25,11 @@
 //	{"id":1,"kind":"submit","input":"What is 2+2?"}
 //	{"type":"reply","id":1,"kind":"submit","ok":true,"task_id":"8c0f…"}
 //
-// An ok reply to submit, steer, cancel and resolve means the instruction is
+// An ok reply to submit, steer, cancel, resolve and class means the instruction is
 // committed: it survives a crash from that moment on. The kinds and their
 // fields (anything else is refused by name):
 //
-//	submit       input (required), task_id, class, priority, budget {max_steps, deadline (RFC 3339)}, allow, deny
+//	submit       input (required), task_id, class, pin_class, priority, budget {max_steps, deadline (RFC 3339)}, allow, deny
 //	             → task_id
 //	steer        task_id, input (both required)
 //	cancel       task_id (required)
@@ -38,6 +38,11 @@
 //	status       → status: the machine's snapshot (neumann.Status)
 //	subscribe    from_seq (default 0) → from_seq; starts or restarts the event stream
 //	unsubscribe  stops the event stream
+//	class        task_id, class (both required): moves the task to that group (Machine.SetClass)
+//	cores        class, cores (both required, cores >= 1): pins the group's window (Machine.SetCores)
+//	autoscale    class, on (both required): the group's window adapts again, or freezes (Machine.AutoScale)
+//	group_reset  class (required): closes the group's breaker (Machine.GroupReset)
+//	queue        → queue: the queues by class (Machine.Queue)
 //
 // A failed reply has "ok":false and an error with a code and a message:
 //
@@ -45,9 +50,12 @@
 //
 // Codes: bad_request (malformed JSON, an object missing, unknown or ill-typed
 // field; the message names it), unknown_kind, unsupported (a designed
-// operator control the machine does not have yet: suspend, resume, priority,
-// class, cores, group_reset), not_found, finished, not_reconciling, busy
-// (with "count" and "limit"), stopped, not_started, failed (anything else). A
+// operator control the machine does not have yet: suspend, resume,
+// priority), not_found, finished, not_reconciling, busy (with "count" and
+// "limit"), task_busy (class: the task is between no two instructions yet;
+// try again), incompatible (class: the group cannot take the task; "check"
+// names the failed check: tools, tool_count or context), stopped,
+// not_started, failed (anything else, an unknown class among them). A
 // bad line costs one error reply; the server carries on. Blank lines are
 // skipped; lines longer than Server.MaxLine (16 MiB) are refused.
 //
