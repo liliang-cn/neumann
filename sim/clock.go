@@ -6,10 +6,12 @@ import (
 	"time"
 )
 
-// Clock is a fake clock for deadlines: time moves only when Advance is called,
-// and a timer set with AfterFunc fires then, on Advance's goroutine, in the
-// order the timers fall due. A timer that is already due when it is set fires
-// at once on a goroutine of its own, as time.AfterFunc does.
+// Clock is a fake clock that moves only when told to (Advance, Set). It
+// satisfies any interface{ Now() time.Time }, and runs timers too: a timer set
+// with AfterFunc fires when the clock reaches it, on the goroutine that moved
+// the clock, in the order the timers fall due. A timer that is already due
+// when it is set fires at once on a goroutine of its own, as time.AfterFunc
+// does.
 type Clock struct {
 	mu     sync.Mutex
 	now    time.Time
@@ -60,7 +62,19 @@ func (c *Clock) AfterFunc(d time.Duration, f func()) (stop func() bool) {
 // returning after they have run.
 func (c *Clock) Advance(d time.Duration) {
 	c.mu.Lock()
-	c.now = c.now.Add(d)
+	c.set(c.now.Add(d))
+}
+
+// Set moves the clock to t, forward or back, and runs every timer that is due
+// at t, returning after they have run.
+func (c *Clock) Set(t time.Time) {
+	c.mu.Lock()
+	c.set(t)
+}
+
+// set moves the clock with c.mu held, releases it, and runs the due timers.
+func (c *Clock) set(t time.Time) {
+	c.now = t
 	var due []*fakeTimer
 	c.timers = slices.DeleteFunc(c.timers, func(tm *fakeTimer) bool {
 		if tm.at.After(c.now) {

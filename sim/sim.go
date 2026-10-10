@@ -180,32 +180,3 @@ func Truncated() model.Response {
 		Usage:        task.Usage{PromptTokens: 10, CompletionTokens: 50, ReasoningTokens: 50},
 	}
 }
-
-// Clock is a fake clock that moves only when told to. It satisfies any
-// interface{ Now() time.Time }.
-type Clock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func NewClock(start time.Time) *Clock { return &Clock{now: start} }
-
-func (c *Clock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-// Advance moves the clock forward by d.
-func (c *Clock) Advance(d time.Duration) {
-	c.mu.Lock()
-	c.now = c.now.Add(d)
-	c.mu.Unlock()
-}
-
-// Set moves the clock to t.
-func (c *Clock) Set(t time.Time) {
-	c.mu.Lock()
-	c.now = t
-	c.mu.Unlock()
-}
