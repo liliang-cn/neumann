@@ -345,6 +345,9 @@ func TestToolsAreReadOnly(t *testing.T) {
 		if def.Effect != bus.ReadOnly {
 			t.Errorf("%s: effect %v", def.Name, def.Effect)
 		}
+		if def.Cacheable != (def.Name == "list") {
+			t.Errorf("%s: cacheable %v, want it only on list (load and read go to disk every time)", def.Name, def.Cacheable)
+		}
 		if !json.Valid(def.Schema) {
 			t.Errorf("%s: schema %s", def.Name, def.Schema)
 		}

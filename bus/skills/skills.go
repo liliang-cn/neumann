@@ -11,9 +11,10 @@
 // Three tools, all ReadOnly:
 //
 //   - list: the catalogue. Byte-stable for a given set of skills, so it is
-//     safe to cache (the design's Cacheable flag, which bus.ToolDef does not
-//     carry yet, would be true for it). Catalogue returns the same text for a
-//     host that would rather put it in the system prompt.
+//     Cacheable: within one task a repeated list is served from L2 (a Rescan
+//     shows up in the next task, or after a write in this one). Catalogue
+//     returns the same text for a host that would rather put it in the system
+//     prompt.
 //   - load {name}: the SKILL.md body without its frontmatter, the skill's
 //     directory, and its resource files with their sizes.
 //   - read {name, path}: one resource file as text, confined to that skill's
@@ -393,8 +394,9 @@ func (d *Device) Tools(context.Context) ([]bus.ToolDef, error) {
 			Name: "list",
 			Description: "List the installed skills: each one's name and what it is for. A skill is a set of instructions, " +
 				"sometimes with reference files, for one kind of task; call " + load + " before doing such a task.",
-			Schema: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
-			Effect: bus.ReadOnly,
+			Schema:    json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+			Effect:    bus.ReadOnly,
+			Cacheable: true,
 		},
 		{
 			Name: "load",
