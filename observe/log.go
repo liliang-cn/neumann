@@ -13,9 +13,9 @@ import (
 // event kind, the attributes are greppable keys (seq, task, class, and what
 // the kind carries), and "at" is the commit time. Levels:
 //
-//   - info: lifecycle — accepted, done, cancelled, migrated, recovered,
-//     resolved, approved, tool_rewritten, group_up, core_up, core_down, and
-//     kinds this package does not know;
+//   - info: lifecycle — accepted, done, cancelled, compacted, migrated,
+//     recovered, resolved, approved, tool_rewritten, group_up, core_up,
+//     core_down, and kinds this package does not know;
 //   - warn: model_retry, throttled, group_down, migrate_refused,
 //     steer_dropped, tool_late, tool_denied, and approval_needed (an
 //     operator must answer it: Machine.Approve);
@@ -122,6 +122,10 @@ func (g *Log) Observe(ev proto.Event) {
 		str("check", d.Check)
 	case proto.EvRecovered:
 		str("from", d.From)
+	case proto.EvCompacted:
+		a = append(a, slog.Int("rounds", d.Rounds), slog.Int("messages_before", d.MessagesBefore), slog.Int("messages_after", d.MessagesAfter),
+			slog.Int64("tokens_before_est", d.TokensBefore), slog.Int64("tokens_after_est", d.TokensAfter),
+			slog.Int("chunk", d.Chunk), slog.Int("chunks", d.Chunks))
 	case proto.EvDone, proto.EvFailed, proto.EvCancelled:
 		str("stop_reason", d.StopReason)
 		str("error", d.Error)

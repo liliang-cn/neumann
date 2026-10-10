@@ -46,6 +46,14 @@ type data struct {
 	Effect     string `json:"effect"`    // approval_needed
 	Recovered  bool   `json:"recovered"` // approval_needed announced again by a restart
 	Edited     bool   `json:"edited"`    // approved with new arguments
+	// compacted
+	Rounds         int   `json:"rounds"`
+	MessagesBefore int   `json:"messages_before"`
+	MessagesAfter  int   `json:"messages_after"`
+	TokensBefore   int64 `json:"tokens_before_est"`
+	TokensAfter    int64 `json:"tokens_after_est"`
+	Chunk          int   `json:"chunk"`
+	Chunks         int   `json:"chunks"`
 	task.Usage
 }
 
@@ -244,7 +252,12 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 		if t.step != nil {
 			t.step.usage = &u
 			t.steps++
-			in.endStep(ev, d, t, emit)
+			if t.step.pc != task.StepCompact.String() {
+				in.endStep(ev, d, t, emit)
+			}
+			// An answered compaction ends with the event after its usage,
+			// in the same commit: compacted, whose figures its fact carries
+			// (or a retry or the task's end, when it was not applied).
 		}
 	case proto.EvToolCall:
 		if t.batch == nil {

@@ -114,7 +114,7 @@ defer store.Close()
 m, err := neumann.New(neumann.Config{
 	Groups: []neumann.GroupConfig{
 		{Class: "smart", Model: claude, Limits: []string{"anthropic"}, Fallback: "fast"},
-		{Class: "fast", Model: gpt, Max: 32},
+		{Class: "fast", Model: gpt, Max: 32, CompactAt: 0.7}, // compact at 70% of its window
 	},
 	Limiters: []limit.Config{{Name: "anthropic", Limits: map[string]limit.Rate{
 		"requests":     {Per: time.Minute, Limit: 50},
@@ -140,6 +140,11 @@ OPENAI_BASE_URL=https://host/v1 OPENAI_API_KEY=... OPENAI_MODEL=... go run ./exa
 they are unset. The stdio frontend `cmd/neumann` (below) reads
 `NEUMANN_API_KEY`, else `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` for the chosen
 `-provider`.
+
+`openai.New` does not know the model's context window (a gateway may serve
+any model): set `ContextWindow` on the adapter so tasks are compacted before
+they outgrow it. Without it, a task is compacted only once the provider
+rejects a request as too long. `anthropic.New` assumes 200000 tokens.
 
 Model output streams by default when the adapter supports it. `m.Deltas(ctx)`
 is a live preview of it; it is not committed and a slow reader may miss
@@ -180,8 +185,8 @@ pieces. The committed `answer` event is the record.
   instruction), its registers (the provider-neutral messages sent to the
   model), its budget and its confirmed usage.
 - **Instruction and vCore**: an instruction is one step of one task: a model
-  call (`StepModel`) or a dispatch of the tool calls a model turn asked for
-  (`StepTools`). A vCore is a goroutine that loops fetch → execute → commit. A
+  call (`StepModel`), a dispatch of the tool calls a model turn asked for
+  (`StepTools`), or a compaction (`StepCompact`, below). A vCore is a goroutine that loops fetch → execute → commit. A
   task runs at most one instruction at a time; a vCore holds no state between
   instructions and retires only between them.
 - **Execution group** (`GroupConfig`): one model adapter and its vCores. Its
@@ -190,6 +195,19 @@ pieces. The committed `answer` event is the record.
   overload. Its **breaker** opens after repeated transient failures or when the
   quota is exhausted; a `Fallback` group takes its tasks meanwhile. A task's
   `Class` names its group.
+- **Compaction**: a task whose request (system prompt, tools, registers and
+  the output reserve) passes `CompactAt` of its model's context window
+  (default 0.8; the window comes from the adapter's `Caps`) compacts before
+  its next model call. One model call, an instruction like any other,
+  summarises the oldest whole rounds (an assistant turn with all its tool
+  results, never split) into one user message marked as a summary; the
+  task's request and its newest rounds (up to `CompactKeep` of the window,
+  default 0.3) stay verbatim. A span too long for one compaction request is
+  done in chunks, one instruction each. A provider rejecting a request as too
+  long for its window (`model.ContextLength`) also triggers it. A task that
+  no compaction can make fit fails with stop reason `context_overflow`. The
+  original messages are kept in the store's archive: `m.History(ctx, id)`
+  returns the whole conversation.
 - **Limiter** (`limit.Config`): a provider's quota, separate from groups
   because quotas rarely line up with one model. A request needs room in every
   limiter its group names; groups can share limiters.
@@ -206,7 +224,7 @@ pieces. The committed `answer` event is the record.
 - **Events** (`proto.Event`): published only after they are committed, with a
   global `Seq` and a per-task `TaskSeq`. Task events include `accepted`,
   `step`, `tool_call`, `tool_result`, `usage`, `answer`, `done`, `failed`,
-  `cancelled`, `model_retry`, `reconcile_needed`, `tool_denied`,
+  `cancelled`, `model_retry`, `compacted`, `reconcile_needed`, `tool_denied`,
   `approval_needed`, `approved`; machine events (no task)
   include `core_up`, `core_down`, `group_down`, `group_up`, `throttled`.
 
@@ -299,14 +317,16 @@ func (a *myAdapter) Call(ctx context.Context, req model.Request) (model.Response
 }
 ```
 
-Tool calls come back as `task.PartToolCall` parts with `ProviderCallID`, `Name`
-and `Args` set. If the request reached the provider but the answer did not
+A request the provider rejects as longer than the model's context window is
+`model.ContextLength`: the machine compacts the task and sends it again
+instead of failing it. Tool calls come back as `task.PartToolCall` parts with
+`ProviderCallID`, `Name` and `Args` set. If the request reached the provider but the answer did not
 arrive whole, wrap `model.ErrResponseLost` so it is counted as unconfirmed.
 
 Optional interfaces, each discovered by type assertion:
 
 ```go
-func (a *myAdapter) Caps() model.Caps { // model.CapsReporter: checked before a task migrates here
+func (a *myAdapter) Caps() model.Caps { // model.CapsReporter: compaction sizes by Window; checked before a task migrates here
 	return model.Caps{Window: 128000, MaxOut: 4096, Tools: true}
 }
 
@@ -340,8 +360,8 @@ adapter is not a `model.Streamer`.
 
 ### A custom store
 
-Implement `mem.Store` (six methods: `Commit`, `Load`, `Unfinished`, `Calls`,
-`Interrupts`, `Events`) and run the conformance suite against it. The
+Implement `mem.Store` (seven methods: `Commit`, `Load`, `Unfinished`, `Calls`,
+`Interrupts`, `Events`, `Archive`) and run the conformance suite against it. The
 in-memory and SQLite stores pass the same suite:
 
 ```go
@@ -378,7 +398,9 @@ for _, g := range m.Status().Groups {
 
 **Events.** `m.Events(ctx, fromSeq)` streams every committed event after
 `fromSeq` and then live ones; it never blocks the machine and never skips an
-event. `m.EventLog`, `m.Load` and `m.Calls` read the store directly.
+event. `m.EventLog`, `m.Load` and `m.Calls` read the store directly;
+`m.History(ctx, id)` is a task's whole conversation, the messages compaction
+swapped out included.
 
 **Steering and cancelling.** `m.Steer(ctx, id, text)` adds a message to a
 running task (delivered at its next model call, or reported as
@@ -545,14 +567,13 @@ What it does not promise:
 v0.1. The core described above is built and tested: commit-before-act state
 machine, SQLite store with group commit, crash recovery and reconciliation,
 cancellation and deadlines, elastic vCores, execution groups with breakers and
-fallback migration, shared rate limiters, the OpenAI-compatible and Anthropic
+fallback migration, context compaction (including a migration that compacts
+on a smaller target window), shared rate limiters, the OpenAI-compatible and Anthropic
 adapters, MCP and skills devices, the tool result cache and the stdio
 frontend. The API may change before v1.
 
 Designed but not built yet:
 
-- context compaction (`StepCompact`); a migration whose target window is too
-  small is refused instead of compacting first;
 - long-term memory and RAG, sub-agents, multimodal input;
 - the operator controls `Pause` / `Resume` / `Drain`, per-task
   `Suspend` / `Resume` and `SetPriority` (the stdio frontend answers

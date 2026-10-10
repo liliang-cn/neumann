@@ -63,6 +63,9 @@
 //	neumann.approvals.needed     counter    {call}       class, tool                     approval_needed (first announcement only)
 //	neumann.approvals.decided    counter    {call}       class, verdict                  approved, tool_denied by operator, task end
 //	neumann.approval.wait        histogram  s            class, verdict                  first approval_needed → its decision
+//	neumann.compactions          counter    {chunk}      class                           compacted (one per chunk swapped out)
+//	neumann.compaction.rounds    counter    {round}      class                           compacted: rounds swapped out
+//	neumann.compaction.tokens    counter    {token}      class                           compacted: tokens_before_est - tokens_after_est
 //
 // outcome of a model step: ok, error, cancelled; error_class is the
 // model_retry class (rate_limited, quota_exhausted, overload, transient,

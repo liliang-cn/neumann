@@ -52,6 +52,7 @@ type Metrics struct {
 	vcores, transitions, migrations, refused   metric.Int64Counter
 	reconcile, steers                          metric.Int64Counter
 	denied, rewritten, needed, decided         metric.Int64Counter
+	compactions, compactRounds, compactTokens  metric.Int64Counter
 	taskDur, modelDur, toolDur, throttle       metric.Float64Histogram
 	approvalWait                               metric.Float64Histogram
 }
@@ -114,6 +115,9 @@ func NewMetrics(src Source, mp metric.MeterProvider, o MetricsOptions) (*Metrics
 	m.needed = counter("neumann.approvals.needed", "{call}", "Tool calls held for an operator's approval, by class and tool; a restart's announcement again is not counted.")
 	m.decided = counter("neumann.approvals.decided", "{call}", "Held tool calls decided, by class and verdict (allow, edit, deny, or cancelled when the task ended first).")
 	m.approvalWait = hist("neumann.approval.wait", "Wait of a held tool call, from its first approval_needed to its decision or its task's end, by class and verdict.")
+	m.compactions = counter("neumann.compactions", "{chunk}", "Compactions applied (one per chunk swapped out into a summary), by class.")
+	m.compactRounds = counter("neumann.compaction.rounds", "{round}", "Assistant rounds swapped out of the registers by compaction, by class.")
+	m.compactTokens = counter("neumann.compaction.tokens", "{token}", "Estimated tokens compaction took off the task's request (before minus after), by class.")
 	m.taskDur = hist("neumann.task.duration", "Task lifetime, accepted to terminal, by class and outcome.")
 	m.modelDur = hist("neumann.model.duration", "Model instruction latency, from the moment the task could run (its previous commit, after any backoff, or when the limiters let its call go) to the commit of the step's result, by class, pc and outcome.")
 	m.toolDur = hist("neumann.tool.duration", "Tool call latency, tool_call to its result, by tool and outcome.")
@@ -225,6 +229,10 @@ func (m *Metrics) Observe(ev proto.Event) {
 		m.rewritten.Add(bg, 1, m.attrs("tool", d.Tool))
 	case proto.EvRecovered:
 		m.recovered.Add(bg, 1, m.attrs("class", class, "from", d.From))
+	case proto.EvCompacted:
+		m.compactions.Add(bg, 1, m.attrs("class", class))
+		m.compactRounds.Add(bg, int64(d.Rounds), m.attrs("class", class))
+		m.compactTokens.Add(bg, max(d.TokensBefore-d.TokensAfter, 0), m.attrs("class", class))
 	}
 	m.seq.Store(ev.Seq)
 }

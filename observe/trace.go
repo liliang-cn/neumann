@@ -41,15 +41,19 @@ type TracerOptions struct {
 //   - "task": the root span, accepted to done / failed / cancelled. Status
 //     error with the error text for a failed task. Attributes: task id,
 //     class, priority, outcome, stop reason, steps, confirmed tokens.
-//     Retries, throttling, migrations, refusals, recovery, reconcile and
-//     operator resolutions are events on it, and so are the tool policy's
-//     and the operators' decisions: tool_denied, tool_rewritten,
-//     approval_needed (again after a restart, marked neumann.recovered) and
-//     approved.
+//     Retries, throttling, compactions, migrations, refusals, recovery,
+//     reconcile and operator resolutions are events on it, and so are the
+//     tool policy's and the operators' decisions: tool_denied,
+//     tool_rewritten, approval_needed (again after a restart, marked
+//     neumann.recovered) and approved.
 //   - "model" / "compact": one per model instruction, child of the task.
 //     It spans from when the task could run (its previous commit, after any
 //     backoff, or when the limiters let its call go) to the commit of the
 //     step's result. Status error with the error class for a failed call.
+//     A compaction that was applied carries its compacted event's figures
+//     (neumann.compact.rounds, .messages_before, .messages_after,
+//     .tokens_before_est, .tokens_after_est, .chunk, .chunks), which are
+//     also an event on the task span.
 //   - "dispatch": the instruction that sends planned calls after a
 //     restart, child of the task.
 //   - "tools": one per round of tool calls, child of the task, from the
@@ -216,6 +220,9 @@ func (t *Tracer) fact(f fact) {
 		if u := f.usage; u != nil {
 			attrs = append(attrs, tokenAttrs(*u)...)
 		}
+		if f.ev.Kind == proto.EvCompacted {
+			attrs = append(attrs, compactAttrs(f.d)...)
+		}
 		t.emit(f.task, spanID(f.task, "step", f.seq), TaskSpanID(f.task), name, f.start, f.end, st, attrs, nil)
 	case factApprovalEnd:
 		// The wait for an operator, from the call's first announcement.
@@ -303,6 +310,8 @@ func markAttrs(f fact) []attribute.KeyValue {
 		add("neumann.from", d.From)
 		add("neumann.to", d.To)
 		add("neumann.reason", d.Reason)
+	case proto.EvCompacted:
+		a = append(a, compactAttrs(d)...)
 	case proto.EvMigrateRefused:
 		add("neumann.from", d.From)
 		add("neumann.to", d.To)
@@ -329,4 +338,14 @@ func markAttrs(f fact) []attribute.KeyValue {
 		}
 	}
 	return a
+}
+
+// compactAttrs are a compacted event's figures (design §5.3).
+func compactAttrs(d data) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.Int("neumann.compact.rounds", d.Rounds),
+		attribute.Int("neumann.compact.messages_before", d.MessagesBefore), attribute.Int("neumann.compact.messages_after", d.MessagesAfter),
+		attribute.Int64("neumann.compact.tokens_before_est", d.TokensBefore), attribute.Int64("neumann.compact.tokens_after_est", d.TokensAfter),
+		attribute.Int("neumann.compact.chunk", d.Chunk), attribute.Int("neumann.compact.chunks", d.Chunks),
+	}
 }
