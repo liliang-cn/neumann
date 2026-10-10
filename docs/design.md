@@ -502,6 +502,8 @@ type Adapter interface {
 
 OpenAI 兼容适配器把服务商返回的 tool_call 原样存进 `Part.Opaque`，回传给同一服务商时逐字节重放（Gemini 的 thought signature 就在这里）；发给其他服务商时用机器自己的 id 重新渲染。缓存标记由适配器负责：OpenAI 兼容服务自动缓存；Anthropic 在工具定义末尾和消息序列倒数第二条打 `cache_control`。请求按固定顺序组装（系统提示词 → 排好序的工具 → 消息），前两部分在任务生命周期内逐字节不变。
 
+Anthropic 原生适配器（`model/anthropic`，标准库实现，传输层复用 `openai.NewTransport`）：`POST {BaseURL}/messages`，头 `x-api-key` 与 `anthropic-version: 2023-06-01`；`max_tokens` 必填，默认 8192；`Provider()` 为 `anthropic:<模型>`。系统提示词放顶层 `system`；工具调用渲染为 `tool_use` 块，工具结果渲染为 user 消息里的 `tool_result` 块。Anthropic 要求角色交替、`tool_result` 紧跟它的 `tool_use` 回合，所以同角色的相邻消息合并成一条，合并后的 user 回合里 `tool_result` 块排在最前（插话、中途的 system 消息作为文本块排在后面），渲染为空的消息直接省略。id：同一 Provider 且有 `ProviderCallID` 时用服务商的 id，否则用机器 id，`[a-zA-Z0-9_-]` 以外的字符替换成 `_`；结果引用同一个 id。`input` 必须是 JSON 对象：空参数发 `{}`，不是对象（包括非法 JSON）的参数原文放在 `{"_raw": "..."}` 里，不丢信息。响应里除纯文本外的每个块（`tool_use`、`thinking`、`redacted_thinking`、未知类型）原样存进 `Opaque`；回放给同一 Provider 时逐字节发回（thinking 的签名绑定在产生它的模型上），发给其他 Provider 时 thinking 丢弃、tool_use 按中立字段重新渲染。流式下按 `index` 重组每个块：`text_delta`、`thinking_delta`、`signature_delta` 逐片拼接，`input_json_delta` 拼成完整的 `input`，键顺序沿用 `content_block_start`，组装结果与非流式响应的块一致；流在 `message_stop` 之前断开是错误。用量：`PromptTokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens`（`input_tokens` 只计最后一个缓存断点之后的部分），`CachedTokens = cache_read_input_tokens`。`stop_reason` 映射到与 OpenAI 兼容适配器相同的词：`end_turn`/`stop_sequence` → `stop`，`tool_use` → `tool_calls`，`max_tokens` → `length`。缓存标记 `cache_control: {"type":"ephemeral"}` 打在最后一个工具定义上，以及倒数第二条消息的最后一个可标记块上（thinking 块不能带标记，向前找）；标记插在块的右花括号之前、写进新的切片，块的其他字节和它来自的 `Opaque` 都不变。非 2xx 的错误带状态码和响应片段（服务端回显的 key 会被抹掉），429 标 `rate limited`、529 标 `overloaded`，留给第四阶段的 `Classify` 区分。
+
 ## 12. 协议
 
 ```go
