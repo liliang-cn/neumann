@@ -671,3 +671,48 @@ func TestCompactionSettingsAreValidated(t *testing.T) {
 		}
 	}
 }
+
+// Compaction with a round held for an operator's approval (design §9.7):
+// while the round waits, no model instruction runs and nothing of it is
+// swapped out (its call has no result yet); compactions before and after it
+// swap out only complete rounds, the registers stay paired at every
+// commit-visible point, and the history holds every round.
+func TestCompactionAroundARoundHeldForApproval(t *testing.T) {
+	r := &rounder{rounds: 20, size: 400}
+	sm := &sim.Model{Info: &smallWindow, Fn: r.fn}
+	policy := func(_ context.Context, info neumann.ToolCallInfo) neumann.Decision {
+		if strings.HasPrefix(string(info.Args), `{"n":12,`) {
+			return neumann.RequireApproval("the thirteenth round")
+		}
+		return neumann.Allow()
+	}
+	m := startWith(t, neumann.Config{Model: sm, Devices: []bus.Device{echoDev()}, ToolPolicy: policy})
+	id := submit(t, m, proto.Instruction{Input: "count to twenty"})
+	waitFor(t, func() bool {
+		tc, err := m.Load(bg, id)
+		return err == nil && tc.State == task.Waiting && tc.Wait == task.WaitApproval
+	})
+	held := loadTask(t, m, id)
+	if len(compactedEvents(t, m, id)) == 0 {
+		t.Fatal("no compaction before the held round")
+	}
+	last := held.Regs[len(held.Regs)-1]
+	if last.Role != task.RoleAssistant || len(last.ToolCalls()) != 1 || task.CheckPairing(held.Regs[:len(held.Regs)-1]) != nil {
+		t.Fatalf("the held round is not the open end of paired registers: %+v", last)
+	}
+	before := len(compactedEvents(t, m, id))
+	if err := m.Approve(bg, id, last.ToolCalls()[0].CallID, neumann.ApprovalDecision{}); err != nil {
+		t.Fatal(err)
+	}
+	got := waitDone(t, m, id)
+	if got.State != task.Done || got.LastAnswer() != "done after 20" {
+		t.Fatalf("task ended %s %q: %q", got.State, got.StopReason, got.LastAnswer())
+	}
+	if len(compactedEvents(t, m, id)) <= before {
+		t.Fatal("no compaction after the held round")
+	}
+	if err := task.CheckPairing(got.Regs); err != nil {
+		t.Fatal(err)
+	}
+	checkHistory(t, m, id, "count to twenty", 20)
+}
