@@ -65,10 +65,6 @@ func DefaultSteerFormat(text string) string {
 // Clock is the machine's notion of now: scheduling order and aging read it.
 type Clock interface{ Now() time.Time }
 
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now() }
-
 var (
 	ErrBusy     = errors.New("neumann: at capacity")
 	ErrStopped  = errors.New("neumann: machine stopped")
@@ -135,7 +131,7 @@ func New(cfg Config) (*Machine, error) {
 		cfg.AgingAfter = sched.DefaultAging
 	}
 	if cfg.Clock == nil {
-		cfg.Clock = realClock{}
+		cfg.Clock = sched.RealClock{}
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
@@ -188,7 +184,15 @@ func (m *Machine) commit(ctx context.Context, c mem.CommitSet) error {
 // Start launches the vCores. ctx bounds only fetching: cancelling it stops
 // vCores taking new instructions, but the machine keeps running in-flight
 // work and holds its resources until Stop. A stopped machine cannot restart.
-// Phase 1 keeps nothing across processes, so there is nothing to recover.
+//
+// Before any vCore runs, Start recovers every unfinished task in the store
+// (design §4.5): a task caught mid model call is counted unconfirmed and
+// runs the step again; a tool round caught in flight is settled call by call
+// — finished calls keep their results, read-only and idempotent calls are
+// sent again under the same idempotency key, and a call with side effects
+// whose outcome is now unknown is either reported to the model (if its tool
+// allows it) or held for an operator (see Resolve). If recovery fails, Start
+// returns the error and may be called again.
 func (m *Machine) Start(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
@@ -200,6 +204,10 @@ func (m *Machine) Start(ctx context.Context) error {
 	}
 	if m.started {
 		return errors.New("neumann: already started")
+	}
+	sends, err := m.recover(ctx)
+	if err != nil {
+		return err
 	}
 	m.started = true
 	runCtx, cancel := context.WithCancel(ctx)
@@ -220,6 +228,9 @@ func (m *Machine) Start(ctx context.Context) error {
 				m.cfg.Logf("neumann: warming the model connection failed: %v", err)
 			}
 		}()
+	}
+	for _, d := range sends {
+		m.env.Dispatch(d.id, d.allow, d.deny, d.batch)
 	}
 	for i := range m.cfg.Cores {
 		m.cores.Add(1)
@@ -250,13 +261,22 @@ func (m *Machine) Stop(ctx context.Context) error {
 	if already {
 		return nil
 	}
-	m.inflight.Wait() // submits and steers admitted before the flag finish their commits
+	// Submits, steers and resolves admitted before the flag finish their
+	// commits, within the deadline. One that finishes later is durable all
+	// the same, and recovery picks it up on the next start.
+	admitted := make(chan struct{})
+	go func() { m.inflight.Wait(); close(admitted) }()
+	select {
+	case <-admitted:
+	case <-ctx.Done():
+	}
 	m.sched.Close()
 	var err error
 	if m.started {
 		done := make(chan struct{})
 		go func() {
 			m.cores.Wait()
+			m.env.CloseDispatch() // a late Resolve cannot start a batch while we wait
 			m.env.WaitBatches()
 			close(done)
 		}()
@@ -466,4 +486,81 @@ func (m *Machine) Status() Status {
 	u := m.active
 	m.admit.Unlock()
 	return Status{Cores: m.cfg.Cores, Ready: r, Waiting: w, Held: h, Unfinished: u, DeltasDropped: m.deltas.dropped.Load()}
+}
+
+type recoveredDispatch struct {
+	id          string
+	allow, deny []string
+	batch       []mem.CallRecord
+}
+
+// recover settles every unfinished task and hands them to the scheduler. It
+// commits every decision before any task is scheduled, so a failure part way
+// leaves nothing scheduled and can be retried by calling Start again.
+func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
+	tasks, err := m.store.Unfinished(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("neumann: read unfinished tasks: %w", err)
+	}
+	var sends []recoveredDispatch
+	for _, t := range tasks {
+		if t.Class != m.cfg.Class {
+			m.cfg.Logf("neumann: recovered task %s belongs to class %q, which this machine does not run", t.ID, t.Class)
+		}
+		batch, err := m.env.Recover(ctx, t)
+		if err != nil {
+			return nil, fmt.Errorf("neumann: recover task %s: %w", t.ID, err)
+		}
+		if len(batch) > 0 {
+			sends = append(sends, recoveredDispatch{t.ID, slices.Clone(t.Allow), slices.Clone(t.Deny), batch})
+		}
+	}
+	for _, t := range tasks {
+		m.sched.Add(t)
+	}
+	m.admit.Lock()
+	m.active = len(tasks)
+	m.admit.Unlock()
+	if len(tasks) > 0 {
+		m.cfg.Logf("neumann: recovered %d unfinished tasks; %d resume with calls in flight", len(tasks), len(sends))
+	}
+	return sends, nil
+}
+
+// Outcome is an operator's answer for a call whose outcome a restart made
+// unknown: Retry sends it again (a new attempt under a new idempotency key);
+// otherwise Result is what the call returned and IsError marks a failure.
+type Outcome = core.Outcome
+
+// ErrNotReconciling is returned by Resolve for a task or call that is not
+// held for an operator.
+var ErrNotReconciling = core.ErrNotReconciling
+
+// Resolve answers a call held for reconciliation (a reconcile_needed event
+// names it). When the task holds no other unknown call, its round is settled
+// and the task resumes.
+func (m *Machine) Resolve(ctx context.Context, taskID, callID string, o Outcome) error {
+	if err := m.enter(false); err != nil {
+		return err
+	}
+	defer m.inflight.Done()
+	t, ok := m.sched.CheckoutIf(taskID, func(t *task.TCB) bool {
+		return t.State == task.Waiting && t.Wait == task.WaitReconcile
+	})
+	if !ok {
+		if _, err := m.store.Load(ctx, taskID); err != nil {
+			return err
+		}
+		return fmt.Errorf("neumann: task %s: %w", taskID, ErrNotReconciling)
+	}
+	batch, err := m.env.Resolve(ctx, t, callID, o)
+	allow, deny := slices.Clone(t.Allow), slices.Clone(t.Deny)
+	m.sched.Requeue(t) // unchanged when err != nil
+	if err != nil {
+		return err
+	}
+	if len(batch) > 0 {
+		m.env.Dispatch(taskID, allow, deny, batch)
+	}
+	return nil
 }

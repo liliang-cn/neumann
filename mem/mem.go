@@ -33,9 +33,10 @@ type CallRecord struct {
 	Status  CallStatus      `json:"status"`
 	Attempt int             `json:"attempt"`
 	Key     string          `json:"key,omitempty"` // idempotency key: task/call/attempt
-	// Effect and ReportUnknown are recorded when the call is planned, from
+	// Device, Effect and ReportUnknown are recorded when the call is planned, from
 	// the tool's declaration at that moment: recovery after a restart decides
 	// by them, not by whatever the bus declares by then.
+	Device        string           `json:"device"`
 	Effect        task.Effect      `json:"effect"`
 	ReportUnknown bool             `json:"report_unknown,omitempty"`
 	Result        *task.ToolResult `json:"result,omitempty"`
@@ -67,7 +68,9 @@ type Interrupt struct {
 //   - When Task is terminal, every interrupt still unapplied is marked applied,
 //     and a steer_dropped event is added for each steer among them, in the
 //     same commit.
-//   - Events get their Seq and TaskSeq; Commit returns them.
+//   - Events get their Seq and TaskSeq; Commit returns them. Both are dense:
+//     Seq counts 1, 2, 3… across all events and TaskSeq 1, 2, 3… per task,
+//     with no gap left by a rejected commit.
 type CommitSet struct {
 	Task          *task.TCB
 	NewTask       bool

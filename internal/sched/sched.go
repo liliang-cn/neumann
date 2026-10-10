@@ -149,10 +149,18 @@ func (s *Sched) before(a, b *task.TCB, now time.Time) bool {
 // Checkout takes a waiting task out of the wait set so that its caller can
 // commit a transition for it (for example, its tools finished).
 func (s *Sched) Checkout(id string) (*task.TCB, bool) {
+	return s.CheckoutIf(id, func(*task.TCB) bool { return true })
+}
+
+// CheckoutIf is Checkout for a task that satisfies ok, decided under the
+// scheduler's lock. A caller that may only take a task in one particular wait
+// (an operator resolving a held call) must not take one whose tool batch is
+// still running: that batch would find its task gone.
+func (s *Sched) CheckoutIf(id string, ok func(*task.TCB) bool) (*task.TCB, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t, ok := s.waiting[id]
-	if !ok {
+	t, found := s.waiting[id]
+	if !found || !ok(t) {
 		return nil, false
 	}
 	delete(s.waiting, id)

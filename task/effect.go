@@ -19,3 +19,18 @@ func (e Effect) String() string {
 	}
 	return effectNames[e]
 }
+
+// MarshalText stores an Effect by name, so stored call records do not depend
+// on the order of the constants.
+func (e Effect) MarshalText() ([]byte, error) { return nameOf("Effect", int(e), effectNames[:]) }
+
+func (e *Effect) UnmarshalText(b []byte) error {
+	i, err := indexOf("Effect", b, effectNames[:])
+	if err == nil {
+		*e = Effect(i)
+	}
+	return err
+}
+
+// Valid reports whether e is one of the declared effects.
+func (e Effect) Valid() bool { return e >= 0 && int(e) < len(effectNames) }

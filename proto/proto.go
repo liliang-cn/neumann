@@ -37,6 +37,12 @@ const (
 	EvFailed       = "failed"
 	EvCancelled    = "cancelled"
 	EvSteerDropped = "steer_dropped"
+
+	// Recovery after a restart, and an operator's answer for a call whose
+	// outcome became unknown.
+	EvRecovered       = "recovered"
+	EvReconcileNeeded = "reconcile_needed"
+	EvResolved        = "resolved"
 )
 
 // Event is something that happened, published only after it was committed.

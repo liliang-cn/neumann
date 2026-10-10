@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/liliang-cn/neumann/mem"
@@ -62,7 +63,16 @@ func waitIO(t *task.TCB) {
 // it arrives; when all are in, the task is checked out of the wait set, given
 // its tool message, committed as ready, and requeued.
 func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallRecord) {
+	e.dispatchMu.Lock()
+	if e.dispatchClosed {
+		e.dispatchMu.Unlock()
+		// Shutting down: the calls stay dispatched in the call log, and
+		// recovery sends them when the machine starts again.
+		e.Logf("neumann: not dispatching %d calls of task %s: dispatch is closed", len(batch), taskID)
+		return
+	}
 	e.batches.Add(1)
+	e.dispatchMu.Unlock()
 	go func() {
 		defer e.batches.Done()
 		ctx := e.halt() // phase 3 adds the task's own cancel context
@@ -108,6 +118,15 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 	// The final transition carries the finished records too (an idempotent
 	// upsert of what the per-result commits recorded), so the model can never
 	// see a result that is not in the call log.
+	// The round's other calls (already done, or reported unknown) come from
+	// the call log: after a restart, only part of a round may be in flight.
+	recs, err := e.Store.Calls(ctx, taskID)
+	if err != nil {
+		e.Logf("neumann: read calls of task %s after tools failed; it is no longer scheduled: %v", taskID, err)
+		e.Sched.Forget(taskID)
+		return
+	}
+	rs := round(t, recs)
 	done := make([]mem.CallRecord, len(batch))
 	var events []proto.Event
 	for i, r := range batch {
@@ -121,7 +140,11 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 			events = append(events, proto.NewEvent(proto.EvToolResult, taskID, map[string]any{"call_id": r.CallID, "is_error": res.IsError}))
 		}
 	}
-	t.Regs = append(t.Regs, toolMessage(done))
+	for _, d := range done {
+		rs = upsert(rs, d)
+	}
+	slices.SortFunc(rs, func(a, b mem.CallRecord) int { return a.Index - b.Index })
+	t.Regs = append(t.Regs, toolMessage(rs))
 	e.ready(t, task.StepModel)
 	if err := e.Commit(ctx, mem.CommitSet{Task: t, Calls: done, Events: events}); err != nil {
 		e.Logf("neumann: commit after tools for task %s failed; it is no longer scheduled: %v", taskID, err)
@@ -137,10 +160,12 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 func toolMessage(records []mem.CallRecord) task.Message {
 	msg := task.Message{Role: task.RoleTool}
 	for _, r := range records {
-		var res task.ToolResult
-		if r.Result != nil {
-			res = *r.Result
+		if r.Result == nil {
+			// A round is assembled only when every call has a result; a
+			// missing one would reach the model as an empty success.
+			panic(fmt.Sprintf("core: call %s/%s has no result (status %s)", r.TaskID, r.CallID, r.Status))
 		}
+		res := *r.Result
 		msg.Parts = append(msg.Parts, task.Part{
 			Kind: task.PartToolResult, CallID: r.CallID, Text: res.Content, IsError: res.IsError,
 		})

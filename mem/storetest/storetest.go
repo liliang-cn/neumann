@@ -5,9 +5,13 @@ package storetest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/proto"
@@ -45,6 +49,9 @@ func Run(t *testing.T, newStore Factory) {
 		{"SameVersionIsAConflict", testSameVersionIsAConflict},
 		{"AppliedMustBePending", testAppliedMustBePending},
 		{"NonSteerInterruptDroppedSilently", testNonSteerInterruptDroppedSilently},
+		{"FullTaskRoundTrip", testFullTaskRoundTrip},
+		{"FullCallRecordRoundTrip", testFullCallRecordRoundTrip},
+		{"UnfinishedCoversEveryNonTerminalState", testUnfinishedCoversEveryNonTerminalState},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore) })
@@ -385,5 +392,86 @@ func testNonSteerInterruptDroppedSilently(t *testing.T, newStore Factory) {
 	}
 	if pending, _ := s.Interrupts(ctx, "a", true); len(pending) != 0 {
 		t.Fatalf("pending %+v", pending)
+	}
+}
+
+// fullTask sets every field recovery reads, with non-empty slices (a store
+// may keep an empty slice as nil) and a UTC time without a monotonic reading.
+func fullTask(id string) *task.TCB {
+	return &task.TCB{
+		ID: id, State: task.Running, PC: task.StepTools, Wait: task.WaitIO, Class: "big", Priority: 1,
+		ReadySince: time.Date(2026, 10, 10, 8, 30, 0, 0, time.UTC),
+		System:     "sys",
+		Tools:      []task.ToolSpec{{Name: "dev_x", Description: "x", Schema: json.RawMessage(`{"type":"object"}`)}},
+		Regs: []task.Message{
+			task.Text(task.RoleUser, "q"),
+			{Role: task.RoleAssistant, Parts: []task.Part{
+				{Kind: task.PartReasoning, Text: "r", Provider: "p", Opaque: json.RawMessage(`{ "sig": "a<b" }`)},
+				{Kind: task.PartToolCall, CallID: "c-1", ProviderCallID: "call_9", Name: "dev_x", Args: json.RawMessage(`{"a":`), Provider: "p", Opaque: json.RawMessage(`{"id":"call_9"}`)},
+			}},
+			{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: "boom", IsError: true}}},
+		},
+		Allow: []string{"dev_"}, Deny: []string{"dev_y"},
+		Budget:      task.Budget{MaxSteps: 9},
+		Used:        task.Usage{Steps: 3, PromptTokens: 100, CompletionTokens: 20, ReasoningTokens: 5, CachedTokens: 64},
+		CallSeq:     1,
+		Unconfirmed: 2,
+		StopReason:  "",
+		Version:     1,
+	}
+}
+
+func testFullTaskRoundTrip(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	want := fullTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: want, NewTask: true})
+	got, err := s.Load(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip changed the task:\n got %+v\nwant %+v", got, want)
+	}
+	un, _ := s.Unfinished(ctx)
+	if len(un) != 1 || !reflect.DeepEqual(un[0], want) {
+		t.Fatalf("Unfinished changed the task: %+v", un)
+	}
+}
+
+func testFullCallRecordRoundTrip(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	mustCommit(t, s, mem.CommitSet{Task: newTask("a"), NewTask: true})
+	want := []mem.CallRecord{
+		{TaskID: "a", CallID: "c-1", Index: 1, Tool: "dev_x", Args: json.RawMessage(`{"a":`), Status: mem.CallUnknown,
+			Attempt: 2, Key: "a/c-1/2", Device: "dev", Effect: task.SideEffect, ReportUnknown: true,
+			Result: &task.ToolResult{Content: "?", IsError: true}},
+		{TaskID: "a", CallID: "c-2", Index: 2, Tool: "dev_y", Args: json.RawMessage(`{"b":1}`), Status: mem.CallDispatched,
+			Attempt: 1, Key: "a/c-2/1", Device: "dev", Effect: task.Idempotent},
+	}
+	mustCommit(t, s, mem.CommitSet{Calls: want})
+	got, err := s.Calls(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("round trip changed the calls:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func testUnfinishedCoversEveryNonTerminalState(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	states := []task.State{task.Ready, task.Running, task.Waiting, task.Suspended, task.Done, task.Failed, task.Cancelled}
+	for i, st := range states {
+		tc := newTask(fmt.Sprintf("t%d", i))
+		tc.State = st
+		mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	}
+	un, _ := s.Unfinished(ctx)
+	var got []task.State
+	for _, tc := range un {
+		got = append(got, tc.State)
+	}
+	if !reflect.DeepEqual(got, []task.State{task.Ready, task.Running, task.Waiting, task.Suspended}) {
+		t.Fatalf("unfinished states %v", got)
 	}
 }

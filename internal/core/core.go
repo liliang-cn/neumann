@@ -46,6 +46,32 @@ type Env struct {
 	Delta func(proto.Delta)
 
 	batches sync.WaitGroup
+
+	dispatchMu     sync.Mutex // guards dispatchClosed against batches.Add
+	dispatchClosed bool
+
+	failMu     sync.Mutex
+	startFails map[string]int // consecutive failed start commits, per task
+}
+
+// maxStartRetries bounds how often a step whose start could not be committed
+// is tried again.
+const maxStartRetries = 3
+
+func (e *Env) startFailed(id string) int {
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	if e.startFails == nil {
+		e.startFails = map[string]int{}
+	}
+	e.startFails[id]++
+	return e.startFails[id]
+}
+
+func (e *Env) startCommitted(id string) {
+	e.failMu.Lock()
+	defer e.failMu.Unlock()
+	delete(e.startFails, id)
 }
 
 func (e *Env) frameSteer(text string) string {
@@ -83,8 +109,16 @@ func (e *Env) RunVCore(ctx context.Context, class string, core int) {
 }
 
 // WaitBatches waits for every dispatched tool batch to hand its task back.
-// Call it only after every vCore has returned.
 func (e *Env) WaitBatches() { e.batches.Wait() }
+
+// CloseDispatch refuses every later tool batch; its calls stay dispatched in
+// the call log for recovery. Shutdown calls it after the vCores have
+// returned and before WaitBatches, so no batch can start while it waits.
+func (e *Env) CloseDispatch() {
+	e.dispatchMu.Lock()
+	e.dispatchClosed = true
+	e.dispatchMu.Unlock()
+}
 
 func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	var (
@@ -110,8 +144,15 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		e.Sched.Forget(t.ID)
 		return
 	}
-	if errors.Is(err, errNotCommitted) {
-		e.Logf("neumann: task %s: %v; it is no longer scheduled", t.ID, err)
+	if errors.Is(err, errStartNotCommitted) {
+		// Nothing happened yet, so the step is retried a few times. A store
+		// that keeps failing is not going to record anything else either.
+		if e.startFailed(t.ID) <= maxStartRetries {
+			e.Logf("neumann: task %s: %v; retrying", t.ID, err)
+			e.Sched.Requeue(t)
+			return
+		}
+		e.Logf("neumann: task %s: %v; giving up, it is no longer scheduled", t.ID, err)
 		e.Sched.Forget(t.ID)
 		return
 	}

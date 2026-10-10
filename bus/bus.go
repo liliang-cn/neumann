@@ -94,6 +94,9 @@ func New(ctx context.Context, perDevice int, devs ...Device) (*Bus, error) {
 				return fail(fmt.Errorf("bus: device %q has a tool with an empty name", d.Name()))
 			}
 			name := FullName(d.Name(), def.Name)
+			if !def.Effect.Valid() {
+				return fail(fmt.Errorf("bus: tool %q of device %q declares an unknown effect %d", def.Name, d.Name(), int(def.Effect)))
+			}
 			if _, dup := b.routes[name]; dup {
 				return fail(fmt.Errorf("bus: duplicate tool name %q (device %q, tool %q)", name, d.Name(), def.Name))
 			}
@@ -157,18 +160,19 @@ func (b *Bus) Specs(allow, deny []string) []task.ToolSpec {
 
 // Effect is a tool's declared effect; unknown names are SideEffect.
 func (b *Bus) Effect(name string) Effect {
-	e, _ := b.Recovery(name)
+	_, e, _ := b.Recovery(name)
 	return e
 }
 
-// Recovery is what a restart needs to know about a tool: its effect, and
-// whether an unknown outcome may be reported to the model. Unknown names are
-// SideEffect and not reported.
-func (b *Bus) Recovery(name string) (Effect, bool) {
+// Recovery is what a restart needs to know about a tool, recorded when a
+// call is planned: the device that runs it, its effect, and whether an
+// unknown outcome may be reported to the model. Unknown names have no
+// device, are SideEffect and are not reported.
+func (b *Bus) Recovery(name string) (device string, effect Effect, reportUnknown bool) {
 	if r, ok := b.routes[name]; ok {
-		return r.def.Effect, r.def.ReportUnknown
+		return r.dev.Name(), r.def.Effect, r.def.ReportUnknown
 	}
-	return SideEffect, false
+	return "", SideEffect, false
 }
 
 // Call runs one tool call, waiting in the device's queue for a free slot. It
