@@ -421,23 +421,29 @@ func (s *Sched) CheckoutIf(id string, ok func(*task.TCB) bool) (*task.TCB, bool)
 // WaitingFor lists the tasks of class in the wait set for reason w, oldest
 // ReadySince first. A list, not the tasks: each must still be checked out.
 func (s *Sched) WaitingFor(class string, w task.WaitReason) []string {
+	// What it sorts by is copied under the lock: once a task leaves the wait
+	// set, its new owner writes its TCB.
+	type entry struct {
+		since time.Time
+		id    string
+	}
 	s.mu.Lock()
-	var ts []*task.TCB
+	var es []entry
 	for _, t := range s.waiting {
 		if t.Class == class && t.State == task.Waiting && t.Wait == w {
-			ts = append(ts, t)
+			es = append(es, entry{t.ReadySince, t.ID})
 		}
 	}
 	s.mu.Unlock()
-	slices.SortFunc(ts, func(a, b *task.TCB) int {
-		if c := a.ReadySince.Compare(b.ReadySince); c != 0 {
+	slices.SortFunc(es, func(a, b entry) int {
+		if c := a.since.Compare(b.since); c != 0 {
 			return c
 		}
-		return strings.Compare(a.ID, b.ID)
+		return strings.Compare(a.id, b.id)
 	})
-	ids := make([]string, len(ts))
-	for i, t := range ts {
-		ids[i] = t.ID
+	ids := make([]string, len(es))
+	for i, e := range es {
+		ids[i] = e.id
 	}
 	return ids
 }
