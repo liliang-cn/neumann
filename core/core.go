@@ -1,0 +1,114 @@
+// Package core runs vCores: the loop that fetches a ready task, executes one
+// instruction, commits, and only then acts on what it committed (design §5).
+package core
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"github.com/liliang-cn/neumann/bus"
+	"github.com/liliang-cn/neumann/mem"
+	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/proto"
+	"github.com/liliang-cn/neumann/sched"
+	"github.com/liliang-cn/neumann/task"
+)
+
+// Env is what every vCore shares. The machine builds one.
+type Env struct {
+	Store mem.Store
+	Sched *sched.Sched
+	Bus   *bus.Bus
+	Model model.Adapter
+	Clock sched.Clock
+
+	// Commit is the only write path: commit to the store and, on success, let
+	// subscribers see the events. Nothing a commit describes may happen before
+	// Commit returns nil.
+	Commit func(ctx context.Context, c mem.CommitSet) error
+	Logf   func(format string, args ...any)
+
+	batches sync.WaitGroup
+}
+
+type stepData struct {
+	PC   string `json:"pc"`
+	Core int    `json:"core"`
+}
+
+// RunVCore is one vCore. It returns when the scheduler closes or ctx ends,
+// and only ever between two instructions.
+func (e *Env) RunVCore(ctx context.Context, class string, core int) {
+	for {
+		t, ok := e.Sched.Next(ctx, class)
+		if !ok {
+			return
+		}
+		e.step(ctx, t, core)
+	}
+}
+
+// WaitBatches waits for every dispatched tool batch to hand its task back.
+// Call it only after every vCore has returned.
+func (e *Env) WaitBatches() { e.batches.Wait() }
+
+func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
+	var (
+		c     mem.CommitSet
+		batch []mem.CallRecord
+		err   error
+	)
+	switch t.PC {
+	case task.StepModel:
+		c, err = e.execModel(ctx, t, core)
+	case task.StepTools:
+		c, batch, err = e.execTools(ctx, t, core)
+	default:
+		err = fmt.Errorf("instruction %s is not implemented", t.PC)
+	}
+	if err != nil {
+		c, batch = e.fail(t, mem.CommitSet{}, err.Error()), nil
+	}
+	if err := e.Commit(ctx, c); err != nil {
+		e.Logf("neumann: commit for task %s failed; it is no longer scheduled: %v", t.ID, err)
+		e.Sched.Forget(t.ID)
+		return
+	}
+	id := t.ID
+	allow := append([]string(nil), t.Allow...)
+	deny := append([]string(nil), t.Deny...)
+	e.Sched.Requeue(t) // t now belongs to the scheduler
+	if len(batch) > 0 {
+		e.dispatch(id, allow, deny, batch)
+	}
+}
+
+// ready makes t runnable at its next instruction.
+func (e *Env) ready(t *task.TCB, pc task.PC) {
+	t.State = task.Ready
+	t.Wait = task.WaitNone
+	t.PC = pc
+	t.ReadySince = e.Clock.Now()
+	t.Version++
+}
+
+func (e *Env) finish(t *task.TCB, c mem.CommitSet, reason string) mem.CommitSet {
+	t.State = task.Done
+	t.StopReason = reason
+	t.Version++
+	c.Task = t
+	c.Events = append(c.Events,
+		proto.NewEvent(proto.EvAnswer, t.ID, map[string]string{"text": t.LastAnswer()}),
+		proto.NewEvent(proto.EvDone, t.ID, map[string]string{"stop_reason": reason}))
+	return c
+}
+
+func (e *Env) fail(t *task.TCB, c mem.CommitSet, reason string) mem.CommitSet {
+	t.State = task.Failed
+	t.StopReason = reason
+	t.Version++
+	c.Task = t
+	c.Events = append(c.Events, proto.NewEvent(proto.EvFailed, t.ID, map[string]string{"error": reason}))
+	return c
+}
