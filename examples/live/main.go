@@ -1,5 +1,5 @@
 // Command live runs neumann against a real OpenAI-compatible endpoint: six
-// tasks on two vCores, parallel tool calls, a slow tool with a steer arriving
+// tasks on NEUMANN_CORES vCores (default 6), parallel tool calls, a slow tool with a steer arriving
 // while it runs, and the event stream printed as it is committed. At the end
 // it checks the phase-1 invariants against what really happened.
 //
@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -104,7 +105,7 @@ func main() {
 	m, err := neumann.New(neumann.Config{
 		Model:   adapter,
 		Devices: devices(),
-		Cores:   2,
+		Cores:   cores(),
 		System:  "You are a precise assistant. Use the provided tools for arithmetic, weather and population; never compute or guess those yourself. Call independent tools in parallel. Answer in one or two sentences.",
 		Logf:    log.Printf,
 	})
@@ -115,7 +116,7 @@ func main() {
 	if err := m.Start(ctx); err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("neumann live run: model %s, 2 vCores\n\n", modelName)
+	fmt.Printf("neumann live run: model %s, %d vCores\n\n", modelName, cores())
 
 	inputs := []string{
 		"What is (17*23) + (41*3)?",
@@ -203,7 +204,7 @@ func main() {
 	}
 	if t, _ := m.Load(ctx, steerTarget); t != nil {
 		for _, msg := range t.Regs {
-			if msg.Role == task.RoleUser && msg.TextContent() == steerText {
+			if msg.Role == task.RoleUser && msg.TextContent() == neumann.DefaultSteerFormat(steerText) {
 				steerSeen = true
 			}
 		}
@@ -232,6 +233,13 @@ func main() {
 	if failures > 0 {
 		os.Exit(1)
 	}
+}
+
+func cores() int {
+	if n, err := strconv.Atoi(os.Getenv("NEUMANN_CORES")); err == nil && n > 0 {
+		return n
+	}
+	return 6
 }
 
 func compact(b json.RawMessage) string {
