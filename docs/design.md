@@ -211,6 +211,12 @@ type CallRecord struct {
 - 订阅：`m.Events(ctx, fromSeq)`；`m.EventLog(ctx, afterSeq, limit)` 直接读。第一阶段没有内存环形缓冲，订阅者每次被唤醒都从 Store 按序号读，语义相同。订阅者先从内存环形缓冲读；落后太多、超出缓冲时，自动改为从 `Store.Events` 按序号补读，追上后再回到内存。**生产者从不阻塞，订阅者也不丢事件。**
 - 第一版事件表不自动清理；清理策略（按时间或按已确认的序号）属于运维配置，留到有真实数据量再定。
 
+### 4.4.1 流式增量
+
+模型调用默认流式：适配器实现 `model.Streamer` 就走流式，正文和推理的增量实时推给 `m.Deltas(ctx)` 的订阅者（`proto.Delta{TaskID, Step, Text, Reasoning}`）。增量是预览，不提交、没有序号：订阅者落后超过 1024 条就丢（计入 `Status.DeltasDropped`），推送从不阻塞 vCore；失败或被打断的一步可能已经流出过文字。记录以提交的 `answer` 事件为准。模型不支持流式时，`Start` 记一条日志——包一层只转发 `Call` 的适配器会悄悄关掉流式，这是实际踩到过的。
+
+实测 cpa 上的 gemini-3.8-flash-high：它先在后台推理、推理不流出，首段正文只比整段回答早 9–75ms。流式的收益取决于模型：推理可见或回答较长时才明显。
+
 ### 4.5 重启
 
 1. 加载所有未结束的 TCB、它们的调用记录和未送达的中断。
@@ -485,6 +491,10 @@ type Adapter interface {
 第一版两个适配器：OpenAI 兼容（`/chat/completions`）和 Anthropic 原生（`/v1/messages`）。
 
 传输层：默认 HTTP/2，所有 vCore 的请求共用一条 TLS 连接多路复用，TLS 会话可恢复；HTTP/3（QUIC）可选，QUIC 拨号失败时永久回退到 HTTP/2——只有拨号阶段的失败才回退，请求发出后的超时不重发。`Start` 时后台预热连接。实测 cpa（家用宽带）：预热后的单次往返约 75ms，16 个并发请求 HTTP/2 比 HTTP/1.1 快约 40%，HTTP/3 与 HTTP/2 持平；一次模型调用约 3.5s，协议层的空间约占 2%。
+
+流式下工具调用按 `index` 汇总：`arguments` 逐片拼接，其他字段（id、type、服务商私有的扩展）以最后一次为准，组装成完整对象后同样存进 `Opaque`。流在收到 finish_reason 或 `[DONE]` 之前断开，是错误，不是短回答。
+
+已知网关差异：cpa 的非流式响应里 `completion_tokens` 包含推理 token（OpenAI 的约定），流式响应里不包含。`Usage` 原样记录服务商报的数，不做猜测性修正。
 
 OpenAI 兼容适配器把服务商返回的 tool_call 原样存进 `Part.Opaque`，回传给同一服务商时逐字节重放（Gemini 的 thought signature 就在这里）；发给其他服务商时用机器自己的 id 重新渲染。缓存标记由适配器负责：OpenAI 兼容服务自动缓存；Anthropic 在工具定义末尾和消息序列倒数第二条打 `cache_control`。请求按固定顺序组装（系统提示词 → 排好序的工具 → 消息），前两部分在任务生命周期内逐字节不变。
 

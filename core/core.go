@@ -39,6 +39,11 @@ type Env struct {
 	// sends the text as it is.
 	SteerFormat func(text string) string
 
+	// Delta receives a model step's output as it is generated, when the
+	// adapter can stream. It is called on the vCore's goroutine and must not
+	// block. nil: calls are not streamed.
+	Delta func(proto.Delta)
+
 	batches sync.WaitGroup
 }
 

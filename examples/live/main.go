@@ -50,6 +50,13 @@ func (c *counting) Call(ctx context.Context, req model.Request) (model.Response,
 	return c.Adapter.Call(ctx, req)
 }
 
+// Stream keeps the wrapper a model.Streamer: an adapter wrapper that forwards
+// only Call silently turns streaming off.
+func (c *counting) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
+	c.calls.Add(1)
+	return c.Adapter.(model.Streamer).Stream(ctx, req, emit)
+}
+
 var weather = map[string]string{"paris": "18°C, light rain", "tokyo": "24°C, clear", "vienna": "15°C, windy", "chengdu": "22°C, overcast"}
 
 func devices() []bus.Device {
@@ -140,6 +147,31 @@ func main() {
 	}
 	steerTarget := ids[2]
 
+	// Streamed output: note when each step's first text arrives, to compare
+	// with when the step's answer is committed.
+	type stepKey struct {
+		task string
+		step int
+	}
+	var firstMu sync.Mutex
+	firstText := map[stepKey]time.Duration{}
+	dctx, dcancel := context.WithCancel(ctx)
+	defer dcancel()
+	go func() {
+		for d := range m.Deltas(dctx) {
+			if d.Text == "" {
+				continue
+			}
+			k := stepKey{d.TaskID, d.Step}
+			firstMu.Lock()
+			if _, seen := firstText[k]; !seen {
+				firstText[k] = time.Since(start)
+				fmt.Printf("%6.2fs  %-3s %-13s step %d: %q…\n", time.Since(start).Seconds(), names[d.TaskID], "first text", d.Step, clip(d.Text, 40))
+			}
+			firstMu.Unlock()
+		}
+	}()
+
 	var steered sync.Once
 	pending := len(ids)
 	evCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -158,6 +190,16 @@ func main() {
 					fmt.Printf("%6.2fs  %-3s %-13s %q\n", time.Since(start).Seconds(), name, "STEER SENT", steerText)
 				}()
 			})
+		}
+		if ev.Kind == proto.EvAnswer {
+			t, _ := m.Load(ctx, ev.TaskID)
+			firstMu.Lock()
+			if ft, ok := firstText[stepKey{ev.TaskID, t.Used.Steps}]; ok {
+				lead := time.Since(start) - ft
+				fmt.Printf("%6.2fs  %-3s %-13s streaming showed the first text %dms before the answer was committed\n",
+					time.Since(start).Seconds(), name, "stream lead", lead.Milliseconds())
+			}
+			firstMu.Unlock()
 		}
 		if ev.Terminal() {
 			if pending--; pending == 0 {
@@ -251,3 +293,11 @@ func compact(b json.RawMessage) string {
 }
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+func clip(s string, n int) string {
+	r := []rune(oneLine(s))
+	if len(r) > n {
+		return string(r[:n])
+	}
+	return string(r)
+}

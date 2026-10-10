@@ -511,3 +511,112 @@ func TestStartWarmsTheModelConnection(t *testing.T) {
 		t.Fatal("Start did not warm the model connection")
 	}
 }
+
+func TestDeltasStreamTheAnswer(t *testing.T) {
+	m, _ := start(t, neumann.Config{Devices: []bus.Device{echoDev()}}, func(req model.Request) (model.Response, error) {
+		if sim.ToolRounds(req) == 0 {
+			return sim.CallTools("dev_echo"), nil
+		}
+		return sim.Reply("Hello, streaming world"), nil
+	})
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	deltas := m.Deltas(ctx)
+	id := submit(t, m, proto.Instruction{Input: "q"})
+	got := waitDone(t, m, id)
+	var text strings.Builder
+	timeout := time.After(2 * time.Second)
+	for text.Len() < len("Hello, streaming world") {
+		select {
+		case d := <-deltas:
+			if d.TaskID != id || d.Step != 2 {
+				t.Fatalf("delta %+v", d)
+			}
+			text.WriteString(d.Text)
+		case <-timeout:
+			t.Fatalf("streamed %q", text.String())
+		}
+	}
+	if text.String() != got.LastAnswer() {
+		t.Fatalf("streamed %q, answer %q", text.String(), got.LastAnswer())
+	}
+}
+
+func TestSlowDeltaSubscriberNeverBlocks(t *testing.T) {
+	long := strings.Repeat("word ", 50)
+	m, _ := start(t, neumann.Config{Cores: 4, MaxQueued: 4000}, func(model.Request) (model.Response, error) { return sim.Reply(long), nil })
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	_ = m.Deltas(ctx) // subscribed, never read
+	const tasks = 2000
+	for i := range tasks {
+		submit(t, m, proto.Instruction{Input: fmt.Sprintf("t%d", i)})
+	}
+	wctx, wcancel := context.WithTimeout(bg, 30*time.Second)
+	defer wcancel()
+	done := 0
+	for ev := range m.Events(wctx, 0) {
+		if ev.Terminal() {
+			if done++; done == tasks {
+				break
+			}
+		}
+	}
+	if done != tasks {
+		t.Fatalf("%d of %d tasks finished: a full delta subscriber blocked the machine", done, tasks)
+	}
+	if m.Status().DeltasDropped == 0 {
+		t.Fatal("a full subscriber should have missed deltas")
+	}
+}
+
+func TestDeltasEndWhenTheMachineStops(t *testing.T) {
+	sm := &sim.Model{Fn: func(model.Request) (model.Response, error) { return sim.Reply("x"), nil }}
+	m, err := neumann.New(neumann.Config{Model: sm, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Start(bg)
+	ch := m.Deltas(bg)
+	ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+	defer cancel()
+	m.Stop(ctx)
+	select {
+	case _, ok := <-ch:
+		if ok {
+			for range ch {
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("delta stream still open after Stop")
+	}
+	if _, ok := <-m.Deltas(bg); ok {
+		t.Fatal("subscribing after Stop returned an open stream")
+	}
+}
+
+type callOnly struct{ m *sim.Model }
+
+func (c callOnly) Provider() string { return "call-only" }
+func (c callOnly) Call(ctx context.Context, req model.Request) (model.Response, error) {
+	return c.m.Call(ctx, req)
+}
+
+func TestStartReportsAModelThatCannotStream(t *testing.T) {
+	var mu sync.Mutex
+	var logs []string
+	logf := func(f string, a ...any) { mu.Lock(); logs = append(logs, fmt.Sprintf(f, a...)); mu.Unlock() }
+	m, err := neumann.New(neumann.Config{Model: callOnly{&sim.Model{}}, Logf: logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Start(bg)
+	ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+	defer cancel()
+	m.Stop(ctx)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(logs) == 0 || !strings.Contains(logs[0], "does not implement model.Streamer") {
+		t.Fatalf("logs %q", logs)
+	}
+}

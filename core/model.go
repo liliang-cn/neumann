@@ -31,7 +31,10 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	c.Events = append(c.Events, proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepModel.String(), Core: core}))
 	c.Applied = applySteers(t, pending, e.frameSteer)
 
-	resp, err := e.callModel(ctx, model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs})
+	stepNo := t.Used.Steps + 1
+	resp, err := e.callModel(ctx, model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs}, func(d model.Delta) {
+		e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
+	})
 	t.Used.Steps++
 	if err != nil {
 		// Steers applied for this call were never answered: take them back so
@@ -97,13 +100,17 @@ type panicError struct{ v any }
 
 func (p *panicError) Error() string { return fmt.Sprintf("model panicked: %v", p.v) }
 
-// callModel calls the adapter; a panic in it fails the task, not the process.
-func (e *Env) callModel(ctx context.Context, req model.Request) (resp model.Response, err error) {
+// callModel calls the adapter, streaming through emit when the adapter can
+// and a Delta sink is set; a panic in it fails the task, not the process.
+func (e *Env) callModel(ctx context.Context, req model.Request, emit func(model.Delta)) (resp model.Response, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			resp, err = model.Response{}, &panicError{v: r}
 		}
 	}()
+	if s, ok := e.Model.(model.Streamer); ok && e.Delta != nil {
+		return s.Stream(ctx, req, emit)
+	}
 	return e.Model.Call(ctx, req)
 }
 

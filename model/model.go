@@ -32,3 +32,18 @@ type Adapter interface {
 type Warmer interface {
 	Warm(ctx context.Context) error
 }
+
+// Delta is a piece of an answer while it is being generated. It is a preview
+// for people watching: it is never committed, and the committed answer is the
+// record of what the model said.
+type Delta struct {
+	Text      string `json:"text,omitempty"`
+	Reasoning string `json:"reasoning,omitempty"`
+}
+
+// Streamer is an adapter that can report a call's output as it arrives. The
+// machine uses it whenever an adapter implements it; emit is called from the
+// calling goroutine, in order, and must not block.
+type Streamer interface {
+	Stream(ctx context.Context, req Request, emit func(Delta)) (Response, error)
+}

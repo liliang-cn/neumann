@@ -80,12 +80,13 @@ func (e *CapacityError) Error() string {
 func (e *CapacityError) Is(target error) bool { return target == ErrBusy }
 
 type Machine struct {
-	cfg   Config
-	store mem.Store
-	sched *sched.Sched
-	bus   *bus.Bus
-	env   *core.Env
-	hub   *hub
+	cfg    Config
+	store  mem.Store
+	sched  *sched.Sched
+	bus    *bus.Bus
+	env    *core.Env
+	hub    *hub
+	deltas *deltaHub
 
 	// admit guards active and stopped. active counts unfinished tasks; a task
 	// whose commit failed is forgotten by its vCore and keeps its slot (a bug
@@ -141,15 +142,16 @@ func New(cfg Config) (*Machine, error) {
 	haltCtx, haltCancel := context.WithCancel(context.Background())
 	m := &Machine{
 		haltCtx: haltCtx, haltCancel: haltCancel,
-		cfg:   cfg,
-		store: cfg.Store,
-		sched: sched.New(cfg.Clock, cfg.AgingAfter),
-		bus:   b,
-		hub:   newHub(),
+		cfg:    cfg,
+		store:  cfg.Store,
+		sched:  sched.New(cfg.Clock, cfg.AgingAfter),
+		bus:    b,
+		hub:    newHub(),
+		deltas: newDeltaHub(),
 	}
 	m.env = &core.Env{
 		Store: m.store, Sched: m.sched, Bus: b, Model: cfg.Model, Clock: cfg.Clock,
-		Commit: m.commit, Logf: cfg.Logf, SteerFormat: cfg.SteerFormat, Halt: haltCtx,
+		Commit: m.commit, Logf: cfg.Logf, SteerFormat: cfg.SteerFormat, Delta: m.deltas.publish, Halt: haltCtx,
 	}
 	return m, nil
 }
@@ -194,6 +196,11 @@ func (m *Machine) Start(ctx context.Context) error {
 	m.started = true
 	runCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
+	if _, ok := m.cfg.Model.(model.Streamer); !ok {
+		// Not an error, but easy to cause by accident: a wrapper around an
+		// adapter that forwards only Call hides the adapter's Stream.
+		m.cfg.Logf("neumann: model %s does not implement model.Streamer; Deltas will stay silent", m.cfg.Model.Provider())
+	}
 	if w, ok := m.cfg.Model.(model.Warmer); ok {
 		// Open the connection (and its TLS or QUIC handshake) now, so the
 		// first task does not pay for it. In the background: a slow or failed
@@ -266,6 +273,7 @@ func (m *Machine) Stop(ctx context.Context) error {
 	}
 	m.haltCancel()
 	m.hub.close()
+	m.deltas.close()
 	return errors.Join(err, m.bus.Close())
 }
 
@@ -421,6 +429,8 @@ type Status struct {
 	Waiting    int `json:"waiting"`    // in the wait set
 	Held       int `json:"held"`       // on a vCore or being completed by a tool batch
 	Unfinished int `json:"unfinished"` // admitted and not yet terminal
+
+	DeltasDropped int64 `json:"deltas_dropped"` // streamed pieces a slow subscriber missed
 }
 
 // Status is a cheap snapshot: no model call, no store read.
@@ -429,5 +439,5 @@ func (m *Machine) Status() Status {
 	m.admit.Lock()
 	u := m.active
 	m.admit.Unlock()
-	return Status{Cores: m.cfg.Cores, Ready: r, Waiting: w, Held: h, Unfinished: u}
+	return Status{Cores: m.cfg.Cores, Ready: r, Waiting: w, Held: h, Unfinished: u, DeltasDropped: m.deltas.dropped.Load()}
 }

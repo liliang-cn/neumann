@@ -33,7 +33,23 @@ func (m *Model) Call(ctx context.Context, req model.Request) (model.Response, er
 	return m.Fn(req)
 }
 
-// Calls is how many times Call was invoked.
+// Stream is Call that also reports the reply's text in three pieces, so tests
+// exercise the streaming path the machine takes by default.
+func (m *Model) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
+	resp, err := m.Call(ctx, req)
+	if err != nil {
+		return resp, err
+	}
+	r := []rune(resp.Message.TextContent())
+	for i, n := 0, len(r); i < 3 && n > 0; i++ {
+		if piece := string(r[i*n/3 : (i+1)*n/3]); piece != "" {
+			emit(model.Delta{Text: piece})
+		}
+	}
+	return resp, nil
+}
+
+// Calls is how many times Call or Stream was invoked.
 func (m *Model) Calls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()

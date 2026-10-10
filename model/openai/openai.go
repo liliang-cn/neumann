@@ -65,23 +65,49 @@ type wireResp struct {
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		CacheHitTokens   int `json:"prompt_cache_hit_tokens"` // DeepSeek's spelling of cached_tokens
-		PromptDetails    struct {
-			CachedTokens int `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-		CompletionDetails struct {
-			ReasoningTokens int `json:"reasoning_tokens"`
-		} `json:"completion_tokens_details"`
-	} `json:"usage"`
+	Usage wireUsage `json:"usage"`
+}
+
+type wireUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	CacheHitTokens   int `json:"prompt_cache_hit_tokens"` // DeepSeek's spelling of cached_tokens
+	PromptDetails    struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionDetails struct {
+		ReasoningTokens int `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+}
+
+func (u wireUsage) usage() task.Usage {
+	return task.Usage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		ReasoningTokens:  u.CompletionDetails.ReasoningTokens,
+		CachedTokens:     max(u.PromptDetails.CachedTokens, u.CacheHitTokens),
+	}
 }
 
 func (a *Adapter) Call(ctx context.Context, req model.Request) (model.Response, error) {
-	msgs, err := a.messages(req)
+	resp, err := a.post(ctx, req, false)
 	if err != nil {
 		return model.Response{}, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return model.Response{}, fmt.Errorf("openai: read response: %w", err)
+	}
+	return a.parse(data)
+}
+
+// post sends a chat-completions request and returns the response once its
+// status is known to be 2xx.
+func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
+	msgs, err := a.messages(req)
+	if err != nil {
+		return nil, err
 	}
 	body := map[string]any{"model": a.Model, "messages": msgs}
 	if len(req.Tools) > 0 {
@@ -90,31 +116,35 @@ func (a *Adapter) Call(ctx context.Context, req model.Request) (model.Response, 
 	if a.MaxTokens > 0 {
 		body["max_tokens"] = a.MaxTokens
 	}
+	if stream {
+		body["stream"] = true
+		body["stream_options"] = map[string]bool{"include_usage": true}
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return model.Response{}, fmt.Errorf("openai: encode request: %w", err)
+		return nil, fmt.Errorf("openai: encode request: %w", err)
 	}
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
-		return model.Response{}, fmt.Errorf("openai: %w", err)
+		return nil, fmt.Errorf("openai: %w", err)
 	}
 	hreq.Header.Set("Content-Type", "application/json")
+	if stream {
+		hreq.Header.Set("Accept", "text/event-stream")
+	}
 	if a.APIKey != "" {
 		hreq.Header.Set("Authorization", "Bearer "+a.APIKey)
 	}
 	resp, err := a.HTTP.Do(hreq)
 	if err != nil {
-		return model.Response{}, fmt.Errorf("openai: %w", err)
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return model.Response{}, fmt.Errorf("openai: read response: %w", err)
+		return nil, fmt.Errorf("openai: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		return model.Response{}, fmt.Errorf("openai: %s returned %d: %s", a.Model, resp.StatusCode, snippet(data))
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		return nil, fmt.Errorf("openai: %s returned %d: %s", a.Model, resp.StatusCode, snippet(data))
 	}
-	return a.parse(data)
+	return resp, nil
 }
 
 func (a *Adapter) parse(data []byte) (model.Response, error) {
@@ -126,11 +156,21 @@ func (a *Adapter) parse(data []byte) (model.Response, error) {
 		return model.Response{}, fmt.Errorf("openai: response has no choices: %s", snippet(data))
 	}
 	ch := w.Choices[0]
-	msg := task.Message{Role: task.RoleAssistant}
-	if ch.Message.Content != nil && *ch.Message.Content != "" {
-		msg.Parts = append(msg.Parts, task.Part{Kind: task.PartText, Text: *ch.Message.Content})
+	text := ""
+	if ch.Message.Content != nil {
+		text = *ch.Message.Content
 	}
-	for _, rc := range ch.Message.ToolCalls {
+	return a.response(text, ch.Message.ToolCalls, ch.FinishReason, w.Usage.usage())
+}
+
+// response assembles the neutral turn from the provider's text, its complete
+// tool-call objects (kept whole as Opaque for replay) and the usage.
+func (a *Adapter) response(text string, calls []json.RawMessage, finish string, u task.Usage) (model.Response, error) {
+	msg := task.Message{Role: task.RoleAssistant}
+	if text != "" {
+		msg.Parts = append(msg.Parts, task.Part{Kind: task.PartText, Text: text})
+	}
+	for _, rc := range calls {
 		var c wireCall
 		if err := json.Unmarshal(rc, &c); err != nil {
 			return model.Response{}, fmt.Errorf("openai: decode tool call: %w", err)
@@ -144,19 +184,10 @@ func (a *Adapter) parse(data []byte) (model.Response, error) {
 			Opaque:         bytes.Clone(rc),
 		})
 	}
-	if len(msg.Parts) == 0 && ch.FinishReason != "length" {
+	if len(msg.Parts) == 0 && finish != "length" {
 		return model.Response{}, errors.New("openai: response has neither text nor tool calls")
 	}
-	return model.Response{
-		Message:      msg,
-		FinishReason: ch.FinishReason,
-		Usage: task.Usage{
-			PromptTokens:     w.Usage.PromptTokens,
-			CompletionTokens: w.Usage.CompletionTokens,
-			ReasoningTokens:  w.Usage.CompletionDetails.ReasoningTokens,
-			CachedTokens:     max(w.Usage.PromptDetails.CachedTokens, w.Usage.CacheHitTokens),
-		},
-	}, nil
+	return model.Response{Message: msg, FinishReason: finish, Usage: u}, nil
 }
 
 // messages renders neutral messages in the chat-completions shape. A tool

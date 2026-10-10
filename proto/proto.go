@@ -66,3 +66,14 @@ func NewEvent(kind, taskID string, data any) Event {
 func (e Event) Terminal() bool {
 	return e.Kind == EvDone || e.Kind == EvFailed || e.Kind == EvCancelled
 }
+
+// Delta is a piece of a model step's output while it is being generated,
+// pushed live to subscribers. Deltas are never committed and carry no Seq: a
+// subscriber that falls behind loses some, and the step's committed answer
+// event is the record. Step is the task's model-step number (1-based).
+type Delta struct {
+	TaskID    string `json:"task_id"`
+	Step      int    `json:"step"`
+	Text      string `json:"text,omitempty"`
+	Reasoning string `json:"reasoning,omitempty"`
+}
