@@ -58,8 +58,9 @@ neumann 是一个 Go 写的常驻 agent 运行时，按冯·诺依曼计算机�
 type Role string // system / user / assistant / tool
 
 type Message struct {
-    Role  Role
-    Parts []Part
+    Role    Role
+    Parts   []Part
+    Summary bool // 压缩放进来的摘要消息（5.3）；适配器照普通消息发
 }
 
 type Part struct {
@@ -111,6 +112,9 @@ type TCB struct {
     Retries    int             // 连续的可重试模型失败（过载、临时错误）；成功清零；限流不计
     MaxOut     int             // 本任务模型调用的输出上限，0 = 适配器默认
     Truncations int            // 因"截断且无内容"放大过 MaxOut 的次数，最多 2
+    Window     int             // 服务商以"超出上下文"拒绝请求后学到的窗口，0 = 用 Caps.Window；迁移时清零（5.3）
+    CompactChunk int           // 进行中的压缩轮已换出的块数，不在压缩轮中为 0
+    Archived   int             // 压缩移进归档的消息数（5.3）
     StopReason string
     Version    int64           // 每次提交 +1
 }
@@ -131,6 +135,7 @@ type CommitSet struct {
     Calls         []CallRecord // 新增或更新的调用记录；所属任务必须存在
     NewInterrupts []Interrupt  // 外部输入；任务不存在或已结束时整个提交被拒绝
     Applied       []int64      // 把 Task 的这些未送达中断标记为已送达；序号不属于 Task 或已送达则拒绝
+    Archive       []Message    // 追加到 Task 的归档：压缩换出的原始消息；必须带 Task，与提交同进同退
     Events        []Event      // 本次提交产生的事件；外部指令本身由 accepted 等事件记录
 }
 
@@ -141,6 +146,7 @@ type Store interface {
     Calls(ctx context.Context, taskID string) ([]CallRecord, error)
     Interrupts(ctx context.Context, taskID string, unappliedOnly bool) ([]Interrupt, error)
     Events(ctx context.Context, afterSeq int64, limit int) ([]Event, error)
+    Archive(ctx context.Context, taskID string) ([]Message, error) // 按提交顺序
 }
 ```
 
@@ -232,7 +238,7 @@ type CallRecord struct {
 ### 4.5 重启
 
 1. 加载所有未结束的 TCB、它们的调用记录和未送达的中断。
-2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`）。`Running` 在模型调用之前提交，含义是"请求可能已经发出"：提交之后、调用之前被停机打断时，会多算一次未确认。这一步要送达的插话在 `Running` 提交之后才合并，崩溃不会留下"上下文里有、中断表里却还未送达"的插话。预算按 `Used.Steps + Unconfirmed` 计，反复崩溃的任务不会越过预算重发。
+2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`；`PC` 保留：压缩调用中途崩溃，重启后重做这次压缩）。`Running` 在模型调用之前提交，含义是"请求可能已经发出"：提交之后、调用之前被停机打断时，会多算一次未确认。这一步要送达的插话在 `Running` 提交之后才合并，崩溃不会留下"上下文里有、中断表里却还未送达"的插话。预算按 `Used.Steps + Unconfirmed` 计，反复崩溃的任务不会越过预算重发。
 3. 调用记录按 4.2 的表处理。
 4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；所有未结束任务重设 Deadline 定时器。`Waiting(Reconcile)` 和 `Waiting(Approval)` 保持原状，各自再宣布一次等待的调用（9.7）。`Waiting(Backoff)` 和 `Waiting(Group)` 提交为 `Ready`（`ReadySince` 不变，`Retries` 保留）：退避定时器和熔断状态都不持久，重启后各组从闭合开始，退避从下一次失败重新起算。
 5. `Class` 已不在配置里的任务（换了配置重启），在第 2、3 步之前移到 `Config.Default` 的组：先做 6.3 的能力校验，通过则提交 `Class` 改变（状态不变）和 `migrated`（`reason = "class_removed"`）；不通过则提交一个原因为 `class_removed` 的取消中断和 `migrate_refused`（带不满足的那一条），随后按取消做最终提交（调用照 9.5 处理），任务 `Failed`，`StopReason = "class_removed"`。不留没有 vCore 会取的任务。
@@ -272,7 +278,7 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
 ### 5.1 execModel
 
 1. 检查 `MaxSteps`、`MaxTokens`；超出则提交 `Done`，`StopReason = "budget"`，答案是最后一条 assistant 文本，**不算一条模型指令**（不发 step 事件）。未送达的插话由终态提交报告为 `steer_dropped`。Deadline 由调度器负责（第 9 节）。
-2. 寄存器 token 估算超过 `0.7 × 本组模型窗口`（窗口未知时用 `Config.CompactAt`，默认 60000）时，改设 `PC = StepCompact`，提交后结束本步。
+2. 按 5.3 量窗口：`估算(System + Tools + Regs) + 输出预留 > CompactAt × 窗口`（或任务正处在压缩轮中）时，这条指令改为压缩（`execCompact`，`PC = StepCompact` 随 `Running` 提交）；怎么压都放不下时 `Failed`，`StopReason = "context_overflow"`，不调用、不算指令。窗口未知不压缩。
 3. 本组熔断中（不闭合、也没到放探测请求的时候）：不预占、不调用，任务提交 `Waiting(Group)`。否则向本组的限流器预占额度（7.2），等额度时 vCore 持着任务、什么都不提交；拿到额度后 `Admit`，不放行则退还额度、任务转 `Waiting(Group)`；放行则提交 `Running`，通过适配器调一次模型。等额度和调用都以任务的 context 进行，取消和 Deadline 会立刻打断。调用结束先与限流器结算（7.2），再把结果报给执行组（第 6 节），然后才组装任务自己的提交。
 4. 结果：
    - **有工具调用**：assistant 消息原样追加，调用记录写为 `planned`，`PC = StepTools`。
@@ -288,6 +294,22 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
 ### 5.3 execCompact
 
 用一次模型调用把最早的若干个完整轮次（assistant 加上它的全部 tool 结果，从不拆开）换出成一条摘要消息。被换出的部分按"压缩请求本身必须放得进本组窗口"来切块：一块放不下就分几次压缩，每次一条指令。单条消息本身就超过窗口时，任务 `Failed`，`StopReason = "context_overflow"`。
+
+实现中的决定（`internal/core/compact.go`，寄存器的切分和渲染在 `task/compact.go`）：
+
+- **窗口**：`model.CapsOf(适配器).Window`；任务的 `Window`（服务商拒绝过时学到的）更小或 Caps 未知时用它。两者都没有：不主动压缩，只在服务商以"超出上下文"拒绝时压缩。
+- **触发**：每条模型指令开头（预算、熔断检查之后），`估算(System + Tools + Regs，按目标服务商过滤 reasoning) + 输出预留 > CompactAt × 窗口` 时压缩。`CompactAt` 按组配置（`GroupConfig.CompactAt`），默认 0.8。输出预留：这次请求带的 `MaxOut`（截断放大后的也算），否则 `Caps.MaxOut`，否则 4096。估算就是 `task.EstimateTokens`，与限流预占、迁移校验同一个。
+- **单元**：寄存器从头切：头部到第一条 user 消息为止（任务的请求）永远原样保留；之后每个 assistant 消息连同紧跟着回答它的 tool 消息是一个单元（"轮次"），每条 user / system 消息（插话、之前的摘要）各自是一个单元。单元整体保留或整体换出，所以换出后不会有没有调用的结果、没有结果的调用（配对不变式，`task.CheckPairing`）；还在等结果的轮次和它之后的都不换出。已经送达的插话是普通 user 消息，可以被压缩。
+- **保留**：最新的若干单元，合计估算不超过 `CompactKeep × 窗口`（默认 0.3），至少最新一个。中间的就是要换出的部分。
+- **切块**：从最早的单元起，取请求放得进窗口的最长一段：`估算(压缩提示词 + 这段的文字稿) + 摘要输出上限 ≤ 窗口`。上一块的摘要排在下一块开头，跟着一起压，一轮压完只剩一条摘要。摘要带不上下一个单元时，那个单元单独压（它的摘要排在旧摘要后面，下一块再合并）。只剩一条摘要可压时这一轮结束；两条以上摘要合并。每块一条指令，`PC` 保持 `StepCompact`，`CompactChunk` 计数，换完回到 `StepModel`。块的估算按各单元转义后文字稿字节数相加算，与整段 `EstimateTokens` 逐字节一致（有测试），不用每个候选块都序列化一遍。
+- **放不下**：必须压（请求加预留超过窗口，或服务商拒绝了）时先判断能不能压到放得下：头部 + 保留的单元 + 一条按上限算的摘要 + 输出预留 ≤ 窗口（保留 30% 不行就只留最新一个单元再试），且每个要换出的单元单独放得进压缩请求。不行就直接 `context_overflow`，不做无用的压缩、也不调用：单条消息（或一轮）本身就超过窗口、请求本身就超过窗口，都在这里。只是超过阈值、还放得进窗口时，有单元放不进压缩请求就先不压，照常调用。
+- **压缩请求**：系统提示词是固定常量 `task.CompactSystem`（要求忠实摘要，保留事实、数字、标识、决定、后面要用的工具结果、失败的尝试、用户后来的指示、未决问题、当前计划和下一步），没有工具，一条 user 消息装这段的文字稿（`task.Transcript`：每条消息 `### <角色>`，工具调用和结果带 id，旧摘要单独标出，reasoning 不带），`MaxOut = min(2048, 窗口/8, Caps.MaxOut)`。同一段永远渲染出同样的字节。发文字稿而不是原样的轮次：带 `tool_use` 的请求在有的服务商那里必须同时带工具定义，而压缩请求不给工具。
+- **摘要消息**：role 为 user、`Summary = true`，正文以固定的 `task.SummaryHeader`（"这是之前工作的摘要……"）开头。选 user：紧跟在任务请求之后，Anthropic 适配器把相邻的同角色消息并成一个 user 回合，OpenAI 兼容接受连续的 user 消息；下一个保留单元是 assistant 时角色照常交替。两个适配器都有渲染测试。
+- **一条模型指令**：压缩调用走与模型步完全相同的路径（`modelCall`：熔断、预占、`Admit`、`Running` 提交、调用、结算、上报、分类），失败也一样处理：退避、等组、迁移、`model_error`；退避和等组时 `PC` 保持 `StepCompact`，回来接着压。有回答就计入 `Used.Steps` 和用量，清零 `Retries`，发 `step`（`pc = "compact"`）和 `usage`；不流式推送增量。回答没有文字按临时错误重试。这一步不送达插话：插话留在中断表里，下一条模型指令送达。
+- **先提交后动作**：结果一次提交：新 `Regs`（摘要替换这一块）、`Archive`（这一块里除旧摘要以外的原始消息）、`Archived` 加上它们的条数、`compacted` 事件 `{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（`chunks` 是切这一块时按每条摘要满上限估出的总块数），任务 `Ready`。崩溃在 `Running` 之后：重启按 `PC` 重做这次压缩（`Unconfirmed + 1`）；提交落盘之后：新寄存器已经生效。不存在只做了一半的压缩。有未送达的取消时这次提交被拒（4.1 规则 4），按取消最终提交：寄存器、归档不变，有回答的调用仍计入用量。
+- **归档**：原始消息不丢，存在 Store 的归档里（`CommitSet.Archive`、`Store.Archive`，SQLite 一张 `archive` 表，消息 gob 编码），与任务同一个事务。选 Store 而不是事件载荷：事件表按序号读，要拿一个任务的全部历史得扫全表；归档按任务读，且与寄存器的变化原子提交。`m.History(ctx, id)` 返回任务的完整历史：头部 + 归档（取 TCB 里 `Archived` 那么多条，两次读之间又压缩了也不错乱）+ 寄存器里摘要之后的消息，不含摘要。每块总是取最早的未压缩单元，所以归档顺序就是时间顺序。
+- **服务商拒绝**：新的错误类别 `model.ContextLength`（第 11 节）。不按永久错误失败：任务学到窗口 `(估算(被拒的请求) + 它的输出上限) × 3/4`（比已学到的小才更新），按它必须压缩，提交 `Ready`、`PC = StepCompact` 和 `model_retry`（`class = "context_length"`，`wait = "compact"`）；压不下就 `context_overflow`。被拒的调用不算 `Used.Steps`、不计 `Retries`、预占全额退回，对执行组算一次回答（同 `Permanent`）。压缩请求本身被拒同样处理，块切得更小。每次拒绝都让窗口变小，每块压缩都减少剩余的原始单元或摘要数，所以不会无限循环。
+- **代价**：任务的头部（系统提示词、工具、请求）加输出预留本身接近阈值减去保留部分时，几乎每步都会压缩一块；这是配置问题（`CompactKeep` 必须小于 `CompactAt`，`New` 校验）。
 
 ## 6. 执行组与弹性 vCore
 
@@ -306,6 +328,8 @@ type GroupConfig struct {
     Fallback   string        // 熔断时迁往的组
     OnMigrateFail string     // "wait"（默认）或 "fail"
     MaxQueued  int           // 本组未结束任务上限，0 = 只受全局限制；迁入的任务不受它限制
+    CompactAt   float64      // 压缩阈值，占窗口的比例，默认 0.8（5.3）
+    CompactKeep float64      // 原样保留的最新轮次占窗口的比例，默认 0.3；必须小于 CompactAt
 }
 ```
 
@@ -350,7 +374,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 
 1. **工具能力**：目标适配器必须支持工具调用；任务快照的工具数不超过目标适配器的上限。
 2. **上下文**：`估算(System + Tools + Regs) + MaxOut 预留 ≤ 目标窗口`。
-3. 第 2 条不满足时，检查能否在目标组上压缩到放得下：按 5.3 切块，每块压缩请求都必须放得进目标窗口。能，则迁移后第一条指令就是 `StepCompact`。
+3. 第 2 条不满足时，检查能否在目标组上压缩到放得下：按 5.3 切块，每块压缩请求都必须放得进目标窗口，压完（头部 + 保留的轮次 + 一条摘要 + 输出预留）放得进目标窗口。能，则迁移后第一条指令就是 `StepCompact`。
 4. 都不满足：按 `OnMigrateFail`，`wait` 则留在 `Waiting(Group)`，`fail` 则 `Failed`，`StopReason = "migrate_incompatible"`，事件里带不满足的那一条。
 
 校验通过：提交 `Class` 改变、`ReadySince` 保留（不重新排队尾）、`migrated` 事件。迁移后第一次请求丢掉原服务商的 `reasoning` 块，L1 必然不命中。
@@ -361,7 +385,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 - 目标沿 `Fallback` 链找：跳过熔断中的组，取第一个通过校验的。链上的组全在熔断中：留在 `Waiting(Group)` 等本组，不算迁移失败；之后任何一个组恢复（`group_up`、`GroupReset`），除了唤醒它自己的 `Waiting(Group)` 任务，也唤醒 `Fallback` 链经过它的那些组里未 `PinClass` 的等待任务，让它们重新走一遍迁移判断（本组若是额度熔断，永远不会半开，不这样就永远等下去）；停进来与恢复交错时，交还后再看一次链上有没有组已恢复。校验不过而停下的任务（发过 `migrate_refused`）不在交还后重试，后备组再恢复也不唤醒它（后备组能接什么没变，唤醒只会再拒一次）：它等本组的 `group_up` / `GroupReset`，或操作员 `SetClass`（这个标记只在内存里，重启后任务本来就直接就绪、重新判断）；有没熔断但校验不过的：按**本组**的 `OnMigrateFail`，`wait` 时停进 `Waiting(Group)` 并发 `migrate_refused`（`{from, to, check, detail}`），`fail` 时 `failed` 事件带 `check`、`detail`。
 - 能力取自 `model.CapsOf(适配器)`（在 panic 保护下读，适配器 panic 即校验不过，`check = "caps"`）：适配器实现 `model.CapsReporter`（`Caps() Caps{Window, MaxOut, Tools, MaxTools}`）就用它；没实现的按"支持工具、数量不限、窗口未知"，窗口未知（0）不拒绝。OpenAI 兼容适配器：`ContextWindow` 默认 0（网关背后模型不定），`MaxTools` 默认 128，`NoTools`；Anthropic：`ContextWindow` 默认 200000，`MaxTools` 默认不限，`NoTools`。
 - 估算用 `task.EstimateTokens`：JSON 字节数 / 4 + 1，与 7.2 默认预占同一个估算；按目标服务商实际会收到的消息算（去掉外来 reasoning）。输出预留：任务的 `MaxOut`，否则目标的 `Caps.MaxOut` / `OutputCap`，否则 4096。
-- 第 3 条（能否在目标组上切块压缩）依赖 `StepCompact`，它还没有实现：放不下就按校验失败处理（`check = "context"`），不迁移后再压缩。
+- 第 3 条用 5.3 的同一套判断（`canCompact`，按目标的 Caps 和组的 `CompactKeep` 算），通过则迁移提交里 `PC = StepCompact`；不通过才是 `check = "context"`，`detail` 写明哪一条放不下（某一轮放不进压缩请求，或请求和最新一轮本身就放不下）。迁移清掉任务学到的 `Window` 和 `CompactChunk`（换了服务商）；`SetClass`、类被删除时的 `Rehome` 同样，任务在等工具时保留 `StepTools`，下一条模型指令按新窗口量。
 - reasoning 由 vCore 在组请求时过滤（`forProvider`）：`Provider` 非空且不等于目标适配器 `Provider()` 的 reasoning 块不发，块全被去掉的消息不发，它两边同角色的消息并成一条（角色仍然交替，严格的服务商不会收到非法序列）；寄存器原样保留，迁回原服务商时还在。两个适配器本来也按 `Provider` 丢弃外来 reasoning（Anthropic 丢 thinking，OpenAI 兼容不渲染 reasoning），过滤在 vCore 做是为了对任何适配器成立。
 - 迁移提交：`State = Ready`、`PC = StepModel`、`ReadySince` 不变、`Retries` 不变、`migrated`（`{from, to, reason: "group_down"}`）；交还后进新组的就绪队列，触发新组扩容。准入计数随之从旧类移到新类。
 - 手动迁移 `m.SetClass(ctx, id, class)`：同样的校验，不通过返回 `*MigrateError`（`Check`、`Detail`），什么都不提交；`PinClass` 只禁止自动迁移，不拦操作员。只能在指令之间移动：任务在就绪队列、`Waiting(Group / Backoff / Reconcile)`、`Suspended` 时取出、提交、交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试。等旧组的 `Waiting(Group)` 改为 `Ready`，其他状态不变（退避保留 `WakeAt`）；`migrated` 的 `reason` 为 `manual`。
@@ -625,6 +649,7 @@ type RateReporter interface{ RateInfo(resp *Response, err error) *RateInfo }
 | `Overload` | 529、503 overloaded；无法区分的 429 | 窗口减半（每周期一次） | 保留预占 | 退避后重试，计重试次数 |
 | `Transient` | 其余 5xx、网络错误、超时 | 计入熔断 | 见 7.2 | 退避后重试，计重试次数；响应丢失时 `Unconfirmed + 1` |
 | `Permanent` | 其余 4xx | — | 退还预占 | `Failed`，`StopReason = "model_error"` |
+| `ContextLength` | 请求超出上下文窗口（OpenAI `context_length_exceeded`、Anthropic "prompt is too long"） | 算一次回答（同 `Permanent`） | 退还预占 | 学到更小的窗口，压缩后重发（5.3）；压不下 `Failed`，`StopReason = "context_overflow"` |
 
 退避：第 n 次连续失败等 `min(60s, 1s·2^(n-1))` 的全抖动（在 0 到该值之间均匀取），不短于服务商的 `RetryAfter`；第 8 次（`Config.MaxModelRetries`）连续失败时任务 `Failed`，`StopReason = "model_error"`，错误文字在 `failed` 事件里。`Retries` 记在 TCB 上随提交持久化，成功（包括截断）清零。每个重试决定都是一次提交：`Waiting(Backoff)` + `WakeAt` + `model_retry` 事件（`{class, attempt, delay_ms, wait, error}`，`attempt` 是计入的重试次数，限流时不变），提交之后调度器才挂定时器；`QuotaExhausted` 同样发 `model_retry`（`wait = "group"`）。失败的调用仍是一条指令（发 `step` 事件），但不计入 `Used.Steps`（4.6），`MaxSteps` 不约束它们，约束它们的是重试上限；带提示的限流（`RetryAfter`、`RateInfo.RetryAt` 或已耗尽维度的重置时间）不计重试次数，由服务商的重试时刻和限流器暂停节制；什么提示都没有的 429 和被误判的额度错误分不开，按临时错误退避并计入重试次数，也不暂停限流器，所以服务商一直这么回时任务以 `model_error` 结束，不会无限循环。退避步长到上限前不会溢出（`BackoffMax` 接近最大时长时也一样）。`Unknown`（谁也解释不了的错误）按 `Transient` 处理：网络抖动比请求本身有错更常见，重试上限兜住判断错的代价。适配器报了 `Canceled` 而任务并没有被取消（适配器自己超时、报成裸的 `DeadlineExceeded`）也按 `Transient`。
 
@@ -632,7 +657,7 @@ type RateReporter interface{ RateInfo(resp *Response, err error) *RateInfo }
 
 `context.Canceled` 永远不是可重试错误。永久错误的判断优先于报错文字里的"timeout"之类字样。
 
-实现（`model`）：`ErrClass` 取值 `Unknown`（零值）/ `RateLimited` / `QuotaExhausted` / `Overload` / `Transient` / `Permanent` / `Canceled`，`Retryable()` 只对 `RateLimited`、`Overload`、`Transient` 为真。适配器能解释的失败一律返回 `*model.Error{Class, Status, RetryAfter, Provider, Msg, Err, Rate}`，`Msg` 是状态码之外的响应片段，服务端回显的 key 会被抹掉。`model.Classify(err)` 按顺序判断：链上有 `context.Canceled` → `Canceled`（适配器说什么都不改变这一条）；链上有 `*model.Error` 且类别不是 `Unknown` → 用它的类别（所以永久错误不会被文字里的"timeout"翻案——这里根本不读文字）；`context.DeadlineExceeded` → `Canceled`；`net.Error`、`io.ErrUnexpectedEOF`、连接被重置 / 拒绝、`EPIPE`、`model.ErrResponseLost` → `Transient`；其余 `Unknown`。`model.ClassifyWith(adapter, err)` 先排除取消，再问适配器的 `Classifier`，答 `Unknown` 时回落到 `Classify`。
+实现（`model`）：`ErrClass` 取值 `Unknown`（零值）/ `RateLimited` / `QuotaExhausted` / `Overload` / `Transient` / `Permanent` / `Canceled` / `ContextLength`，`Retryable()` 只对 `RateLimited`、`Overload`、`Transient` 为真。适配器能解释的失败一律返回 `*model.Error{Class, Status, RetryAfter, Provider, Msg, Err, Rate}`，`Msg` 是状态码之外的响应片段，服务端回显的 key 会被抹掉。`model.Classify(err)` 按顺序判断：链上有 `context.Canceled` → `Canceled`（适配器说什么都不改变这一条）；链上有 `*model.Error` 且类别不是 `Unknown` → 用它的类别（所以永久错误不会被文字里的"timeout"翻案——这里根本不读文字）；`context.DeadlineExceeded` → `Canceled`；`net.Error`、`io.ErrUnexpectedEOF`、连接被重置 / 拒绝、`EPIPE`、`model.ErrResponseLost` → `Transient`；其余 `Unknown`。`model.ClassifyWith(adapter, err)` 先排除取消，再问适配器的 `Classifier`，答 `Unknown` 时回落到 `Classify`。
 
 **调用方的 Deadline 和单次请求超时是两回事。** 到达 `Classify` 的裸 `DeadlineExceeded` 是调用方的 ctx 到期，也就是任务的 Deadline（9.4），重试只会越过它，所以算 `Canceled`。单次请求超时（`http.Client.Timeout`、流读到一半卡住）发生时调用方还有时间，是服务商慢，算 `Transient`。两者在错误链上都表现为 `DeadlineExceeded`，只有适配器分得清：出错时看自己调用方的 `ctx.Err()`，非空就是 `Canceled`（`Err` 设为 `ctx.Err()`），为空就包成 `*model.Error{Class: Transient}`。
 
@@ -643,6 +668,7 @@ OpenAI 兼容适配器的分类，状态码先定，正文只在 429/403/402 里
 - 402 → `QuotaExhausted`。
 - 429 / 403 / 流内错误：服务商给的等待时间（`retry-after-ms`、`Retry-After` 秒数或 HTTP 日期、正文里 Google 的 `retryDelay`、"Resets in 120h41m12s"、"try again in 6m0s"，取最长）超过 1 小时 → `QuotaExhausted`，`RetryAfter` 带上这个时间；正文有 `insufficient_quota` / billing / credit balance / quota reached → `QuotaExhausted`；正文只说 quota 或 RESOURCE_EXHAUSTED、却没有短窗口的迹象（retry 头、正文里的等待时间、per minute / per second）→ `QuotaExhausted`。实测 CLIProxyAPI 在凭证全部冷却时回 429 + `rate_limit_error`，内层是上游的 "Individual quota reached … Resets in 120h41m12s"：外层说限流，实际是五天后才重置的额度耗尽，重试没有意义。Gemini 的每分钟配额同样说 "Quota exceeded"，但带 `retryDelay` 和 PerMinute，归 `RateLimited`。
 - 429 其余：有 `retry-after` 类头或正文等待时间 → `RateLimited`；只有 `x-ratelimit-*` / `anthropic-ratelimit-*` 头 → `RateLimited`，`RetryAfter` 取已耗尽维度里最晚的重置时间；什么都没有 → `Overload`。
+- 429 以外的 4xx（以及流内错误）正文说请求超出上下文窗口 → `ContextLength`：`context_length_exceeded`、"maximum context length"、"prompt is too long"、"exceed context limit"（`httperr.ContextTooLong`，两个适配器共用）。429 和 5xx 里出现这些字样不算。
 - 529 → `Overload`；5xx 正文含 overload → `Overload`；其余 5xx、408 → `Transient`；其余 4xx → `Permanent`。
 - 流内错误 `{"error":{...}}` 的数字 `code` 当作状态码；没有数字 code 时含 overload / rate limit → `Overload`，否则 `Transient`。
 - 网络错误、单次请求超时 → `Transient`；响应丢失同上。
@@ -659,7 +685,7 @@ OpenAI 兼容适配器的分类，状态码先定，正文只在 429/403/402 里
 
 OpenAI 兼容适配器把服务商返回的 tool_call 原样存进 `Part.Opaque`，回传给同一服务商时逐字节重放（Gemini 的 thought signature 就在这里）；发给其他服务商时用机器自己的 id 重新渲染。缓存标记由适配器负责：OpenAI 兼容服务自动缓存；Anthropic 在工具定义末尾和消息序列倒数第二条打 `cache_control`。请求按固定顺序组装（系统提示词 → 排好序的工具 → 消息），前两部分在任务生命周期内逐字节不变。
 
-Anthropic 原生适配器（`model/anthropic`，标准库实现，传输层复用 `openai.NewTransport`）：`POST {BaseURL}/messages`，头 `x-api-key` 与 `anthropic-version: 2023-06-01`；`max_tokens` 必填，默认 8192；`Provider()` 为 `anthropic:<模型>`。系统提示词放顶层 `system`；工具调用渲染为 `tool_use` 块，工具结果渲染为 user 消息里的 `tool_result` 块。Anthropic 要求角色交替、`tool_result` 紧跟它的 `tool_use` 回合，所以同角色的相邻消息合并成一条，合并后的 user 回合里 `tool_result` 块排在最前（插话、中途的 system 消息作为文本块排在后面），渲染为空的消息直接省略。id：同一 Provider 且有 `ProviderCallID` 时用服务商的 id，否则用机器 id，`[a-zA-Z0-9_-]` 以外的字符替换成 `_`；结果引用同一个 id。`input` 必须是 JSON 对象：空参数发 `{}`，不是对象（包括非法 JSON）的参数原文放在 `{"_raw": "..."}` 里，不丢信息。响应里除纯文本外的每个块（`tool_use`、`thinking`、`redacted_thinking`、未知类型）原样存进 `Opaque`；回放给同一 Provider 时逐字节发回（thinking 的签名绑定在产生它的模型上），发给其他 Provider 时 thinking 丢弃、tool_use 按中立字段重新渲染。流式下按 `index` 重组每个块：`text_delta`、`thinking_delta`、`signature_delta` 逐片拼接，`input_json_delta` 拼成完整的 `input`，键顺序沿用 `content_block_start`，组装结果与非流式响应的块一致；流在 `message_stop` 之前断开是错误。用量：`PromptTokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens`（`input_tokens` 只计最后一个缓存断点之后的部分），`CachedTokens = cache_read_input_tokens`。`stop_reason` 映射到与 OpenAI 兼容适配器相同的词：`end_turn`/`stop_sequence` → `stop`，`tool_use` → `tool_calls`，`max_tokens` → `length`。缓存标记 `cache_control: {"type":"ephemeral"}` 打在最后一个工具定义上，以及倒数第二条消息的最后一个可标记块上（thinking 块不能带标记，向前找）；标记插在块的右花括号之前、写进新的切片，块的其他字节和它来自的 `Opaque` 都不变。错误分类和 `RateInfo` 与 OpenAI 兼容适配器共用 `model/internal/httperr`（状态码、retry 提示、额度规则、限流头），在其上读正文的 `error.type`：共用的额度规则先定（CLIProxyAPI 的 `rate_limit_error` + "Resets in 120h41m12s" 仍是 `QuotaExhausted`），529 一律 `Overload`；然后 `rate_limit_error` → `RateLimited`（没有 retry 提示时取已耗尽维度的重置时间），`overloaded_error` → `Overload`，`api_error` / `timeout_error` → `Transient`，`billing_error` 和 400 的 "credit balance is too low" → `QuotaExhausted`，`invalid_request_error` / `authentication_error` / `permission_error` / `not_found_error` / `request_too_large` → `Permanent`；没有或不认识的 `error.type` 沿用共用结论。流内 `error` 事件按同样规则分类（状态码记 0）；流在 `message_stop` 之前结束、body 被截断、2xx 解析不了 → `Transient` 包 `ErrResponseLost`；取消与单次请求超时的区分同 OpenAI 兼容适配器。不带 Anthropic 专有信息的同一组状态码、头和正文，两个适配器的结论一致（有交叉测试）。
+Anthropic 原生适配器（`model/anthropic`，标准库实现，传输层复用 `openai.NewTransport`）：`POST {BaseURL}/messages`，头 `x-api-key` 与 `anthropic-version: 2023-06-01`；`max_tokens` 必填，默认 8192；`Provider()` 为 `anthropic:<模型>`。系统提示词放顶层 `system`；工具调用渲染为 `tool_use` 块，工具结果渲染为 user 消息里的 `tool_result` 块。Anthropic 要求角色交替、`tool_result` 紧跟它的 `tool_use` 回合，所以同角色的相邻消息合并成一条，合并后的 user 回合里 `tool_result` 块排在最前（插话、中途的 system 消息作为文本块排在后面），渲染为空的消息直接省略。id：同一 Provider 且有 `ProviderCallID` 时用服务商的 id，否则用机器 id，`[a-zA-Z0-9_-]` 以外的字符替换成 `_`；结果引用同一个 id。`input` 必须是 JSON 对象：空参数发 `{}`，不是对象（包括非法 JSON）的参数原文放在 `{"_raw": "..."}` 里，不丢信息。响应里除纯文本外的每个块（`tool_use`、`thinking`、`redacted_thinking`、未知类型）原样存进 `Opaque`；回放给同一 Provider 时逐字节发回（thinking 的签名绑定在产生它的模型上），发给其他 Provider 时 thinking 丢弃、tool_use 按中立字段重新渲染。流式下按 `index` 重组每个块：`text_delta`、`thinking_delta`、`signature_delta` 逐片拼接，`input_json_delta` 拼成完整的 `input`，键顺序沿用 `content_block_start`，组装结果与非流式响应的块一致；流在 `message_stop` 之前断开是错误。用量：`PromptTokens = input_tokens + cache_creation_input_tokens + cache_read_input_tokens`（`input_tokens` 只计最后一个缓存断点之后的部分），`CachedTokens = cache_read_input_tokens`。`stop_reason` 映射到与 OpenAI 兼容适配器相同的词：`end_turn`/`stop_sequence` → `stop`，`tool_use` → `tool_calls`，`max_tokens` → `length`。缓存标记 `cache_control: {"type":"ephemeral"}` 打在最后一个工具定义上，以及倒数第二条消息的最后一个可标记块上（thinking 块不能带标记，向前找）；标记插在块的右花括号之前、写进新的切片，块的其他字节和它来自的 `Opaque` 都不变。错误分类和 `RateInfo` 与 OpenAI 兼容适配器共用 `model/internal/httperr`（状态码、retry 提示、额度规则、限流头），在其上读正文的 `error.type`：共用的额度规则先定（CLIProxyAPI 的 `rate_limit_error` + "Resets in 120h41m12s" 仍是 `QuotaExhausted`），529 一律 `Overload`；然后 `rate_limit_error` → `RateLimited`（没有 retry 提示时取已耗尽维度的重置时间），`overloaded_error` → `Overload`，`api_error` / `timeout_error` → `Transient`，`billing_error` 和 400 的 "credit balance is too low" → `QuotaExhausted`，`invalid_request_error` / `authentication_error` / `permission_error` / `not_found_error` / `request_too_large` → `Permanent`（共用规则先判出的 `ContextLength` 优先：Anthropic 以 400 `invalid_request_error` 发 "prompt is too long: … tokens > … maximum" 和 "input length and `max_tokens` exceed context limit"）；没有或不认识的 `error.type` 沿用共用结论。流内 `error` 事件按同样规则分类（状态码记 0）；流在 `message_stop` 之前结束、body 被截断、2xx 解析不了 → `Transient` 包 `ErrResponseLost`；取消与单次请求超时的区分同 OpenAI 兼容适配器。不带 Anthropic 专有信息的同一组状态码、头和正文，两个适配器的结论一致（有交叉测试）。
 
 ## 12. 协议
 
@@ -692,7 +718,9 @@ type Event struct {
 
 `Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
-任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`done`、`failed`、`cancelled`、`steer_dropped`。
+任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`done`、`failed`、`cancelled`、`steer_dropped`。
+
+`compacted`：`{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（5.3）。`step` 的 `pc` 为 `model`、`tools` 或 `compact`。`model_retry` 的 `class` 可以是 `context_length`（`wait = "compact"`）。
 
 `migrated`：`{from, to, reason}`，`reason` 为 `group_down` 或 `manual`。`migrate_refused`：`{from, to, check, detail}`，本组熔断、`Fallback` 校验不过、任务留下等本组。`tool_result` 来自 L2 时带 `cached: true`。
 
@@ -710,6 +738,7 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 |---|---|
 | 模型请求失败 | 按第 11 节分类：限流、过载、临时错误退避重试，额度耗尽等执行组，永久错误 `Failed`（`model_error`） |
 | 截断且无内容 | `MaxOut` 乘 4 重做，最多两次，之后 `Failed`（`truncated`） |
+| 上下文超过阈值 / 服务商拒绝为超出上下文 | 压缩（5.3）；怎么压都放不下 `Failed`（`context_overflow`） |
 | 预占量永远放不下 | `Failed`（`too_large`） |
 | 工具出错 / 超时 / 越权 | 错误文本作为该调用的结果交给模型 |
 | 提交失败 | 记 ERROR；这次状态转换不存在，任务不再调度，发不出事件（因为事件也没提交）；`Status` 里标出该任务和错误 |
@@ -754,6 +783,7 @@ m, err := neumann.New(neumann.Config{
 err = m.Start(ctx)                         // 按 4.5 恢复，然后启动 vCore
 id, err := m.Submit(ctx, neumann.Instruction{Kind: "submit", Input: "...", Class: "big"}) // 返回即已持久化
 sub := m.Events(ctx, fromSeq)              // 可补读；m.EventLog / m.Load / m.Calls 直接读主存
+h, err := m.History(ctx, id)               // 完整历史：压缩换出的原始消息从归档取回，不含摘要
 err = m.Stop(ctx)                          // 停止取指，等在途指令和工具批次提交；ctx 到期则取消它们（被打断的不提交），再等 2 秒后关闭
 
 err = m.SetCores("little", 8)              // 固定窗口；多出的 vCore 执行完当前指令后退役
@@ -809,7 +839,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
    弹性 vCore 与多执行组（阶段 4 完成）：`Config.Groups`（单组字段保留为简写，窗口固定在 `Cores`）；每组的 `Scaler` 接进 vCore 循环（6.1 的实现说明），窗口通过 vCore 数真正约束并发；`IdleRetire` 空闲回收到 `Min`；`core_up` / `core_down` 带原因；`m.SetCores` / `m.AutoScale`；熔断时按 `Fallback` 链迁移，能力校验（`model.Caps`、`task.EstimateTokens`），失败按 `OnMigrateFail`；`m.SetClass` 手动迁移；`PinClass`；发往新服务商的请求不带外来 reasoning；多个组共享限流器；每组 `MaxQueued`；`m.Queue()`、`Status` 的每组 vCore 与队列；L2 接进机器（终态提交后 `ForgetTask`、派发用 `RunCached`、命中的 `tool_result` 带 `cached`、`Status.Cache`）；stdio 前端接上 `class` / `cores` / `autoscale` / `group_reset` / `queue`。
    验证：`TestCoresTrackProviderCapacity`（第 18 节 13，机器层，K = 4）、`TestOneEpochOfOverloadsHalvesTheWindowOnce`（14）、`TestTwoGroupsShareALimiter`（15）、`TestMigrationToTheFallbackGroup` / `TestMigrationRefusedByEachCheck`（17：成功、三种校验 × `wait` / `fail`、`PinClass`）、`TestCoresRetireOnlyBetweenInstructions`（19）、`TestSetClassMovesATask`、`TestSetCoresAndAutoScale`、`TestIdleCoresRetireDownToMin`、`TestStopShutsEveryCoreDown`（`shutdown`，goroutine 数回落）、`TestGroupConfigIsValidated`、`TestGroupMaxQueued`、`TestCachedToolResultThroughTheMachine`、`TestCrashAtEveryCommitPointWithAMigration`（两组，任务中途迁移，每个提交点前后各崩一次）。
    评审后修正：后备组恢复时唤醒链上停着的任务（`TestParkedTaskMigratesWhenItsFallbackReturns`：本组额度熔断；`TestParkedBacklogMovesWhenTheFallbackComesBack`：本组临时错误熔断，积压在后备组恢复后立刻迁走，不再每个半开周期一个）；类已删除的恢复任务移到默认组或以 `class_removed` 失败（`TestRecoveredTaskOfARemovedClass`）；`forProvider` 去掉空消息后合并同角色邻居。
-   没做：`StepCompact`（迁移的第 3 条校验因此总是"放不下"）、`suspend` / `resume` / `priority`。
+   没做：`suspend` / `resume` / `priority`。
+5. **上下文压缩**（5.3）：`StepCompact` 是一条模型指令，与模型步共用 `modelCall`；按组的 `CompactAt` / `CompactKeep` 触发和保留，按窗口切块，一块一条指令；摘要以 user 消息替换换出的轮次，原始消息进 Store 的归档（`CommitSet.Archive`、`Store.Archive`，两个 Store 和一致性套件），`m.History` 取回完整历史；`model.ContextLength` 从两个适配器分出来，触发压缩而不是失败；迁移的第 3 条校验接上，放不下但能压的任务迁移后先压缩；`context_overflow`。
+   验证：`TestCompactionTriggersAtTheThreshold`（阈值、组的 `CompactAt`、压缩请求都放得进窗口、计步）、`TestLongTaskCompactsAndCompletes`（60 轮对 4k 窗口：完成、每个请求配对、请求原样在头、最新轮次原样、历史完整）、`TestMultiChunkCompactionAfterAMigration`（64k → 4k 迁移，第一条指令是压缩，分块 i/n）、`TestOversizedMessageOverflows`（请求、最新一轮、放不进压缩请求的旧轮次）、`TestContextLengthRejectionCompactsThenSucceeds`（窗口未知、服务商拒绝 → 压缩 → 成功；压不下 → `context_overflow`）、`TestCompactionFailureBacksOff`、`TestCancelAndDeadlineDuringCompaction`、`TestCompactionCountsAgainstTheBudget`、`TestSteerDuringCompactionReachesTheNextStep`、`TestCompactionYieldsToACommittedCancel`、`TestNextChunk`、`TestCompactRequestEstimateIsExact`、两个适配器的 `TestCompactedRegistersRender` 和 `ContextLength` 分类用例、一致性套件的 `ArchiveAppendsWithItsTask` / `ArchiveIsAllOrNothing`、`TestCrashAtEveryCommitPointWithACompaction`（640 token 窗口，付款后中途压缩两次，每个提交点前后各崩一次，含压缩调用中途，重启后寄存器和历史都配对、完整）。
 
 5. **工具策略与人工批准**（9.7）：`Config.ToolPolicy` 在每个调用第一次派发之前决定（放行、拒绝、改参数、要批准），决定与调用同一次提交、写在调用记录上，恢复不再问；`Waiting(Approval)` 整轮等待，`m.Approve` 允许、拒绝或编辑，最后一个决定的提交派发这一轮；取消、Deadline、`Stop`、恢复、插话、`Status` / `Queue`；stdio 的 `approve`、`not_awaiting_approval`；`examples/approval`。
    验证：`TestToolPolicyDecidesEachCall`（放行、拒绝、改参数、改成非法 JSON：调用记录、事件、设备只见放行的、tool 消息顺序）、`TestToolPolicyPanicDenies`、`TestApprovalAllowDenyEdit`、`TestMixedRoundKeepsOrderAndPairing`（放行、待批准、拒绝混在一轮：批准前什么都不跑，之后顺序与配对不变）、`TestApproveErrors`、`TestApproveRightAfterTheAnnouncement`（收到事件立刻批准、两个操作员同时批准同一轮）、`TestCheckoutWaitGivesUpOnceTheTaskIsHandedBackElsewhere`、`TestConcurrentApprovalsAllGetTheTask`、`TestFiveApprovalsThenReadyAllReturn`、`TestEntryAfterAReadyHandBackGivesUp`、`TestCancelInsteadKeepsADenialWithItsEvent`、`TestRewriteArgsMustBeAnObject`、`TestCancelInsteadSettlesALoggedPlannedCall`（`execTools` 的提交被取消拒绝时，库里已有的待批准 `planned` 调用由 `cancelSet` 记 `cancelled`）、`TestCancelWhileAwaitingApproval`、`TestDeadlineWhileAwaitingApproval`、`TestSteerWaitsForTheApprovedRound`、`TestApprovalSurvivesARestart`（`Stop` 立即返回，重启后再宣布、不再问钩子）、`TestCrashAtEveryCommitPointWithAnApproval`（支付要批准，每个提交点前后各崩一次，批准在重启前或重启后给出，钩子不重问已决定的调用，支付至多一次）、`TestApproveOverTheWire`。
@@ -842,7 +874,7 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
 14. 同一周期内 10 个在途请求同时返回 `Overload`，窗口只减半一次。
 15. 两个执行组共享一个限流器：两组合计的请求速率不超过限流器的额度。
 16. `RateLimited` 不改变窗口；`QuotaExhausted` 熔断且不自动半开。
-17. 迁移校验：目标窗口放不下且无法切块压缩时，按 `OnMigrateFail` 处理；迁移成功时发往新服务商的请求不含原服务商的 reasoning 块。（切块压缩尚未实现，放不下即失败；断言在目标模拟模型实际收到的请求上做。）
+17. 迁移校验：目标窗口放不下且无法切块压缩时，按 `OnMigrateFail` 处理；能切块压缩时迁移，第一条指令是压缩；迁移成功时发往新服务商的请求不含原服务商的 reasoning 块。（断言在目标模拟模型实际收到的请求上做。）
 18. 中立格式经 OpenAI 和 Anthropic 适配器各往返一次，与原文一致（reasoning 块按规则保留或丢弃，`ProviderCallID` 按规则使用）。
 19. vCore 只在指令之间退役。
 20. 32 个并发 `Submit` 对 `MaxQueued = 4`：恰好 4 个被接受。
