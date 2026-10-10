@@ -7,6 +7,7 @@ import (
 	"strings"
 )
 
+// Role says who a message is from.
 type Role string
 
 const (
@@ -16,6 +17,7 @@ const (
 	RoleTool      Role = "tool"
 )
 
+// PartKind says what a Part holds.
 type PartKind string
 
 const (
@@ -45,6 +47,7 @@ type Part struct {
 	Opaque   json.RawMessage `json:"opaque,omitempty"`
 }
 
+// Message is one provider-neutral turn: a role and its ordered parts.
 type Message struct {
 	Role  Role   `json:"role"`
 	Parts []Part `json:"parts"`

@@ -1,9 +1,30 @@
 package task
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"slices"
 	"time"
 )
+
+// nameOf returns names[v], or an error naming the type when v is out of range.
+func nameOf(typ string, v int, names []string) ([]byte, error) {
+	if v < 0 || v >= len(names) {
+		return nil, fmt.Errorf("task: invalid %s %d", typ, v)
+	}
+	return []byte(names[v]), nil
+}
+
+// indexOf returns the index of name in names, or an error naming the type.
+func indexOf(typ string, name []byte, names []string) (int, error) {
+	for i, n := range names {
+		if n == string(name) {
+			return i, nil
+		}
+	}
+	return 0, fmt.Errorf("task: unknown %s %q", typ, name)
+}
 
 // State is where a task is in its life.
 type State int
@@ -27,6 +48,16 @@ func (s State) String() string {
 	return stateNames[s]
 }
 
+func (s State) MarshalText() ([]byte, error) { return nameOf("State", int(s), stateNames[:]) }
+
+func (s *State) UnmarshalText(b []byte) error {
+	i, err := indexOf("State", b, stateNames[:])
+	if err == nil {
+		*s = State(i)
+	}
+	return err
+}
+
 // Terminal reports whether the task has finished for good.
 func (s State) Terminal() bool { return s == Done || s == Failed || s == Cancelled }
 
@@ -48,6 +79,16 @@ func (p PC) String() string {
 	return pcNames[p]
 }
 
+func (p PC) MarshalText() ([]byte, error) { return nameOf("PC", int(p), pcNames[:]) }
+
+func (p *PC) UnmarshalText(b []byte) error {
+	i, err := indexOf("PC", b, pcNames[:])
+	if err == nil {
+		*p = PC(i)
+	}
+	return err
+}
+
 // WaitReason says what a Waiting task is waiting for.
 type WaitReason int
 
@@ -58,6 +99,25 @@ const (
 	WaitReconcile
 	WaitGroup
 )
+
+var waitNames = [...]string{"none", "io", "backoff", "reconcile", "group"}
+
+func (w WaitReason) String() string {
+	if w < 0 || int(w) >= len(waitNames) {
+		return "unknown"
+	}
+	return waitNames[w]
+}
+
+func (w WaitReason) MarshalText() ([]byte, error) { return nameOf("WaitReason", int(w), waitNames[:]) }
+
+func (w *WaitReason) UnmarshalText(b []byte) error {
+	i, err := indexOf("WaitReason", b, waitNames[:])
+	if err == nil {
+		*w = WaitReason(i)
+	}
+	return err
+}
 
 // Budget bounds a task. Phase 1 enforces MaxSteps only.
 type Budget struct {
@@ -82,7 +142,8 @@ func (u *Usage) Add(o Usage) {
 }
 
 // TCB is a task control block: everything a task carries between
-// instructions. Exactly one owner may modify it at a time (design §8).
+// instructions (fields: design §3.2). Exactly one owner may modify it at a
+// time (design §8).
 type TCB struct {
 	ID         string     `json:"id"`
 	State      State      `json:"state"`
@@ -98,20 +159,46 @@ type TCB struct {
 	Deny       []string   `json:"deny,omitempty"`
 	Budget     Budget     `json:"budget"`
 	Used       Usage      `json:"used"`
-	StopReason string     `json:"stop_reason,omitempty"`
-	Version    int64      `json:"version"`
+	// CallSeq is how many tool call ids the task has handed out; the next one
+	// is c-<CallSeq+1>. It never decreases, so ids stay unique after compaction
+	// removes old messages.
+	CallSeq    int    `json:"call_seq"`
+	StopReason string `json:"stop_reason,omitempty"`
+	Version    int64  `json:"version"`
 }
 
-// Clone returns a deep copy. The store keeps clones so that the owner can go
-// on mutating its TCB without changing what was committed.
+// Clone returns a deep copy, or nil for a nil receiver. The store keeps clones
+// so that the owner can go on mutating its TCB without changing what was
+// committed. It copies field by field rather than through JSON: raw bytes
+// (a truncated Args, a provider's Opaque block) must survive byte-for-byte.
 func (t *TCB) Clone() *TCB {
-	b, err := json.Marshal(t)
-	if err != nil {
-		panic("task: marshal TCB: " + err.Error())
+	if t == nil {
+		return nil
 	}
-	var c TCB
-	if err := json.Unmarshal(b, &c); err != nil {
-		panic("task: unmarshal TCB: " + err.Error())
+	c := *t
+	c.Allow = slices.Clone(t.Allow)
+	c.Deny = slices.Clone(t.Deny)
+	if t.Tools != nil {
+		c.Tools = make([]ToolSpec, len(t.Tools))
+		for i, ts := range t.Tools {
+			ts.Schema = json.RawMessage(bytes.Clone(ts.Schema))
+			c.Tools[i] = ts
+		}
+	}
+	if t.Regs != nil {
+		c.Regs = make([]Message, len(t.Regs))
+		for i, m := range t.Regs {
+			if m.Parts != nil {
+				parts := make([]Part, len(m.Parts))
+				for j, p := range m.Parts {
+					p.Args = json.RawMessage(bytes.Clone(p.Args))
+					p.Opaque = json.RawMessage(bytes.Clone(p.Opaque))
+					parts[j] = p
+				}
+				m.Parts = parts
+			}
+			c.Regs[i] = m
+		}
 	}
 	return &c
 }
@@ -127,14 +214,4 @@ func (t *TCB) LastAnswer() string {
 		}
 	}
 	return ""
-}
-
-// CallCount is how many tool calls the task has made; the next call's id is
-// "c-<CallCount()+1>".
-func (t *TCB) CallCount() int {
-	n := 0
-	for _, m := range t.Regs {
-		n += len(m.ToolCalls())
-	}
-	return n
 }
