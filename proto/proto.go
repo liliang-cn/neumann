@@ -1,0 +1,68 @@
+// Package proto is the machine's wire format: instructions in, events out.
+package proto
+
+import (
+	"encoding/json"
+
+	"github.com/liliang-cn/neumann/task"
+)
+
+// Instruction kinds. Phase 1 implements submit and steer.
+const (
+	KindSubmit = "submit"
+	KindSteer  = "steer"
+)
+
+// Instruction is everything the machine accepts from outside.
+type Instruction struct {
+	Kind     string       `json:"kind"`
+	TaskID   string       `json:"task_id,omitempty"`
+	Input    string       `json:"input,omitempty"`
+	Class    string       `json:"class,omitempty"`
+	Priority int          `json:"priority,omitempty"`
+	Budget   *task.Budget `json:"budget,omitempty"`
+	Allow    []string     `json:"allow,omitempty"`
+	Deny     []string     `json:"deny,omitempty"`
+}
+
+// Event kinds.
+const (
+	EvAccepted     = "accepted"
+	EvStep         = "step"
+	EvToolCall     = "tool_call"
+	EvToolResult   = "tool_result"
+	EvUsage        = "usage"
+	EvAnswer       = "answer"
+	EvDone         = "done"
+	EvFailed       = "failed"
+	EvCancelled    = "cancelled"
+	EvSteerDropped = "steer_dropped"
+)
+
+// Event is something that happened, published only after it was committed.
+// Seq is global and TaskSeq is per task; the store assigns both.
+type Event struct {
+	Kind    string          `json:"kind"`
+	TaskID  string          `json:"task_id,omitempty"`
+	Seq     int64           `json:"seq"`
+	TaskSeq int64           `json:"task_seq"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+// NewEvent builds an uncommitted event; data is marshalled to JSON.
+func NewEvent(kind, taskID string, data any) Event {
+	ev := Event{Kind: kind, TaskID: taskID}
+	if data != nil {
+		b, err := json.Marshal(data)
+		if err != nil {
+			panic("proto: marshal event data: " + err.Error())
+		}
+		ev.Data = b
+	}
+	return ev
+}
+
+// Terminal reports whether the event ends its task.
+func (e Event) Terminal() bool {
+	return e.Kind == EvDone || e.Kind == EvFailed || e.Kind == EvCancelled
+}
