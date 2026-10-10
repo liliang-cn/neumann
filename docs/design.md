@@ -94,7 +94,7 @@ type TCB struct {
     State      State
     PC         PC
     Wait       WaitReason
-    WakeAt     time.Time       // WaitBackoff 时有效
+    WakeAt     time.Time       // WaitBackoff 时有效；只在本次运行内有意义，重启后任务直接就绪
     Class      string          // 执行组；迁移时改变
     PinClass   bool            // true = 禁止迁移
     Priority   int             // 0 = 交互，1 = 后台
@@ -108,8 +108,9 @@ type TCB struct {
     Used       Usage           // 已确认的用量（见 4.6）
     Unconfirmed int            // 已发出、但没有拿到响应的模型请求数
     CallSeq    int             // 已分配的工具调用 id 数；下一个是 c-<CallSeq+1>，只增不减，压缩后 id 也不重复
-    Retries    int
-    MaxOut     int
+    Retries    int             // 连续的可重试模型失败（过载、临时错误）；成功清零；限流不计
+    MaxOut     int             // 本任务模型调用的输出上限，0 = 适配器默认
+    Truncations int            // 因"截断且无内容"放大过 MaxOut 的次数，最多 2
     StopReason string
     Version    int64           // 每次提交 +1
 }
@@ -227,7 +228,7 @@ type CallRecord struct {
 1. 加载所有未结束的 TCB、它们的调用记录和未送达的中断。
 2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`）。`Running` 在模型调用之前提交，含义是"请求可能已经发出"：提交之后、调用之前被停机打断时，会多算一次未确认。这一步要送达的插话在 `Running` 提交之后才合并，崩溃不会留下"上下文里有、中断表里却还未送达"的插话。预算按 `Used.Steps + Unconfirmed` 计，反复崩溃的任务不会越过预算重发。
 3. 调用记录按 4.2 的表处理。
-4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；`Waiting(Backoff)` 按 `WakeAt` 重设定时器；所有未结束任务重设 Deadline 定时器。
+4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；所有未结束任务重设 Deadline 定时器。`Waiting(Backoff)` 和 `Waiting(Group)` 提交为 `Ready`（`ReadySince` 不变，`Retries` 保留）：退避定时器和熔断状态都不持久，重启后各组从闭合开始，退避从下一次失败重新起算。
 5. 每个执行组按 `Min` 启动 vCore，`W` 回到 `Initial`；限流器从空状态开始，由服务商响应头重新校准（7.3）。
 
 ### 4.6 计量
@@ -264,13 +265,13 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
 
 1. 检查 `MaxSteps`、`MaxTokens`；超出则提交 `Done`，`StopReason = "budget"`，答案是最后一条 assistant 文本，**不算一条模型指令**（不发 step 事件）。未送达的插话由终态提交报告为 `steer_dropped`。Deadline 由调度器负责（第 9 节）。
 2. 寄存器 token 估算超过 `0.7 × 本组模型窗口`（窗口未知时用 `Config.CompactAt`，默认 60000）时，改设 `PC = StepCompact`，提交后结束本步。
-3. 向本组的限流器预占额度（7.2），通过适配器调一次模型。请求以任务的 context 发出，取消会立刻中断它。
+3. 本组熔断中（不闭合、也没到放探测请求的时候）：不预占、不调用，任务提交 `Waiting(Group)`。否则向本组的限流器预占额度（7.2），等额度时 vCore 持着任务、什么都不提交；拿到额度后 `Admit`，不放行则退还额度、任务转 `Waiting(Group)`；放行则提交 `Running`，通过适配器调一次模型。等额度和调用都以任务的 context 进行，取消和 Deadline 会立刻打断。调用结束先与限流器结算（7.2），再把结果报给执行组（第 6 节），然后才组装任务自己的提交。
 4. 结果：
    - **有工具调用**：assistant 消息原样追加，调用记录写为 `planned`，`PC = StepTools`。
    - **最终文本**：调用期间到达了插话，则文本作为 assistant 轮次，`PC = StepModel`，**插话留在中断表里不合并**：下一条模型指令开头再送达，若下一步因预算或模型出错而结束，它由终态提交报告为 `steer_dropped`。没有插话则 `Done`。
-   - 模型调用 panic 等同于模型出错：任务 `Failed`，原因 `model panicked: …`。
-   - **截断且没有内容**：`MaxOut` 乘 4 重做，最多两次，之后 `Failed`。
-5. 提交里带 `usage` 事件（已确认用量）。出错见第 13 节。
+   - 模型调用 panic 等同于永久错误：任务 `Failed`，`StopReason = "model_error"`，事件里的错误是 `model panicked: …`；不报给执行组（说明不了服务商的状况）。
+   - **截断且没有内容**（`finish_reason = "length"`，没有文本也没有工具调用）：`MaxOut` 乘 4 重做（`MaxOut` 为 0 时从适配器的 `model.OutputCap` 起算，没有则 4096），整个任务最多两次，第三次 `Failed`，`StopReason = "truncated"`。重做是一条计数的指令（`Used.Steps + 1`），发 `model_retry`（`class = "truncated"`，带新的 `max_out`），这一步合并的插话退回未送达，重做时再送达。放大后的 `MaxOut` 留在任务上。
+5. 提交里带 `usage` 事件（已确认用量）。成功（包括截断）清零 `Retries`。出错见第 11、13 节。
 
 ### 5.2 execTools
 
@@ -315,7 +316,9 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 
 - 同组连续 5 次指令以临时错误失败（成功一次清零），或适配器报告额度耗尽（第 11 节），本组熔断：停止发请求，发 `group_down`。
 - 临时错误熔断 30 秒后半开：放一个请求试探，成功则 `group_up`。额度耗尽熔断不自动半开，等操作员 `group_reset`。
-- 熔断期间，本组就绪的任务转 `Waiting(Group)`。没有 `Fallback`、或任务 `PinClass` 时，就这样等到恢复或 Deadline。
+- 熔断期间，本组就绪的任务转 `Waiting(Group)`：惰性的，vCore 取到它时才提交，不调用、不预占。没有 `Fallback`、或任务 `PinClass` 时，就这样等到恢复或 Deadline。
+- 等在 `Waiting(Group)` 的任务没人取，所以有任务停进来时挂一个半开定时器（机器时钟）：到放探测请求的时刻，唤醒最早的一个去发探测，并再挂一次（探测的任务被取消、探测丢失时，`OpenFor` 之后换一个）。探测成功（或得到任何非临时错误的回答）即 `group_up`，唤醒本组全部 `Waiting(Group)` 任务。额度耗尽熔断不挂定时器，只有 `m.GroupReset(ctx, class)`：熔断复位、`group_up`（带 `reset`）、唤醒。唤醒 = 提交 `Ready`，`ReadySince` 不变。任务停进来与 `group_up` 交错时，停进来的一方交还后再看一次熔断状态，已闭合就自己唤醒，不会漏。
+- `group_down` / `group_up` 是机器事件（没有任务），单独提交：熔断状态不持久，没有可以一起提交的状态。
 
 ### 6.3 迁移
 
@@ -368,25 +371,40 @@ func (l *Limiter) Status() Status          // 各维度 Limit、Used、Available
 ### 7.2 预占与结算由适配器定义
 
 ```go
-type Adapter interface {
-    // ...
-    Reserve(req Request) map[string]int64           // 发请求前各维度预占多少
+type Metered interface { // 可选
+    Reserve(req Request) map[string]int64               // 发请求前各维度预占多少
     Settle(req Request, resp Response) map[string]int64 // 拿到响应后各维度实际用了多少
-    RateInfo(resp Response, err error) *RateInfo     // 从响应头读到的剩余额度和重置时间
+}
+type RateReporter interface { // 可选
+    RateInfo(resp *Response, err error) *RateInfo // 从响应头读到的剩余额度和重置时间
 }
 ```
 
+适配器没实现 `Metered` 时用默认：预占 `requests` 1，`tokens` 和 `input_tokens` 按请求 JSON 字节数 / 4 粗估，`output_tokens` 取 `MaxOut`（没有就是适配器的 `OutputCap`，再没有 4096）；结算按响应的 `Usage`（`tokens` = 输入 + 输出），响应没报用量时只结算 `requests`，token 维度保持预占量。
+
 不同服务商算法不同，所以不统一估算：例如有的服务商把请求里的输出上限也计入 TPM，有的把输入、输出分开限制，缓存命中的 token 可能不计入。预占在请求发出前从各限流器扣除，响应后按 `Settle` 多退少补；请求失败且服务商未处理时 `Cancel` 全额退回。`Settle`、`Cancel` 只有第一次生效。
+
+调用结束后的处理：
+
+| 结果 | 预占 |
+|---|---|
+| 成功（含截断） | `Settle(实际用量)`，再 `Observe(Response 的 RateInfo)` |
+| `RateLimited`、`Overload`；`Transient` 且响应丢失（`ErrResponseLost`）或带状态码（5xx）；被取消打断的调用 | `Settle(预占量)`：服务商可能已经计数；然后 `Observe(Error 的 RateInfo)` |
+| `Transient` 不带状态码也没丢响应（连接被拒绝、拨号失败：请求没出去）；`Permanent`；`QuotaExhausted`；适配器 panic；调用前就取消 | `Cancel()` |
+
+`Unknown` 按 `Transient` 处理（见第 11 节），状态码为 0，所以全额退回。预占量超过某维度 `Limit`（`ErrTooLarge`）：任务 `Failed`，`StopReason = "too_large"`。
 
 多退：缩小这次预占自己的那条记录，它仍按原时刻过期（已过期的没有可退的）。少补：差额按**结算时刻**新记一条，可能让窗口超出 `Limit`，从而推迟之后的预占——一个流式调用跑了九十秒才报出超额的 token，这些 token 是刚用掉的，按发出时刻记会让它们还没算进去就过期了。`actual` 里没有的维度保持预占量（例如 `requests` 总是 1）。
 
-预占发生在 vCore 取到任务、组装好请求之后（预占量取决于请求）。额度不够时，vCore 持着这个任务等待额度，等待可以被取消和 Deadline 打断；本组其他 vCore 也各自在预占处等待，所以本组实际上暂停了。其他执行组不受影响，除非它们引用了同一个限流器。发 `throttled` 事件。
+预占发生在 vCore 取到任务、组装好请求之后（预占量取决于请求），在 `Running` 提交之前：等额度的任务状态不变。额度不够时，vCore 持着这个任务等待额度，等待可以被取消和 Deadline 打断（任务的 context），打断后按取消做最终提交；本组其他 vCore 也各自在预占处等待，所以本组实际上暂停了。其他执行组不受影响，除非它们引用了同一个限流器。等待超过 50ms 时发机器事件 `throttled`（`{task, class, waited_ms}`），随下一次提交落盘。`Stop` 停止取指时，等额度的 vCore 放弃等待、把原样的任务交还调度器：什么都没提交，下次启动照常执行。
 
 ### 7.3 用服务商的反馈校准
 
 适配器从响应头（剩余请求数、剩余 token、重置时间、`retry-after`）读出 `RateInfo`，转成 `limit.Info{Dims: map[string]limit.Observed{维度: {Remaining, ResetAt}}}` 交给 `Observe`，限流器据此修正自己的计数：本地以为还有额度但服务商说没了，以服务商为准——该维度的可用量封顶为服务商报的剩余量，直到它给的 `ResetAt`；期间批出的预占从这个数里扣，这些预占的退款也退回这个数。服务商报的比本地多的忽略：响应乱序到达，晚到的响应头描述的是更早的时刻。没有未来 `ResetAt` 的报告也忽略：不知道该信多久。同一个响应先 `Settle` 再 `Observe`，否则这次请求的用量会被算两遍。
 
-`RateLimited`（第 11 节）用 `PauseUntil(retry-after)`：在那之前不批任何预占，暂停只会延长不会缩短。`Overload` 不归限流器管，是执行组拥塞窗口的事（6.1）。
+`RateLimited`（第 11 节）用 `PauseUntil(重试时刻)`：在那之前不批任何预占，暂停只会延长不会缩短，本组其他任务因此也等，而不是各自再挨一次 429。重试时刻依次取：`Error.RetryAfter`（按机器时钟换算）、`RateInfo.RetryAt`、已耗尽维度里最晚的 `ResetAt`、都没有则一个退避基数（1s）。没有配置限流器时只有这个任务自己等。`Overload` 不归限流器管，是执行组拥塞窗口的事（6.1）。
+
+限流器没有给 `Clock` 时用机器的时钟（假时钟同样驱动限流等待）。
 
 重启后限流器从空开始，第一个响应就会把它校准。
 
@@ -422,7 +440,9 @@ type Adapter interface {
 
 ### 9.4 Deadline
 
-调度器为每个有 Deadline 的任务维护一个定时器，**与任务处于什么状态无关**：就绪、等待工具、退避、待核对、熔断等待、挂起、正在某个 vCore 上执行，都会触发。触发时按"取消"处理（9.5），`StopReason = "deadline"`，终态为 `Failed`。
+调度器为每个有 Deadline 的任务维护一个定时器，**与任务处于什么状态无关**：就绪、等待工具、退避、待核对、熔断等待、挂起、正在某个 vCore 上执行（包括在限流器上等额度），都会触发。触发时按"取消"处理（9.5），`StopReason = "deadline"`，终态为 `Failed`。
+
+退避定时器也归调度器：任务以 `Waiting(Backoff)` 交还时按 `WakeAt` 挂上，到点由唤醒方取出、提交 `Ready`（`ReadySince` 不变）、交还；被取消、取出或调度器关闭时停掉。唤醒提交被取消拒绝（`ErrCancelPending`）时就地做最终提交。机器停止后不再唤醒，任务留在 `Waiting(Backoff)`，下次启动按 4.5 就绪。
 
 ### 9.5 取消
 
@@ -436,7 +456,7 @@ type Adapter interface {
    - 任务转 `Cancelled`，未送达的插话各一个 `steer_dropped`。
 4. 取消之后才到达的工具结果，调用记录标为 `late` 并保存结果，不进入寄存器，发 `tool_late` 事件。
 
-挂起和熔断等待中的任务取消时没有在途调用，直接由调度器做最终提交。
+挂起、退避和熔断等待中的任务取消时没有在途调用，由取消方从等待集合取出、直接做最终提交（退避定时器一并停掉）。在限流器上等额度的任务归 vCore 持有：取消信号打断等待，vCore 做最终提交。
 
 与任务自己的结束同时到达的取消：任务按它自己的提交结束，取消中断随终态提交被标为已送达，不产生效果。
 
@@ -522,11 +542,15 @@ type RateReporter interface{ RateInfo(resp *Response, err error) *RateInfo }
 
 | 类别 | 例子 | 执行组 | 限流器 | 任务 |
 |---|---|---|---|---|
-| `RateLimited` | 429 且带限流响应头或 `retry-after` | 不变 | 按 `RateInfo` 暂停到重置时间 | 回就绪队列，不计重试次数 |
-| `QuotaExhausted` | 额度或账单耗尽 | 熔断，不自动半开 | — | `Waiting(Group)` 或迁移 |
-| `Overload` | 529、503 overloaded；无法区分的 429 | 窗口减半（每周期一次） | 退避 | 退避后重试 |
-| `Transient` | 其余 5xx、网络错误、超时 | 计入熔断 | — | 退避后重试，`Unconfirmed + 1` |
-| `Permanent` | 其余 4xx | — | 退还预占 | `Failed` |
+| `RateLimited` | 429 且带限流响应头或 `retry-after` | 不变 | 按 `RateInfo` 暂停到重置时间 | `Waiting(Backoff)` 到重试时刻（7.3），不计重试次数 |
+| `QuotaExhausted` | 额度或账单耗尽 | 熔断，不自动半开 | 退还预占 | `Waiting(Group)` 或迁移 |
+| `Overload` | 529、503 overloaded；无法区分的 429 | 窗口减半（每周期一次） | 保留预占 | 退避后重试，计重试次数 |
+| `Transient` | 其余 5xx、网络错误、超时 | 计入熔断 | 见 7.2 | 退避后重试，计重试次数；响应丢失时 `Unconfirmed + 1` |
+| `Permanent` | 其余 4xx | — | 退还预占 | `Failed`，`StopReason = "model_error"` |
+
+退避：第 n 次连续失败等 `min(60s, 1s·2^(n-1))` 的全抖动（在 0 到该值之间均匀取），不短于服务商的 `RetryAfter`；第 8 次（`Config.MaxModelRetries`）连续失败时任务 `Failed`，`StopReason = "model_error"`，错误文字在 `failed` 事件里。`Retries` 记在 TCB 上随提交持久化，成功（包括截断）清零。每个重试决定都是一次提交：`Waiting(Backoff)` + `WakeAt` + `model_retry` 事件（`{class, attempt, delay_ms, wait, error}`，`attempt` 是计入的重试次数，限流时不变），提交之后调度器才挂定时器；`QuotaExhausted` 同样发 `model_retry`（`wait = "group"`）。每次失败的调用都是一条指令（`Used.Steps + 1`，包括限流），所以 `MaxSteps` 也约束重试。`Unknown`（谁也解释不了的错误）按 `Transient` 处理：网络抖动比请求本身有错更常见，重试上限兜住判断错的代价。适配器报了 `Canceled` 而任务并没有被取消（适配器自己超时、报成裸的 `DeadlineExceeded`）也按 `Transient`。
+
+`Unconfirmed` 只在 `errors.Is(err, ErrResponseLost)` 时加一（以及原有的：调用被取消打断、重启时发现 `Running`）；连接被拒绝不加（18.12）。
 
 `context.Canceled` 永远不是可重试错误。永久错误的判断优先于报错文字里的"timeout"之类字样。
 
@@ -586,9 +610,9 @@ type Event struct {
 }
 ```
 
-任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`migrated`、`reconcile_needed`、`done`、`failed`、`cancelled`、`steer_dropped`。
+任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`migrated`、`reconcile_needed`、`done`、`failed`、`cancelled`、`steer_dropped`。
 
-机器事件：`core_up`、`core_down`、`throttled`、`group_down`、`group_up`。
+机器事件（`task_id` 为空）：`core_up`、`core_down`、`throttled`（`{task, class, waited_ms}`）、`group_down`（`{class, cause}`）、`group_up`（`{class}`，操作员复位时带 `reset`）。
 
 stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。
 
@@ -598,8 +622,9 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 
 | 情况 | 处理 |
 |---|---|
-| 模型请求失败 | 按第 11 节分类 |
-| 截断且无内容 | 提高输出上限重做，最多两次 |
+| 模型请求失败 | 按第 11 节分类：限流、过载、临时错误退避重试，额度耗尽等执行组，永久错误 `Failed`（`model_error`） |
+| 截断且无内容 | `MaxOut` 乘 4 重做，最多两次，之后 `Failed`（`truncated`） |
+| 预占量永远放不下 | `Failed`（`too_large`） |
 | 工具出错 / 超时 / 越权 | 错误文本作为该调用的结果交给模型 |
 | 提交失败 | 记 ERROR；这次状态转换不存在，任务不再调度，发不出事件（因为事件也没提交）；`Status` 里标出该任务和错误 |
 | 进程崩溃 | 按 4.5 恢复 |
@@ -609,7 +634,7 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 
 ## 14. 观测
 
-`m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
+`m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态（当前实现：`Status.Groups` 给出窗口与熔断，含下一次放探测的时刻；`Status.Limiters` 给出各限流器的 `limit.Status`）；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
 
 ## 15. 公开 API
 
@@ -669,6 +694,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
    已完成：`Commit` 在有未送达取消时只接受取消的最终提交、拒绝 `dispatched`（`ErrCancelPending`，两个 Store 同一规则，一致性套件覆盖），取消信号到达前提交被拒的一方据此最终提交，先提交的取消一定赢；`m.Cancel(ctx, id)` 提交取消中断（`Text` 是原因）后返回，结束的任务返回 `ErrFinished`、不存在的返回 `ErrNotFound`；调度器持有每个任务的 context 和 Deadline 定时器（`Budget.Deadline`，绝对时间，`Submit` 时给出），不论状态；没人在干活的任务（就绪、待核对、挂起，以后的退避、熔断等待）由取消方 `Sched.Cancel` 取出并做最终提交，vCore 或工具批次持有的任务只收到信号，交还时 `Requeue` 在同一把锁下拒收，由持有方最终提交——取消不会落在提交和交还之间；总线 `Run` 区分"没碰到设备"（之前没发过的才是 `cancelled`）、"设备跑着时放弃"（`unknown` + 带 `cancelled` 标记的 `reconcile_needed`，任务不等）和结果，放弃之后设备的真实结果在最终提交之后记为 `late` 并发 `tool_late`，不进寄存器；模型调用期间被取消算一次 `Unconfirmed`，已回来的工具调用记为 `cancelled`、从不派发；Deadline 已过的任务不再开始任何指令、不再把任何调用交给总线（包括恢复和 `resolve` 的批次），即使定时器还没跑；晚到结果只在最终提交落盘后记录，`Stop` 等在途的晚到提交；恢复时有未完成的取消中断就直接做最终提交，Deadline 重新挂上、已过的立即触发。
    验证：`TestCrashAtEveryCommitPoint*`（支付、执行中取消、执行中超时、模型调用期间取消已提交但未通知（要工具 / 给答案）、只读调用里超时后重启六种任务，每个提交点之前和之后各崩一次，SQLite；"之后"= 提交已落盘、调用方没收到）、`TestAcceptedInputSurvivesACrash`（第 18 节 9）、`TestDeadlineFiresInEveryState`（第 18 节 10：就绪、等工具、待核对、执行中、已过期）、`TestCancelWhileToolsInFlight` / `TestCancelledPlannedCallsNeverRun` / `TestLateResultIsRecordedLate`（第 18 节 11）。
 4. **自适应伸缩、限流器与迁移**：拥塞窗口、限流器、错误分类、熔断、迁移校验、第二个适配器。
+   已完成（错误处理接进 vCore 循环，vCore 数仍固定、仍只有一个组）：`execModel` 用 `model.ClassifyWith` 分类，按第 11 节处理每一类；`Waiting(Backoff)` 带 `WakeAt` 提交后由调度器挂定时器，到点提交 `Ready`、`ReadySince` 不变；`Retries` 持久化、成功清零、默认 8 次；截断无内容按 `MaxOut` × 4 重做两次（`model.Request.MaxOut`，两个适配器都发 `max_tokens`）；`Config.Limiters` / `Config.Limits`，调用前 `ReserveAll`（等额度在 `Running` 提交之前、可被取消/Deadline 打断、`Stop` 时原样交还），调用后先结算再校准，按 7.2 的表退还，`RateLimited` 暂停限流器；每个类一个 `core.Group`（`internal/group` 的窗口与熔断），调用前 `Admit`、调用后 `Report`，熔断时任务惰性转 `Waiting(Group)`，半开定时器唤醒最早的任务去探测，`group_up` 唤醒全部，`m.GroupReset` 复位额度熔断；`Status` 带每组窗口/熔断和每个限流器的快照；重启时 `Waiting(Backoff)` / `Waiting(Group)` 直接就绪。新提交路径（退避、等组、截断重做、唤醒）都遵守 4.1 规则 4。
+   验证：`TestRateLimitedWaitsWithoutSpendingRetries`、`TestOverloadAndTransientBackOff`、`TestModelRetriesRunOut`、`TestPermanentFailsAtOnce`、`TestOnlyALostResponseIsUnconfirmed`（第 18 节 12）、`TestTruncatedTurnIsRedoneWithALargerCap`、`TestQuotaExhaustedHoldsTheGroupUntilReset`（第 18 节 16）、`TestTransientFailuresOpenTheBreaker`、`TestSharedLimiterSerialisesCalls`、`TestCancelAndDeadlineWhileWaiting`（第 18 节 10 的退避、熔断等待，外加等额度）、`TestCrashAtEveryCommitPointWithModelFailures`（同一任务里临时错误 + 限流，每个提交点前后各崩一次）、`TestSettleBeforeObserve`、`TestRetryCommitsYieldToACommittedCancel`。
+   留给下一步：弹性 vCore（`Scaler`、`core_up` / `core_down`、`SetCores` / `AutoScale`）、窗口真正限制并发（现在 `W` 只记录不约束）、多个执行组与 `Fallback` 迁移、`Config.Groups`。
 
 ## 18. 测试
 
