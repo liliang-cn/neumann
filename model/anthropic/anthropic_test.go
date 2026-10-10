@@ -548,3 +548,25 @@ func TestProviderAndDefaults(t *testing.T) {
 	var _ model.Streamer = a
 	var _ model.Warmer = a
 }
+
+// A request's own MaxOut wins over the adapter's max_tokens; without one the
+// adapter's (or the default) is sent.
+func TestMaxOutWinsOverTheDefault(t *testing.T) {
+	s := newServer(t, 200, textReply)
+	a := New(s.URL+"/v1", "sk-ant-test", "claude-x")
+	req := model.Request{Messages: []task.Message{task.Text(task.RoleUser, "hi")}}
+	for i, c := range []struct {
+		adapter, req int
+		want         float64
+	}{{0, 0, 8192}, {0, 32768, 32768}, {1000, 0, 1000}, {1000, 4000, 4000}} {
+		a.MaxTokens, req.MaxOut = c.adapter, c.req
+		call(t, a, req)
+		if got := s.body(i)["max_tokens"]; got != c.want {
+			t.Fatalf("adapter %d request %d: max_tokens %v, want %v", c.adapter, c.req, got, c.want)
+		}
+		if a.MaxOut() != int(c.want) && c.req == 0 {
+			t.Fatalf("MaxOut %d", a.MaxOut())
+		}
+	}
+	var _ model.OutputCap = a
+}

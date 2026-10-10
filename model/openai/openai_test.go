@@ -195,3 +195,27 @@ func TestDeepSeekCacheHitField(t *testing.T) {
 		t.Fatalf("cached %d", resp.Usage.CachedTokens)
 	}
 }
+
+// A request's own MaxOut is sent as max_tokens and wins over MaxTokens; with
+// neither, no max_tokens is sent at all.
+func TestMaxOutIsSentAsMaxTokens(t *testing.T) {
+	s := newServer(t, 200, textReply)
+	a := New(s.URL+"/v1", "sk-test", "m1")
+	req := model.Request{Messages: []task.Message{task.Text(task.RoleUser, "hi")}}
+	for i, c := range []struct {
+		adapter, req int
+		want         any
+	}{{0, 0, nil}, {0, 16384, float64(16384)}, {1000, 0, float64(1000)}, {1000, 4000, float64(4000)}} {
+		a.MaxTokens, req.MaxOut = c.adapter, c.req
+		if _, err := a.Call(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		if got := s.body(i)["max_tokens"]; got != c.want {
+			t.Fatalf("adapter %d request %d: max_tokens %v, want %v", c.adapter, c.req, got, c.want)
+		}
+		if a.MaxOut() != c.adapter {
+			t.Fatalf("MaxOut %d", a.MaxOut())
+		}
+	}
+	var _ model.OutputCap = a
+}

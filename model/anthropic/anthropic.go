@@ -57,6 +57,15 @@ func New(baseURL, apiKey, modelName string) *Adapter {
 // Provider: a thinking signature is bound to the model that produced it.
 func (a *Adapter) Provider() string { return "anthropic:" + a.Model }
 
+// MaxOut is the max_tokens sent when a request carries no MaxOut: MaxTokens,
+// or DefaultMaxTokens when that is unset (model.OutputCap).
+func (a *Adapter) MaxOut() int {
+	if a.MaxTokens > 0 {
+		return a.MaxTokens
+	}
+	return DefaultMaxTokens
+}
+
 // WithProtocol switches the adapter's wire protocol and returns it.
 func (a *Adapter) WithProtocol(p openai.Protocol) *Adapter {
 	a.HTTP.Transport = openai.NewTransport(p)

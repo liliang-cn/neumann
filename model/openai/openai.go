@@ -43,6 +43,19 @@ func New(baseURL, apiKey, modelName string) *Adapter {
 // provider-private fields are replayed only to the same Provider.
 func (a *Adapter) Provider() string { return "openai:" + a.Model }
 
+// MaxOut is the output cap sent when a request carries none: MaxTokens, or 0
+// when the provider decides (model.OutputCap).
+func (a *Adapter) MaxOut() int { return max(a.MaxTokens, 0) }
+
+// maxTokens is the request's own cap when it has one, else MaxTokens; 0 sends
+// no max_tokens at all.
+func (a *Adapter) maxTokens(req model.Request) int {
+	if req.MaxOut > 0 {
+		return req.MaxOut
+	}
+	return a.MaxTokens
+}
+
 type wireMsg struct {
 	Role       string            `json:"role"`
 	Content    *string           `json:"content"`
@@ -120,8 +133,8 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 	if len(req.Tools) > 0 {
 		body["tools"] = tools(req.Tools)
 	}
-	if a.MaxTokens > 0 {
-		body["max_tokens"] = a.MaxTokens
+	if n := a.maxTokens(req); n > 0 {
+		body["max_tokens"] = n
 	}
 	if stream {
 		body["stream"] = true

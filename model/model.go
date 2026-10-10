@@ -21,6 +21,10 @@ type Request struct {
 	System   string
 	Tools    []task.ToolSpec
 	Messages []task.Message
+	// MaxOut caps the tokens the answer may use; 0 leaves it to the adapter
+	// (its configured default, or the provider's). The machine raises it when
+	// a turn is cut off before producing anything (design §13).
+	MaxOut int
 }
 
 // Response carries the assistant turn in neutral form. Tool calls come back
@@ -38,6 +42,24 @@ type Response struct {
 type Adapter interface {
 	Provider() string
 	Call(ctx context.Context, req Request) (Response, error)
+}
+
+// OutputCap is an adapter that knows the output cap it sends when
+// Request.MaxOut is 0. The machine raises a truncated turn's cap from it, and
+// reserves output tokens by it; without it, 4096 is assumed.
+type OutputCap interface {
+	MaxOut() int
+}
+
+// Metered is an adapter that knows how its provider counts a request against
+// its limits (design §7.2): Reserve is what to take from each limiter
+// dimension before the request is sent, Settle what the request actually
+// used once its response is in. Dimensions are named as the limiter names
+// them (DimRequests, DimTokens, ...); one left out of Settle keeps its
+// reserved amount. Without it the machine uses a default (see core).
+type Metered interface {
+	Reserve(req Request) map[string]int64
+	Settle(req Request, resp Response) map[string]int64
 }
 
 // Warmer is an adapter that can open its connection ahead of the first call.

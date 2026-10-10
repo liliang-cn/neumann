@@ -72,14 +72,14 @@ func (a *Adapter) body(req model.Request, stream bool) ([]byte, error) {
 	}
 	w := wireReq{
 		Model:     a.Model,
-		MaxTokens: a.MaxTokens,
+		MaxTokens: a.MaxOut(),
 		System:    req.System,
 		Messages:  msgs,
 		Tools:     tools(req.Tools),
 		Stream:    stream,
 	}
-	if w.MaxTokens <= 0 {
-		w.MaxTokens = DefaultMaxTokens
+	if req.MaxOut > 0 {
+		w.MaxTokens = req.MaxOut // the request's own cap wins over the default
 	}
 	if a.ThinkingBudget > 0 {
 		w.Thinking = &wireThinking{Type: "enabled", BudgetTokens: a.ThinkingBudget}
