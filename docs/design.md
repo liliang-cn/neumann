@@ -492,7 +492,13 @@ type ToolDef struct {
 - 设备没有声明 `Effect` 时一律当作 `SideEffect`：宁可在恢复时停下来核对，也不重复一个有副作用的操作。MCP 工具的 `readOnlyHint` / `idempotentHint` 映射到 `Effect`。
 - 仲裁：每个设备 `MaxConcurrent`，超出的 FIFO 排队。
 - 页表：快照工具列表时按 `Allow` / `Deny` 过滤，派发时再检查一次，越权调用返回错误结果给模型，不执行。
-- L2：只缓存 `ReadOnly && Cacheable`，作用域是单个任务，同一任务里任何非 `ReadOnly` 调用完成后清空，命中返回真实结果。
+- L2（`cache`）：只缓存 `ReadOnly && Cacheable`（其他 `Effect` 上的 `Cacheable` 忽略），作用域是单个任务，取自幂等键 `task/call/attempt` 最后两段之前的部分；键里没有任务的调用不查、不填、不清。键是完整工具名 + 规范化参数：JSON 排序键、去空白、字符串统一转义，数字按原文（`1` 与 `1.0` 不同，宁可不命中也不错命中）；非 JSON 或对象里有重复键的参数按原始字节。
+  - 命中返回同一任务里先前调用的真实结果，不进设备队列、不跑设备，`Outcome` 照常是 `Returned`：调用照常记录、恰好一个结果；`RunCached` 另外报告是否命中，`Run` 签名不变。页表先于缓存检查，被拒的调用碰不到缓存；已取消的 ctx 先于缓存返回 `NotRun`。
+  - 未命中才跑设备，只存非 `IsError` 的结果；超时、晚到结果从不入缓存。同一任务同时发出的相同调用不合并（不做 single-flight），各跑各的，后完成的覆盖：`ReadOnly` 本来就允许多跑，合并会把一个调用的取消牵连到另一个。
+  - 清空看完成，不看派发：非 `ReadOnly` 调用在设备返回时（结果交出之前）清空本任务缓存；总线因超时或取消不再等它时也清一次，因为它可能仍会生效。查询时记下任务的代数，期间有写完成的，那次读的结果不存（它可能读到写之前的状态）。
+  - `CacheTTL` 到期后不再命中（0 = 直到被清空），查到时惰性删除；时钟可注入（`cache.Config.Now`）。
+  - 内存有界：每任务最多 256 条（`DefaultMaxEntriesPerTask`），全局 64 MiB（`DefaultMaxBytes`，按键 + 内容 + 每条 160 字节估算），各按 LRU 淘汰；单条超过全局上限的不存。
+  - 任务结束时由机器调用 `bus.ForgetTask(id)`（即 `L2.Forget`）丢掉它的缓存，在途的未命中也不会再填回；没调用之前，结束任务的条目只受上限和 TTL 约束。总线默认带一个默认上限的 L2，`SetCache(nil)` 关闭；`CacheStats()` 给出命中、未命中、填入、淘汰、过期、清空次数和当前条目、字节、任务数，供 `m.Status()` 使用。
 - 第一版设备：`builtin`、`mcp`（`github.com/modelcontextprotocol/go-sdk`）、`skills`。
 
 ## 11. 模型适配器

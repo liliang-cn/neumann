@@ -11,8 +11,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/liliang-cn/neumann/cache"
 	"github.com/liliang-cn/neumann/task"
 )
 
@@ -31,7 +33,12 @@ type ToolDef struct {
 	Description string
 	Schema      json.RawMessage
 	Effect      Effect
-	Timeout     time.Duration // 0 = DefaultTimeout
+	// Cacheable: a successful result may be served again, from L2, to a
+	// call with the same arguments in the same task. Only ReadOnly tools are
+	// cached; on any other effect it is ignored.
+	Cacheable bool
+	CacheTTL  time.Duration // how long a cached result is served; 0 = until the task's cache is cleared
+	Timeout   time.Duration // 0 = DefaultTimeout
 	// ReportUnknown: when a restart leaves this SideEffect tool's outcome
 	// unknown, tell the model so instead of waiting for an operator to
 	// resolve it. Leave false for anything a person must check.
@@ -66,15 +73,18 @@ type Bus struct {
 	routes map[string]route
 	specs  []task.ToolSpec
 	devs   []Device
+	l2     atomic.Pointer[cache.L2]
 }
 
 // New attaches devices. perDevice bounds concurrent calls per device; calls
-// beyond it wait in that device's queue.
+// beyond it wait in that device's queue. The bus starts with an L2 cache with
+// the default caps (see SetCache); only tools that declare Cacheable use it.
 func New(ctx context.Context, perDevice int, devs ...Device) (*Bus, error) {
 	if perDevice <= 0 {
 		perDevice = 4
 	}
 	b := &Bus{routes: map[string]route{}, devs: devs}
+	b.l2.Store(cache.New(cache.Config{}))
 	fail := func(err error) (*Bus, error) {
 		for _, d := range devs {
 			_ = d.Close()
@@ -97,6 +107,9 @@ func New(ctx context.Context, perDevice int, devs ...Device) (*Bus, error) {
 			name := FullName(d.Name(), def.Name)
 			if !def.Effect.Valid() {
 				return fail(fmt.Errorf("bus: tool %q of device %q declares an unknown effect %d", def.Name, d.Name(), int(def.Effect)))
+			}
+			if def.CacheTTL < 0 {
+				return fail(fmt.Errorf("bus: tool %q of device %q declares a negative CacheTTL", def.Name, d.Name()))
 			}
 			if _, dup := b.routes[name]; dup {
 				return fail(fmt.Errorf("bus: duplicate tool name %q (device %q, tool %q)", name, d.Name(), def.Name))
@@ -205,6 +218,46 @@ func (o Outcome) String() string {
 	return "unknown"
 }
 
+// SetCache replaces the L2 cache; nil turns caching off. Calls already past
+// their lookup finish against the cache they started with.
+func (b *Bus) SetCache(c *cache.L2) { b.l2.Store(c) }
+
+// Cache is the L2 cache in use, nil when caching is off.
+func (b *Bus) Cache() *cache.L2 { return b.l2.Load() }
+
+// CacheStats reads L2's counters (hits, misses, evictions, ...); zero when
+// caching is off.
+func (b *Bus) CacheStats() cache.Stats {
+	if c := b.l2.Load(); c != nil {
+		return c.Stats()
+	}
+	return cache.Stats{}
+}
+
+// ForgetTask drops taskID's L2 entries. The machine calls it when a task
+// ends; until then, a finished task's entries are only bounded by the caps
+// and their TTLs.
+func (b *Bus) ForgetTask(taskID string) {
+	if c := b.l2.Load(); c != nil {
+		c.Forget(taskID)
+	}
+}
+
+// keyTask is the task scope of an idempotency key task/call/attempt: all of
+// it before the last two '/'. A key without one names no task, and its call
+// neither reads, fills nor clears any cache.
+func keyTask(key string) (string, bool) {
+	i := strings.LastIndexByte(key, '/')
+	if i < 0 {
+		return "", false
+	}
+	j := strings.LastIndexByte(key[:i], '/')
+	if j <= 0 {
+		return "", false
+	}
+	return key[:j], true
+}
+
 // Call runs one tool call, waiting in the device's queue for a free slot. It
 // never returns a Go error: every failure becomes an error result, because
 // each call the model made must get exactly one result.
@@ -224,19 +277,54 @@ func (b *Bus) Call(ctx context.Context, name string, args json.RawMessage, key s
 // not merely an echo of the cancellation, late receives it on the device's
 // goroutine after its slot is released. A timeout is a result (Returned), and
 // what the device returns after it is dropped.
+//
+// L2: a ReadOnly && Cacheable call whose key names a task is first looked up
+// in that task's cache; a hit is Returned with the result an earlier call
+// returned, and the device does not run (RunCached says it was a hit). A miss
+// runs the device, and its result is stored if it is not an error and no
+// write in the task completed meanwhile. Identical misses in flight together
+// each run. When a non-ReadOnly call in a task finishes on its device, or the
+// bus stops waiting for it, the task's cache is cleared. Late results and
+// timeouts are never stored; a refused call never reaches the cache.
 func (b *Bus) Run(ctx context.Context, name string, args json.RawMessage, key string, allow, deny []string, late func(task.ToolResult)) (task.ToolResult, Outcome) {
+	res, how, _ := b.RunCached(ctx, name, args, key, allow, deny, late)
+	return res, how
+}
+
+// RunCached is Run that also reports whether the result was served from L2.
+// A hit is an ordinary Returned result: the call is recorded like any other,
+// with exactly one result.
+func (b *Bus) RunCached(ctx context.Context, name string, args json.RawMessage, key string, allow, deny []string, late func(task.ToolResult)) (task.ToolResult, Outcome, bool) {
 	if !Permitted(name, allow, deny) {
-		return task.ToolResult{Content: "tool " + name + " is not permitted for this task", IsError: true}, Returned
+		return task.ToolResult{Content: "tool " + name + " is not permitted for this task", IsError: true}, Returned, false
 	}
 	r, ok := b.routes[name]
 	if !ok {
-		return task.ToolResult{Content: "unknown tool " + name, IsError: true}, Returned
+		return task.ToolResult{Content: "unknown tool " + name, IsError: true}, Returned, false
 	}
-	cancelled := func() (task.ToolResult, Outcome) {
-		return task.ToolResult{Content: "cancelled before the tool ran: " + ctx.Err().Error(), IsError: true}, NotRun
+	cancelled := func() (task.ToolResult, Outcome, bool) {
+		return task.ToolResult{Content: "cancelled before the tool ran: " + ctx.Err().Error(), IsError: true}, NotRun, false
 	}
 	if ctx.Err() != nil {
 		return cancelled()
+	}
+	l2 := b.l2.Load()
+	taskID, scoped := keyTask(key)
+	scoped = scoped && l2 != nil
+	var miss *cache.Miss // nil unless this call may fill the cache
+	if scoped && r.def.Effect == ReadOnly && r.def.Cacheable {
+		res, hit, m := l2.Lookup(taskID, name, args)
+		if hit {
+			return res, Returned, true
+		}
+		miss = m
+		defer miss.Drop() // no-op once filled
+	}
+	clears := scoped && r.def.Effect != ReadOnly // a write clears its task's cache once it ran
+	invalidate := func() {
+		if clears {
+			l2.Invalidate(taskID)
+		}
 	}
 	select {
 	case r.slot <- struct{}{}:
@@ -290,6 +378,7 @@ func (b *Bus) Run(ctx context.Context, name string, args json.RawMessage, key st
 			res, err := r.dev.Call(cctx, DeviceCall{Tool: r.tool, Args: args, Key: key})
 			return outcome{res, err}
 		}()
+		invalidate() // before the result is handed over: the write is done
 		<-r.slot
 		mu.Lock()
 		if !gaveUp {
@@ -305,11 +394,12 @@ func (b *Bus) Run(ctx context.Context, name string, args json.RawMessage, key st
 	// stopped reports a call the bus stopped waiting for. byCancel is read
 	// once by the caller, so the outcome and the late hand-off agree even
 	// when the timeout and a cancel land together.
-	stopped := func(byCancel bool) (task.ToolResult, Outcome) {
+	stopped := func(byCancel bool) (task.ToolResult, Outcome, bool) {
+		invalidate() // a write given up on may still take effect
 		if !byCancel {
-			return task.ToolResult{Content: fmt.Sprintf("tool %s timed out after %v", name, timeout), IsError: true}, Returned
+			return task.ToolResult{Content: fmt.Sprintf("tool %s timed out after %v", name, timeout), IsError: true}, Returned, false
 		}
-		return task.ToolResult{Content: "cancelled while the tool ran: " + context.Canceled.Error(), IsError: true}, Abandoned
+		return task.ToolResult{Content: "cancelled while the tool ran: " + context.Canceled.Error(), IsError: true}, Abandoned, false
 	}
 	var o outcome
 	select {
@@ -332,7 +422,9 @@ func (b *Bus) Run(ctx context.Context, name string, args json.RawMessage, key st
 	if cctx.Err() != nil && echo(o) {
 		return stopped(ctx.Err() != nil)
 	}
-	return finish(o), Returned
+	res := finish(o)
+	miss.Fill(res, r.def.CacheTTL) // stores only a non-error result, and only if no write completed since the lookup
+	return res, Returned, false
 }
 
 func (b *Bus) Close() error {
