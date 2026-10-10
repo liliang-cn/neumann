@@ -57,6 +57,8 @@ func Run(t *testing.T, newStore Factory) {
 		{"PendingCancelRefusesEverythingButItsFinalCommit", testPendingCancelRefusesEverythingButItsFinalCommit},
 		{"CancelDecidedByCommitOrder", testCancelDecidedByCommitOrder},
 		{"EventTimesAreCommitTimes", testEventTimesAreCommitTimes},
+		{"ArchiveAppendsWithItsTask", testArchiveAppendsWithItsTask},
+		{"ArchiveIsAllOrNothing", testArchiveIsAllOrNothing},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore) })
@@ -410,6 +412,7 @@ func fullTask(id string) *task.TCB {
 		Tools:      []task.ToolSpec{{Name: "dev_x", Description: "x", Schema: json.RawMessage(`{"type":"object"}`)}},
 		Regs: []task.Message{
 			task.Text(task.RoleUser, "q"),
+			task.SummaryMessage("earlier work"),
 			{Role: task.RoleAssistant, Parts: []task.Part{
 				{Kind: task.PartReasoning, Text: "r", Provider: "p", Opaque: json.RawMessage(`{ "sig": "a<b" }`)},
 				{Kind: task.PartToolCall, CallID: "c-1", ProviderCallID: "call_9", Name: "dev_x", Args: json.RawMessage(`{"a":`), Provider: "p", Opaque: json.RawMessage(`{"id":"call_9"}`)},
@@ -417,16 +420,19 @@ func fullTask(id string) *task.TCB {
 			{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: "boom", IsError: true}}},
 		},
 		Allow: []string{"dev_"}, Deny: []string{"dev_y"},
-		Budget:      task.Budget{MaxSteps: 9, Deadline: time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)},
-		Used:        task.Usage{Steps: 3, PromptTokens: 100, CompletionTokens: 20, ReasoningTokens: 5, CachedTokens: 64},
-		CallSeq:     1,
-		Unconfirmed: 2,
-		WakeAt:      time.Date(2026, 10, 10, 8, 31, 0, 0, time.UTC),
-		Retries:     3,
-		MaxOut:      16384,
-		Truncations: 1,
-		StopReason:  "",
-		Version:     1,
+		Budget:       task.Budget{MaxSteps: 9, Deadline: time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)},
+		Used:         task.Usage{Steps: 3, PromptTokens: 100, CompletionTokens: 20, ReasoningTokens: 5, CachedTokens: 64},
+		CallSeq:      1,
+		Unconfirmed:  2,
+		WakeAt:       time.Date(2026, 10, 10, 8, 31, 0, 0, time.UTC),
+		Retries:      3,
+		MaxOut:       16384,
+		Truncations:  1,
+		Window:       8000,
+		CompactChunk: 2,
+		Archived:     5,
+		StopReason:   "",
+		Version:      1,
 	}
 }
 
@@ -645,5 +651,79 @@ func testEventTimesAreCommitTimes(t *testing.T, newStore Factory) {
 		if stored[i].Time != live[i].Time || stored[i].Seq != live[i].Seq {
 			t.Fatalf("event %d: committed at %v (%d), read back %v (%d)", i, live[i].Time, live[i].Seq, stored[i].Time, stored[i].Seq)
 		}
+	}
+}
+
+// archived is a run of messages as compaction swaps them out: every kind of
+// part, raw bytes that are not valid JSON, and a summary.
+func archived() []task.Message {
+	return []task.Message{
+		{Role: task.RoleAssistant, Parts: []task.Part{
+			{Kind: task.PartReasoning, Text: "r", Provider: "p", Opaque: json.RawMessage(`{ "sig": "a<b" }`)},
+			{Kind: task.PartText, Text: "looking"},
+			{Kind: task.PartToolCall, CallID: "c-1", ProviderCallID: "call_9", Name: "dev_x", Args: json.RawMessage(`{"a":`), Provider: "p", Opaque: json.RawMessage(`{"id":"call_9"}`)},
+		}},
+		{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: "boom", IsError: true}}},
+		task.SummaryMessage("older"),
+	}
+}
+
+// Compaction's archive: messages committed with their task are appended to
+// it in commit order, byte for byte, and read back as copies.
+func testArchiveAppendsWithItsTask(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	if got, err := s.Archive(ctx, "nope"); err != nil || len(got) != 0 {
+		t.Fatalf("archive of an unknown task: %v, %v", got, err)
+	}
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true, Archive: archived()[:1]})
+	mustCommit(t, s, mem.CommitSet{Task: newTask("b"), NewTask: true, Archive: []task.Message{task.Text(task.RoleUser, "b's")}})
+	tc.Version = 2
+	more := archived()[1:]
+	mustCommit(t, s, mem.CommitSet{Task: tc, Archive: more})
+	more[0].Parts[0].Text = "mutated after commit"
+	got, err := s.Archive(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, archived()) {
+		t.Fatalf("archive round trip:\n got %+v\nwant %+v", got, archived())
+	}
+	got[0].Parts[1].Text = "mutated after read"
+	if again, _ := s.Archive(ctx, "a"); again[0].Parts[1].Text != "looking" {
+		t.Fatal("the store saw a mutation made after a read")
+	}
+	if b, _ := s.Archive(ctx, "b"); len(b) != 1 || b[0].TextContent() != "b's" {
+		t.Fatalf("archive of b: %+v", b)
+	}
+	tc.State, tc.StopReason, tc.Version = task.Done, "end_turn", 3
+	mustCommit(t, s, mem.CommitSet{Task: tc, Archive: []task.Message{task.Text(task.RoleAssistant, "last")}})
+	if got, _ := s.Archive(ctx, "a"); len(got) != 4 {
+		t.Fatalf("a terminal commit's archive: %d messages", len(got))
+	}
+}
+
+// An archive needs its task in the same commit, and a refused commit
+// archives nothing: a compaction is never half applied.
+func testArchiveIsAllOrNothing(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	if _, err := s.Commit(ctx, mem.CommitSet{Archive: archived()}); err == nil {
+		t.Fatal("an archive without its task was accepted")
+	}
+	stale := tc.Clone()
+	stale.Version = 1
+	if _, err := s.Commit(ctx, mem.CommitSet{Task: stale, Archive: archived()}); !errors.Is(err, mem.ErrVersion) {
+		t.Fatalf("stale version: %v", err)
+	}
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptCancel, Text: "cancelled"}}})
+	next := tc.Clone()
+	next.Version = 2
+	if _, err := s.Commit(ctx, mem.CommitSet{Task: next, Archive: archived()}); !errors.Is(err, mem.ErrCancelPending) {
+		t.Fatalf("compaction over a pending cancel: %v", err)
+	}
+	if got, _ := s.Archive(ctx, "a"); len(got) != 0 {
+		t.Fatalf("refused commits archived %d messages", len(got))
 	}
 }

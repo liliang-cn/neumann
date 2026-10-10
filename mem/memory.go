@@ -26,6 +26,7 @@ type Memory struct {
 	tasks      map[string]*task.TCB
 	calls      map[string][]CallRecord
 	interrupts map[string][]Interrupt
+	archive    map[string][]task.Message
 	events     []proto.Event
 	taskSeq    map[string]int64
 	intSeq     int64
@@ -38,6 +39,7 @@ func NewMemory() *Memory {
 		tasks:      map[string]*task.TCB{},
 		calls:      map[string][]CallRecord{},
 		interrupts: map[string][]Interrupt{},
+		archive:    map[string][]task.Message{},
 		taskSeq:    map[string]int64{},
 	}
 }
@@ -61,6 +63,9 @@ func (m *Memory) Commit(ctx context.Context, c CommitSet) ([]proto.Event, error)
 	}
 	for _, r := range c.Calls {
 		m.upsertCall(r)
+	}
+	if len(c.Archive) > 0 {
+		m.archive[c.Task.ID] = append(m.archive[c.Task.ID], task.CloneMessages(c.Archive)...)
 	}
 	for _, in := range c.NewInterrupts {
 		m.intSeq++
@@ -121,6 +126,9 @@ func (m *Memory) validate(c CommitSet) error {
 	}
 	if len(c.Applied) > 0 && c.Task == nil {
 		return errors.New("mem: Applied requires Task")
+	}
+	if len(c.Archive) > 0 && c.Task == nil {
+		return errors.New("mem: Archive requires Task")
 	}
 	if t := c.Task; t != nil {
 		old, exists := m.tasks[t.ID]
@@ -287,4 +295,13 @@ func (m *Memory) Events(ctx context.Context, afterSeq int64, limit int) ([]proto
 		out = append(out, cloneEvent(e))
 	}
 	return out, nil
+}
+
+func (m *Memory) Archive(ctx context.Context, taskID string) ([]task.Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return task.CloneMessages(m.archive[taskID]), nil
 }

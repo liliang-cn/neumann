@@ -121,6 +121,9 @@ type Interrupt struct {
 //     ErrCancelPending, so the cancel committed first wins over work that
 //     comes after it, whatever the holder of the task has seen. Results, late
 //     results and further interrupts are still recorded.
+//   - Archive appends messages to Task's archive, in order: the messages a
+//     compaction swapped out of its registers (design §5.3). It requires
+//     Task, and goes in or is refused with the rest of the commit.
 //   - Events get their Seq and TaskSeq; Commit returns them. Both are dense:
 //     Seq counts 1, 2, 3… across all events and TaskSeq 1, 2, 3… per task,
 //     with no gap left by a rejected commit.
@@ -130,6 +133,7 @@ type CommitSet struct {
 	Calls         []CallRecord
 	NewInterrupts []Interrupt
 	Applied       []int64
+	Archive       []task.Message
 	Events        []proto.Event
 }
 
@@ -150,4 +154,7 @@ type Store interface {
 	Calls(ctx context.Context, taskID string) ([]CallRecord, error)
 	Interrupts(ctx context.Context, taskID string, unappliedOnly bool) ([]Interrupt, error)
 	Events(ctx context.Context, afterSeq int64, limit int) ([]proto.Event, error)
+	// Archive is everything Archive commits appended for a task, oldest
+	// first; empty for a task with none, or none at all.
+	Archive(ctx context.Context, taskID string) ([]task.Message, error)
 }

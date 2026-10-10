@@ -7,7 +7,7 @@
 // its own savepoint: one that fails validation is rolled back alone and does
 // not affect the others in its transaction.
 //
-// TCBs and call records are stored gob-encoded: a model can emit tool
+// TCBs, call records and archived messages are stored gob-encoded: a model can emit tool
 // arguments that are not valid JSON, and they must round-trip byte for byte.
 package sqlite
 
@@ -73,7 +73,13 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS task_seqs (
 	task_id TEXT PRIMARY KEY,
 	n       INTEGER NOT NULL
-);`
+);
+CREATE TABLE IF NOT EXISTS archive (
+	seq     INTEGER PRIMARY KEY,
+	task_id TEXT NOT NULL,
+	msg     BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS archive_task ON archive (task_id, seq);`
 
 type Store struct {
 	db   *sql.DB
@@ -305,6 +311,9 @@ func (s *Store) apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto
 	if len(c.Applied) > 0 && c.Task == nil {
 		return nil, errors.New("mem: Applied requires Task")
 	}
+	if len(c.Archive) > 0 && c.Task == nil {
+		return nil, errors.New("mem: Archive requires Task")
+	}
 	if t := c.Task; t != nil {
 		version, _, exists, err := taskRow(ctx, tx, t.ID)
 		if err != nil {
@@ -393,6 +402,15 @@ func (s *Store) apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto
 			`INSERT INTO calls (task_id, call_id, idx, rec) VALUES (?, ?, ?, ?)
 			 ON CONFLICT (task_id, call_id) DO UPDATE SET idx = excluded.idx, rec = excluded.rec`,
 			r.TaskID, r.CallID, r.Index, blob); err != nil {
+			return nil, err
+		}
+	}
+	for i, msg := range c.Archive {
+		blob, err := encode(msg)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: encode archived message %d of %s: %w", i, c.Task.ID, err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO archive (task_id, msg) VALUES (?, ?)", c.Task.ID, blob); err != nil {
 			return nil, err
 		}
 	}
@@ -601,6 +619,28 @@ func (s *Store) Events(ctx context.Context, afterSeq int64, limit int) ([]proto.
 			e.Data = data
 		}
 		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) Archive(ctx context.Context, taskID string) ([]task.Message, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT seq, msg FROM archive WHERE task_id = ? ORDER BY seq", taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []task.Message
+	for rows.Next() {
+		var seq int64
+		var blob []byte
+		if err := rows.Scan(&seq, &blob); err != nil {
+			return nil, err
+		}
+		var m task.Message
+		if err := decode(blob, &m); err != nil {
+			return nil, fmt.Errorf("sqlite: decode archived message %d of %s: %w", seq, taskID, err)
+		}
+		out = append(out, m)
 	}
 	return out, rows.Err()
 }
