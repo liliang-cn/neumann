@@ -2500,19 +2500,20 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	msg := resp.Message
 	msg.Role = task.RoleAssistant
 	if len(msg.ToolCalls()) > 0 {
-		n := t.CallCount()
 		for i := range msg.Parts {
 			p := &msg.Parts[i]
 			if p.Kind != task.PartToolCall {
 				continue
 			}
-			n++
-			p.CallID = fmt.Sprintf("c-%d", n)
+			t.CallSeq++
+			p.CallID = fmt.Sprintf("c-%d", t.CallSeq)
 			c.Calls = append(c.Calls, mem.CallRecord{
-				TaskID: t.ID, CallID: p.CallID, Index: n, Tool: p.Name, Args: p.Args, Status: mem.CallPlanned,
+				TaskID: t.ID, CallID: p.CallID, Index: t.CallSeq, Tool: p.Name, Args: p.Args, Status: mem.CallPlanned,
 			})
+			// Args go into the event as a string: a model can emit malformed
+			// JSON, and marshalling it as raw JSON would fail.
 			c.Events = append(c.Events, proto.NewEvent(proto.EvToolCall, t.ID,
-				map[string]any{"call_id": p.CallID, "tool": p.Name, "args": p.Args}))
+				map[string]any{"call_id": p.CallID, "tool": p.Name, "args": string(p.Args)}))
 		}
 		t.Regs = append(t.Regs, msg)
 		e.ready(t, task.StepTools)

@@ -124,15 +124,16 @@ type TCB struct {
 
 ```go
 type CommitSet struct {
-    Task       *TCB              // 新状态；Version 必须等于库里的 Version + 1
-    Calls      []CallRecord      // 新增或更新的调用记录
-    Interrupts []InterruptUpdate // 新增的中断，或把已有中断标记为 applied
-    Events     []Event           // 本次提交产生的事件
-    Accepted   *Instruction      // 提交来自一条外部指令时，原样记录
+    Task          *TCB         // 新状态；NewTask 时 Version 必须为 1，否则必须等于库里的 Version + 1
+    NewTask       bool
+    Calls         []CallRecord // 新增或更新的调用记录；所属任务必须存在
+    NewInterrupts []Interrupt  // 外部输入；任务不存在或已结束时整个提交被拒绝
+    Applied       []int64      // 把 Task 的这些未送达中断标记为已送达；序号不属于 Task 或已送达则拒绝
+    Events        []Event      // 本次提交产生的事件；外部指令本身由 accepted 等事件记录
 }
 
 type Store interface {
-    Commit(ctx context.Context, c CommitSet) (seq int64, err error) // 一个事务；返回最后一个事件的全局序号
+    Commit(ctx context.Context, c CommitSet) ([]Event, error) // 一个事务；返回带好 Seq / TaskSeq 的事件
     Load(ctx context.Context, id string) (*TCB, error)
     Unfinished(ctx context.Context) ([]*TCB, error)
     Calls(ctx context.Context, taskID string) ([]CallRecord, error)
