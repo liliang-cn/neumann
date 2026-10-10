@@ -149,8 +149,17 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	var p *panicError
 	panicked := errors.As(err, &p)
 	lost := err != nil && errors.Is(err, model.ErrResponseLost)
-	if err != nil && !panicked {
-		class = model.ClassifyWith(e.Model, err)
+	// The adapter's hooks run under the same guard as the call: a panic in
+	// any of them is the adapter panicking, and fails the task (the call's
+	// response, if it had one, is not used).
+	hookPanicked := func(perr error) bool {
+		if perr == nil {
+			return false
+		}
+		err, panicked, class = perr, true, model.Unknown
+		return true
+	}
+	if err != nil && !panicked && !hookPanicked(guarded("Classify", func() { class = model.ClassifyWith(e.Model, err) })) {
 		if class == model.Canceled && tctx.Err() == nil {
 			// The task was not cancelled: the adapter gave up on its own (a
 			// timeout it reported as a bare deadline). The provider was slow.
@@ -160,12 +169,15 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 			class = model.Transient
 		}
 	}
-	info := e.rateInfo(resp, err)
+	var info *model.RateInfo
+	if !panicked {
+		hookPanicked(guarded("RateInfo", func() { info = e.rateInfo(resp, err) }))
+	}
 	how := refundOf(err, class)
 	if panicked {
 		how = cancelAll
 	}
-	e.settleCall(g, res, how, req, resp, info)
+	hookPanicked(e.settleCall(g, res, how, req, resp, info))
 	if class == model.RateLimited {
 		if at, ok := e.retryAt(err, info); ok {
 			pause(g, at)
@@ -317,10 +329,31 @@ var errNotStarted = errors.New("step not started: the machine is stopping")
 // Nothing was sent and the task is unchanged, so the step can be tried again.
 var errStartNotCommitted = errors.New("start of step not committed")
 
-// panicError is a model adapter's panic, recovered into a failure of its task.
-type panicError struct{ v any }
+// panicError is a model adapter's panic, recovered into a failure of its
+// task. in names the hook it happened in; empty for the call itself.
+type panicError struct {
+	v  any
+	in string
+}
 
-func (p *panicError) Error() string { return fmt.Sprintf("model panicked: %v", p.v) }
+func (p *panicError) Error() string {
+	if p.in != "" {
+		return fmt.Sprintf("model panicked in %s: %v", p.in, p.v)
+	}
+	return fmt.Sprintf("model panicked: %v", p.v)
+}
+
+// guarded runs one of the adapter's hooks (Classify, RateInfo, Reserve,
+// Settle), turning a panic in it into a *panicError.
+func guarded(in string, f func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = &panicError{v: r, in: in}
+		}
+	}()
+	f()
+	return nil
+}
 
 // callModel calls the adapter, streaming through emit when the adapter can
 // and a Delta sink is set; a panic in it fails the task, not the process.

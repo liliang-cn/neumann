@@ -1,10 +1,12 @@
 package core
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/liliang-cn/neumann/internal/group"
+	"github.com/liliang-cn/neumann/limit"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/sim"
@@ -114,5 +116,68 @@ func TestFailedCallsAreNotSteps(t *testing.T) {
 		if got.Used.Steps != 0 || got.Unconfirmed != c.unconfirmed || sm.Calls() != 1 || !hasKind(s, "step") {
 			t.Fatalf("%s: steps %d, unconfirmed %d, calls %d, events %s", name, got.Used.Steps, got.Unconfirmed, sm.Calls(), kinds(s))
 		}
+	}
+}
+
+// hookModel is an adapter whose optional hooks panic on demand.
+type hookModel struct {
+	*sim.Model
+	panicIn string
+}
+
+func (h hookModel) Classify(err error) model.ErrClass {
+	if h.panicIn == "Classify" {
+		panic("classify broke")
+	}
+	return model.Unknown
+}
+
+func (h hookModel) RateInfo(resp *model.Response, err error) *model.RateInfo {
+	if h.panicIn == "RateInfo" {
+		panic("rate info broke")
+	}
+	return nil
+}
+
+func (h hookModel) Reserve(req model.Request) map[string]int64 {
+	if h.panicIn == "Reserve" {
+		panic("reserve broke")
+	}
+	return map[string]int64{"requests": 1}
+}
+
+func (h hookModel) Settle(req model.Request, resp model.Response) map[string]int64 {
+	if h.panicIn == "Settle" {
+		panic("settle broke")
+	}
+	return map[string]int64{"requests": 1}
+}
+
+// An adapter hook that panics is the adapter panicking: the task fails with
+// model_error, its reservation goes back, and the process lives on.
+func TestPanickingAdapterHooksFailTheTask(t *testing.T) {
+	for hook, fn := range map[string]modelFn{
+		"Classify": func(model.Request) (model.Response, error) { return model.Response{}, sim.Transient() },
+		"RateInfo": reply,
+		"Reserve":  reply,
+		"Settle":   reply,
+	} {
+		t.Run(hook, func(t *testing.T) {
+			e, s, _ := newTestEnv(t, fn)
+			e.Model = hookModel{Model: e.Model.(*sim.Model), panicIn: hook}
+			l, err := limit.New(limit.Config{Name: "gw", Limits: map[string]limit.Rate{"requests": {Per: time.Minute, Limit: 10}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.Groups = map[string]*Group{"default": {Class: "default", Ctl: group.New(group.Config{}), Limiters: []*limit.Limiter{l}}}
+			e.step(bg, newTask(t, e, s, "q"), 0)
+			got := load(t, s)
+			if got.State != task.Failed || got.StopReason != StopModelError || !strings.Contains(failedError(s), "panicked") {
+				t.Fatalf("task %s %q, error %q", got.State, got.StopReason, failedError(s))
+			}
+			if used := l.Status().Dims["requests"].Used; used != 0 {
+				t.Fatalf("reservation kept: %d requests used", used)
+			}
+		})
 	}
 }

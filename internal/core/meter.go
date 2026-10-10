@@ -133,8 +133,12 @@ func (e *Env) reserve(ctx context.Context, g *Group, taskID string, req model.Re
 	if g == nil || len(g.Limiters) == 0 {
 		return nil, nil, nil
 	}
+	var amounts map[string]int64
+	if err := guarded("Reserve", func() { amounts = e.reserveAmounts(req, out) }); err != nil {
+		return nil, nil, err
+	}
 	start := e.Clock.Now()
-	res, err := limit.ReserveAll(ctx, g.Limiters, e.reserveAmounts(req, out))
+	res, err := limit.ReserveAll(ctx, g.Limiters, amounts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -186,12 +190,18 @@ func refundOf(err error, class model.ErrClass) refund {
 // settleCall ends a reservation after its call: settled first, then calibrated
 // with what the provider said (design §7.3). The order matters: the
 // provider's remaining figure already counts this request, so observing it
-// before the settle would charge the request's extra usage twice.
-func (e *Env) settleCall(g *Group, res *limit.Reservation, how refund, req model.Request, resp model.Response, info *model.RateInfo) {
+// before the settle would charge the request's extra usage twice. A panic
+// in the adapter's Settle gives the reservation back and is returned.
+func (e *Env) settleCall(g *Group, res *limit.Reservation, how refund, req model.Request, resp model.Response, info *model.RateInfo) error {
 	if res != nil {
 		switch how {
 		case settleActual:
-			res.Settle(e.settleAmounts(req, resp))
+			var actual map[string]int64
+			if err := guarded("Settle", func() { actual = e.settleAmounts(req, resp) }); err != nil {
+				res.Cancel()
+				return err
+			}
+			res.Settle(actual)
 		case settleReserved:
 			res.Settle(nil)
 		default:
@@ -207,6 +217,7 @@ func (e *Env) settleCall(g *Group, res *limit.Reservation, how refund, req model
 			l.Observe(obs)
 		}
 	}
+	return nil
 }
 
 // rateInfo is what the provider said about its limits on this call: the
