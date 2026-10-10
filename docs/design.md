@@ -107,6 +107,7 @@ type TCB struct {
     Budget     Budget          // MaxSteps、Deadline（绝对时间）、MaxTokens
     Used       Usage           // 已确认的用量（见 4.6）
     Unconfirmed int            // 已发出、但没有拿到响应的模型请求数
+    CallSeq    int             // 已分配的工具调用 id 数；下一个是 c-<CallSeq+1>，只增不减，压缩后 id 也不重复
     Retries    int
     MaxOut     int
     StopReason string
@@ -161,6 +162,7 @@ type CallRecord struct {
     Tool     string
     Args     json.RawMessage
     Effect   Effect          // 来自设备声明，见第 10 节
+    Index    int             // 在任务内的调用顺序；结果按它排列
     Status   CallStatus
     Attempt  int
     Key      string          // 幂等键：taskID/callID/attempt，作为参数旁的元数据传给设备
@@ -173,7 +175,7 @@ type CallRecord struct {
 1. 模型返回工具调用时，`execModel` 的提交里写入这些调用，状态 `planned`。
 2. `execTools` **先提交** 状态 `dispatched`、`Attempt + 1`，任务转 `Waiting(IO)`，**然后**才把调用交给总线。
 3. 每个调用完成后，调度器提交 `done` 和结果，同一事务里带上 `tool_result` 事件。
-4. 全部 `done` 时，调度器提交：按调用顺序把结果追加成 tool 消息，任务转 `Ready`、`PC = StepModel`。
+4. 全部 `done` 时，调度器提交：按调用顺序把结果追加成 tool 消息，任务转 `Ready`、`PC = StepModel`。这次提交把所有 `done` 记录和任务一起再写一遍（幂等），保证模型看到的每个结果都在调用记录里，即使第 3 步的某次单条提交失败过。
 
 崩溃后重启，每条记录按状态处理：
 
@@ -204,7 +206,7 @@ type CallRecord struct {
 
 - 每个事件有全局序号 `Seq`（单调递增）和任务内序号 `TaskSeq`。
 - 事件只在提交成功后发布给订阅者。
-- 订阅：`m.Events(fromSeq)`。订阅者先从内存环形缓冲读；落后太多、超出缓冲时，自动改为从 `Store.Events` 按序号补读，追上后再回到内存。**生产者从不阻塞，订阅者也不丢事件。**
+- 订阅：`m.Events(ctx, fromSeq)`；`m.EventLog(ctx, afterSeq, limit)` 直接读。第一阶段没有内存环形缓冲，订阅者每次被唤醒都从 Store 按序号读，语义相同。订阅者先从内存环形缓冲读；落后太多、超出缓冲时，自动改为从 `Store.Events` 按序号补读，追上后再回到内存。**生产者从不阻塞，订阅者也不丢事件。**
 - 第一版事件表不自动清理；清理策略（按时间或按已确认的序号）属于运维配置，留到有真实数据量再定。
 
 ### 4.5 重启
@@ -233,9 +235,10 @@ for {
     case StepTools:   c = execTools(t)   // 只算出 dispatched 的提交，派发在提交之后
     case StepCompact: c = execCompact(t) // 一次模型调用
     }
-    if err := mem.Commit(ctx, c); err != nil { sched.Fail(t, err); continue }
-    if t.PC == StepTools { bus.Dispatch(c.Calls, t.Ctx()) } // 先提交，后派发
-    sched.Requeue(t)  // 更新内存里的队列
+    if halted() { sched.Forget(t.ID); continue }     // 强制停机打断的指令什么都不提交
+    if err := mem.Commit(ctx, c); err != nil { sched.Forget(t.ID); continue }
+    sched.Requeue(t)                                  // 先交还任务……
+    if t.PC == StepTools { bus.Dispatch(c.Calls) }    // ……再派发，批次完成时才能从等待集合取到它
     group.AfterStep(result)
 }
 ```
@@ -246,12 +249,13 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
 
 ### 5.1 execModel
 
-1. 检查 `MaxSteps`、`MaxTokens`；超出则提交 `Done`，`StopReason = "budget"`，答案是最后一条 assistant 文本。Deadline 由调度器负责（第 9 节）。
+1. 检查 `MaxSteps`、`MaxTokens`；超出则提交 `Done`，`StopReason = "budget"`，答案是最后一条 assistant 文本，**不算一条模型指令**（不发 step 事件）。未送达的插话由终态提交报告为 `steer_dropped`。Deadline 由调度器负责（第 9 节）。
 2. 寄存器 token 估算超过 `0.7 × 本组模型窗口`（窗口未知时用 `Config.CompactAt`，默认 60000）时，改设 `PC = StepCompact`，提交后结束本步。
 3. 向本组的限流器预占额度（7.2），通过适配器调一次模型。请求以任务的 context 发出，取消会立刻中断它。
 4. 结果：
    - **有工具调用**：assistant 消息原样追加，调用记录写为 `planned`，`PC = StepTools`。
-   - **最终文本**：有未送达的插话，则文本作为 assistant 轮次、送达插话、`PC = StepModel`；否则 `Done`。
+   - **最终文本**：调用期间到达了插话，则文本作为 assistant 轮次，`PC = StepModel`，**插话留在中断表里不合并**：下一条模型指令开头再送达，若下一步因预算或模型出错而结束，它由终态提交报告为 `steer_dropped`。没有插话则 `Done`。
+   - 模型调用 panic 等同于模型出错：任务 `Failed`，原因 `model panicked: …`。
    - **截断且没有内容**：`MaxOut` 乘 4 重做，最多两次，之后 `Failed`。
 5. 提交里带 `usage` 事件（已确认用量）。出错见第 13 节。
 
@@ -350,7 +354,7 @@ type Adapter interface {
 
 ## 8. 并发规则
 
-1. **TCB 单一所有者。** 在就绪队列、等待集合时归调度器；被 `Next` 取走后归那个 vCore，直到 `Requeue`。只有所有者能提交这个任务的状态变化。
+1. **TCB 单一所有者。** 在就绪队列、等待集合时归调度器；被 `Next` 取走后归那个 vCore，被 `Checkout` 取走后归那个工具批次，直到 `Requeue`（或提交失败、强制停机时的 `Forget`）。只有所有者能提交这个任务的状态变化。重复入队、未知状态入队、批次找不到自己的任务都是所有权错误，直接 panic。
 2. **外部输入不直接改 TCB。** 写入中断表并提交即可返回（4.3），由所有者在下一次提交时取用。
 3. **取消信号不受所有权限制。** 每个任务有一个由调度器持有的 `context.CancelFunc`。取消时先提交取消中断，再立刻调用它：在途的模型请求和工具调用马上收到取消（第 9 节）。信号可以随时送达，状态修改仍由所有者做。
 4. **一个任务同一时刻最多一条指令。**
@@ -442,7 +446,8 @@ type ToolDef struct {
 }
 ```
 
-- 模型看到的工具名是 `<设备名>_<工具名>`。挂载时检测重名，重名报错。
+- 模型看到的工具名是 `<设备名>_<工具名>`，`[A-Za-z0-9_-]` 以外的字符替换成 `_`。设备名或工具名为空、或替换后重名，挂载时报错并关闭已传入的设备。页表的前缀按完整工具名匹配，所以 `dev_` 也匹配名为 `dev_extra` 的设备。
+- 超时、取消由总线强制执行，不依赖设备配合：设备调用在单独的 goroutine 里，超时或取消时总线立刻返回错误结果；设备 panic 被恢复成错误结果。不理会 context 的设备会一直占着自己的并发名额，直到它真正返回。设备恰好在超时同一时刻完成时，以它的结果为准。
 - 设备没有声明 `Effect` 时一律当作 `SideEffect`：宁可在恢复时停下来核对，也不重复一个有副作用的操作。MCP 工具的 `readOnlyHint` / `idempotentHint` 映射到 `Effect`。
 - 仲裁：每个设备 `MaxConcurrent`，超出的 FIFO 排队。
 - 页表：快照工具列表时按 `Allow` / `Deny` 过滤，派发时再检查一次，越权调用返回错误结果给模型，不执行。
@@ -547,8 +552,8 @@ m, err := neumann.New(neumann.Config{
 })
 err = m.Start(ctx)                         // 按 4.5 恢复，然后启动 vCore
 id, err := m.Submit(ctx, neumann.Instruction{Kind: "submit", Input: "...", Class: "big"}) // 返回即已持久化
-sub := m.Events(fromSeq)                   // 可补读
-err = m.Stop(ctx)                          // 停止取指，等在途指令提交后返回
+sub := m.Events(ctx, fromSeq)              // 可补读；m.EventLog / m.Load / m.Calls 直接读主存
+err = m.Stop(ctx)                          // 停止取指，等在途指令和工具批次提交；ctx 到期则取消它们（被打断的不提交），再等 2 秒后关闭
 ```
 
 ## 16. 包结构
@@ -576,6 +581,15 @@ neumann/            Machine、Config、公开 API、操作员控制
 
 1. **固定并发 + 状态机**：一个执行组、固定 vCore 数、内存版 Store；TCB 状态机、就绪队列、等待集合、工具异步派发、中断表、插话。
 2. **原子持久化与工具恢复**：SQLite Store、`Commit` 组提交、调用记录、事件表与补读、4.5 的重启流程、`Waiting(Reconcile)` 与 `resolve`。
+   第一阶段留下、这一阶段必须处理的接缝：
+   - `Running` 从未提交。强制停机打断模型调用后，库里的任务是 `Ready`；要么在调用前提交 `Running`，要么删掉 4.5 第 2 步的规则，并据此计 `Unconfirmed`。
+   - `CallRecord` 还没有 `Device` 和 `Effect`。规划调用时就要从总线记下来，不能在恢复时去问当前的总线（工具声明可能已经变了）。
+   - `Waiting(IO)` 的任务可能同时有 `done` 和 `dispatched` 记录，且没有完成提交。把 `complete` 里组装 tool 消息的部分抽成"从调用记录组装"的函数，恢复时复用。
+   - `dispatched` 的调用可能从未发出（停机发生在提交之后、派发之前）。这是预写日志固有的，`SideEffect` 调用会因此进入核对；写进运维说明。
+   - 准入计数从 0 开始。`Start` 要用 `Unfinished` 的数量初始化，否则重启后的终态提交会把它减成负数。
+   - `Submit` / `Steer` 目前在准入锁里做提交。换成 SQLite 组提交后会串行化所有提交：改成在锁里预留名额、锁外提交、失败时回滚。
+   - 单条结果提交失败时，对应的 `tool_result` 事件不会发出（完成提交会补记录，但不补事件）。
+   - 把 `core`、`sched` 移到 `internal/`，外部代码不能绕过所有权规则调用 `Requeue` / `Checkout` / `Forget`；`Config.Clock` 的类型随之移到根包。
 3. **取消、Deadline 与故障注入**：9.4、9.5；在每一个提交点前后注入崩溃。
 4. **自适应伸缩、限流器与迁移**：拥塞窗口、限流器、错误分类、熔断、迁移校验、第二个适配器。
 
