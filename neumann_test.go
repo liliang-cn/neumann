@@ -483,3 +483,31 @@ func TestDefaultSteerFormat(t *testing.T) {
 		t.Fatalf("model saw %q", saw)
 	}
 }
+
+type warmModel struct {
+	*sim.Model
+	warmed chan struct{}
+}
+
+func (w *warmModel) Warm(context.Context) error { close(w.warmed); return nil }
+
+func TestStartWarmsTheModelConnection(t *testing.T) {
+	wm := &warmModel{Model: &sim.Model{Fn: func(model.Request) (model.Response, error) { return sim.Reply("x"), nil }}, warmed: make(chan struct{})}
+	m, err := neumann.New(neumann.Config{Model: wm, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		defer cancel()
+		m.Stop(ctx)
+	}()
+	select {
+	case <-wm.warmed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not warm the model connection")
+	}
+}

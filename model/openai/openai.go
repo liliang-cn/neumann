@@ -33,7 +33,7 @@ func New(baseURL, apiKey, modelName string) *Adapter {
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		Model:   modelName,
-		HTTP:    &http.Client{Timeout: 5 * time.Minute},
+		HTTP:    &http.Client{Transport: NewTransport(HTTP2), Timeout: 5 * time.Minute},
 	}
 }
 

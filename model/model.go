@@ -26,3 +26,9 @@ type Adapter interface {
 	Provider() string
 	Call(ctx context.Context, req Request) (Response, error)
 }
+
+// Warmer is an adapter that can open its connection ahead of the first call.
+// The machine warms it in the background at Start.
+type Warmer interface {
+	Warm(ctx context.Context) error
+}

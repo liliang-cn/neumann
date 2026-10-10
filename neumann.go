@@ -194,6 +194,18 @@ func (m *Machine) Start(ctx context.Context) error {
 	m.started = true
 	runCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
+	if w, ok := m.cfg.Model.(model.Warmer); ok {
+		// Open the connection (and its TLS or QUIC handshake) now, so the
+		// first task does not pay for it. In the background: a slow or failed
+		// warm-up only means the first call connects as it would have anyway.
+		go func() {
+			wctx, cancel := context.WithTimeout(runCtx, 10*time.Second)
+			defer cancel()
+			if err := w.Warm(wctx); err != nil {
+				m.cfg.Logf("neumann: warming the model connection failed: %v", err)
+			}
+		}()
+	}
 	for i := range m.cfg.Cores {
 		m.cores.Add(1)
 		go func() {
