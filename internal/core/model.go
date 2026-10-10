@@ -50,17 +50,19 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	}
 	g := e.groupOf(t.Class)
 	if e.groupDown(g) {
-		// The group is down: no request, no reservation. The task waits for
-		// group_up (or a half-open probe) in the wait set.
-		return park(t, c), nil, nil
+		// The group is down: no request, no reservation. The task moves to
+		// its group's fallback, or waits for group_up (or a half-open probe)
+		// in the wait set.
+		return e.groupGone(t, c, g), nil, nil
 	}
+	a := e.adapter(g)
 
 	// The call runs under the task's own context: a cancel or deadline ends
 	// it at once, whoever holds the task. So does the wait for room in the
 	// limiters before it.
 	tctx, release := e.taskContext(t.ID)
 	defer release()
-	req := model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs, MaxOut: e.sendOut(g, t)}
+	req := model.Request{System: t.System, Tools: t.Tools, Messages: forProvider(t.Regs, a.Provider()), MaxOut: e.sendOut(g, t)}
 	// The wait for room also ends when the machine stops fetching: nothing
 	// is committed yet, so the task goes back as it is.
 	rctx, stopWaiting := context.WithCancel(tctx)
@@ -92,9 +94,10 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		tk, ok, _ := g.Ctl.Admit()
 		if !ok {
 			// Went down while this task waited for room (or another task took
-			// the probe): the room goes back, and the task waits for the group.
+			// the probe): the room goes back, and the task moves or waits for
+			// the group.
 			res.Cancel()
-			return park(t, c, pre...), nil, nil
+			return e.groupGone(t, c, g, pre...), nil, nil
 		}
 		ticket = &tk
 	}
@@ -141,8 +144,8 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	c.Applied = applySteers(t, pending, e.frameSteer)
 
 	stepNo := t.Used.Steps + 1
-	req.Messages = t.Regs
-	resp, err := e.callModel(tctx, req, func(d model.Delta) {
+	req.Messages = forProvider(t.Regs, a.Provider())
+	resp, err := e.callModel(tctx, a, req, func(d model.Delta) {
 		e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
 	})
 	class := model.Unknown
@@ -159,7 +162,7 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		err, panicked, class = perr, true, model.Unknown
 		return true
 	}
-	if err != nil && !panicked && !hookPanicked(guarded("Classify", func() { class = model.ClassifyWith(e.Model, err) })) {
+	if err != nil && !panicked && !hookPanicked(guarded("Classify", func() { class = model.ClassifyWith(a, err) })) {
 		if class == model.Canceled && tctx.Err() == nil {
 			// The task was not cancelled: the adapter gave up on its own (a
 			// timeout it reported as a bare deadline). The provider was slow.
@@ -171,7 +174,7 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	}
 	var info *model.RateInfo
 	if !panicked {
-		hookPanicked(guarded("RateInfo", func() { info = e.rateInfo(resp, err) }))
+		hookPanicked(guarded("RateInfo", func() { info = rateInfo(a, resp, err) }))
 	}
 	how := refundOf(err, class)
 	if panicked {
@@ -357,16 +360,16 @@ func guarded(in string, f func()) (err error) {
 
 // callModel calls the adapter, streaming through emit when the adapter can
 // and a Delta sink is set; a panic in it fails the task, not the process.
-func (e *Env) callModel(ctx context.Context, req model.Request, emit func(model.Delta)) (resp model.Response, err error) {
+func (e *Env) callModel(ctx context.Context, a model.Adapter, req model.Request, emit func(model.Delta)) (resp model.Response, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			resp, err = model.Response{}, &panicError{v: r}
 		}
 	}()
-	if s, ok := e.Model.(model.Streamer); ok && e.Delta != nil {
+	if s, ok := a.(model.Streamer); ok && e.Delta != nil {
 		return s.Stream(ctx, req, emit)
 	}
-	return e.Model.Call(ctx, req)
+	return a.Call(ctx, req)
 }
 
 // applySteers appends each pending steer as a user message, rendered by

@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -27,7 +26,7 @@ func (e *Env) maxOut(t *task.TCB) int {
 	if t.MaxOut > 0 {
 		return t.MaxOut
 	}
-	if oc, ok := e.Model.(model.OutputCap); ok && oc.MaxOut() > 0 {
+	if oc, ok := e.adapter(e.groupOf(t.Class)).(model.OutputCap); ok && oc.MaxOut() > 0 {
 		return oc.MaxOut()
 	}
 	return DefaultMaxOut
@@ -80,8 +79,8 @@ func outCeiling(g *Group) int64 {
 // (the request's JSON bytes / 4: rough, but cheap, and never zero for a
 // large context), and the output cap for "output_tokens". Settlement corrects
 // the estimate with what the provider reported.
-func (e *Env) reserveAmounts(req model.Request, out int) map[string]int64 {
-	if m, ok := e.Model.(model.Metered); ok {
+func reserveAmounts(a model.Adapter, req model.Request, out int) map[string]int64 {
+	if m, ok := a.(model.Metered); ok {
 		return m.Reserve(req)
 	}
 	in := estimateInput(req)
@@ -94,23 +93,15 @@ func (e *Env) reserveAmounts(req model.Request, out int) map[string]int64 {
 }
 
 func estimateInput(req model.Request) int64 {
-	b, err := json.Marshal(struct {
-		S string
-		T []task.ToolSpec
-		M []task.Message
-	}{req.System, req.Tools, req.Messages})
-	if err != nil {
-		return 1
-	}
-	return int64(len(b)/4) + 1
+	return task.EstimateTokens(req.System, req.Tools, req.Messages)
 }
 
 // settleAmounts is what a request used, from its response: the adapter's own
 // figures when it is model.Metered, otherwise the reported usage. A response
 // that reported no usage settles only the request: its tokens stay at the
 // reservation, since nothing better is known.
-func (e *Env) settleAmounts(req model.Request, resp model.Response) map[string]int64 {
-	if m, ok := e.Model.(model.Metered); ok {
+func settleAmounts(a model.Adapter, req model.Request, resp model.Response) map[string]int64 {
+	if m, ok := a.(model.Metered); ok {
 		return m.Settle(req, resp)
 	}
 	out := map[string]int64{model.DimRequests: 1}
@@ -134,7 +125,7 @@ func (e *Env) reserve(ctx context.Context, g *Group, taskID string, req model.Re
 		return nil, nil, nil
 	}
 	var amounts map[string]int64
-	if err := guarded("Reserve", func() { amounts = e.reserveAmounts(req, out) }); err != nil {
+	if err := guarded("Reserve", func() { amounts = reserveAmounts(e.adapter(g), req, out) }); err != nil {
 		return nil, nil, err
 	}
 	start := e.Clock.Now()
@@ -197,7 +188,7 @@ func (e *Env) settleCall(g *Group, res *limit.Reservation, how refund, req model
 		switch how {
 		case settleActual:
 			var actual map[string]int64
-			if err := guarded("Settle", func() { actual = e.settleAmounts(req, resp) }); err != nil {
+			if err := guarded("Settle", func() { actual = settleAmounts(e.adapter(g), req, resp) }); err != nil {
 				res.Cancel()
 				return err
 			}
@@ -223,8 +214,8 @@ func (e *Env) settleCall(g *Group, res *limit.Reservation, how refund, req model
 // rateInfo is what the provider said about its limits on this call: the
 // adapter's model.RateReporter when it has one, else what the response or
 // the error carries.
-func (e *Env) rateInfo(resp model.Response, err error) *model.RateInfo {
-	if rr, ok := e.Model.(model.RateReporter); ok {
+func rateInfo(a model.Adapter, resp model.Response, err error) *model.RateInfo {
+	if rr, ok := a.(model.RateReporter); ok {
 		if err == nil {
 			return rr.RateInfo(&resp, nil)
 		}

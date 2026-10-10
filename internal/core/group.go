@@ -10,20 +10,30 @@ import (
 	"github.com/liliang-cn/neumann/internal/group"
 	"github.com/liliang-cn/neumann/limit"
 	"github.com/liliang-cn/neumann/mem"
+	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
 )
 
 // Group is one execution group as the vCore loop uses it (design §6): its
-// window and breaker, and the limiters every request of the group takes room
-// in (§7). There is one per class; the machine builds them. Its breaker state
-// is not durable: a restarted machine starts every group closed.
+// model, its window, scaler and breaker, and the limiters every request of
+// the group takes room in (§7). There is one per class; the machine builds
+// them. Its breaker state is not durable: a restarted machine starts every
+// group closed.
 type Group struct {
 	Class    string
+	Model    model.Adapter // nil: the Env's
 	Ctl      *group.Group
 	Limiters []*limit.Limiter
 	Limits   []string      // the limiters' names, as configured
 	OpenFor  time.Duration // the breaker's open time; 0 = group.DefaultBreakerOpenFor
+
+	// Fallback is the class a task of this group moves to while the group
+	// is down (design §6.3); empty: it waits. OnMigrateFail is what a task
+	// does when the fallback cannot take it: MigrateWait (the default) or
+	// MigrateFail.
+	Fallback      string
+	OnMigrateFail string
 
 	mu   sync.Mutex
 	kick func() bool // the half-open timer, armed while tasks wait for the group
@@ -34,6 +44,14 @@ func (g *Group) openFor() time.Duration {
 		return g.OpenFor
 	}
 	return group.DefaultBreakerOpenFor
+}
+
+// adapter is the model a group's requests go to: its own, else the Env's.
+func (e *Env) adapter(g *Group) model.Adapter {
+	if g != nil && g.Model != nil {
+		return g.Model
+	}
+	return e.Model
 }
 
 // groupOf is the group of a class; nil when the class has none (a task of a

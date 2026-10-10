@@ -20,6 +20,7 @@ type Instruction struct {
 	TaskID   string       `json:"task_id,omitempty"`
 	Input    string       `json:"input,omitempty"`
 	Class    string       `json:"class,omitempty"`
+	PinClass bool         `json:"pin_class,omitempty"` // never moved to a fallback group
 	Priority int          `json:"priority,omitempty"`
 	Budget   *task.Budget `json:"budget,omitempty"`
 	Allow    []string     `json:"allow,omitempty"`
@@ -56,6 +57,19 @@ const (
 	EvThrottled = "throttled"
 	EvGroupDown = "group_down"
 	EvGroupUp   = "group_up"
+
+	// A vCore started ({class, core, reason, live}: reason demand) or
+	// retired (reason overload, idle, manual or shutdown); live is the
+	// group's vCore count after the change (design §6.1).
+	EvCoreUp   = "core_up"
+	EvCoreDown = "core_down"
+
+	// A task moved to another execution group: {from, to, reason}, reason
+	// group_down or manual (design §6.3). migrate_refused: its group is down
+	// and the fallback cannot take it ({from, to, check, detail}); the task
+	// waits for its group.
+	EvMigrated       = "migrated"
+	EvMigrateRefused = "migrate_refused"
 )
 
 // Event is something that happened, published only after it was committed.

@@ -66,15 +66,15 @@ func TestSettleBeforeObserve(t *testing.T) {
 func TestDefaultAmounts(t *testing.T) {
 	e, _, _ := newTestEnv(t, reply)
 	req := model.Request{System: "be brief", Messages: []task.Message{task.Text(task.RoleUser, "what is two plus two, exactly?")}}
-	got := e.reserveAmounts(req, 4096)
+	got := reserveAmounts(e.Model, req, 4096)
 	if got["requests"] != 1 || got["output_tokens"] != 4096 || got["tokens"] < 10 || got["tokens"] != got["input_tokens"] {
 		t.Fatalf("reserve %v", got)
 	}
-	s := e.settleAmounts(req, model.Response{Usage: task.Usage{PromptTokens: 40, CompletionTokens: 7}})
+	s := settleAmounts(e.Model, req, model.Response{Usage: task.Usage{PromptTokens: 40, CompletionTokens: 7}})
 	if s["requests"] != 1 || s["tokens"] != 47 || s["input_tokens"] != 40 || s["output_tokens"] != 7 {
 		t.Fatalf("settle %v", s)
 	}
-	if s := e.settleAmounts(req, model.Response{}); len(s) != 1 || s["requests"] != 1 {
+	if s := settleAmounts(e.Model, req, model.Response{}); len(s) != 1 || s["requests"] != 1 {
 		t.Fatalf("settle without usage %v", s)
 	}
 	if n := e.maxOut(&task.TCB{}); n != DefaultMaxOut {

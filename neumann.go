@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/liliang-cn/neumann/bus"
+	"github.com/liliang-cn/neumann/cache"
 	"github.com/liliang-cn/neumann/internal/core"
 	"github.com/liliang-cn/neumann/internal/group"
 	"github.com/liliang-cn/neumann/internal/sched"
@@ -34,13 +36,33 @@ const (
 	DefaultPerDevice = 4
 )
 
-// Config of a phase-1 machine: one execution group with a fixed vCore count.
+// Config of a machine. Its execution groups are Groups; with none, Model,
+// Class, Cores and Limits describe one group (the shorthand every machine
+// before execution groups used).
 type Config struct {
-	Model        model.Adapter
+	// Groups are the execution groups, one per class (design §6, §15): each
+	// a model adapter with elastic vCores, a congestion window, a breaker,
+	// the limiters it takes room in, and the fallback its tasks move to
+	// while it is down. Classes are unique; a Fallback names another group,
+	// and following fallbacks never comes back to where it started.
+	Groups []GroupConfig
+	// Default is the class of a task submitted with none; empty: the first
+	// group's.
+	Default string
+
+	// The one-group shorthand, used only when Groups is empty: a group of
+	// class Class (default DefaultClass) on Model, taking room in Limits,
+	// whose window is pinned at Cores (default DefaultCores) — at most Cores
+	// vCores, started as work arrives, as before execution groups existed.
+	// AutoScale(class, true) lets it adapt. Setting any of them together
+	// with Groups is an error.
+	Model  model.Adapter
+	Cores  int
+	Class  string
+	Limits []string
+
 	Devices      []bus.Device
 	Store        mem.Store // nil: in-memory, not durable
-	Cores        int
-	Class        string
 	System       string
 	MaxQueued    int // unfinished tasks admitted at once
 	MaxPerDevice int // concurrent calls per device
@@ -53,11 +75,11 @@ type Config struct {
 	// it is.
 	SteerFormat func(text string) string
 
-	// Limiters are the machine's rate limiters (design §7); Limits names the
-	// ones every model request of the group takes room in (all of them at
-	// once, or it waits). A limiter with no Clock runs on the machine's.
+	// Limiters are the machine's rate limiters (design §7). A group names
+	// the ones every one of its model requests takes room in (all of them at
+	// once, or it waits); groups that name the same limiter share it. A
+	// limiter with no Clock runs on the machine's.
 	Limiters []limit.Config
-	Limits   []string
 
 	// The model step's retry policy (design §11): a task fails with
 	// "model_error" after MaxModelRetries consecutive overloaded or transient
@@ -71,6 +93,57 @@ type Config struct {
 	BackoffMax      time.Duration
 	BackoffJitter   func(step time.Duration) time.Duration
 }
+
+// GroupConfig is one execution group (design §6).
+type GroupConfig struct {
+	Class  string
+	Model  model.Adapter
+	Limits []string // names in Config.Limiters
+
+	// The vCores (design §6.1): the window W starts at Initial (default 2)
+	// and stays within [Min, Max] (Min default 1, Max 0 = no limit); the
+	// group runs at most floor(W) vCores, started as work arrives, and
+	// retires one that has waited IdleRetire (default 30s) for work while it
+	// has more than Min. Cooldown is how long a halving stops the window
+	// growing (default 10s).
+	Min        int
+	Max        int
+	Initial    float64
+	IdleRetire time.Duration
+	Cooldown   time.Duration
+
+	// The breaker (design §6.2): BreakerThreshold consecutive transient
+	// failures open it (default 5), for BreakerOpenFor (default 30s).
+	BreakerThreshold int
+	BreakerOpenFor   time.Duration
+
+	// Fallback is the class a task moves to while this group is down
+	// (design §6.3); empty: it waits. OnMigrateFail is what a task does when
+	// the fallback cannot take it: MigrateWait (default) or MigrateFail.
+	Fallback      string
+	OnMigrateFail string
+
+	// MaxQueued bounds this class's unfinished tasks, as Config.MaxQueued
+	// bounds the machine's; 0 = no bound of its own. A task moved here by
+	// migration is never refused.
+	MaxQueued int
+}
+
+// What a task does when its group is down and the fallback cannot take it.
+const (
+	MigrateWait = core.MigrateWait
+	MigrateFail = core.MigrateFail
+)
+
+// MigrateError is a move to another group refused by a capability check
+// (design §6.3); SetClass returns it. Check is "tools", "tool_count" or
+// "context".
+type MigrateError = core.MigrateError
+
+// ErrTaskBusy is returned by SetClass for a task that is executing an
+// instruction or waiting for its tools: it can be moved between instructions
+// only, and the caller may try again.
+var ErrTaskBusy = errors.New("neumann: task is executing an instruction or waiting for its tools")
 
 // DefaultSteerFormat tells the model that a message arrived while it was
 // working, so it treats the message as part of the request in progress, not
@@ -98,11 +171,18 @@ var (
 	ErrNotFound = mem.ErrNotFound
 )
 
-// CapacityError is returned by Submit when admission would exceed MaxQueued.
-// errors.Is(err, ErrBusy) is true for it.
-type CapacityError struct{ Count, Limit int }
+// CapacityError is returned by Submit when admission would exceed MaxQueued,
+// the machine's (Class empty) or a group's. errors.Is(err, ErrBusy) is true
+// for it.
+type CapacityError struct {
+	Class        string
+	Count, Limit int
+}
 
 func (e *CapacityError) Error() string {
+	if e.Class != "" {
+		return fmt.Sprintf("neumann: at capacity: %d unfinished tasks of class %q, limit %d", e.Count, e.Class, e.Limit)
+	}
 	return fmt.Sprintf("neumann: at capacity: %d unfinished tasks, limit %d", e.Count, e.Limit)
 }
 
@@ -117,11 +197,14 @@ type Machine struct {
 	hub    *hub
 	deltas *deltaHub
 
-	// admit guards active and stopped. active counts unfinished tasks; a task
-	// whose commit failed is forgotten by its vCore and keeps its slot (a bug
-	// path only, in phase 1).
+	// admit guards active, perClass, classOf and stopped. active counts
+	// unfinished tasks, perClass the same by class, and classOf is each
+	// unfinished task's class; a task whose commit failed is forgotten by its
+	// vCore and keeps its slot (a bug path only).
 	admit     sync.Mutex
 	active    int
+	perClass  map[string]int
+	classOf   map[string]string
 	stopped   bool
 	accepting bool           // set by Start once recovery is done
 	inflight  sync.WaitGroup // Submit and Steer calls admitted and still committing
@@ -132,24 +215,17 @@ type Machine struct {
 	life    sync.Mutex
 	started bool
 	cancel  context.CancelFunc
-	cores   sync.WaitGroup
 
-	groups   []*core.Group    // by class; one today
+	groups   []*core.Group // in Config order
+	byClass  map[string]*core.Group
+	queued   map[string]int // each class's MaxQueued; 0 = none
+	defClass string
 	limiters []*limit.Limiter // in Config order
 }
 
 func New(cfg Config) (*Machine, error) {
-	if cfg.Model == nil {
-		return nil, errors.New("neumann: Config.Model is required")
-	}
 	if cfg.Store == nil {
 		cfg.Store = mem.NewMemory()
-	}
-	if cfg.Cores <= 0 {
-		cfg.Cores = DefaultCores
-	}
-	if cfg.Class == "" {
-		cfg.Class = DefaultClass
 	}
 	if cfg.MaxQueued <= 0 {
 		cfg.MaxQueued = DefaultMaxQueued
@@ -169,7 +245,11 @@ func New(cfg Config) (*Machine, error) {
 	if cfg.SteerFormat == nil {
 		cfg.SteerFormat = DefaultSteerFormat
 	}
-	limiters, err := buildLimiters(cfg)
+	groups, pinned, err := groupConfigs(cfg)
+	if err != nil {
+		return nil, err
+	}
+	limiters, err := buildLimiters(cfg, groups)
 	if err != nil {
 		return nil, err
 	}
@@ -180,44 +260,130 @@ func New(cfg Config) (*Machine, error) {
 	haltCtx, haltCancel := context.WithCancel(context.Background())
 	m := &Machine{
 		haltCtx: haltCtx, haltCancel: haltCancel,
-		cfg:    cfg,
-		store:  cfg.Store,
-		sched:  sched.New(cfg.Clock, cfg.AgingAfter),
-		bus:    b,
-		hub:    newHub(),
-		deltas: newDeltaHub(),
+		cfg:      cfg,
+		store:    cfg.Store,
+		sched:    sched.New(cfg.Clock, cfg.AgingAfter),
+		bus:      b,
+		hub:      newHub(),
+		deltas:   newDeltaHub(),
+		perClass: map[string]int{},
+		classOf:  map[string]string{},
+		byClass:  map[string]*core.Group{},
+		queued:   map[string]int{},
+		defClass: cfg.Default,
 	}
-	// One group per class: one class today. Its window and breaker read the
-	// machine's clock, so a fake clock drives the breaker's open time too.
-	g := &core.Group{
-		Class:  cfg.Class,
-		Ctl:    group.New(group.Config{Clock: cfg.Clock}),
-		Limits: slices.Clone(cfg.Limits),
+	if m.defClass == "" {
+		m.defClass = groups[0].Class
 	}
-	for _, name := range cfg.Limits {
-		g.Limiters = append(g.Limiters, limiters[name])
+	// Each group's window, scaler and breaker read the machine's clock, so a
+	// fake clock drives cooldowns, idle retirement and the breaker's open
+	// time too.
+	for _, gc := range groups {
+		g := &core.Group{
+			Class: gc.Class,
+			Model: gc.Model,
+			Ctl: group.New(group.Config{
+				Min: gc.Min, Max: gc.Max, Initial: gc.Initial, Cooldown: gc.Cooldown, IdleRetire: gc.IdleRetire,
+				BreakerThreshold: gc.BreakerThreshold, BreakerOpenFor: gc.BreakerOpenFor, Clock: cfg.Clock,
+			}),
+			Limits:        slices.Clone(gc.Limits),
+			OpenFor:       gc.BreakerOpenFor,
+			Fallback:      gc.Fallback,
+			OnMigrateFail: gc.OnMigrateFail,
+		}
+		for _, name := range gc.Limits {
+			g.Limiters = append(g.Limiters, limiters[name])
+		}
+		if pinned > 0 {
+			g.Ctl.Window.SetCores(pinned)
+		}
+		m.groups = append(m.groups, g)
+		m.byClass[g.Class] = g
+		m.queued[g.Class] = gc.MaxQueued
 	}
 	m.limiters = make([]*limit.Limiter, 0, len(cfg.Limiters))
 	for _, lc := range cfg.Limiters {
 		m.limiters = append(m.limiters, limiters[lc.Name])
 	}
-	m.groups = []*core.Group{g}
 	m.env = &core.Env{
-		Store: m.store, Sched: m.sched, Bus: b, Model: cfg.Model, Clock: cfg.Clock,
+		Store: m.store, Sched: m.sched, Bus: b, Model: m.byClass[m.defClass].Model, Clock: cfg.Clock,
 		Commit: m.commit, Logf: cfg.Logf, SteerFormat: cfg.SteerFormat, Delta: m.deltas.publish, Halt: haltCtx,
-		Groups:     map[string]*core.Group{g.Class: g},
+		Groups:     m.byClass,
 		MaxRetries: cfg.MaxModelRetries, BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax, Jitter: cfg.BackoffJitter,
 		Guard: m.guard,
 	}
 	m.sched.SetContext(haltCtx)
 	m.sched.OnDeadline(m.deadline)
 	m.sched.OnWake(m.wake)
+	m.sched.OnReady(m.env.Grow)
 	return m, nil
 }
 
-// buildLimiters builds cfg.Limiters by name and checks that every name in
-// cfg.Limits is one of them.
-func buildLimiters(cfg Config) (map[string]*limit.Limiter, error) {
+// groupConfigs is cfg's groups, checked: Groups, or the one group the
+// shorthand describes, whose window is then pinned at the returned count.
+func groupConfigs(cfg Config) ([]GroupConfig, int, error) {
+	groups := slices.Clone(cfg.Groups)
+	pinned := 0
+	if len(groups) == 0 {
+		if cfg.Model == nil {
+			return nil, 0, errors.New("neumann: Config.Model or Config.Groups is required")
+		}
+		class := cfg.Class
+		if class == "" {
+			class = DefaultClass
+		}
+		pinned = cfg.Cores
+		if pinned <= 0 {
+			pinned = DefaultCores
+		}
+		groups = []GroupConfig{{Class: class, Model: cfg.Model, Limits: slices.Clone(cfg.Limits), Initial: float64(pinned)}}
+	} else if cfg.Model != nil || cfg.Cores != 0 || cfg.Class != "" || len(cfg.Limits) > 0 {
+		return nil, 0, errors.New("neumann: Config.Model, Cores, Class and Limits describe one group; with Groups, set them in each GroupConfig")
+	}
+	byClass := map[string]GroupConfig{}
+	for _, g := range groups {
+		switch {
+		case g.Class == "":
+			return nil, 0, errors.New("neumann: a group has no Class")
+		case strings.Contains(g.Class, "/"):
+			return nil, 0, fmt.Errorf("neumann: class %q must not contain '/'", g.Class)
+		case g.Model == nil:
+			return nil, 0, fmt.Errorf("neumann: group %q has no Model", g.Class)
+		case g.Min < 0 || g.Max < 0 || g.Initial < 0 || g.MaxQueued < 0 || g.IdleRetire < 0 || g.Cooldown < 0 || g.BreakerThreshold < 0 || g.BreakerOpenFor < 0:
+			return nil, 0, fmt.Errorf("neumann: group %q has a negative setting", g.Class)
+		case g.Max > 0 && g.Max < g.Min:
+			return nil, 0, fmt.Errorf("neumann: group %q has Max %d below Min %d", g.Class, g.Max, g.Min)
+		case g.OnMigrateFail != "" && g.OnMigrateFail != MigrateWait && g.OnMigrateFail != MigrateFail:
+			return nil, 0, fmt.Errorf("neumann: group %q: OnMigrateFail %q is neither %q nor %q", g.Class, g.OnMigrateFail, MigrateWait, MigrateFail)
+		}
+		if _, dup := byClass[g.Class]; dup {
+			return nil, 0, fmt.Errorf("neumann: two groups of class %q", g.Class)
+		}
+		byClass[g.Class] = g
+	}
+	for _, g := range groups {
+		seen := map[string]bool{g.Class: true}
+		for next := g.Fallback; next != ""; next = byClass[next].Fallback {
+			if _, ok := byClass[next]; !ok {
+				return nil, 0, fmt.Errorf("neumann: group %q falls back to %q, which is not a group", g.Class, next)
+			}
+			if seen[next] {
+				return nil, 0, fmt.Errorf("neumann: the fallbacks of group %q come back to %q", g.Class, next)
+			}
+			seen[next] = true
+		}
+	}
+	if cfg.Default != "" {
+		if _, ok := byClass[cfg.Default]; !ok {
+			return nil, 0, fmt.Errorf("neumann: Default names %q, which is not a group", cfg.Default)
+		}
+	}
+	return groups, pinned, nil
+}
+
+// buildLimiters builds cfg.Limiters by name and checks that every name a
+// group gives is one of them.
+func buildLimiters(cfg Config, groups []GroupConfig) (map[string]*limit.Limiter, error) {
 	out := make(map[string]*limit.Limiter, len(cfg.Limiters))
 	for _, lc := range cfg.Limiters {
 		if _, dup := out[lc.Name]; dup {
@@ -232,9 +398,11 @@ func buildLimiters(cfg Config) (map[string]*limit.Limiter, error) {
 		}
 		out[lc.Name] = l
 	}
-	for _, name := range cfg.Limits {
-		if out[name] == nil {
-			return nil, fmt.Errorf("neumann: Limits names %q, which is not in Limiters", name)
+	for _, g := range groups {
+		for _, name := range g.Limits {
+			if out[name] == nil {
+				return nil, fmt.Errorf("neumann: group %q: Limits names %q, which is not in Limiters", g.Class, name)
+			}
 		}
 	}
 	return out, nil
@@ -286,7 +454,7 @@ func (m *Machine) wake(id string) {
 // quota never closes by itself — group_up is announced, and every task
 // waiting for the group runs again.
 func (m *Machine) GroupReset(ctx context.Context, class string) error {
-	if err := m.enter(false); err != nil {
+	if err := m.enter(); err != nil {
 		return err
 	}
 	defer m.inflight.Done()
@@ -299,16 +467,33 @@ func (m *Machine) commit(ctx context.Context, c mem.CommitSet) error {
 	if err != nil {
 		return err
 	}
-	ended := 0
+	var ended []string
 	for _, ev := range evs {
 		if ev.Terminal() {
-			ended++
+			ended = append(ended, ev.TaskID)
 		}
 	}
-	if ended > 0 {
+	if len(ended) > 0 || c.Task != nil {
 		m.admit.Lock()
-		m.active -= ended
+		m.active -= len(ended)
+		for _, id := range ended {
+			if class, ok := m.classOf[id]; ok {
+				m.perClass[class]--
+				delete(m.classOf, id)
+			}
+		}
+		if t := c.Task; t != nil && !t.State.Terminal() {
+			// A migration: the task now counts against its new class.
+			if class, ok := m.classOf[t.ID]; ok && class != t.Class {
+				m.perClass[class]--
+				m.perClass[t.Class]++
+				m.classOf[t.ID] = t.Class
+			}
+		}
 		m.admit.Unlock()
+	}
+	for _, id := range ended {
+		m.bus.ForgetTask(id) // its L2 entries go with it (design §10)
 	}
 	m.hub.notify()
 	return nil
@@ -345,12 +530,18 @@ func (m *Machine) Start(ctx context.Context) error {
 	m.started = true
 	runCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
-	if _, ok := m.cfg.Model.(model.Streamer); !ok {
-		// Not an error, but easy to cause by accident: a wrapper around an
-		// adapter that forwards only Call hides the adapter's Stream.
-		m.cfg.Logf("neumann: model %s does not implement model.Streamer; Deltas will stay silent", m.cfg.Model.Provider())
-	}
-	if w, ok := m.cfg.Model.(model.Warmer); ok {
+	warmed := map[model.Adapter]bool{}
+	for _, g := range m.groups {
+		if _, ok := g.Model.(model.Streamer); !ok {
+			// Not an error, but easy to cause by accident: a wrapper around an
+			// adapter that forwards only Call hides the adapter's Stream.
+			m.cfg.Logf("neumann: model %s of class %s does not implement model.Streamer; Deltas will stay silent for it", g.Model.Provider(), g.Class)
+		}
+		w, ok := g.Model.(model.Warmer)
+		if !ok || warmed[g.Model] {
+			continue
+		}
+		warmed[g.Model] = true
 		// Open the connection (and its TLS or QUIC handshake) now, so the
 		// first task does not pay for it. In the background: a slow or failed
 		// warm-up only means the first call connects as it would have anyway.
@@ -365,13 +556,9 @@ func (m *Machine) Start(ctx context.Context) error {
 	for _, d := range sends {
 		m.env.Dispatch(d.id, d.allow, d.deny, d.batch)
 	}
-	for i := range m.cfg.Cores {
-		m.cores.Add(1)
-		go func() {
-			defer m.cores.Done()
-			m.env.RunVCore(runCtx, m.cfg.Class, i)
-		}()
-	}
+	// vCores start as work arrives (design §6.1): now for the recovered
+	// ready queues, later whenever a task joins one.
+	m.env.StartCores(runCtx)
 	return nil
 }
 
@@ -394,8 +581,11 @@ func (m *Machine) Stop(ctx context.Context) error {
 	if already {
 		return nil
 	}
-	// No instruction is fetched from here on. Close only stops fetching:
-	// tool batches and admitted submits can still hand tasks back.
+	// No instruction is fetched, and no vCore started, from here on. Close
+	// only stops fetching: tool batches and admitted submits can still hand
+	// tasks back. Every vCore retires (core_down, shutdown) once its
+	// instruction is committed.
+	m.env.CloseCores()
 	m.sched.Close()
 	// Submits, steers and resolves admitted before the flag finish their
 	// commits, within the deadline. One that finishes later is durable all
@@ -410,7 +600,7 @@ func (m *Machine) Stop(ctx context.Context) error {
 	if m.started {
 		done := make(chan struct{})
 		go func() {
-			m.cores.Wait()
+			m.env.WaitCores()
 			m.env.CloseDispatch() // a late Resolve cannot start a batch while we wait
 			m.env.WaitBatches()
 			m.env.CloseLate() // late results being recorded land before the store is let go
@@ -456,9 +646,9 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 	}
 	class := in.Class
 	if class == "" {
-		class = m.cfg.Class
+		class = m.defClass
 	}
-	if class != m.cfg.Class {
+	if m.byClass[class] == nil {
 		return "", fmt.Errorf("neumann: unknown class %q", class)
 	}
 	id := in.TaskID
@@ -474,6 +664,7 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 		State:      task.Ready,
 		PC:         task.StepModel,
 		Class:      class,
+		PinClass:   in.PinClass,
 		Priority:   in.Priority,
 		ReadySince: m.cfg.Clock.Now(),
 		System:     m.cfg.System,
@@ -491,14 +682,16 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 	// slip past the limit together; the commit happens outside it, so submits
 	// do not queue behind each other's disk writes. Stop waits for reserved
 	// submits to finish before it closes anything.
-	if err := m.enter(true); err != nil {
+	if err := m.enterTask(id, class); err != nil {
 		return "", err
 	}
 	defer m.inflight.Done()
-	accepted := proto.NewEvent(proto.EvAccepted, id, map[string]any{"class": class, "priority": in.Priority})
+	accepted := proto.NewEvent(proto.EvAccepted, id, map[string]any{"class": class, "priority": in.Priority, "pin_class": in.PinClass})
 	if _, err := m.store.Commit(ctx, mem.CommitSet{Task: t, NewTask: true, Events: []proto.Event{accepted}}); err != nil {
 		m.admit.Lock()
 		m.active--
+		m.perClass[class]--
+		delete(m.classOf, id)
 		m.admit.Unlock()
 		return "", err
 	}
@@ -521,7 +714,7 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 // ErrNotFound for an unknown one. A task that ends on its own while the cancel
 // is being committed ends as it ended.
 func (m *Machine) Cancel(ctx context.Context, taskID string) error {
-	if err := m.enter(false); err != nil {
+	if err := m.enter(); err != nil {
 		return err
 	}
 	defer m.inflight.Done()
@@ -548,10 +741,14 @@ func (m *Machine) deadline(id string) {
 	}
 }
 
-// enter admits one outside request: it fails once the machine is stopped and,
-// for a new task, when the machine is full (reserving the task's slot
-// otherwise). The caller must call m.inflight.Done when its commit is over.
-func (m *Machine) enter(newTask bool) error {
+// enter admits one outside request: it fails once the machine is stopped.
+// The caller must call m.inflight.Done when its commit is over.
+func (m *Machine) enter() error { return m.enterTask("", "") }
+
+// enterTask is enter for a new task id of class (id empty: not a new task):
+// it also fails when the machine, or the class, is full, and reserves the
+// task's slot otherwise.
+func (m *Machine) enterTask(id, class string) error {
 	m.admit.Lock()
 	defer m.admit.Unlock()
 	if m.stopped {
@@ -562,11 +759,19 @@ func (m *Machine) enter(newTask bool) error {
 		// by recovery and scheduled twice.
 		return ErrNotStarted
 	}
-	if newTask {
+	if id != "" {
 		if m.active >= m.cfg.MaxQueued {
 			return &CapacityError{Count: m.active, Limit: m.cfg.MaxQueued}
 		}
+		if limit := m.queued[class]; limit > 0 && m.perClass[class] >= limit {
+			return &CapacityError{Class: class, Count: m.perClass[class], Limit: limit}
+		}
+		if _, dup := m.classOf[id]; dup {
+			return fmt.Errorf("neumann: task %s: %w", id, mem.ErrExists)
+		}
 		m.active++
+		m.perClass[class]++
+		m.classOf[id] = class
 	}
 	m.inflight.Add(1)
 	return nil
@@ -581,7 +786,7 @@ func (m *Machine) Steer(ctx context.Context, taskID, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("neumann: steer needs text")
 	}
-	if err := m.enter(false); err != nil {
+	if err := m.enter(); err != nil {
 		return err
 	}
 	defer m.inflight.Done()
@@ -652,7 +857,7 @@ func (m *Machine) Calls(ctx context.Context, id string) ([]mem.CallRecord, error
 }
 
 type Status struct {
-	Cores      int `json:"cores"`
+	Cores      int `json:"cores"`      // live vCores, every group
 	Ready      int `json:"ready"`      // in ready queues
 	Waiting    int `json:"waiting"`    // in the wait set
 	Held       int `json:"held"`       // on a vCore or being completed by a tool batch
@@ -662,17 +867,30 @@ type Status struct {
 
 	Groups   []GroupStatus  `json:"groups"`
 	Limiters []limit.Status `json:"limiters"`
+	Cache    cache.Stats    `json:"cache"` // L2, the tool result cache (design §10)
 }
 
-// GroupStatus is one execution group's window and breaker (design §6, §14).
+// GroupStatus is one execution group (design §6, §14): its window, its
+// vCores, its queue and its breaker.
 type GroupStatus struct {
-	Class  string   `json:"class"`
-	Limits []string `json:"limits,omitempty"`
+	Class    string   `json:"class"`
+	Model    string   `json:"model"` // the adapter's Provider
+	Limits   []string `json:"limits,omitempty"`
+	Fallback string   `json:"fallback,omitempty"`
 
-	W       float64 `json:"w"`      // congestion window
-	Target  int     `json:"target"` // floor(W) within [Min, Max]
-	Epoch   uint64  `json:"epoch"`  // congestion epoch: one halving each
-	Cooling bool    `json:"cooling"`
+	W        float64       `json:"w"`      // congestion window
+	Target   int           `json:"target"` // floor(W) within [Min, Max]: the vCores the group runs at most
+	Min      int           `json:"min"`
+	Max      int           `json:"max"`   // 0 = no limit
+	Auto     bool          `json:"auto"`  // false while an operator pins W (SetCores)
+	Epoch    uint64        `json:"epoch"` // congestion epoch: one halving each
+	Cooling  bool          `json:"cooling"`
+	Live     int           `json:"live"` // vCores alive
+	Busy     int           `json:"busy"` // ...executing an instruction
+	Ready    int           `json:"ready"`
+	Waiting  int           `json:"waiting"`       // in the wait set, for any reason
+	ForGroup int           `json:"waiting_group"` // ...of which for this group to come back
+	Longest  time.Duration `json:"longest_wait"`  // how long the oldest ready task has been ready
 
 	Breaker   string    `json:"breaker"`         // closed, open, half_open
 	Cause     string    `json:"cause,omitempty"` // why it is open: transient, quota
@@ -687,12 +905,16 @@ func (m *Machine) Status() Status {
 	m.admit.Lock()
 	u := m.active
 	m.admit.Unlock()
-	st := Status{Cores: m.cfg.Cores, Ready: r, Waiting: w, Held: h, Unfinished: u, DeltasDropped: m.deltas.dropped.Load()}
+	st := Status{Ready: r, Waiting: w, Held: h, Unfinished: u, DeltasDropped: m.deltas.dropped.Load(), Cache: m.bus.CacheStats()}
+	queues, now := m.sched.Queues(), m.cfg.Clock.Now()
 	for _, g := range m.groups {
-		win, br := g.Ctl.Window.Snapshot(), g.Ctl.Breaker.Snapshot()
+		gs, q := g.Ctl.Snapshot(), queues[g.Class]
+		win, br := gs.Window, gs.Breaker
+		st.Cores += gs.Running
 		st.Groups = append(st.Groups, GroupStatus{
-			Class: g.Class, Limits: slices.Clone(g.Limits),
-			W: win.W, Target: win.Target, Epoch: win.Epoch, Cooling: win.Cooling,
+			Class: g.Class, Model: g.Model.Provider(), Limits: slices.Clone(g.Limits), Fallback: g.Fallback,
+			W: win.W, Target: win.Target, Min: win.Min, Max: win.Max, Auto: win.Auto, Epoch: win.Epoch, Cooling: win.Cooling,
+			Live: gs.Running, Busy: gs.Busy, Ready: q.Ready, Waiting: q.Waiting, ForGroup: q.ForGroup, Longest: longest(q, now),
 			Breaker: br.State.String(), Cause: string(br.Cause), Failures: br.Failures, OpenedAt: br.OpenedAt, NextProbe: br.NextProbe,
 		})
 	}
@@ -700,6 +922,128 @@ func (m *Machine) Status() Status {
 		st.Limiters = append(st.Limiters, l.Status())
 	}
 	return st
+}
+
+func longest(q sched.Queue, now time.Time) time.Duration {
+	if q.Oldest.IsZero() {
+		return 0
+	}
+	return max(now.Sub(q.Oldest), 0)
+}
+
+// QueueStatus is the scheduler's queues by class (design §9.1, §9.6).
+type QueueStatus struct {
+	Classes []ClassQueue `json:"classes"`
+}
+
+// ClassQueue is one class's queues: its ready queue (and how much of it is
+// background work), its wait set, and how long its oldest ready task has
+// been ready.
+type ClassQueue struct {
+	Class      string        `json:"class"`
+	Ready      int           `json:"ready"`
+	Background int           `json:"background"`
+	Waiting    int           `json:"waiting"`
+	ForGroup   int           `json:"waiting_group"`
+	Longest    time.Duration `json:"longest_wait"`
+}
+
+// Queue reports the queues of every class the machine runs, in Config order,
+// and of any other class a recovered task still has. Like Status, it is a
+// cheap copy: no store read.
+func (m *Machine) Queue() QueueStatus {
+	queues, now := m.sched.Queues(), m.cfg.Clock.Now()
+	var out QueueStatus
+	add := func(class string, q sched.Queue) {
+		out.Classes = append(out.Classes, ClassQueue{
+			Class: class, Ready: q.Ready, Background: q.Background, Waiting: q.Waiting, ForGroup: q.ForGroup, Longest: longest(q, now),
+		})
+	}
+	for _, g := range m.groups {
+		add(g.Class, queues[g.Class])
+		delete(queues, g.Class)
+	}
+	others := slices.Sorted(maps.Keys(queues))
+	for _, class := range others {
+		add(class, queues[class])
+	}
+	return out
+}
+
+// SetCores pins class's window at n (design §6.1, §9.6): the group runs at
+// most n vCores (n is clamped to the group's [Min, Max]) and the window no
+// longer adapts. More vCores start as work asks for them; extra ones retire
+// once their current instruction is committed (core_down, manual).
+func (m *Machine) SetCores(class string, n int) error {
+	g := m.byClass[class]
+	if g == nil {
+		return fmt.Errorf("neumann: unknown class %q", class)
+	}
+	if n < 1 {
+		return fmt.Errorf("neumann: SetCores(%q, %d): a group needs at least one vCore", class, n)
+	}
+	g.Ctl.Window.SetCores(n)
+	m.env.Grow(class)
+	return nil
+}
+
+// AutoScale turns class's adaptive window back on (from where SetCores left
+// it), or freezes it where it is.
+func (m *Machine) AutoScale(class string, on bool) error {
+	g := m.byClass[class]
+	if g == nil {
+		return fmt.Errorf("neumann: unknown class %q", class)
+	}
+	g.Ctl.Window.AutoScale(on)
+	m.env.Grow(class)
+	return nil
+}
+
+// SetClass moves a task to another execution group (design §6.3, §9.6): the
+// operator's migration. The same capability checks as a fallback move apply,
+// and a refusal is a *MigrateError that changes nothing; PinClass does not
+// stop an operator. It returns once the move is committed: the task keeps its
+// ReadySince, a migrated event (reason manual) records it, and its next model
+// step goes to the new group, leaving the old provider's reasoning out. A
+// task waiting for the group it leaves is ready again.
+//
+// A task can be moved between instructions only: one executing an
+// instruction or waiting for its tools gives ErrTaskBusy, and the caller may
+// try again. A finished task gives ErrFinished, an unknown one ErrNotFound.
+func (m *Machine) SetClass(ctx context.Context, taskID, class string) error {
+	if err := m.enter(); err != nil {
+		return err
+	}
+	defer m.inflight.Done()
+	if m.byClass[class] == nil {
+		return fmt.Errorf("neumann: unknown class %q", class)
+	}
+	t, ok := m.sched.Take(taskID, func(t *task.TCB) bool {
+		switch t.State {
+		case task.Ready, task.Suspended:
+			return true
+		case task.Waiting:
+			return t.Wait != task.WaitIO
+		}
+		return false
+	})
+	if !ok {
+		tc, err := m.store.Load(ctx, taskID)
+		switch {
+		case err != nil:
+			return err
+		case tc.State.Terminal():
+			return fmt.Errorf("neumann: task %s: %w", taskID, ErrFinished)
+		}
+		return fmt.Errorf("neumann: task %s: %w", taskID, ErrTaskBusy)
+	}
+	err := m.env.SetClass(ctx, t, class)
+	if errors.Is(err, mem.ErrCancelPending) {
+		m.env.Finalise(ctx, t) // cancelled first: it ends where it is
+		return fmt.Errorf("neumann: task %s was cancelled before it moved: %w", taskID, ErrFinished)
+	}
+	m.env.HandBack(ctx, t, nil) // t is unchanged when err != nil
+	return err
 }
 
 type recoveredDispatch struct {
@@ -723,7 +1067,7 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 	sem := make(chan struct{}, 32)
 	var wg sync.WaitGroup
 	for i, t := range tasks {
-		if t.Class != m.cfg.Class {
+		if m.byClass[t.Class] == nil {
 			m.cfg.Logf("neumann: recovered task %s belongs to class %q, which this machine does not run", t.ID, t.Class)
 		}
 		wg.Add(1)
@@ -751,6 +1095,14 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 	// fires as soon as its task is, and its final commit counts itself out.
 	m.admit.Lock()
 	m.active = unfinished
+	clear(m.perClass)
+	clear(m.classOf)
+	for _, t := range tasks {
+		if !t.State.Terminal() {
+			m.perClass[t.Class]++
+			m.classOf[t.ID] = t.Class
+		}
+	}
 	m.admit.Unlock()
 	for _, t := range tasks {
 		m.sched.Add(t) // a finished one is forgotten; deadlines are armed again
@@ -777,7 +1129,7 @@ var ErrNotReconciling = core.ErrNotReconciling
 // names it). When the task holds no other unknown call, its round is settled
 // and the task resumes.
 func (m *Machine) Resolve(ctx context.Context, taskID, callID string, o Outcome) error {
-	if err := m.enter(false); err != nil {
+	if err := m.enter(); err != nil {
 		return err
 	}
 	defer m.inflight.Done()

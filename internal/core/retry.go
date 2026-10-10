@@ -113,7 +113,8 @@ func outcomeOf(class model.ErrClass) group.Outcome {
 //     transient failure: a provider that keeps saying it ends the task
 //     rather than looping forever.
 //   - QuotaExhausted: the group's breaker is open until an operator resets
-//     it; the task waits for the group, Waiting(Group).
+//     it; the task moves to the group's fallback (groupGone) or waits for
+//     the group, Waiting(Group).
 //   - Overload, Transient and Unknown: Waiting(Backoff) with exponential
 //     backoff, counted in Retries; at the limit the task fails with
 //     "model_error". Unknown is an error nobody could explain, and is taken as
@@ -133,10 +134,11 @@ func (e *Env) modelFailed(t *task.TCB, c mem.CommitSet, class model.ErrClass, er
 			return e.backoff(t, c, class, at, text)
 		}
 	case model.QuotaExhausted:
-		if e.groupOf(t.Class) == nil {
+		g := e.groupOf(t.Class)
+		if g == nil {
 			return failWith(t, c, StopModelError, text)
 		}
-		return park(t, c, retryEvent(t, class.String(), 0, "group", text))
+		return e.groupGone(t, c, g, retryEvent(t, class.String(), 0, "group", text))
 	}
 	t.Retries++
 	if t.Retries >= e.maxRetries() {

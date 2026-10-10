@@ -244,13 +244,18 @@ func TestSubmitStreamsEventsInOrderThroughDone(t *testing.T) {
 	}
 	evs = h.eventsUntil(evs, 1)
 	var kinds []string
-	for i, e := range evs {
+	var prev *out
+	for _, e := range evs {
+		if e.TaskID == "" {
+			continue // a machine event: a vCore starting
+		}
 		if e.TaskID != r.TaskID {
 			t.Fatalf("event of another task: %+v", e)
 		}
-		if i > 0 && (e.Seq <= evs[i-1].Seq || e.TaskSeq != evs[i-1].TaskSeq+1) {
-			t.Fatalf("events out of order: %+v after %+v", e, evs[i-1])
+		if prev != nil && (e.Seq <= prev.Seq || e.TaskSeq != prev.TaskSeq+1) {
+			t.Fatalf("events out of order: %+v after %+v", e, *prev)
 		}
+		prev = &e
 		kinds = append(kinds, e.Kind)
 	}
 	got := strings.Join(kinds, " ")

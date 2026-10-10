@@ -338,7 +338,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("group_reset: %v", r)
 	}
 	p.send(`{"kind":"status"}`)
-	if r := p.reply(nil); r["status"].(map[string]any)["cores"] != float64(2) {
+	if r := p.reply(nil); r["status"].(map[string]any)["groups"].([]any)[0].(map[string]any)["target"] != float64(2) {
 		t.Fatalf("status: %v", r)
 	}
 

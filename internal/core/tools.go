@@ -103,6 +103,7 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []Send) {
 			recorded: make([]bool, len(batch)),
 			notSent:  make([]bool, len(batch)),
 			late:     make([]bool, len(batch)),
+			cached:   make([]bool, len(batch)),
 		}
 		var wg sync.WaitGroup
 		for i, s := range batch {
@@ -114,7 +115,7 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []Send) {
 					b.notSent[i], b.late[i] = true, true // out of time: never handed to the bus
 					return
 				}
-				res, how := e.Bus.Run(tctx, r.Tool, r.Args, r.Key, allow, deny, e.lateFor(taskID, r, over, &landed))
+				res, how, hit := e.Bus.RunCached(tctx, r.Tool, r.Args, r.Key, allow, deny, e.lateFor(taskID, r, over, &landed))
 				if e.halt().Err() != nil {
 					return // halted: the record stays dispatched for recovery
 				}
@@ -125,10 +126,10 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []Send) {
 				case bus.Abandoned:
 					return // cancelled while it ran: its outcome is unknown
 				}
-				b.results[i], b.got[i] = res, true
+				b.results[i], b.got[i], b.cached[i] = res, true, hit
 				r.Status = mem.CallDone
 				r.Result = &res
-				ev := proto.NewEvent(proto.EvToolResult, taskID, map[string]any{"call_id": r.CallID, "is_error": res.IsError})
+				ev := resultEvent(taskID, r.CallID, res, hit)
 				if err := e.Commit(commitCtx, mem.CommitSet{Calls: []mem.CallRecord{r}, Events: []proto.Event{ev}}); err != nil {
 					e.Logf("neumann: commit of result %s/%s failed: %v", taskID, r.CallID, err)
 				} else {
@@ -148,6 +149,17 @@ type outcomes struct {
 	recorded []bool // ...and its own commit landed
 	notSent  []bool // this send never reached the device
 	late     []bool // ...because the deadline had passed
+	cached   []bool // the result came from L2, not the device
+}
+
+// resultEvent is a call's tool_result event; a result L2 served is marked
+// cached.
+func resultEvent(taskID, callID string, res task.ToolResult, cached bool) proto.Event {
+	d := map[string]any{"call_id": callID, "is_error": res.IsError}
+	if cached {
+		d["cached"] = true
+	}
+	return proto.NewEvent(proto.EvToolResult, taskID, d)
 }
 
 // complete hands the batch's task on: with its round finished, or, when the
@@ -206,7 +218,7 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []Send, b *outc
 		if !b.recorded[i] {
 			// Its own commit failed, so its tool_result event was never
 			// published; it goes out with the transition that records it.
-			events = append(events, proto.NewEvent(proto.EvToolResult, taskID, map[string]any{"call_id": r.CallID, "is_error": res.IsError}))
+			events = append(events, resultEvent(taskID, r.CallID, res, b.cached[i]))
 		}
 	}
 	for _, d := range done {

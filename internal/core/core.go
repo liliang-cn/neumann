@@ -65,6 +65,7 @@ type Env struct {
 	Guard func() (release func(), ok bool)
 
 	batches sync.WaitGroup
+	cores   cores // elastic vCores: StartCores, Grow, CloseCores, WaitCores
 
 	dispatchMu     sync.Mutex // guards dispatchClosed against batches.Add
 	dispatchClosed bool
