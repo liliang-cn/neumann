@@ -15,14 +15,14 @@ import (
 	"github.com/liliang-cn/neumann/task"
 )
 
-// Effect is what calling a tool does to the world; recovery depends on it.
-// The zero value is SideEffect: an undeclared tool is assumed to have one.
-type Effect int
+// Effect is the declared effect of a tool (see task.Effect). The zero value
+// is SideEffect: an undeclared tool is assumed to have one.
+type Effect = task.Effect
 
 const (
-	SideEffect Effect = iota
-	ReadOnly
-	Idempotent
+	SideEffect = task.SideEffect
+	ReadOnly   = task.ReadOnly
+	Idempotent = task.Idempotent
 )
 
 type ToolDef struct {

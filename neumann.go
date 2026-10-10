@@ -17,11 +17,11 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/liliang-cn/neumann/bus"
-	"github.com/liliang-cn/neumann/core"
+	"github.com/liliang-cn/neumann/internal/core"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
-	"github.com/liliang-cn/neumann/sched"
+	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/task"
 )
 
@@ -43,7 +43,7 @@ type Config struct {
 	MaxQueued    int // unfinished tasks admitted at once
 	MaxPerDevice int // concurrent calls per device
 	AgingAfter   time.Duration
-	Clock        sched.Clock
+	Clock        Clock
 	Logf         func(format string, args ...any)
 
 	// SteerFormat renders a steer as the user message the model sees. nil
@@ -61,6 +61,13 @@ func DefaultSteerFormat(text string) string {
 	return "[The user sent this while you were working on the request above. " +
 		"Take it into account together with that request.]\n" + text
 }
+
+// Clock is the machine's notion of now: scheduling order and aging read it.
+type Clock interface{ Now() time.Time }
+
+type realClock struct{}
+
+func (realClock) Now() time.Time { return time.Now() }
 
 var (
 	ErrBusy     = errors.New("neumann: at capacity")
@@ -127,7 +134,7 @@ func New(cfg Config) (*Machine, error) {
 		cfg.AgingAfter = sched.DefaultAging
 	}
 	if cfg.Clock == nil {
-		cfg.Clock = sched.RealClock{}
+		cfg.Clock = realClock{}
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf

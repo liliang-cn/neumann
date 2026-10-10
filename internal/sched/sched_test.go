@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liliang-cn/neumann/sched"
+	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/task"
 )
 

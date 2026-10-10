@@ -13,7 +13,7 @@ import (
 	"github.com/liliang-cn/neumann/bus/builtin"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
-	"github.com/liliang-cn/neumann/sched"
+	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/sim"
 	"github.com/liliang-cn/neumann/task"
 )
