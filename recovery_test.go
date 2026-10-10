@@ -73,6 +73,8 @@ type world struct {
 
 	flaky bool         // the machines meter their calls through a limiter, and time runs
 	fails atomic.Int32 // model calls after the tool round so far (flakyModel)
+
+	little modelFn // non-nil: the machines run two groups, big (the scenario's model) falling back to little
 }
 
 func (w *world) setStore(s mem.Store) {
@@ -172,6 +174,9 @@ type crashScenario struct {
 	maxPays  int32
 	flaky    bool   // time runs, and calls go through a limiter
 	retries  string // the model_retry classes a clean run must show, comma-separated
+	little   modelFn
+	class    string        // the class the task must end in; empty: any
+	moved    *atomic.Int32 // counts runs whose first process committed the task in class
 }
 
 func fixed(fn modelFn) func(*world) modelFn { return func(*world) modelFn { return fn } }
@@ -220,7 +225,21 @@ var (
 	// operator would.
 	quotaScenario = crashScenario{name: "quota", model: quotaModel, maxPays: 1, retries: "quota_exhausted",
 		ends: map[task.State]string{task.Done: "end_turn"}}
+	// Two groups: after the payment, big's quota runs out and the task moves
+	// to little, which answers. A restart before the move finds big's
+	// breaker closed, runs out of quota again and moves then.
+	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
+		return sim.Reply("done"), nil
+	}, maxPays: 1, retries: "quota_exhausted", class: "little", moved: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
 )
+
+// bigModel pays, then is out of quota for good.
+func bigModel(req model.Request) (model.Response, error) {
+	if sim.ToolRounds(req) == 0 {
+		return sim.CallTools("dev_pay", "dev_look"), nil
+	}
+	return model.Response{}, sim.QuotaExhausted()
+}
 
 // flakyModel pays, then fails transiently, then is rate limited, then
 // answers. The failures are counted in the world, so a restart does not
@@ -288,6 +307,13 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 		cfg.Limiters = []limit.Config{{Name: "gw", Limits: map[string]limit.Rate{"requests": {Per: time.Minute, Limit: 100}}}}
 		cfg.Limits = []string{"gw"}
 	}
+	if w.little != nil {
+		cfg.Model, cfg.Cores = nil, 0
+		cfg.Groups = []neumann.GroupConfig{
+			{Class: "big", Model: &sim.Model{Name: "big", Fn: fn}, Fallback: "little", Initial: 2},
+			{Class: "little", Model: &sim.Model{Name: "little", Fn: w.little}, Initial: 2},
+		}
+	}
 	m, err := neumann.New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -343,6 +369,7 @@ type crashRun struct {
 func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crashRun) {
 	path := filepath.Join(t.TempDir(), "neumann.db")
 	w := newWorld()
+	w.little = sc.little
 	if sc.flaky {
 		w.flaky = true
 		defer w.tick()()
@@ -386,6 +413,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		return run // never accepted, never there: nothing to recover
 	}
 	id = in.TaskID
+	if tc, err := s2.Load(bg, id); err == nil && sc.moved != nil && tc.Class == sc.class {
+		sc.moved.Add(1)
+	}
 	m2 := newMachine(t, s2, w, sc.model(w))
 	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
 	defer cancel()
@@ -396,7 +426,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	defer stop(t, m2)
 	for ev := range events {
 		if ev.Kind == proto.EvGroupDown {
-			if err := m2.GroupReset(bg, neumann.DefaultClass); err != nil {
+			var g struct{ Class string }
+			json.Unmarshal(ev.Data, &g)
+			if err := m2.GroupReset(bg, g.Class); err != nil {
 				t.Fatalf("group reset: %v", err)
 			}
 		}
@@ -444,6 +476,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	if reason, ok := sc.ends[got.State]; !ok || reason != got.StopReason {
 		t.Fatalf("crash after %d commits (after=%v): task ended %s %q", n, after, got.State, got.StopReason)
+	}
+	if sc.class != "" && got.Class != sc.class {
+		t.Fatalf("crash after %d commits (after=%v): task ended in class %q", n, after, got.Class)
 	}
 	if got.State == task.Done && (got.LastAnswer() != "done" || got.Retries != 0) {
 		t.Fatalf("crash after %d commits: answer %q, retries %d", n, got.LastAnswer(), got.Retries)
@@ -712,4 +747,21 @@ func TestCrashAtEveryCommitPointPastTheDeadline(t *testing.T) {
 		t.Fatal("no crash point left a re-sendable call behind a passed deadline")
 	}
 	t.Logf("%d crash points; recovery finished the deadline at %d; a re-send was held back at %d", points, recovered, unsent)
+}
+
+// The same sweep on two groups, with the task moving from one to the other
+// mid-task: big runs out of quota after the payment and the task migrates to
+// little. Every crash point, before and after its commit, still finishes the
+// task once, in little, paying once.
+func TestCrashAtEveryCommitPointWithAMigration(t *testing.T) {
+	migrateScenario.moved.Store(0)
+	points, held, _ := sweep(t, migrateScenario)
+	if held == 0 {
+		t.Fatal("no crash point left the payment's outcome unknown")
+	}
+	moved := migrateScenario.moved.Load() - 1 // the clean run moved too
+	if moved == 0 || int(moved) == points {
+		t.Fatalf("the first process moved the task at %d of %d crash points: the sweep misses one side of the move", moved, points)
+	}
+	t.Logf("%d crash points; the operator was needed at %d; the task had moved before the crash at %d", points, held, moved)
 }
