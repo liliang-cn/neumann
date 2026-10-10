@@ -65,6 +65,10 @@ type Env struct {
 	// release ends it. nil admits everything.
 	Guard func() (release func(), ok bool)
 
+	// Policy decides each tool call before its first dispatch is committed
+	// (design §9.7). nil allows every call and records no decision.
+	Policy Policy
+
 	batches sync.WaitGroup
 	cores   cores // elastic vCores: StartCores, Grow, CloseCores, WaitCores
 

@@ -318,7 +318,7 @@ func (s *Sched) Cancelled(id string) bool {
 //
 // The task's owner finalises it. When nobody is at work on it, that is the
 // caller: a task in the ready queue, or in the wait set for anything but its
-// tool batch (reconciliation, suspension, later backoff and group waits), is
+// tool batch (reconciliation, approval, suspension, backoff and group waits), is
 // checked out and returned, and the caller must commit its final state and
 // Requeue it, or Forget it. A task on a vCore, waiting on I/O, or held by a
 // batch or an operator is left to its holder, who learns of the cancel from
@@ -581,6 +581,7 @@ type Queue struct {
 	Oldest     time.Time // the earliest ReadySince in the ready queue; zero when it is empty
 	Waiting    int       // in the wait set, for any reason
 	ForGroup   int       // ...of which waiting for their group (Waiting(Group))
+	Approval   int       // ...of which waiting for an operator's approval (Waiting(Approval))
 }
 
 // Queues reports every class that has a task ready or waiting.
@@ -609,6 +610,9 @@ func (s *Sched) Queues() map[string]Queue {
 		c.Waiting++
 		if t.State == task.Waiting && t.Wait == task.WaitGroup {
 			c.ForGroup++
+		}
+		if t.State == task.Waiting && t.Wait == task.WaitApproval {
+			c.Approval++
 		}
 		out[t.Class] = c
 	}

@@ -34,8 +34,8 @@ var failReasons = map[string]string{
 
 // Cancel commits a cancel for a task, then signals it (design §9.5): the
 // task's context ends, so a model call or tool call in flight for it stops at
-// once. A task nobody is at work on (ready, held for reconciliation,
-// suspended) is finalised here before Cancel returns; any other is finalised
+// once. A task nobody is at work on (ready, held for reconciliation or
+// approval, suspended) is finalised here before Cancel returns; any other is finalised
 // by its owner, the vCore or tool batch holding it. The store refuses a
 // cancel for an unknown task (mem.ErrNotFound) or a finished one
 // (mem.ErrFinished).
@@ -252,8 +252,8 @@ func (e *Env) finalise(ctx context.Context, t *task.TCB, c mem.CommitSet, fates 
 // and keeps only what the step learned for certain: confirmed usage and
 // unconfirmed requests, the call ids it handed out, results that came back,
 // and its step and usage events. A call it was about to dispatch for the
-// first time is recorded cancelled; one already in the call log is settled
-// from what the log says.
+// first time, or had held for approval or denied (design §9.7), is recorded
+// cancelled; one already in the call log is settled from what the log says.
 func (e *Env) cancelInstead(ctx context.Context, t *task.TCB, c mem.CommitSet) {
 	ctx = context.WithoutCancel(ctx)
 	stored, err := e.Store.Load(ctx, t.ID)
@@ -278,9 +278,12 @@ func (e *Env) cancelInstead(ctx context.Context, t *task.TCB, c mem.CommitSet) {
 		}
 	}
 	for _, r := range c.Calls {
+		// A call c planned and never sent: about to be dispatched, held for
+		// approval, or denied by the tool policy (done, but never sent).
+		unsent := r.Status == mem.CallDispatched || r.Status == mem.CallPlanned || r.Status == mem.CallDone && r.Attempt == 0
 		switch {
-		case r.Status == mem.CallDispatched && !logged(r.CallID):
-			r.Status, r.Attempt, r.Key = mem.CallCancelled, 0, ""
+		case unsent && !logged(r.CallID):
+			r.Status, r.Attempt, r.Key, r.Result = mem.CallCancelled, 0, "", nil
 		case r.Status == mem.CallDispatched:
 			continue // settled by cancelSet from the log
 		}

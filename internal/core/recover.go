@@ -106,7 +106,18 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 		if err := checkRound(t, rs); err != nil {
 			return nil, err
 		}
+		// A call planned and never decided (a store from before the policy
+		// was set) is decided now, before anything sends it.
+		decided := e.decide(ctx, t, rs)
 		c, batch := e.settle(t, rs, "restart")
+		if len(decided) > 0 {
+			for _, r := range rs {
+				if r.Policy != "" && !slices.ContainsFunc(c.Calls, func(o mem.CallRecord) bool { return o.CallID == r.CallID }) {
+					c.Calls = append(c.Calls, r)
+				}
+			}
+			c.Events = append(decided, c.Events...)
+		}
 		if err := e.Commit(ctx, c); err != nil {
 			return nil, err
 		}
@@ -136,6 +147,22 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 		}
 		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "reconcile", "held": held})
 		return nil, e.Commit(ctx, mem.CommitSet{Events: []proto.Event{ev}})
+	case t.State == task.Waiting && t.Wait == task.WaitApproval:
+		// Still waiting for an operator: each held call is announced again,
+		// so an operator reading events from now on learns of it. The policy
+		// is not asked again; its decisions are in the call log.
+		recs, err := e.Store.Calls(ctx, t.ID)
+		if err != nil {
+			return nil, err
+		}
+		var evs []proto.Event
+		for _, r := range round(t, recs) {
+			if pendingApproval(r) {
+				evs = append(evs, approvalNeeded(t.ID, r, true))
+			}
+		}
+		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "waiting_approval", "pending": len(evs)})
+		return nil, e.Commit(ctx, mem.CommitSet{Events: append([]proto.Event{ev}, evs...)})
 	}
 	return nil, nil
 }
@@ -212,9 +239,20 @@ func (e *Env) Resolve(ctx context.Context, t *task.TCB, callID string, o Outcome
 // Otherwise the calls to send go out and the task waits on I/O; with nothing
 // to send, the round's tool message is assembled and the task is ready.
 func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSet, []Send) {
+	c, send, summary := e.settleRound(t, rs)
+	summary["from"], summary["why"] = "waiting_io", why
+	c.Events = append(c.Events, proto.NewEvent(proto.EvRecovered, t.ID, summary))
+	return c, send
+}
+
+// settleRound is settle without its recovered event, which an operator's
+// approval does not want. A round with a call still held for approval
+// (design §9.7) waits for it in Waiting(Approval), nothing sent; a call held
+// for reconciliation takes precedence.
+func (e *Env) settleRound(t *task.TCB, rs []mem.CallRecord) (mem.CommitSet, []Send, map[string]any) {
 	var c mem.CommitSet
 	var send []Send
-	held := 0
+	held, awaiting := 0, 0
 	for i := range rs {
 		r := &rs[i]
 		switch r.Status {
@@ -224,6 +262,10 @@ func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSe
 				held++
 			}
 		case mem.CallPlanned:
+			if pendingApproval(*r) {
+				awaiting++
+				continue
+			}
 			send = append(send, Send{CallRecord: *r})
 		case mem.CallDispatched:
 			switch {
@@ -245,11 +287,17 @@ func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSe
 			}
 		}
 	}
-	summary := map[string]any{"from": "waiting_io", "why": why, "send": len(send), "held": held}
+	summary := map[string]any{"send": len(send), "held": held}
+	if awaiting > 0 {
+		summary["awaiting"] = awaiting
+	}
 	switch {
 	case held > 0:
 		t.State, t.Wait, t.PC = task.Waiting, task.WaitReconcile, task.StepTools
 		t.Version++
+		send = nil
+	case awaiting > 0:
+		awaitApproval(t)
 		send = nil
 	case len(send) > 0:
 		for i, r := range send {
@@ -266,8 +314,7 @@ func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSe
 		e.ready(t, task.StepModel)
 	}
 	c.Task = t
-	c.Events = append(c.Events, proto.NewEvent(proto.EvRecovered, t.ID, summary))
-	return c, send
+	return c, send, summary
 }
 
 // upsert replaces the record with r's CallID in list, or appends r.

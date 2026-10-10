@@ -70,6 +70,19 @@ const (
 	// waits for its group.
 	EvMigrated       = "migrated"
 	EvMigrateRefused = "migrate_refused"
+
+	// The tool policy and human approval (design §9.7). tool_denied: a call
+	// was refused and never executed; the model gets an error result
+	// ({call_id, tool, reason, by}, by "policy" or "operator"); it takes the
+	// place of tool_result. tool_rewritten: the policy replaced a call's
+	// arguments ({call_id, tool, original, args}). approval_needed: a call is
+	// held for an operator ({call_id, tool, device, effect, args, reason};
+	// recovered: true when a restart announces it again). approved: an
+	// operator let a held call run ({call_id}; an edit adds original and args).
+	EvToolDenied     = "tool_denied"
+	EvToolRewritten  = "tool_rewritten"
+	EvApprovalNeeded = "approval_needed"
+	EvApproved       = "approved"
 )
 
 // Event is something that happened, published only after it was committed.

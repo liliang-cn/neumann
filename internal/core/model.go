@@ -236,17 +236,19 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	msg.Parts = slices.Clone(msg.Parts) // the adapter's slice is not ours to write
 	msg.Role = task.RoleAssistant
 	if len(msg.ToolCalls()) > 0 {
-		var batch []mem.CallRecord
-		for _, r := range e.plan(t, &msg) {
-			batch = append(batch, dispatched(r))
+		recs := e.plan(t, &msg)
+		for _, r := range recs {
 			// Args go into the event as a string: a model can emit malformed
 			// JSON, and marshalling it as raw JSON would fail.
 			c.Events = append(c.Events, proto.NewEvent(proto.EvToolCall, t.ID,
 				map[string]any{"call_id": r.CallID, "tool": r.Tool, "args": string(r.Args)}))
 		}
 		t.Regs = append(t.Regs, msg)
-		waitIO(t)
-		c.Calls = batch
+		// The tool policy decides each call here, before the commit that
+		// dispatches it, and its decisions go into that commit (design §9.7).
+		c.Events = append(c.Events, e.decide(tctx, t, recs)...)
+		batch := e.startRound(t, recs)
+		c.Calls = recs
 		c.Task = t
 		// No re-read of the interrupts here: a cancel committed since then
 		// makes the store refuse this commit, and the step finalises.

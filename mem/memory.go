@@ -196,6 +196,9 @@ func (m *Memory) upsertCall(r CallRecord) {
 
 func cloneCall(r CallRecord) CallRecord {
 	r.Args = append(json.RawMessage(nil), r.Args...)
+	if r.OrigArgs != nil {
+		r.OrigArgs = append(json.RawMessage(nil), r.OrigArgs...)
+	}
 	if r.Result != nil {
 		res := *r.Result
 		r.Result = &res

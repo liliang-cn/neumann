@@ -76,6 +76,24 @@ type world struct {
 	fails atomic.Int32 // model calls after the tool round so far (flakyModel)
 
 	little modelFn // non-nil: the machines run two groups, big (the scenario's model) falling back to little
+
+	approve bool            // the machines hold dev_pay for an operator's approval (approvalPolicy)
+	decided map[string]bool // calls whose policy decision the restarted machine found committed
+	reasked atomic.Int32    // ...and that it asked the policy about again
+}
+
+// approvalPolicy holds every payment for an operator and allows the rest. A
+// call the store already holds a decision for is never asked about again.
+func (w *world) approvalPolicy(_ context.Context, info neumann.ToolCallInfo) neumann.Decision {
+	w.mu.Lock()
+	if w.decided[info.CallID] {
+		w.reasked.Add(1)
+	}
+	w.mu.Unlock()
+	if strings.HasSuffix(info.Tool, "pay") {
+		return neumann.RequireApproval("a payment")
+	}
+	return neumann.Allow()
 }
 
 func (w *world) setStore(s mem.Store) {
@@ -178,6 +196,10 @@ type crashScenario struct {
 	little   modelFn
 	class    string        // the class the task must end in; empty: any
 	moved    *atomic.Int32 // counts runs whose first process committed the task in class
+	// approved, when set: payments wait for an operator's approval, which
+	// each process gives as soon as it sees approval_needed; it counts the
+	// runs in which the restarted machine gave it.
+	approved *atomic.Int32
 }
 
 func fixed(fn modelFn) func(*world) modelFn { return func(*world) modelFn { return fn } }
@@ -229,6 +251,10 @@ var (
 	// Two groups: after the payment, big's quota runs out and the task moves
 	// to little, which answers. A restart before the move finds big's
 	// breaker closed, runs out of quota again and moves then.
+	// The payment waits for an operator's approval, the read goes with it:
+	// a crash before the approval, between it and the dispatch, or after.
+	approvalScenario = crashScenario{name: "approval", model: fixed(payModel), maxPays: 1, approved: new(atomic.Int32),
+		ends: map[task.State]string{task.Done: "end_turn"}}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
 	}, maxPays: 1, retries: "quota_exhausted", class: "little", moved: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
@@ -304,6 +330,9 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 		SteerFormat: func(s string) string { return s }, Logf: func(string, ...any) {},
 		BackoffJitter: func(d time.Duration) time.Duration { return d },
 	}
+	if w.approve {
+		cfg.ToolPolicy = w.approvalPolicy
+	}
 	if w.flaky {
 		cfg.Limiters = []limit.Config{{Name: "gw", Limits: map[string]limit.Rate{"requests": {Per: time.Minute, Limit: 100}}}}
 		cfg.Limits = []string{"gw"}
@@ -326,8 +355,19 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 // quiesce waits until the dead machine has nothing left in flight.
 func quiesce(t *testing.T, m *neumann.Machine, store mem.Store, id string) {
 	t.Helper()
+	quiesceOr(t, m, store, id, func() bool { return false })
+}
+
+// quiesceOr is quiesce that also stops waiting once dead says the process
+// died while nothing was ready or held: a task left waiting for an approval
+// that could not be committed stays in the wait set for good.
+func quiesceOr(t *testing.T, m *neumann.Machine, store mem.Store, id string, dead func() bool) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
+		if st := m.Status(); dead() && st.Ready+st.Held == 0 {
+			return
+		}
 		if tc, err := store.Load(bg, id); err == nil && tc.State.Terminal() {
 			return
 		}
@@ -376,6 +416,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	path := filepath.Join(t.TempDir(), "neumann.db")
 	w := newWorld()
 	w.little = sc.little
+	w.approve = sc.approved != nil
 	if sc.flaky {
 		w.flaky = true
 		defer w.tick()()
@@ -396,14 +437,31 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		w.deadline = w.clock.Now().Add(sc.deadline)
 		in.Budget = &task.Budget{Deadline: w.deadline}
 	}
+	opCtx, opStop := context.WithCancel(bg)
+	defer opStop()
+	if w.approve {
+		// The operator approves every held call as soon as it is announced.
+		go func() {
+			for ev := range m1.Events(opCtx, 0) {
+				if ev.Kind == proto.EvApprovalNeeded {
+					var d struct {
+						CallID string `json:"call_id"`
+					}
+					json.Unmarshal(ev.Data, &d)
+					m1.Approve(bg, ev.TaskID, d.CallID, neumann.ApprovalDecision{})
+				}
+			}
+		}()
+	}
 	id, submitErr := m1.Submit(bg, in)
 	if submitErr != nil && !errors.Is(submitErr, errCrashed) {
 		t.Fatalf("submit: %v", submitErr)
 	}
 	if submitErr == nil {
-		quiesce(t, m1, s1, id)
+		quiesceOr(t, m1, s1, id, func() bool { return w.approve && cs.crashed.Load() })
 	}
 	stop(t, m1)
+	opStop()
 	s1.Close()
 	run.commits = cs.commits.Load()
 
@@ -421,6 +479,17 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	id = in.TaskID
 	if tc, err := s2.Load(bg, id); err == nil && sc.moved != nil && tc.Class == sc.class {
 		sc.moved.Add(1)
+	}
+	if w.approve {
+		recs, _ := s2.Calls(bg, id)
+		w.mu.Lock()
+		w.decided = map[string]bool{}
+		for _, r := range recs {
+			if r.Policy != "" {
+				w.decided[r.CallID] = true
+			}
+		}
+		w.mu.Unlock()
 	}
 	m2 := newMachine(t, s2, w, sc.model(w))
 	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
@@ -453,6 +522,18 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		}
 		if ev.Kind == proto.EvRecovered && d.From == "waiting_group" {
 			run.fromGroup = true
+		}
+		if ev.Kind == proto.EvApprovalNeeded {
+			err := m2.Approve(bg, id, d.CallID, neumann.ApprovalDecision{})
+			switch {
+			case err == nil:
+				sc.approved.Add(1)
+			case errors.Is(err, neumann.ErrNotAwaitingApproval):
+				// Announced by the first process and decided there, or
+				// announced twice (before the crash and by the restart).
+			default:
+				t.Fatalf("approve: %v", err)
+			}
 		}
 		if ev.Kind == proto.EvReconcileNeeded && !d.Cancelled {
 			// The operator checks the bank: the payment went through exactly
@@ -491,6 +572,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	if p := w.pays.Load(); p > sc.maxPays {
 		t.Fatalf("crash after %d commits (after=%v): the payment ran %d times", n, after, p)
+	}
+	if k := w.reasked.Load(); k > 0 {
+		t.Fatalf("crash after %d commits (after=%v): the restarted machine asked the policy again about %d decided calls", n, after, k)
 	}
 	if k := w.afterDead.Load(); k > 0 {
 		t.Fatalf("crash after %d commits (after=%v): %d calls started after the deadline", n, after, k)
@@ -570,6 +654,10 @@ func checkEventsHaveState(t *testing.T, s mem.Store, id string) {
 		case proto.EvToolLate:
 			if !known || r.Status != mem.CallLate || r.Result == nil {
 				t.Fatalf("tool_late %s, but the record is %+v", d.CallID, r)
+			}
+		case proto.EvApprovalNeeded:
+			if !known || r.Policy != mem.PolicyApproval {
+				t.Fatalf("approval_needed %s, but the record is %+v", d.CallID, r)
 			}
 		case proto.EvReconcileNeeded:
 			if !known || r.Attempt < 1 {
@@ -770,4 +858,23 @@ func TestCrashAtEveryCommitPointWithAMigration(t *testing.T) {
 		t.Fatalf("the first process moved the task at %d of %d crash points: the sweep misses one side of the move", moved, points)
 	}
 	t.Logf("%d crash points; the operator was needed at %d; the task had moved before the crash at %d", points, held, moved)
+}
+
+// The same sweep with the payment held for an operator's approval: a crash
+// before the approval is committed, after it and before the dispatch, and
+// after the dispatch, each before and after its commit lands. The restarted
+// machine never asks the policy again about a call it decided, announces a
+// held call again, and an approval given to it finishes the task, paying at
+// most once.
+func TestCrashAtEveryCommitPointWithAnApproval(t *testing.T) {
+	approvalScenario.approved.Store(0)
+	points, held, _ := sweep(t, approvalScenario)
+	after := approvalScenario.approved.Load()
+	if after == 0 {
+		t.Fatal("no crash point left the approval to the restarted machine")
+	}
+	if held == 0 {
+		t.Fatal("no crash point left the approved payment's outcome unknown")
+	}
+	t.Logf("%d crash points; approved after the restart at %d; the operator resolved the payment at %d", points, after, held)
 }

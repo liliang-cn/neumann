@@ -98,9 +98,10 @@ const (
 	WaitBackoff
 	WaitReconcile
 	WaitGroup
+	WaitApproval // a tool round held until an operator approves its calls
 )
 
-var waitNames = [...]string{"none", "io", "backoff", "reconcile", "group"}
+var waitNames = [...]string{"none", "io", "backoff", "reconcile", "group", "approval"}
 
 func (w WaitReason) String() string {
 	if w < 0 || int(w) >= len(waitNames) {

@@ -75,6 +75,11 @@ type Config struct {
 	// it is.
 	SteerFormat func(text string) string
 
+	// ToolPolicy, when set, decides every tool call before its first
+	// dispatch is committed (design §9.7): allow it, deny it, rewrite its
+	// arguments, or hold its round for an operator (Approve). See ToolPolicy.
+	ToolPolicy ToolPolicy
+
 	// Limiters are the machine's rate limiters (design §7). A group names
 	// the ones every one of its model requests takes room in (all of them at
 	// once, or it waits); groups that name the same limiter share it. A
@@ -312,6 +317,7 @@ func New(cfg Config) (*Machine, error) {
 		MaxRetries: cfg.MaxModelRetries, BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax, Jitter: cfg.BackoffJitter,
 		Guard: m.guard,
 	}
+	m.env.Policy = cfg.ToolPolicy
 	m.sched.SetContext(haltCtx)
 	m.sched.OnDeadline(m.deadline)
 	m.sched.OnWake(m.wake)
@@ -862,6 +868,7 @@ type Status struct {
 	Waiting    int `json:"waiting"`    // in the wait set
 	Held       int `json:"held"`       // on a vCore or being completed by a tool batch
 	Unfinished int `json:"unfinished"` // admitted and not yet terminal
+	Approval   int `json:"approval"`   // waiting for an operator's approval (Approve)
 
 	DeltasDropped int64 `json:"deltas_dropped"` // streamed pieces a slow subscriber missed
 
@@ -890,6 +897,7 @@ type GroupStatus struct {
 	Ready    int           `json:"ready"`
 	Waiting  int           `json:"waiting"`       // in the wait set, for any reason
 	ForGroup int           `json:"waiting_group"` // ...of which for this group to come back
+	Approval int           `json:"approval"`      // ...of which for an operator's approval
 	Longest  time.Duration `json:"longest_wait"`  // how long the oldest ready task has been ready
 
 	Breaker   string    `json:"breaker"`         // closed, open, half_open
@@ -914,9 +922,12 @@ func (m *Machine) Status() Status {
 		st.Groups = append(st.Groups, GroupStatus{
 			Class: g.Class, Model: g.Model.Provider(), Limits: slices.Clone(g.Limits), Fallback: g.Fallback,
 			W: win.W, Target: win.Target, Min: win.Min, Max: win.Max, Auto: win.Auto, Epoch: win.Epoch, Cooling: win.Cooling,
-			Live: gs.Running, Busy: gs.Busy, Ready: q.Ready, Waiting: q.Waiting, ForGroup: q.ForGroup, Longest: longest(q, now),
+			Live: gs.Running, Busy: gs.Busy, Ready: q.Ready, Waiting: q.Waiting, ForGroup: q.ForGroup, Approval: q.Approval, Longest: longest(q, now),
 			Breaker: br.State.String(), Cause: string(br.Cause), Failures: br.Failures, OpenedAt: br.OpenedAt, NextProbe: br.NextProbe,
 		})
+	}
+	for _, q := range queues {
+		st.Approval += q.Approval
 	}
 	for _, l := range m.limiters {
 		st.Limiters = append(st.Limiters, l.Status())
@@ -945,6 +956,7 @@ type ClassQueue struct {
 	Background int           `json:"background"`
 	Waiting    int           `json:"waiting"`
 	ForGroup   int           `json:"waiting_group"`
+	Approval   int           `json:"approval"`
 	Longest    time.Duration `json:"longest_wait"`
 }
 
@@ -956,7 +968,7 @@ func (m *Machine) Queue() QueueStatus {
 	var out QueueStatus
 	add := func(class string, q sched.Queue) {
 		out.Classes = append(out.Classes, ClassQueue{
-			Class: class, Ready: q.Ready, Background: q.Background, Waiting: q.Waiting, ForGroup: q.ForGroup, Longest: longest(q, now),
+			Class: class, Ready: q.Ready, Background: q.Background, Waiting: q.Waiting, ForGroup: q.ForGroup, Approval: q.Approval, Longest: longest(q, now),
 		})
 	}
 	for _, g := range m.groups {

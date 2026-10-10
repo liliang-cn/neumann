@@ -453,7 +453,8 @@ func testFullCallRecordRoundTrip(t *testing.T, newStore Factory) {
 	want := []mem.CallRecord{
 		{TaskID: "a", CallID: "c-1", Index: 1, Tool: "dev_x", Args: json.RawMessage(`{"a":`), Status: mem.CallUnknown,
 			Attempt: 2, Key: "a/c-1/2", Device: "dev", Effect: task.SideEffect, ReportUnknown: true,
-			Result: &task.ToolResult{Content: "?", IsError: true}},
+			Result: &task.ToolResult{Content: "?", IsError: true},
+			Policy: mem.PolicyApproval, Approval: mem.ApprovalEdited, Reason: "a payment", OrigArgs: json.RawMessage(`{"a":1,`)},
 		{TaskID: "a", CallID: "c-2", Index: 2, Tool: "dev_y", Args: json.RawMessage(`{"b":1}`), Status: mem.CallDispatched,
 			Attempt: 1, Key: "a/c-2/1", Device: "dev", Effect: task.Idempotent},
 	}

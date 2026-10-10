@@ -44,7 +44,35 @@ type CallRecord struct {
 	Effect        task.Effect      `json:"effect"`
 	ReportUnknown bool             `json:"report_unknown,omitempty"`
 	Result        *task.ToolResult `json:"result,omitempty"`
+
+	// The tool policy's decision (Policy*), taken once, before the call is
+	// first dispatched, and committed with it: recovery never asks again. A
+	// call held for an operator (PolicyApproval) stays planned while Approval
+	// is ApprovalPending. Reason is why the call was denied or held. OrigArgs
+	// are the model's arguments when the policy or an operator replaced them
+	// (Args are what the device is sent).
+	Policy   string          `json:"policy,omitempty"`
+	Approval string          `json:"approval,omitempty"`
+	Reason   string          `json:"reason,omitempty"`
+	OrigArgs json.RawMessage `json:"orig_args,omitempty"`
 }
+
+// The tool policy's decisions (CallRecord.Policy); empty: no policy was
+// configured when the call was planned.
+const (
+	PolicyAllow    = "allow"
+	PolicyDeny     = "deny"
+	PolicyRewrite  = "rewrite"
+	PolicyApproval = "approval"
+)
+
+// An operator's answer to a call the policy held (CallRecord.Approval).
+const (
+	ApprovalPending = "pending"
+	ApprovalAllowed = "allowed"
+	ApprovalDenied  = "denied"
+	ApprovalEdited  = "edited"
+)
 
 // Interrupt kinds. A steer's Text is the message; a cancel's Text is its
 // reason, the StopReason the task ends with ("cancelled" or "deadline").

@@ -37,18 +37,45 @@ func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	c := mem.CommitSet{Events: []proto.Event{
 		proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepTools.String(), Core: core}),
 	}}
-	var batch []mem.CallRecord
+	var planned []mem.CallRecord
 	for _, r := range recs {
 		if r.Status == mem.CallPlanned {
-			batch = append(batch, dispatched(r))
+			planned = append(planned, r)
 		}
 	}
-	if len(batch) == 0 {
+	if len(planned) == 0 {
 		e.ready(t, task.StepModel)
 		c.Task = t
 		return c, nil, nil
 	}
-	c.Calls = batch
+	// Planned calls never sent are decided by the tool policy before the
+	// commit that dispatches them (design §9.7); a held one holds them all.
+	c.Events = append(c.Events, e.decide(ctx, t, planned)...)
+	if slices.ContainsFunc(planned, pendingApproval) {
+		awaitApproval(t)
+		c.Calls, c.Task = planned, t
+		return c, nil, nil
+	}
+	var batch []mem.CallRecord
+	for i, r := range planned {
+		if r.Status == mem.CallPlanned {
+			planned[i] = dispatched(r)
+			batch = append(batch, planned[i])
+		}
+	}
+	c.Calls = planned
+	if len(batch) == 0 {
+		// Every call was denied: the round is answered from the call log.
+		rs := round(t, recs)
+		for _, r := range planned {
+			rs = upsert(rs, r)
+		}
+		slices.SortFunc(rs, func(a, b mem.CallRecord) int { return a.Index - b.Index })
+		t.Regs = append(t.Regs, toolMessage(rs))
+		e.ready(t, task.StepModel)
+		c.Task = t
+		return c, nil, nil
+	}
 	waitIO(t)
 	c.Task = t
 	return c, sends(batch), nil
