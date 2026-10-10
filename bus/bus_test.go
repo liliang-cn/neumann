@@ -111,7 +111,7 @@ func TestCallFailuresBecomeErrorResults(t *testing.T) {
 		{"dev_nope", nil, "unknown tool"},
 		{"dev_boom", []string{"dev_boom"}, "not permitted"},
 		{"dev_boom", nil, "it broke"},
-		{"dev_hang", nil, "deadline exceeded"},
+		{"dev_hang", nil, "timed out after"},
 	}
 	for _, c := range cases {
 		res := b.Call(ctx, c.name, nil, "", nil, c.deny)
@@ -139,6 +139,8 @@ func TestCallPassesArgsAndKey(t *testing.T) {
 
 func TestDeviceConcurrencyIsBounded(t *testing.T) {
 	var inflight, peak atomic.Int32
+	entered := make(chan struct{}, 6)
+	release := make(chan struct{})
 	d := builtin.New("dev").Add(bus.ToolDef{Name: "slow"}, func(context.Context, bus.DeviceCall) (string, error) {
 		n := inflight.Add(1)
 		for {
@@ -147,7 +149,8 @@ func TestDeviceConcurrencyIsBounded(t *testing.T) {
 				break
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		entered <- struct{}{}
+		<-release
 		inflight.Add(-1)
 		return "ok", nil
 	})
@@ -160,9 +163,195 @@ func TestDeviceConcurrencyIsBounded(t *testing.T) {
 			b.Call(ctx, "dev_slow", nil, "", nil, nil)
 		}()
 	}
+	<-entered
+	<-entered
+	time.Sleep(30 * time.Millisecond) // let a third call try to get in
+	close(release)
 	wg.Wait()
+	if p := peak.Load(); p < 1 || p > 2 {
+		t.Fatalf("peak concurrency %d, want 1..2", p)
+	}
 	if peak.Load() != 2 {
-		t.Fatalf("peak concurrency %d, want 2", peak.Load())
+		t.Fatalf("peak concurrency %d, want 2 (barrier guarantees overlap)", peak.Load())
+	}
+}
+
+func TestTimeoutIsEnforcedByBus(t *testing.T) {
+	d := builtin.New("dev").Add(bus.ToolDef{Name: "deaf", Timeout: 20 * time.Millisecond}, func(context.Context, bus.DeviceCall) (string, error) {
+		time.Sleep(300 * time.Millisecond)
+		return "late", nil
+	})
+	b := mustBus(t, 4, d)
+	start := time.Now()
+	res := b.Call(ctx, "dev_deaf", nil, "", nil, nil)
+	if !res.IsError || !strings.Contains(res.Content, "timed out after") {
+		t.Fatalf("got %+v", res)
+	}
+	if el := time.Since(start); el > 200*time.Millisecond {
+		t.Fatalf("took %v", el)
+	}
+}
+
+func TestCancelledCtxNeverReachesDevice(t *testing.T) {
+	var n atomic.Int32
+	d := builtin.New("dev").Add(bus.ToolDef{Name: "x"}, func(context.Context, bus.DeviceCall) (string, error) {
+		n.Add(1)
+		return "ok", nil
+	})
+	b := mustBus(t, 4, d)
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	for range 200 {
+		res := b.Call(cctx, "dev_x", nil, "", nil, nil)
+		if !res.IsError || !strings.Contains(res.Content, "cancelled before the tool ran") {
+			t.Fatalf("got %+v", res)
+		}
+	}
+	if n.Load() != 0 {
+		t.Fatalf("device ran %d times", n.Load())
+	}
+}
+
+func TestQueuedCallHonoursCancel(t *testing.T) {
+	hold := make(chan struct{})
+	entered := make(chan struct{})
+	d := builtin.New("dev").Add(bus.ToolDef{Name: "hold"}, func(context.Context, bus.DeviceCall) (string, error) {
+		entered <- struct{}{}
+		<-hold
+		return "ok", nil
+	})
+	b := mustBus(t, 1, d)
+	done := make(chan struct{})
+	go func() {
+		b.Call(ctx, "dev_hold", nil, "", nil, nil)
+		close(done)
+	}()
+	<-entered
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	res := b.Call(cctx, "dev_hold", nil, "", nil, nil)
+	if !res.IsError || time.Since(start) > 200*time.Millisecond {
+		t.Fatalf("got %+v after %v", res, time.Since(start))
+	}
+	close(hold)
+	<-done
+}
+
+func TestPanicIsIsolated(t *testing.T) {
+	d := builtin.New("dev").
+		Add(bus.ToolDef{Name: "bad"}, func(context.Context, bus.DeviceCall) (string, error) { panic("kaboom") }).
+		Add(bus.ToolDef{Name: "good"}, echo)
+	b := mustBus(t, 1, d)
+	res := b.Call(ctx, "dev_bad", nil, "", nil, nil)
+	if !res.IsError || !strings.Contains(res.Content, "panicked") || !strings.Contains(res.Content, "kaboom") {
+		t.Fatalf("got %+v", res)
+	}
+	done := make(chan task.ToolResult, 1)
+	go func() { done <- b.Call(ctx, "dev_good", json.RawMessage(`1`), "", nil, nil) }()
+	select {
+	case r := <-done:
+		if r.IsError {
+			t.Fatalf("got %+v", r)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slot was not released after panic")
+	}
+}
+
+func TestSlotIsPerDeviceNotPerTool(t *testing.T) {
+	var inflight, peak atomic.Int32
+	fn := func(context.Context, bus.DeviceCall) (string, error) {
+		n := inflight.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		inflight.Add(-1)
+		return "ok", nil
+	}
+	b := mustBus(t, 1, builtin.New("dev").Add(bus.ToolDef{Name: "a"}, fn).Add(bus.ToolDef{Name: "b"}, fn))
+	var wg sync.WaitGroup
+	for _, n := range []string{"dev_a", "dev_b", "dev_a", "dev_b"} {
+		wg.Add(1)
+		go func() { defer wg.Done(); b.Call(ctx, n, nil, "", nil, nil) }()
+	}
+	wg.Wait()
+	if peak.Load() != 1 {
+		t.Fatalf("peak %d, want 1", peak.Load())
+	}
+
+	// two separate devices under perDevice=1 run concurrently
+	var inflight2 atomic.Int32
+	bar := make(chan struct{})
+	mk := func(name string) *builtin.Device {
+		return builtin.New(name).Add(bus.ToolDef{Name: "t"}, func(context.Context, bus.DeviceCall) (string, error) {
+			if inflight2.Add(1) == 2 {
+				close(bar)
+			}
+			select {
+			case <-bar:
+			case <-time.After(time.Second):
+				return "", errors.New("never overlapped")
+			}
+			return "ok", nil
+		})
+	}
+	b2 := mustBus(t, 1, mk("d1"), mk("d2"))
+	for _, n := range []string{"d1_t", "d2_t"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if r := b2.Call(ctx, n, nil, "", nil, nil); r.IsError {
+				t.Errorf("%s: %+v", n, r)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+type closeRec struct {
+	name   string
+	closed *atomic.Int32
+}
+
+func (c closeRec) Name() string { return c.name }
+func (c closeRec) Tools(context.Context) ([]bus.ToolDef, error) {
+	return []bus.ToolDef{{Name: "x"}}, nil
+}
+func (c closeRec) Call(context.Context, bus.DeviceCall) (task.ToolResult, error) {
+	return task.ToolResult{}, nil
+}
+func (c closeRec) Close() error { c.closed.Add(1); return nil }
+
+func TestNewValidatesAndClosesOnError(t *testing.T) {
+	if _, err := bus.New(ctx, 4, builtin.New("").Add(bus.ToolDef{Name: "x"}, echo)); err == nil {
+		t.Fatal("empty device name accepted")
+	}
+	if _, err := bus.New(ctx, 4, builtin.New("dev").Add(bus.ToolDef{Name: ""}, echo)); err == nil {
+		t.Fatal("empty tool name accepted")
+	}
+	var closed atomic.Int32
+	dup := builtin.New("dev").Add(bus.ToolDef{Name: "x"}, echo)
+	_, err := bus.New(ctx, 4, closeRec{"dev", &closed}, dup, closeRec{"zzz", &closed})
+	if err == nil || !strings.Contains(err.Error(), `device "dev"`) || !strings.Contains(err.Error(), `tool "x"`) {
+		t.Fatalf("err = %v", err)
+	}
+	if closed.Load() != 2 {
+		t.Fatalf("closed %d devices, want 2", closed.Load())
+	}
+}
+
+func TestSpecsSchemaIsCopied(t *testing.T) {
+	d := builtin.New("dev").Add(bus.ToolDef{Name: "x", Schema: json.RawMessage(`{"type":"object"}`)}, echo)
+	b := mustBus(t, 4, d)
+	s := b.Specs(nil, nil)
+	s[0].Schema[2] = 'X'
+	if got := string(b.Specs(nil, nil)[0].Schema); got != `{"type":"object"}` {
+		t.Fatalf("schema mutated: %s", got)
 	}
 }
 

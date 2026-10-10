@@ -23,7 +23,8 @@ func New(name string) *Device {
 	return &Device{name: name, fns: map[string]Func{}}
 }
 
-// Add registers a tool and returns the device, for chaining.
+// Add registers a tool and returns the device, for chaining. Call Add only
+// before the device is attached to a bus.
 func (d *Device) Add(def bus.ToolDef, fn Func) *Device {
 	d.defs = append(d.defs, def)
 	d.fns[def.Name] = fn
