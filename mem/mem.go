@@ -52,11 +52,16 @@ type Interrupt struct {
 //   - Task, when set, is the new TCB. NewTask requires Version 1 and an
 //     unused ID; otherwise Version must be the stored Version + 1.
 //   - Calls are upserted by (TaskID, CallID).
-//   - NewInterrupts are rejected for unknown (ErrNotFound) or finished
-//     (ErrFinished) tasks.
-//   - Applied marks interrupts of Task as applied; it requires Task.
-//   - When Task is terminal, every interrupt still unapplied is marked applied
-//     and a steer_dropped event is added for it, in the same commit.
+//   - Calls must belong to a stored task or to the task created by this commit.
+//     Calls on terminal tasks are allowed (late results are recorded there).
+//   - NewInterrupts are checked against the state before this commit: they are
+//     rejected for unknown (ErrNotFound) or finished (ErrFinished) tasks, so an
+//     interrupt for a task created in the same commit is ErrNotFound.
+//   - Applied marks interrupts of Task as applied; it requires Task, and every
+//     seq must be a currently pending interrupt of that task.
+//   - When Task is terminal, every interrupt still unapplied is marked applied,
+//     and a steer_dropped event is added for each steer among them, in the
+//     same commit.
 //   - Events get their Seq and TaskSeq; Commit returns them.
 type CommitSet struct {
 	Task          *task.TCB

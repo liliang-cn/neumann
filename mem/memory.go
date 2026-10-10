@@ -1,6 +1,7 @@
 package mem
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,7 +46,10 @@ func (m *Memory) Commit(ctx context.Context, c CommitSet) ([]proto.Event, error)
 		return nil, err
 	}
 
-	events := append([]proto.Event(nil), c.Events...)
+	events := make([]proto.Event, len(c.Events))
+	for i, e := range c.Events {
+		events[i] = cloneEvent(e)
+	}
 	if c.Task != nil {
 		m.tasks[c.Task.ID] = c.Task.Clone()
 	}
@@ -70,8 +74,10 @@ func (m *Memory) Commit(ctx context.Context, c CommitSet) ([]proto.Event, error)
 				list[i].Applied = true
 			case c.Task.State.Terminal():
 				list[i].Applied = true
-				events = append(events, proto.NewEvent(proto.EvSteerDropped, c.Task.ID,
-					map[string]any{"seq": list[i].Seq, "text": list[i].Text}))
+				if list[i].Kind == InterruptSteer {
+					events = append(events, proto.NewEvent(proto.EvSteerDropped, c.Task.ID,
+						map[string]any{"seq": list[i].Seq, "text": list[i].Text}))
+				}
 			}
 		}
 	}
@@ -79,14 +85,26 @@ func (m *Memory) Commit(ctx context.Context, c CommitSet) ([]proto.Event, error)
 		m.taskSeq[events[i].TaskID]++
 		events[i].Seq = int64(len(m.events)) + 1
 		events[i].TaskSeq = m.taskSeq[events[i].TaskID]
-		m.events = append(m.events, events[i])
+		m.events = append(m.events, cloneEvent(events[i]))
 	}
-	return events, nil
+	out := make([]proto.Event, len(events))
+	for i, e := range events {
+		out[i] = cloneEvent(e)
+	}
+	return out, nil
+}
+
+func cloneEvent(e proto.Event) proto.Event {
+	e.Data = bytes.Clone(e.Data)
+	return e
 }
 
 // validate checks a commit completely before anything is applied, so that a
 // commit applies whole or not at all.
 func (m *Memory) validate(c CommitSet) error {
+	if c.NewTask && c.Task == nil {
+		return errors.New("mem: NewTask requires Task")
+	}
 	if len(c.Applied) > 0 && c.Task == nil {
 		return errors.New("mem: Applied requires Task")
 	}
@@ -101,6 +119,23 @@ func (m *Memory) validate(c CommitSet) error {
 			return fmt.Errorf("%w: %s", ErrNotFound, t.ID)
 		case !c.NewTask && t.Version != old.Version+1:
 			return fmt.Errorf("%w: task %s is at %d, commit carries %d", ErrVersion, t.ID, old.Version, t.Version)
+		}
+	}
+	for _, r := range c.Calls {
+		if _, ok := m.tasks[r.TaskID]; !ok && !(c.NewTask && c.Task.ID == r.TaskID) {
+			return fmt.Errorf("%w: %s", ErrNotFound, r.TaskID)
+		}
+	}
+	for _, seq := range c.Applied {
+		pending := false
+		for _, in := range m.interrupts[c.Task.ID] {
+			if in.Seq == seq && !in.Applied {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return fmt.Errorf("mem: interrupt %d is not pending for task %s", seq, c.Task.ID)
 		}
 	}
 	for _, in := range c.NewInterrupts {
@@ -212,5 +247,9 @@ func (m *Memory) Events(ctx context.Context, afterSeq int64, limit int) ([]proto
 	if limit > 0 && afterSeq+int64(limit) < end {
 		end = afterSeq + int64(limit)
 	}
-	return append([]proto.Event(nil), m.events[afterSeq:end]...), nil
+	out := make([]proto.Event, 0, end-afterSeq)
+	for _, e := range m.events[afterSeq:end] {
+		out = append(out, cloneEvent(e))
+	}
+	return out, nil
 }

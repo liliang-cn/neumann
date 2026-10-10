@@ -3,6 +3,7 @@ package mem_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/liliang-cn/neumann/mem"
@@ -191,5 +192,160 @@ func TestUnfinished(t *testing.T) {
 	got, _ := s.Unfinished(ctx)
 	if len(got) != 1 || got[0].ID != "a" {
 		t.Fatalf("unfinished %+v", got)
+	}
+}
+
+func TestEventDataIsCopied(t *testing.T) {
+	s := mem.NewMemory()
+	data := []byte(`{"k":"v"}`)
+	ev := proto.NewEvent(proto.EvStep, "a", nil)
+	ev.Data = data
+	ret := mustCommit(t, s, mem.CommitSet{Task: newTask("a"), NewTask: true, Events: []proto.Event{ev}})
+	data[2] = 'X'
+	ret[0].Data[2] = 'Y'
+	got, _ := s.Events(ctx, 0, 0)
+	if string(got[0].Data) != `{"k":"v"}` {
+		t.Fatalf("store aliased commit data: %s", got[0].Data)
+	}
+	got[0].Data[2] = 'Z'
+	again, _ := s.Events(ctx, 0, 0)
+	if string(again[0].Data) != `{"k":"v"}` {
+		t.Fatalf("store aliased read data: %s", again[0].Data)
+	}
+}
+
+func TestCallsForUnknownTaskRejected(t *testing.T) {
+	s := mem.NewMemory()
+	_, err := s.Commit(ctx, mem.CommitSet{Calls: []mem.CallRecord{{TaskID: "nope", CallID: "c", Index: 1}}})
+	if !errors.Is(err, mem.ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+	if calls, _ := s.Calls(ctx, "nope"); len(calls) != 0 {
+		t.Fatalf("stored %+v", calls)
+	}
+	// a call for the task created in the same commit is fine
+	mustCommit(t, s, mem.CommitSet{Task: newTask("a"), NewTask: true, Calls: []mem.CallRecord{{TaskID: "a", CallID: "c", Index: 1}}})
+}
+
+func TestNewTaskWithoutTask(t *testing.T) {
+	s := mem.NewMemory()
+	if _, err := s.Commit(ctx, mem.CommitSet{NewTask: true}); err == nil {
+		t.Fatal("NewTask without Task was accepted")
+	}
+}
+
+func TestCommitIsAtomic(t *testing.T) {
+	s := mem.NewMemory()
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true, Events: []proto.Event{proto.NewEvent(proto.EvAccepted, "a", nil)}})
+	tc.Version = 2
+	_, err := s.Commit(ctx, mem.CommitSet{
+		Task:          tc,
+		Calls:         []mem.CallRecord{{TaskID: "a", CallID: "c", Index: 1}},
+		Events:        []proto.Event{proto.NewEvent(proto.EvStep, "a", nil)},
+		NewInterrupts: []mem.Interrupt{{TaskID: "ghost", Kind: mem.InterruptSteer}},
+	})
+	if !errors.Is(err, mem.ErrNotFound) {
+		t.Fatalf("got %v, want ErrNotFound", err)
+	}
+	if got, _ := s.Load(ctx, "a"); got.Version != 1 {
+		t.Fatalf("version %d, want 1", got.Version)
+	}
+	if calls, _ := s.Calls(ctx, "a"); len(calls) != 0 {
+		t.Fatalf("calls %+v", calls)
+	}
+	if evs, _ := s.Events(ctx, 0, 0); len(evs) != 1 {
+		t.Fatalf("events %+v", evs)
+	}
+	evs := mustCommit(t, s, mem.CommitSet{Task: tc, Events: []proto.Event{proto.NewEvent(proto.EvStep, "a", nil)}})
+	if evs[0].Seq != 2 || evs[0].TaskSeq != 2 {
+		t.Fatalf("gap after failed commit: %+v", evs[0])
+	}
+}
+
+func twoSteers(t *testing.T) (*mem.Memory, *task.TCB) {
+	t.Helper()
+	s := mem.NewMemory()
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, steer("a", "one"))
+	mustCommit(t, s, steer("a", "two"))
+	return s, tc
+}
+
+func TestTerminalWithAppliedDropsOnlyTheRest(t *testing.T) {
+	s, tc := twoSteers(t)
+	tc.State, tc.Version = task.Done, 2
+	evs := mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{1}})
+	if len(evs) != 1 || evs[0].Kind != proto.EvSteerDropped || !strings.Contains(string(evs[0].Data), `"seq":2`) {
+		t.Fatalf("events %+v", evs)
+	}
+	if pending, _ := s.Interrupts(ctx, "a", true); len(pending) != 0 {
+		t.Fatalf("still pending: %+v", pending)
+	}
+}
+
+func TestNonTerminalAppliedLeavesOthersPending(t *testing.T) {
+	s, tc := twoSteers(t)
+	tc.Version = 2
+	mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{1}})
+	pending, _ := s.Interrupts(ctx, "a", true)
+	if len(pending) != 1 || pending[0].Seq != 2 {
+		t.Fatalf("pending %+v", pending)
+	}
+}
+
+func TestTaskSeqInterleaves(t *testing.T) {
+	s := mem.NewMemory()
+	e := func(id string) mem.CommitSet {
+		return mem.CommitSet{Events: []proto.Event{proto.NewEvent(proto.EvStep, id, nil)}}
+	}
+	mustCommit(t, s, mem.CommitSet{Task: newTask("a"), NewTask: true})
+	mustCommit(t, s, mem.CommitSet{Task: newTask("b"), NewTask: true})
+	var got []proto.Event
+	for _, id := range []string{"a", "b", "a"} {
+		got = append(got, mustCommit(t, s, e(id))...)
+	}
+	want := [][2]int64{{1, 1}, {2, 1}, {3, 2}}
+	for i, w := range want {
+		if got[i].Seq != w[0] || got[i].TaskSeq != w[1] {
+			t.Fatalf("event %d = seq %d taskseq %d, want %v", i, got[i].Seq, got[i].TaskSeq, w)
+		}
+	}
+}
+
+func TestSameVersionIsAConflict(t *testing.T) {
+	s := mem.NewMemory()
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	if _, err := s.Commit(ctx, mem.CommitSet{Task: tc}); !errors.Is(err, mem.ErrVersion) {
+		t.Fatalf("got %v, want ErrVersion", err)
+	}
+}
+
+func TestAppliedMustBePending(t *testing.T) {
+	s, tc := twoSteers(t)
+	tc.Version = 2
+	if _, err := s.Commit(ctx, mem.CommitSet{Task: tc, Applied: []int64{99}}); err == nil {
+		t.Fatal("unknown seq accepted")
+	}
+	mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{1}})
+	tc.Version = 3
+	if _, err := s.Commit(ctx, mem.CommitSet{Task: tc, Applied: []int64{1}}); err == nil {
+		t.Fatal("already-applied seq accepted")
+	}
+}
+
+func TestNonSteerInterruptDroppedSilently(t *testing.T) {
+	s := mem.NewMemory()
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: "other"}}})
+	tc.State, tc.Version = task.Done, 2
+	if evs := mustCommit(t, s, mem.CommitSet{Task: tc}); len(evs) != 0 {
+		t.Fatalf("events %+v", evs)
+	}
+	if pending, _ := s.Interrupts(ctx, "a", true); len(pending) != 0 {
+		t.Fatalf("pending %+v", pending)
 	}
 }
