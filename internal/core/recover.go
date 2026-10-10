@@ -27,20 +27,28 @@ type Outcome struct {
 	IsError bool   // the call failed
 }
 
-// round returns the calls of t's current tool round: recorded calls the
-// registers hold no result for yet, in call order.
+// round returns the calls of t's current tool round, in call order: the tool
+// calls of the last assistant turn, when no tool message has answered it yet.
+// It reads only the end of the registers, so compaction removing older turns
+// cannot make an old call look current.
 func round(t *task.TCB, recs []mem.CallRecord) []mem.CallRecord {
-	answered := map[string]bool{}
-	for _, m := range t.Regs {
-		for _, p := range m.Parts {
-			if p.Kind == task.PartToolResult {
-				answered[p.CallID] = true
+	var want map[string]bool
+	for i := len(t.Regs) - 1; i >= 0; i-- {
+		m := t.Regs[i]
+		if m.Role == task.RoleTool {
+			return nil // the last round is answered
+		}
+		if m.Role == task.RoleAssistant {
+			want = map[string]bool{}
+			for _, p := range m.ToolCalls() {
+				want[p.CallID] = true
 			}
+			break
 		}
 	}
 	var out []mem.CallRecord
 	for _, r := range recs {
-		if !answered[r.CallID] {
+		if want[r.CallID] {
 			out = append(out, r)
 		}
 	}
@@ -68,13 +76,50 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]mem.CallRecord, error
 		if err != nil {
 			return nil, err
 		}
-		c, batch := e.settle(t, round(t, recs), "restart")
+		rs := round(t, recs)
+		if err := checkRound(t, rs); err != nil {
+			return nil, err
+		}
+		c, batch := e.settle(t, rs, "restart")
 		if err := e.Commit(ctx, c); err != nil {
 			return nil, err
 		}
 		return batch, nil
+	case t.State == task.Waiting && t.Wait == task.WaitReconcile:
+		// Still held from an earlier run. Announced again: an operator
+		// reading events from now on must learn that it waits for them.
+		recs, err := e.Store.Calls(ctx, t.ID)
+		if err != nil {
+			return nil, err
+		}
+		var held []map[string]any
+		for _, r := range round(t, recs) {
+			if r.Status == mem.CallUnknown && r.Result == nil {
+				held = append(held, map[string]any{"call_id": r.CallID, "tool": r.Tool, "device": r.Device, "args": string(r.Args), "key": r.Key})
+			}
+		}
+		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "reconcile", "held": held})
+		return nil, e.Commit(ctx, mem.CommitSet{Events: []proto.Event{ev}})
 	}
 	return nil, nil
+}
+
+// checkRound refuses a round whose call log this version cannot settle, so a
+// damaged or foreign record stops Start with an error naming the task rather
+// than a panic on every start.
+func checkRound(t *task.TCB, rs []mem.CallRecord) error {
+	for _, r := range rs {
+		switch r.Status {
+		case mem.CallPlanned, mem.CallDispatched:
+		case mem.CallDone, mem.CallUnknown:
+			if r.Status == mem.CallDone && r.Result == nil {
+				return fmt.Errorf("task %s: call %s is done but has no result", t.ID, r.CallID)
+			}
+		default:
+			return fmt.Errorf("task %s: call %s has status %q, which recovery cannot settle", t.ID, r.CallID, r.Status)
+		}
+	}
+	return nil
 }
 
 // Resolve applies an operator's outcome to a call held for reconciliation,
@@ -84,6 +129,9 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]mem.CallRecord, error
 func (e *Env) Resolve(ctx context.Context, t *task.TCB, callID string, o Outcome) ([]mem.CallRecord, error) {
 	if t.State != task.Waiting || t.Wait != task.WaitReconcile {
 		return nil, fmt.Errorf("task %s: %w", t.ID, ErrNotReconciling)
+	}
+	if o.Retry && (o.Result != "" || o.IsError) {
+		return nil, errors.New("an outcome is either Retry or a result, not both")
 	}
 	recs, err := e.Store.Calls(ctx, t.ID)
 	if err != nil {
@@ -156,7 +204,7 @@ func (e *Env) settle(t *task.TCB, rs []mem.CallRecord, why string) (mem.CommitSe
 				held++
 				c.Calls = upsert(c.Calls, *r)
 				c.Events = append(c.Events, proto.NewEvent(proto.EvReconcileNeeded, t.ID,
-					map[string]any{"call_id": r.CallID, "tool": r.Tool, "args": string(r.Args), "key": r.Key}))
+					map[string]any{"call_id": r.CallID, "tool": r.Tool, "device": r.Device, "args": string(r.Args), "key": r.Key}))
 			}
 		}
 	}

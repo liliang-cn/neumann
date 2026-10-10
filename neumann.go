@@ -65,6 +65,9 @@ func DefaultSteerFormat(text string) string {
 // Clock is the machine's notion of now: scheduling order and aging read it.
 type Clock interface{ Now() time.Time }
 
+// ErrNotStarted is returned by Submit, Steer and Resolve before Start.
+var ErrNotStarted = errors.New("neumann: machine not started")
+
 var (
 	ErrBusy     = errors.New("neumann: at capacity")
 	ErrStopped  = errors.New("neumann: machine stopped")
@@ -94,10 +97,11 @@ type Machine struct {
 	// admit guards active and stopped. active counts unfinished tasks; a task
 	// whose commit failed is forgotten by its vCore and keeps its slot (a bug
 	// path only, in phase 1).
-	admit    sync.Mutex
-	active   int
-	stopped  bool
-	inflight sync.WaitGroup // Submit and Steer calls admitted and still committing
+	admit     sync.Mutex
+	active    int
+	stopped   bool
+	accepting bool           // set by Start once recovery is done
+	inflight  sync.WaitGroup // Submit and Steer calls admitted and still committing
 
 	haltCtx    context.Context
 	haltCancel context.CancelFunc
@@ -380,6 +384,11 @@ func (m *Machine) enter(newTask bool) error {
 	if m.stopped {
 		return ErrStopped
 	}
+	if !m.accepting {
+		// Before Start has recovered the store, a new task would be read back
+		// by recovery and scheduled twice.
+		return ErrNotStarted
+	}
 	if newTask {
 		if m.active >= m.cfg.MaxQueued {
 			return &CapacityError{Count: m.active, Limit: m.cfg.MaxQueued}
@@ -502,17 +511,31 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 	if err != nil {
 		return nil, fmt.Errorf("neumann: read unfinished tasks: %w", err)
 	}
-	var sends []recoveredDispatch
-	for _, t := range tasks {
+	// Tasks are independent, so they recover concurrently and their commits
+	// share transactions (group commit) instead of paying one fsync each.
+	batches := make([][]mem.CallRecord, len(tasks))
+	errs := make([]error, len(tasks))
+	sem := make(chan struct{}, 32)
+	var wg sync.WaitGroup
+	for i, t := range tasks {
 		if t.Class != m.cfg.Class {
 			m.cfg.Logf("neumann: recovered task %s belongs to class %q, which this machine does not run", t.ID, t.Class)
 		}
-		batch, err := m.env.Recover(ctx, t)
-		if err != nil {
-			return nil, fmt.Errorf("neumann: recover task %s: %w", t.ID, err)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			batches[i], errs[i] = m.env.Recover(ctx, t)
+		}()
+	}
+	wg.Wait()
+	var sends []recoveredDispatch
+	for i, t := range tasks {
+		if errs[i] != nil {
+			return nil, fmt.Errorf("neumann: recover task %s: %w", t.ID, errs[i])
 		}
-		if len(batch) > 0 {
-			sends = append(sends, recoveredDispatch{t.ID, slices.Clone(t.Allow), slices.Clone(t.Deny), batch})
+		if len(batches[i]) > 0 {
+			sends = append(sends, recoveredDispatch{t.ID, slices.Clone(t.Allow), slices.Clone(t.Deny), batches[i]})
 		}
 	}
 	for _, t := range tasks {
@@ -520,6 +543,7 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 	}
 	m.admit.Lock()
 	m.active = len(tasks)
+	m.accepting = true
 	m.admit.Unlock()
 	if len(tasks) > 0 {
 		m.cfg.Logf("neumann: recovered %d unfinished tasks; %d resume with calls in flight", len(tasks), len(sends))

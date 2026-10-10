@@ -13,8 +13,9 @@ import (
 
 // execTools commits the planned calls as dispatched and the task as waiting.
 // The caller dispatches the returned batch only after that commit succeeds.
-// A model step dispatches its own calls; this instruction is for a task whose
-// calls are planned but were never dispatched (phase-2 recovery resumes there).
+// A model step dispatches its own calls, and recovery dispatches through
+// settle; this instruction covers a task left Ready at StepTools with planned
+// calls, which no current path produces but a store may still hold.
 func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []mem.CallRecord, error) {
 	recs, err := e.Store.Calls(ctx, t.ID)
 	if err != nil {
