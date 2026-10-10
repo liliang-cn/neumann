@@ -592,6 +592,8 @@ type Event struct {
 
 stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。
 
+实现在 `proto/jsonl`（线格式的完整说明在它的包文档里），`cmd/neumann` 把它接到 stdin/stdout。回复和事件共用 stdout，每行第一个字段 `"type"` 是 `"reply"` 或 `"event"`：宿主进程（Node、Python）天然只有 stdout，多开一个 fd 两边都别扭；共用一个流还给出了顺序，`subscribe` 的回复恰好落在旧流最后一个事件和新流第一个事件之间。指令可带 `"id"`，回复原样带回；指令按到达顺序逐条执行。读得慢的一方不阻塞机器：事件按输出写出的速度从主存读，回复优先于积压的事件写出。
+
 ## 13. 出错处理
 
 | 情况 | 处理 |
@@ -649,7 +651,8 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
     storetest/      每个 Store 都要通过的一致性套件
   model/            Adapter 接口、错误分类
     openai/  anthropic/
-  proto/            Instruction、Event、JSON Lines 编解码
+  proto/            Instruction、Event
+    jsonl/          JSON Lines 编解码与 stdio 服务（Server）
   sim/              确定性模拟器：假时钟、脚本模型、脚本设备、故障注入点
   cmd/neumann/      stdio 前端
 ```
