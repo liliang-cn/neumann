@@ -77,7 +77,7 @@ func (e *Env) fits(t *task.TCB, target *Group) (compact bool, refused *MigrateEr
 	if caps.MaxTools > 0 && len(t.Tools) > caps.MaxTools {
 		return false, refuse(CheckToolCount, "the task has %d tools and %s takes at most %d", len(t.Tools), a.Provider(), caps.MaxTools)
 	}
-	sz, known := sizeFor(target, caps, 0, t.MaxOut)
+	sz, known := sizeFor(target, caps, 0, t.MaxOut, 0)
 	if !known {
 		return false, nil
 	}
@@ -85,7 +85,7 @@ func (e *Env) fits(t *task.TCB, target *Group) (compact bool, refused *MigrateEr
 	if in+sz.reserve <= sz.window {
 		return false, nil
 	}
-	if err := canCompact(t.System, t.Tools, t.Regs, a.Provider(), sz); err != nil {
+	if err := canCompact(t.System, t.Tools, t.Regs, nil, a.Provider(), sz); err != nil {
 		return false, refuse(CheckContext, "about %d tokens with %d reserved for output do not fit the window of %d, and compaction cannot make them fit: %v",
 			in, sz.reserve, sz.window, err)
 	}
@@ -165,7 +165,7 @@ func migrate(t *task.TCB, c mem.CommitSet, class, reason string, compact bool, e
 	if compact {
 		t.PC = task.StepCompact
 	}
-	t.Window, t.CompactChunk = 0, 0
+	t.Window, t.WindowAt, t.CompactChunk, t.CompactRaise, t.CompactLimit = 0, 0, 0, 0, 0
 	t.Version++
 	c.Task = t
 	c.Events = append(c.Events, evs...)
@@ -194,7 +194,7 @@ func (e *Env) SetClass(ctx context.Context, t *task.TCB, class string) error {
 	}
 	moved := t.Clone()
 	moved.Class = class
-	moved.Window, moved.CompactChunk = 0, 0
+	moved.Window, moved.WindowAt, moved.CompactChunk, moved.CompactRaise, moved.CompactLimit = 0, 0, 0, 0, 0
 	moved.PC = movedPC(moved.PC, compact)
 	if moved.State == task.Waiting && moved.Wait == task.WaitGroup {
 		moved.State, moved.Wait = task.Ready, task.WaitNone
@@ -233,7 +233,7 @@ func (e *Env) Rehome(ctx context.Context, t *task.TCB, class string) error {
 	}
 	moved := t.Clone()
 	moved.Class = class
-	moved.Window, moved.CompactChunk = 0, 0
+	moved.Window, moved.WindowAt, moved.CompactChunk, moved.CompactRaise, moved.CompactLimit = 0, 0, 0, 0, 0
 	moved.PC = movedPC(moved.PC, compact)
 	moved.Version++
 	ev := proto.NewEvent(proto.EvMigrated, t.ID, map[string]any{"from": t.Class, "to": class, "reason": ReasonClassRemoved})

@@ -61,14 +61,14 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		return e.groupGone(t, c, g), nil, nil
 	}
 	a := e.adapter(g)
-	switch d := e.windowFor(t, g, a, false); {
+	switch d := e.windowFor(t, g, a, false, steerMessages(pending, e.frameSteer)); {
 	case d.overflow != "":
 		// Not an instruction either: nothing is sent.
 		return failWith(t, c, StopContextOverflow, d.overflow), nil, nil
 	case d.compact:
 		return e.execCompact(ctx, t, core, g, a, d)
 	}
-	t.CompactChunk = 0 // a pass that found nothing more to swap out is over
+	t.CompactChunk, t.CompactRaise, t.CompactLimit = 0, 0, 0 // a pass that found nothing more to swap out is over
 
 	base := len(t.Regs)
 	req := model.Request{System: t.System, Tools: t.Tools, Messages: forProvider(t.Regs, a.Provider()), MaxOut: e.sendOut(g, t)}
@@ -319,6 +319,7 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		// any other.
 		t.Used.Steps++
 		t.Used.Add(resp.Usage)
+		e.windowAnswered(t, a, req)
 		c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
 	}
 	if lost {
@@ -448,6 +449,17 @@ func (e *Env) callModel(ctx context.Context, a model.Adapter, req model.Request,
 		return s.Stream(ctx, req, emit)
 	}
 	return a.Call(ctx, req)
+}
+
+// steerMessages are the user messages applySteers would add for pending.
+func steerMessages(pending []mem.Interrupt, frame func(string) string) []task.Message {
+	var out []task.Message
+	for _, in := range pending {
+		if in.Kind == mem.InterruptSteer {
+			out = append(out, task.Text(task.RoleUser, frame(in.Text)))
+		}
+	}
+	return out
 }
 
 // applySteers appends each pending steer as a user message, rendered by

@@ -261,7 +261,7 @@ func (e *Env) finish(t *task.TCB, c mem.CommitSet, reason string) mem.CommitSet 
 	t.Version++
 	c.Task = t
 	c.Events = append(c.Events,
-		proto.NewEvent(proto.EvAnswer, t.ID, map[string]string{"text": t.LastAnswer()}),
+		proto.NewEvent(proto.EvAnswer, t.ID, map[string]string{"text": e.lastAnswer(t)}),
 		proto.NewEvent(proto.EvDone, t.ID, map[string]string{"stop_reason": reason}))
 	return c
 }
@@ -273,4 +273,20 @@ func (e *Env) fail(t *task.TCB, c mem.CommitSet, reason string) mem.CommitSet {
 	c.Task = t
 	c.Events = append(c.Events, proto.NewEvent(proto.EvFailed, t.ID, map[string]string{"error": reason}))
 	return c
+}
+
+// lastAnswer is the text of the last assistant message that has any: in the
+// registers, else (compaction swapped it out, design §5.3) in the task's
+// archive. Every message left in the registers is newer than every archived
+// one, so the registers are read first.
+func (e *Env) lastAnswer(t *task.TCB) string {
+	if s := t.LastAnswer(); s != "" || t.Archived == 0 {
+		return s
+	}
+	archived, err := e.Store.Archive(context.Background(), t.ID)
+	if err != nil {
+		e.Logf("neumann: task %s: read archive for its answer: %v", t.ID, err)
+		return ""
+	}
+	return (&task.TCB{Regs: archived[:min(t.Archived, len(archived))]}).LastAnswer()
 }

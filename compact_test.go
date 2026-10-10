@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/liliang-cn/neumann"
 	"github.com/liliang-cn/neumann/bus"
+	"github.com/liliang-cn/neumann/bus/builtin"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/sim"
@@ -715,4 +717,249 @@ func TestCompactionAroundARoundHeldForApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkHistory(t, m, id, "count to twenty", 20)
+}
+
+// toolBlocks counts the tool rounds in a compaction request's transcript.
+func toolBlocks(req model.Request) int {
+	return strings.Count(req.Messages[len(req.Messages)-1].TextContent(), "### tool results")
+}
+
+// A compaction cut off by its output cap (finish_reason "length") is a
+// truncation, never a summary: it is redone with the cap raised fourfold
+// (model_retry class truncated, wait none, the new max_out), at most twice
+// and never past half the window; the chunks shrink to leave the room. A
+// summary cut off with text in it is not accepted either.
+func TestTruncatedCompactionIsRedoneWithALargerCap(t *testing.T) {
+	for _, withText := range []bool{false, true} {
+		t.Run(fmt.Sprintf("text=%v", withText), func(t *testing.T) {
+			r := &rounder{rounds: 20, size: 400}
+			var mu sync.Mutex
+			var caps []int
+			sm := &sim.Model{Info: &smallWindow, Fn: func(req model.Request) (model.Response, error) {
+				if sim.IsCompaction(req) {
+					mu.Lock()
+					caps = append(caps, req.MaxOut)
+					mu.Unlock()
+					if req.MaxOut < 1024 {
+						if withText {
+							resp := sim.Summarize(req)
+							resp.FinishReason = "length"
+							resp.Message = task.Text(task.RoleAssistant, "rounds=0 and th")
+							return resp, nil
+						}
+						return sim.Truncated(), nil
+					}
+				}
+				return r.fn(req)
+			}}
+			m := startWith(t, neumann.Config{Model: sm, Devices: []bus.Device{echoDev()}})
+			id := submit(t, m, proto.Instruction{Input: "go"})
+			got := waitDone(t, m, id)
+			if got.State != task.Done || got.LastAnswer() != "done after 20" {
+				t.Fatalf("task ended %s %q: %q", got.State, got.StopReason, got.LastAnswer())
+			}
+			mu.Lock()
+			first := slices.Clone(caps[:2])
+			mu.Unlock()
+			if first[0] != 256 || first[1] != 1024 {
+				t.Fatalf("compaction caps %v: want 256 then 1024", first)
+			}
+			var trunc []retryData
+			for _, rd := range retries(t, m, id) {
+				if rd.Class == "truncated" {
+					trunc = append(trunc, rd)
+				}
+			}
+			if len(trunc) == 0 || trunc[0].MaxOut != 1024 || trunc[0].Wait != "none" {
+				t.Fatalf("truncation retries %+v", trunc)
+			}
+			for _, msg := range got.Regs {
+				if strings.Contains(task.SummaryText(msg), "and th") {
+					t.Fatal("a cut-off summary reached the registers")
+				}
+			}
+			checkHistory(t, m, id, "go", 20)
+		})
+	}
+}
+
+// A compaction that is still cut off at the largest cap is split: the next
+// request carries half as many rounds (model_retry wait "split"), down to
+// one; a summary of a single round that still cannot finish fails the task
+// with StopReason "truncated", leaving the registers and the archive as they
+// were.
+func TestTruncatedCompactionIsSplitThenFails(t *testing.T) {
+	t.Run("split", func(t *testing.T) {
+		r := &rounder{rounds: 20, size: 400}
+		sm := &sim.Model{Info: &smallWindow, Fn: func(req model.Request) (model.Response, error) {
+			if sim.IsCompaction(req) && toolBlocks(req) > 2 {
+				return sim.Truncated(), nil
+			}
+			return r.fn(req)
+		}}
+		m := startWith(t, neumann.Config{Model: sm, Devices: []bus.Device{echoDev()}})
+		id := submit(t, m, proto.Instruction{Input: "go"})
+		got := waitDone(t, m, id)
+		if got.State != task.Done || got.LastAnswer() != "done after 20" || got.CompactLimit != 0 || got.CompactRaise != 0 {
+			t.Fatalf("task ended %s %q: %q (limit %d, raise %d)", got.State, got.StopReason, got.LastAnswer(), got.CompactLimit, got.CompactRaise)
+		}
+		split := 0
+		for _, rd := range retries(t, m, id) {
+			if rd.Class == "truncated" && rd.Wait == "split" {
+				split++
+			}
+		}
+		if split == 0 {
+			t.Fatal("no split")
+		}
+		for _, d := range compactedEvents(t, m, id) {
+			if d.Rounds > 2 {
+				t.Fatalf("a compaction of %d rounds went through: %+v", d.Rounds, d)
+			}
+		}
+		checkHistory(t, m, id, "go", 20)
+	})
+	t.Run("fails", func(t *testing.T) {
+		r := &rounder{rounds: 20, size: 400}
+		sm := &sim.Model{Info: &smallWindow, Fn: func(req model.Request) (model.Response, error) {
+			if sim.IsCompaction(req) {
+				return sim.Truncated(), nil
+			}
+			return r.fn(req)
+		}}
+		m := startWith(t, neumann.Config{Model: sm, Devices: []bus.Device{echoDev()}})
+		id := submit(t, m, proto.Instruction{Input: "go"})
+		got := waitDone(t, m, id)
+		if got.State != task.Failed || got.StopReason != "truncated" || got.Archived != 0 {
+			t.Fatalf("task ended %s %q, archived %d", got.State, got.StopReason, got.Archived)
+		}
+		if fe := failedEvent(t, m, id); !strings.Contains(fe["error"], "compaction") {
+			t.Fatalf("failed %v", fe)
+		}
+		for _, msg := range got.Regs {
+			if msg.Summary {
+				t.Fatal("a summary in the registers")
+			}
+		}
+	})
+}
+
+// A window learned from a rejection is not kept for good: a provider that
+// accepts more later (or whose limit was a passing one) gets larger requests
+// again once the learned window is forgotten (windowForget answered calls
+// after it was learned), and a call the provider accepted above it raises it.
+func TestLearnedWindowRecovers(t *testing.T) {
+	r := &rounder{rounds: 70, size: 400}
+	var limit atomic.Int64
+	limit.Store(2500)
+	var mu sync.Mutex
+	var accepted []int64
+	sm := &sim.Model{Info: &model.Caps{MaxOut: 256, Tools: true}, Fn: func(req model.Request) (model.Response, error) {
+		if est(req) > limit.Load() {
+			limit.Store(6000) // the provider only refuses once
+			return model.Response{}, sim.ContextTooLong()
+		}
+		if !sim.IsCompaction(req) {
+			mu.Lock()
+			accepted = append(accepted, est(req))
+			mu.Unlock()
+		}
+		return r.fn(req)
+	}}
+	m := startWith(t, neumann.Config{Model: sm, Devices: []bus.Device{echoDev()}})
+	id := submit(t, m, proto.Instruction{Input: "go"})
+	got := waitDone(t, m, id)
+	if got.State != task.Done || got.LastAnswer() != "done after 70" {
+		t.Fatalf("task ended %s %q: %q", got.State, got.StopReason, got.LastAnswer())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if max := slices.Max(accepted); max <= 2500 {
+		t.Fatalf("the largest request after the rejection was %d tokens: the learned window never recovered", max)
+	}
+}
+
+// Pending steers count when the task is measured: a long steer that would
+// push the request over the threshold makes the task compact first, rather
+// than send a request over it.
+func TestPendingSteersCountAgainstTheWindow(t *testing.T) {
+	r := &rounder{rounds: 12, size: 400}
+	entered, gate := make(chan struct{}, 20), make(chan struct{})
+	var once sync.Once
+	dev := builtin.New("dev").Add(bus.ToolDef{Name: "echo"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
+		if strings.HasPrefix(string(c.Args), `{"n":6,`) {
+			once.Do(func() { entered <- struct{}{}; <-gate })
+		}
+		return string(c.Args), nil
+	})
+	var mu sync.Mutex
+	var over []int64
+	sm := &sim.Model{Info: &smallWindow, Fn: func(req model.Request) (model.Response, error) {
+		if !sim.IsCompaction(req) {
+			if e := est(req) + 256; float64(e) > 0.8*4096 {
+				mu.Lock()
+				over = append(over, e)
+				mu.Unlock()
+			}
+		}
+		return r.fn(req)
+	}}
+	m := startWith(t, neumann.Config{Model: sm, Devices: []bus.Device{dev}, SteerFormat: func(s string) string { return s }})
+	id := submit(t, m, proto.Instruction{Input: "go"})
+	<-entered
+	if err := m.Steer(bg, id, strings.Repeat("also mind this. ", 360)); err != nil { // about 1500 tokens
+		t.Fatal(err)
+	}
+	close(gate)
+	got := waitDone(t, m, id)
+	if got.State != task.Done {
+		t.Fatalf("task ended %s %q", got.State, got.StopReason)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(over) > 0 {
+		t.Fatalf("model requests over the threshold: %v", over)
+	}
+}
+
+// A task that runs out of budget right after a compaction answers with the
+// last text the model wrote, even when that text was swapped out to the
+// archive.
+func TestBudgetAnswerAfterACompactionComesFromTheArchive(t *testing.T) {
+	r := &rounder{rounds: 40, size: 400}
+	sm := &sim.Model{Info: &smallWindow, Fn: func(req model.Request) (model.Response, error) {
+		resp, err := r.fn(req)
+		if !sim.IsCompaction(req) && sim.Rounds(req) == 0 {
+			resp.Message.Parts = append([]task.Part{{Kind: task.PartText, Text: "my plan: count"}}, resp.Message.Parts...)
+		}
+		return resp, err
+	}}
+	m := startWith(t, neumann.Config{Model: sm, Devices: []bus.Device{echoDev()}})
+	probe := submit(t, m, proto.Instruction{Input: "go"})
+	waitDone(t, m, probe)
+	steps := 0
+	for _, ev := range eventsOf(t, m, probe) {
+		if ev.Kind == proto.EvStep {
+			steps++
+		}
+		if ev.Kind == proto.EvCompacted {
+			break
+		}
+	}
+	id := submit(t, m, proto.Instruction{Input: "go", Budget: &task.Budget{MaxSteps: steps}})
+	got := waitDone(t, m, id)
+	if got.StopReason != "budget" || got.Archived == 0 || got.LastAnswer() != "" {
+		t.Fatalf("task ended %s %q, archived %d, answer in registers %q", got.State, got.StopReason, got.Archived, got.LastAnswer())
+	}
+	var answer string
+	for _, ev := range eventsOf(t, m, id) {
+		if ev.Kind == proto.EvAnswer {
+			var d struct{ Text string }
+			json.Unmarshal(ev.Data, &d)
+			answer = d.Text
+		}
+	}
+	if answer != "my plan: count" {
+		t.Fatalf("answer %q", answer)
+	}
 }

@@ -200,9 +200,20 @@ type TCB struct {
 	// sizes by it when it is below the adapter's Caps.Window, or when that is
 	// unknown. A move to another group clears it.
 	Window int `json:"window,omitempty"`
+	// WindowAt is Used.Steps when Window was learned: the learned window is
+	// forgotten some answered calls later, so a provider whose limit was a
+	// passing one gets larger requests again (design §5.3).
+	WindowAt int `json:"window_at,omitempty"`
 	// CompactChunk is how many chunks the compaction pass in progress (PC
 	// StepCompact) has swapped out so far; 0 when none is in progress.
 	CompactChunk int `json:"compact_chunk,omitempty"`
+	// CompactRaise is how often the compaction in progress was cut off by
+	// its output cap and is sent again with the cap raised fourfold (at
+	// most 2); CompactLimit, when not 0, is how many units its next chunk
+	// may carry, halved each time it is cut off at the largest cap. Both go
+	// back to 0 once a compaction is applied.
+	CompactRaise int `json:"compact_raise,omitempty"`
+	CompactLimit int `json:"compact_limit,omitempty"`
 	// Archived is how many messages compaction has moved from the registers
 	// to the task's archive (mem.Store.Archive); a reader takes that many,
 	// so a compaction committed between its two reads changes nothing.

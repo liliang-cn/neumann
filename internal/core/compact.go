@@ -39,16 +39,18 @@ type sizing struct {
 	window  int64   // tokens, input and output together
 	at      float64 // the threshold, a share of the window
 	keep    int64   // tokens the newest rounds kept verbatim may take
-	out     int     // a summary's output cap
+	out     int     // the output cap a compaction request is sent with: sum, raised after truncations
+	sum     int     // a summary's expected length at most: the cap before any raise
 	reserve int64   // the output reserve of the task's model step
 }
 
 // sizeFor is the sizing of a task on a model with caps, in a group g (nil:
 // the defaults), when the provider was seen to reject requests at learned
 // tokens (0: never). sent is the output cap the task's model requests
-// carry (0: the adapter's default). ok is false with no window known:
+// carry (0: the adapter's default); raise is how often the compaction in
+// progress was cut off (TCB.CompactRaise). ok is false with no window known:
 // such a task is never compacted ahead of a rejection.
-func sizeFor(g *Group, caps model.Caps, learned, sent int) (sizing, bool) {
+func sizeFor(g *Group, caps model.Caps, learned, sent, raise int) (sizing, bool) {
 	w := int64(caps.Window)
 	if learned > 0 && (w <= 0 || int64(learned) < w) {
 		w = int64(learned)
@@ -67,7 +69,25 @@ func sizeFor(g *Group, caps model.Caps, learned, sent int) (sizing, bool) {
 	if caps.MaxOut > 0 && int64(caps.MaxOut) < out {
 		out = int64(caps.MaxOut)
 	}
-	return sizing{window: w, at: at, keep: int64(keep * float64(w)), out: int(max(out, 1)), reserve: outReserve(caps, sent)}, true
+	out = max(out, 1)
+	return sizing{window: w, at: at, keep: int64(keep * float64(w)), out: int(raiseCompactOut(g, w, out, raise)), sum: int(out),
+		reserve: outReserve(caps, sent)}, true
+}
+
+// raiseCompactOut is a compaction's output cap out raised fourfold raise
+// times, as a truncated model turn's is (redoTruncated), but never above
+// half the window (the chunk needs the rest) nor what the group's limiters
+// could grant one request in output; never below out.
+func raiseCompactOut(g *Group, window, out int64, raise int) int64 {
+	ceil := window / 2
+	if c := outCeiling(g); c > 0 && c < ceil {
+		ceil = c
+	}
+	v := out
+	for range raise {
+		v *= 4
+	}
+	return max(min(v, ceil), out)
 }
 
 // outReserve is the output a model request is taken to use of the window:
@@ -189,7 +209,10 @@ func chunkFits(us []unitCost, sz sizing) bool {
 // alone (its summary then sits after the earlier one, and a later chunk
 // joins them). A unit that does not fit a request even alone is an error:
 // it can never be compacted.
-func nextChunk(us []unitCost, sz sizing, keep int64) (lo, hi int, ok bool, err error) {
+//
+// limit, when not 0, caps the units a chunk carries: a compaction cut off at
+// its largest output cap is split (TCB.CompactLimit).
+func nextChunk(us []unitCost, sz sizing, keep int64, limit int) (lo, hi int, ok bool, err error) {
 	k := keptFrom(us, keep)
 	spanUnits := us[:k]
 	originals, summaries := 0, 0
@@ -208,7 +231,7 @@ func nextChunk(us []unitCost, sz sizing, keep int64) (lo, hi int, ok bool, err e
 			compactTokens(u.bytes), sz.window)
 	}
 	j := 0
-	for j < len(spanUnits) && chunkFits(spanUnits[:j+1], sz) {
+	for j < len(spanUnits) && chunkFits(spanUnits[:j+1], sz) && (limit <= 0 || j < limit) {
 		j++
 	}
 	if j >= 2 || (j == 1 && !spanUnits[0].Summary) {
@@ -230,12 +253,12 @@ func nextChunk(us []unitCost, sz sizing, keep int64) (lo, hi int, ok bool, err e
 // projectChunks is how many chunks the pass starting with [lo, hi) is
 // expected to take: each summary is taken to be as long as its cap.
 func projectChunks(us []unitCost, sz sizing, keep int64, lo, hi int) int {
-	ph := unitCost{Unit: task.Unit{Summary: true, Complete: true}, tokens: int64(sz.out), bytes: escapedLen("### summary of earlier work\n") + 4*sz.out}
+	ph := unitCost{Unit: task.Unit{Summary: true, Complete: true}, tokens: int64(sz.sum), bytes: escapedLen("### summary of earlier work\n") + 4*sz.sum}
 	n := 0
 	for ok := true; ok && n <= 2*len(us)+2; {
 		n++
 		us = slices.Concat(us[:lo], []unitCost{ph}, us[hi:])
-		lo, hi, ok, _ = nextChunk(us, sz, keep)
+		lo, hi, ok, _ = nextChunk(us, sz, keep, 0)
 	}
 	return n
 }
@@ -245,8 +268,10 @@ func projectChunks(us []unitCost, sz sizing, keep int64, lo, hi int) int {
 // the newest rounds within keep, or failing that its newest round alone),
 // with a summary at its cap and the output reserve, fits the window, and
 // every unit to be swapped out fits a compaction request. The registers are
-// measured as provider would be sent them.
-func canCompact(system string, tools []task.ToolSpec, regs []task.Message, provider string, sz sizing) error {
+// measured as provider would be sent them, with extra (the steers the next
+// model step will deliver) after them. Summaries are taken at their first
+// cap, before any raise.
+func canCompact(system string, tools []task.ToolSpec, regs, extra []task.Message, provider string, sz sizing) error {
 	sp := measure(regs)
 	if len(sp.units) == 0 {
 		return errors.New("nothing but the task's request is left to compact")
@@ -254,14 +279,14 @@ func canCompact(system string, tools []task.ToolSpec, regs []task.Message, provi
 	var last error
 	for _, keep := range []int64{sz.keep, 0} {
 		k := keptFrom(sp.units, keep)
-		rest := slices.Concat(regs[:sp.head], regs[sp.units[k].Start:])
-		after := task.EstimateTokens(system, tools, forProvider(rest, provider)) + int64(sz.out) + sz.reserve
+		rest := slices.Concat(regs[:sp.head], regs[sp.units[k].Start:], extra)
+		after := task.EstimateTokens(system, tools, forProvider(rest, provider)) + int64(sz.sum) + sz.reserve
 		if after > sz.window {
 			last = fmt.Errorf("the request and the newest round alone take about %d tokens with a summary and the output reserve", after)
 			continue
 		}
 		for _, u := range sp.units[:k] {
-			if compactTokens(u.bytes)+int64(sz.out) > sz.window {
+			if compactTokens(u.bytes)+int64(sz.sum) > sz.window {
 				return fmt.Errorf("a round of about %d tokens does not fit a compaction request", compactTokens(u.bytes))
 			}
 		}
@@ -277,6 +302,8 @@ type decision struct {
 	overflow string // the task cannot be made to fit: why
 
 	from, to  int // the chunk: regs[from:to]
+	units     int // in the chunk
+	first     unitCost
 	keep      int64
 	sz        sizing
 	projected int // chunks the pass is expected to take, this one included
@@ -291,13 +318,16 @@ type decision struct {
 // compact, keeping only its newest round if keeping more is not enough; if
 // even that cannot make it fit, or a round to swap out cannot fit a
 // compaction request, it overflows. A task over the threshold that still
-// fits the window and has nothing to compact is sent as it is.
-func (e *Env) windowFor(t *task.TCB, g *Group, a model.Adapter, must bool) decision {
-	sz, ok := sizeFor(g, capsOf(a), t.Window, e.sendOut(g, t))
+// fits the window and has nothing to compact is sent as it is. extra are
+// the steers the next model step will deliver: they count in the request
+// measured, so a long steer makes the task compact first rather than send a
+// request over the threshold.
+func (e *Env) windowFor(t *task.TCB, g *Group, a model.Adapter, must bool, extra []task.Message) decision {
+	sz, ok := sizeFor(g, capsOf(a), t.Window, e.sendOut(g, t), t.CompactRaise)
 	if !ok {
 		return decision{}
 	}
-	in := task.EstimateTokens(t.System, t.Tools, forProvider(t.Regs, a.Provider()))
+	in := task.EstimateTokens(t.System, t.Tools, forProvider(slices.Concat(t.Regs, extra), a.Provider()))
 	if !must && t.PC != task.StepCompact && float64(in+sz.reserve) <= sz.at*float64(sz.window) {
 		return decision{}
 	}
@@ -307,7 +337,7 @@ func (e *Env) windowFor(t *task.TCB, g *Group, a model.Adapter, must bool) decis
 			in, sz.reserve, sz.window, why)}
 	}
 	if must {
-		if err := canCompact(t.System, t.Tools, t.Regs, a.Provider(), sz); err != nil {
+		if err := canCompact(t.System, t.Tools, t.Regs, extra, a.Provider(), sz); err != nil {
 			return overflow(err)
 		}
 	}
@@ -316,7 +346,7 @@ func (e *Env) windowFor(t *task.TCB, g *Group, a model.Adapter, must bool) decis
 		if keep == 0 && !must {
 			break
 		}
-		lo, hi, ok, err := nextChunk(sp.units, sz, keep)
+		lo, hi, ok, err := nextChunk(sp.units, sz, keep, t.CompactLimit)
 		if err != nil {
 			if must {
 				return overflow(err)
@@ -324,8 +354,8 @@ func (e *Env) windowFor(t *task.TCB, g *Group, a model.Adapter, must bool) decis
 			return decision{} // it fits as it is
 		}
 		if ok {
-			return decision{compact: true, from: sp.units[lo].Start, to: sp.units[hi-1].End, keep: keep, sz: sz,
-				projected: projectChunks(sp.units, sz, keep, lo, hi)}
+			return decision{compact: true, from: sp.units[lo].Start, to: sp.units[hi-1].End, units: hi - lo, first: sp.units[lo],
+				keep: keep, sz: sz, projected: projectChunks(sp.units, sz, keep, lo, hi)}
 		}
 	}
 	if must {
@@ -350,11 +380,16 @@ func (e *Env) execCompact(ctx context.Context, t *task.TCB, core int, g *Group, 
 	if out != nil {
 		return out.c, out.batch, out.err
 	}
+	t.Retries = 0 // answered: the call went through, as for a model step
+	if resp.FinishReason == "length" {
+		// Cut off by its cap, with or without text: never a summary.
+		return e.compactTruncated(g, t, c, d), nil, nil
+	}
 	text := strings.TrimSpace(resp.Message.TextContent())
 	if text == "" {
 		return e.modelFailed(t, c, model.Transient, errEmptySummary, nil, false), nil, nil
 	}
-	t.Retries = 0
+	t.CompactRaise, t.CompactLimit = 0, 0
 
 	before, inBefore := len(t.Regs), task.EstimateTokens(t.System, t.Tools, forProvider(t.Regs, a.Provider()))
 	rounds := 0
@@ -374,7 +409,7 @@ func (e *Env) execCompact(ctx context.Context, t *task.TCB, core int, g *Group, 
 	n := t.CompactChunk + 1
 	chunks, pc := n, task.StepModel
 	t.CompactChunk = 0
-	if _, _, more, _ := nextChunk(measure(t.Regs).units, d.sz, d.keep); more {
+	if _, _, more, _ := nextChunk(measure(t.Regs).units, d.sz, d.keep, 0); more {
 		chunks, pc = max(n+1, n-1+d.projected), task.StepCompact
 		t.CompactChunk = n
 	}
@@ -403,7 +438,8 @@ func (e *Env) contextRejected(t *task.TCB, c mem.CommitSet, g *Group, a model.Ad
 	if t.Window == 0 || learned < int64(t.Window) {
 		t.Window = int(learned)
 	}
-	d := e.windowFor(t, g, a, true)
+	t.WindowAt = t.Used.Steps
+	d := e.windowFor(t, g, a, true, nil)
 	if !d.compact {
 		why := d.overflow
 		if why == "" {
@@ -417,6 +453,30 @@ func (e *Env) contextRejected(t *task.TCB, c mem.CommitSet, g *Group, a model.Ad
 	return c
 }
 
+// windowForget is how many answered calls a learned window lasts (design
+// §5.3): then it is forgotten, and the next rejection, if any, teaches it
+// again. A provider's limit may have been a passing one (a gateway that
+// routed one request to a smaller model), and a learned window only ever
+// shrinks otherwise: the task would compact against it for the rest of its
+// life.
+const windowForget = 32
+
+// windowAnswered updates a learned window after an answered call req: a
+// request the provider took that was larger than the learned window shows
+// the window is at least that large; a window learned windowForget answered
+// calls ago is forgotten.
+func (e *Env) windowAnswered(t *task.TCB, a model.Adapter, req model.Request) {
+	if t.Window == 0 {
+		return
+	}
+	if took := estimateInput(req) + outReserve(capsOf(a), req.MaxOut); took > int64(t.Window) {
+		t.Window = int(took)
+	}
+	if t.Used.Steps-t.WindowAt >= windowForget {
+		t.Window, t.WindowAt = 0, 0
+	}
+}
+
 // modelPC is the model instruction t resumes at: a compaction pass in
 // progress resumes as one, anything else at its model step.
 func modelPC(t *task.TCB) task.PC {
@@ -424,4 +484,44 @@ func modelPC(t *task.TCB) task.PC {
 		return task.StepCompact
 	}
 	return task.StepModel
+}
+
+// compactTruncated is a compaction cut off by its output cap
+// (finish_reason "length"): what came back is never taken as a summary. It
+// is sent again with the cap raised fourfold, at most maxTruncationRedos
+// times (raiseCompactOut bounds it; a raise that would leave no room for the
+// chunk's first unit is not made), with a model_retry event of class
+// truncated carrying the new max_out. Cut off at the largest cap, the chunk
+// is split: the next one carries half as many units (wait "split"), down to
+// one. A summary of one unit that is still cut off fails the task with
+// StopReason "truncated": its context cannot be compacted, and sending it as
+// it is would overflow. The answered call counts as a step either way.
+func (e *Env) compactTruncated(g *Group, t *task.TCB, c mem.CommitSet, d decision) mem.CommitSet {
+	sent := d.sz.out
+	if t.CompactRaise < maxTruncationRedos {
+		next := raiseCompactOut(g, d.sz.window, int64(d.sz.sum), t.CompactRaise+1)
+		raised := d.sz
+		raised.out = int(next)
+		if int(next) > sent && chunkFits([]unitCost{d.first}, raised) {
+			t.CompactRaise++
+			c.Events = append(c.Events, proto.NewEvent(proto.EvModelRetry, t.ID, map[string]any{
+				"class": "truncated", "attempt": t.CompactRaise, "delay_ms": 0, "wait": "none", "max_out": next,
+				"error": fmt.Sprintf("compaction cut off at %d output tokens", sent),
+			}))
+			e.ready(t, task.StepCompact)
+			c.Task = t
+			return c
+		}
+	}
+	if d.units > 1 {
+		t.CompactLimit = max(d.units/2, 1)
+		c.Events = append(c.Events, proto.NewEvent(proto.EvModelRetry, t.ID, map[string]any{
+			"class": "truncated", "attempt": t.CompactRaise, "delay_ms": 0, "wait": "split", "max_out": sent, "units": t.CompactLimit,
+			"error": fmt.Sprintf("compaction of %d units cut off at %d output tokens", d.units, sent),
+		}))
+		e.ready(t, task.StepCompact)
+		c.Task = t
+		return c
+	}
+	return failWith(t, c, StopTruncated, fmt.Sprintf("compaction of a single round cut off at %d output tokens, after raising the cap %d times", sent, t.CompactRaise))
 }

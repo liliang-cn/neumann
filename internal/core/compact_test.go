@@ -60,7 +60,8 @@ func TestCompactRequestEstimateIsExact(t *testing.T) {
 }
 
 func sizingOf(window int64) sizing {
-	return sizing{window: window, at: DefaultCompactAt, keep: int64(DefaultCompactKeep * float64(window)), out: int(min(2048, window/8)), reserve: 256}
+	out := int(min(2048, window/8))
+	return sizing{window: window, at: DefaultCompactAt, keep: int64(DefaultCompactKeep * float64(window)), out: out, sum: out, reserve: 256}
 }
 
 // A pass's chunks: the longest run from the span's start that fits a
@@ -75,7 +76,7 @@ func TestNextChunk(t *testing.T) {
 	}
 	s := sizingOf(4096)
 	us := measure(regsOf("goal", rounds...)).units
-	lo, hi, ok, err := nextChunk(us, s, s.keep)
+	lo, hi, ok, err := nextChunk(us, s, s.keep, 0)
 	if err != nil || !ok || lo != 0 || hi < 2 || hi >= len(us)-2 {
 		t.Fatalf("first chunk [%d,%d) ok %v err %v of %d units", lo, hi, ok, err, len(us))
 	}
@@ -86,30 +87,34 @@ func TestNextChunk(t *testing.T) {
 		t.Fatalf("kept from %d of %d: 30%% of 4096 holds two rounds", k, len(us))
 	}
 
+	if lo, hi, ok, _ := nextChunk(us, s, s.keep, 2); !ok || lo != 0 || hi != 2 {
+		t.Fatalf("a split chunk carries at most the limit: [%d,%d) %v", lo, hi, ok)
+	}
+
 	summary := []task.Message{task.SummaryMessage("rounds=5")}
 	us = measure(regsOf("goal", summary, rounds[0], rounds[1], rounds[2])).units
-	if lo, hi, ok, _ := nextChunk(us, s, 0); !ok || lo != 0 || hi != 3 {
+	if lo, hi, ok, _ := nextChunk(us, s, 0, 0); !ok || lo != 0 || hi != 3 {
 		t.Fatalf("the summary goes with the next rounds: [%d,%d) %v", lo, hi, ok)
 	}
 
 	big := []task.Message{task.SummaryMessage(strings.Repeat("s", 12400))} // about 3100 tokens
 	us = measure(regsOf("goal", big, rounds[0], rounds[1], rounds[2])).units
-	if lo, hi, ok, _ := nextChunk(us, s, 0); !ok || lo != 1 || hi != 2 {
+	if lo, hi, ok, _ := nextChunk(us, s, 0, 0); !ok || lo != 1 || hi != 2 {
 		t.Fatalf("a round that cannot join the summary goes alone: [%d,%d) %v", lo, hi, ok)
 	}
 
 	us = measure(regsOf("goal", summary, rounds[0])).units
-	if _, _, ok, _ := nextChunk(us, s, 0); ok {
+	if _, _, ok, _ := nextChunk(us, s, 0, 0); ok {
 		t.Fatal("one summary before the kept round: nothing to compact")
 	}
 	us = measure(regsOf("goal", summary, summary, rounds[0])).units
-	if lo, hi, ok, _ := nextChunk(us, s, 0); !ok || lo != 0 || hi != 2 {
+	if lo, hi, ok, _ := nextChunk(us, s, 0, 0); !ok || lo != 0 || hi != 2 {
 		t.Fatalf("two summaries are joined: [%d,%d) %v", lo, hi, ok)
 	}
 
 	huge := padRound("c-99", strings.Repeat("h", 16000))
 	us = measure(regsOf("goal", huge, rounds[0])).units
-	if _, _, ok, err := nextChunk(us, s, 0); ok || err == nil || !strings.Contains(err.Error(), "does not fit a compaction request") {
+	if _, _, ok, err := nextChunk(us, s, 0, 0); ok || err == nil || !strings.Contains(err.Error(), "does not fit a compaction request") {
 		t.Fatalf("a round too large for a request: ok %v, err %v", ok, err)
 	}
 
