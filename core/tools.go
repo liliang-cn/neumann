@@ -12,6 +12,8 @@ import (
 
 // execTools commits the planned calls as dispatched and the task as waiting.
 // The caller dispatches the returned batch only after that commit succeeds.
+// A model step dispatches its own calls; this instruction is for a task whose
+// calls are planned but were never dispatched (phase-2 recovery resumes there).
 func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []mem.CallRecord, error) {
 	recs, err := e.Store.Calls(ctx, t.ID)
 	if err != nil {
@@ -24,13 +26,9 @@ func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	}}
 	var batch []mem.CallRecord
 	for _, r := range recs {
-		if r.Status != mem.CallPlanned {
-			continue
+		if r.Status == mem.CallPlanned {
+			batch = append(batch, dispatched(r))
 		}
-		r.Status = mem.CallDispatched
-		r.Attempt++
-		r.Key = fmt.Sprintf("%s/%s/%d", r.TaskID, r.CallID, r.Attempt)
-		batch = append(batch, r)
 	}
 	if len(batch) == 0 {
 		e.ready(t, task.StepModel)
@@ -38,11 +36,26 @@ func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		return c, nil, nil
 	}
 	c.Calls = batch
-	t.State = task.Waiting
-	t.Wait = task.WaitIO
-	t.Version++
+	waitIO(t)
 	c.Task = t
 	return c, batch, nil
+}
+
+// dispatched marks a planned call as handed to the bus: one more attempt,
+// under the idempotency key task/call/attempt.
+func dispatched(r mem.CallRecord) mem.CallRecord {
+	r.Status = mem.CallDispatched
+	r.Attempt++
+	r.Key = fmt.Sprintf("%s/%s/%d", r.TaskID, r.CallID, r.Attempt)
+	return r
+}
+
+// waitIO parks t until its dispatched calls complete.
+func waitIO(t *task.TCB) {
+	t.State = task.Waiting
+	t.Wait = task.WaitIO
+	t.PC = task.StepTools
+	t.Version++
 }
 
 // dispatch runs a committed batch off the vCore. Each result is committed as

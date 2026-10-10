@@ -35,7 +35,18 @@ type Env struct {
 	// committed state. nil means context.Background(), never halted.
 	Halt context.Context
 
+	// SteerFormat renders a steer as the user message the model sees. nil
+	// sends the text as it is.
+	SteerFormat func(text string) string
+
 	batches sync.WaitGroup
+}
+
+func (e *Env) frameSteer(text string) string {
+	if e.SteerFormat == nil {
+		return text
+	}
+	return e.SteerFormat(text)
 }
 
 type stepData struct {
@@ -81,7 +92,7 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	}
 	switch t.PC {
 	case task.StepModel:
-		c, err = e.execModel(ctx, t, core)
+		c, batch, err = e.execModel(ctx, t, core)
 	case task.StepTools:
 		c, batch, err = e.execTools(ctx, t, core)
 	default:

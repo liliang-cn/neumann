@@ -45,6 +45,21 @@ type Config struct {
 	AgingAfter   time.Duration
 	Clock        sched.Clock
 	Logf         func(format string, args ...any)
+
+	// SteerFormat renders a steer as the user message the model sees. nil
+	// uses DefaultSteerFormat; pass an identity function to send the text as
+	// it is.
+	SteerFormat func(text string) string
+}
+
+// DefaultSteerFormat tells the model that a message arrived while it was
+// working, so it treats the message as part of the request in progress, not
+// as a new question that replaces it. Measured on gemini-3.8-flash-high: sent
+// bare, "Also tell me the weather there." made the model answer the weather
+// and drop the population it had just looked up.
+func DefaultSteerFormat(text string) string {
+	return "[The user sent this while you were working on the request above. " +
+		"Take it into account together with that request.]\n" + text
 }
 
 var (
@@ -116,6 +131,9 @@ func New(cfg Config) (*Machine, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
+	if cfg.SteerFormat == nil {
+		cfg.SteerFormat = DefaultSteerFormat
+	}
 	b, err := bus.New(context.Background(), cfg.MaxPerDevice, cfg.Devices...)
 	if err != nil {
 		return nil, err
@@ -131,7 +149,7 @@ func New(cfg Config) (*Machine, error) {
 	}
 	m.env = &core.Env{
 		Store: m.store, Sched: m.sched, Bus: b, Model: cfg.Model, Clock: cfg.Clock,
-		Commit: m.commit, Logf: cfg.Logf, Halt: haltCtx,
+		Commit: m.commit, Logf: cfg.Logf, SteerFormat: cfg.SteerFormat, Halt: haltCtx,
 	}
 	return m, nil
 }

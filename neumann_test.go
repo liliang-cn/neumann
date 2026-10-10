@@ -32,6 +32,11 @@ func start(t *testing.T, cfg neumann.Config, fn modelFn) (*neumann.Machine, *sim
 	if cfg.Logf == nil {
 		cfg.Logf = t.Logf
 	}
+	if cfg.SteerFormat == nil {
+		// Tests compare the text the model received with the steer sent;
+		// TestDefaultSteerFormat covers the framed default.
+		cfg.SteerFormat = func(s string) string { return s }
+	}
 	m, err := neumann.New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -435,5 +440,46 @@ func TestSubmitRejectsTaskIDWithSlash(t *testing.T) {
 	m, _ := start(t, neumann.Config{}, func(model.Request) (model.Response, error) { return sim.Reply("ok"), nil })
 	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "q", TaskID: "a/b"}); err == nil {
 		t.Fatal("task id with / accepted")
+	}
+}
+
+func TestDefaultSteerFormat(t *testing.T) {
+	entered := make(chan string, 4)
+	gate, release := newGate()
+	defer release()
+	var mu sync.Mutex
+	var saw []string
+	sm := &sim.Model{Fn: func(req model.Request) (model.Response, error) {
+		if sim.ToolRounds(req) == 0 {
+			return sim.CallTools("dev_slow"), nil
+		}
+		mu.Lock()
+		saw = sim.UserTexts(req)
+		mu.Unlock()
+		return sim.Reply("ok"), nil
+	}}
+	m, err := neumann.New(neumann.Config{Model: sm, Devices: []bus.Device{gateDev(entered, gate)}, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		defer cancel()
+		m.Stop(ctx)
+	}()
+	id := submit(t, m, proto.Instruction{Input: "q"})
+	<-entered
+	if err := m.Steer(bg, id, "also X"); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	waitDone(t, m, id)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(saw) != 2 || saw[1] != neumann.DefaultSteerFormat("also X") || !strings.HasSuffix(saw[1], "also X") {
+		t.Fatalf("model saw %q", saw)
 	}
 }

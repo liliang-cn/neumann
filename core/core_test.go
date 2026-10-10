@@ -106,22 +106,37 @@ func TestModelStepAnswers(t *testing.T) {
 	}
 }
 
-func TestModelStepPlansToolCalls(t *testing.T) {
+func TestModelStepDispatchesToolCalls(t *testing.T) {
+	gate := make(chan struct{})
+	dev := builtin.New("dev").Add(bus.ToolDef{Name: "hold"}, func(context.Context, bus.DeviceCall) (string, error) {
+		<-gate
+		return "held", nil
+	})
 	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
-		return sim.CallTools("dev_echo", "dev_echo"), nil
-	}, echoDev())
+		return sim.CallTools("dev_hold", "dev_hold"), nil
+	}, dev)
 	e.step(bg, newTask(t, e, store, "go"), 0)
 	got := load(t, store)
-	if got.State != task.Ready || got.PC != task.StepTools {
-		t.Fatalf("task %s/%s", got.State, got.PC)
+	if got.State != task.Waiting || got.Wait != task.WaitIO || got.PC != task.StepTools {
+		t.Fatalf("task %s/%s/%s", got.State, got.Wait, got.PC)
 	}
 	calls := got.Regs[1].ToolCalls()
 	if len(calls) != 2 || calls[0].CallID != "c-1" || calls[0].ProviderCallID != "p-0" || calls[1].CallID != "c-2" {
 		t.Fatalf("calls %+v", calls)
 	}
 	recs, _ := store.Calls(bg, "t1")
-	if len(recs) != 2 || recs[0].Status != mem.CallPlanned || recs[1].Index != 2 {
+	if len(recs) != 2 || recs[0].Status != mem.CallDispatched || recs[0].Attempt != 1 ||
+		recs[0].Key != "t1/c-1/1" || recs[1].Index != 2 {
 		t.Fatalf("records %+v", recs)
+	}
+	// One instruction: the model step itself hands the calls to the bus.
+	if k := kinds(store); k != "step,usage,tool_call,tool_call" {
+		t.Fatalf("events %s", k)
+	}
+	close(gate)
+	e.WaitBatches()
+	if got := load(t, store); got.State != task.Ready || got.PC != task.StepModel {
+		t.Fatalf("after tools %s/%s", got.State, got.PC)
 	}
 }
 
@@ -157,8 +172,7 @@ func TestToolsAreCommittedBeforeDispatch(t *testing.T) {
 		return sim.Reply("done"), nil
 	}, dev)
 	store = s
-	e.step(bg, newTask(t, e, s, "go"), 0) // model: plan
-	e.step(bg, take(t, e), 0)             // tools: commit dispatched, then dispatch
+	e.step(bg, newTask(t, e, s, "go"), 0) // model: commit dispatched, then dispatch
 	e.WaitBatches()
 
 	got := load(t, s)
@@ -392,7 +406,6 @@ func TestCompletionCommitsResultsWithTheTask(t *testing.T) {
 		return inner(ctx, c)
 	}
 	e.step(bg, newTask(t, e, store, "go"), 0)
-	e.step(bg, take(t, e), 0)
 	e.WaitBatches()
 	got := load(t, store)
 	if got.State != task.Ready || got.PC != task.StepModel {
@@ -497,10 +510,6 @@ func TestSteerDuringToolTurnIsAppliedAfterTheToolMessage(t *testing.T) {
 	}, echoDev())
 	store = s
 	e.step(bg, newTask(t, e, s, "go"), 0)
-	if p, _ := s.Interrupts(bg, "t1", true); len(p) != 1 {
-		t.Fatalf("pending after tool turn %+v", p)
-	}
-	e.step(bg, take(t, e), 0)
 	e.WaitBatches()
 	if p, _ := s.Interrupts(bg, "t1", true); len(p) != 1 {
 		t.Fatalf("pending after tools %+v", p)
@@ -554,7 +563,6 @@ func TestStepCommitFailureForgetsTheTaskAndDispatchesNothing(t *testing.T) {
 		return inner(ctx, c)
 	}
 	e.step(bg, newTask(t, e, store, "go"), 0)
-	e.step(bg, take(t, e), 0)
 	e.WaitBatches()
 	if r, w, h := e.Sched.Counts(); r+w+h != 0 || ran != 0 {
 		t.Fatalf("counts %d %d %d, device ran %d times", r, w, h, ran)
@@ -571,7 +579,6 @@ func TestCompleteCommitFailureForgetsTheTask(t *testing.T) {
 		return inner(ctx, c)
 	}
 	e.step(bg, newTask(t, e, store, "go"), 0)
-	e.step(bg, take(t, e), 0)
 	e.WaitBatches()
 	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
 		t.Fatalf("counts %d %d %d", r, w, h)
@@ -610,7 +617,6 @@ func TestHaltDuringToolCallSkipsResultCommits(t *testing.T) {
 	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.CallTools("dev_wait"), nil }, dev)
 	e.Halt = halt
 	e.step(bg, newTask(t, e, store, "go"), 0)
-	e.step(bg, take(t, e), 0)
 	<-started
 	cancel()
 	e.WaitBatches()

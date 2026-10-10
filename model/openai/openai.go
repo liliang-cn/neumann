@@ -68,6 +68,7 @@ type wireResp struct {
 	Usage struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
+		CacheHitTokens   int `json:"prompt_cache_hit_tokens"` // DeepSeek's spelling of cached_tokens
 		PromptDetails    struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
@@ -153,7 +154,7 @@ func (a *Adapter) parse(data []byte) (model.Response, error) {
 			PromptTokens:     w.Usage.PromptTokens,
 			CompletionTokens: w.Usage.CompletionTokens,
 			ReasoningTokens:  w.Usage.CompletionDetails.ReasoningTokens,
-			CachedTokens:     w.Usage.PromptDetails.CachedTokens,
+			CachedTokens:     max(w.Usage.PromptDetails.CachedTokens, w.Usage.CacheHitTokens),
 		},
 	}, nil
 }

@@ -126,7 +126,7 @@ type Budget struct {
 
 // Usage is confirmed usage: only what a provider's response reported.
 type Usage struct {
-	Steps            int `json:"steps"`
+	Steps            int `json:"steps,omitempty"` // model instructions; a provider response leaves it 0
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	ReasoningTokens  int `json:"reasoning_tokens"`

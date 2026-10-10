@@ -184,3 +184,14 @@ func TestNoChoicesIsAnError(t *testing.T) {
 		t.Fatal("empty choices accepted")
 	}
 }
+
+func TestDeepSeekCacheHitField(t *testing.T) {
+	s := newServer(t, 200, `{"choices":[{"message":{"content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":900,"completion_tokens":1,"prompt_cache_hit_tokens":768,"prompt_cache_miss_tokens":132}}`)
+	resp, err := New(s.URL+"/v1", "k", "deepseek-chat").Call(context.Background(), model.Request{Messages: []task.Message{task.Text(task.RoleUser, "hi")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Usage.CachedTokens != 768 {
+		t.Fatalf("cached %d", resp.Usage.CachedTokens)
+	}
+}
