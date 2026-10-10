@@ -192,10 +192,23 @@ type TCB struct {
 	// fourfold per redo in a row (Truncations, at most 2, design §13); the
 	// first call answered without being cut off resets Truncations, and the
 	// raise with it.
-	MaxOut      int    `json:"max_out,omitempty"`
-	Truncations int    `json:"truncations,omitempty"`
-	StopReason  string `json:"stop_reason,omitempty"`
-	Version     int64  `json:"version"`
+	MaxOut      int `json:"max_out,omitempty"`
+	Truncations int `json:"truncations,omitempty"`
+	// Window is the context window the task's provider turned out to have:
+	// set when it rejected a request as too long for its window (smaller
+	// than what that request was estimated at), 0 when none did. Compaction
+	// sizes by it when it is below the adapter's Caps.Window, or when that is
+	// unknown. A move to another group clears it.
+	Window int `json:"window,omitempty"`
+	// CompactChunk is how many chunks the compaction pass in progress (PC
+	// StepCompact) has swapped out so far; 0 when none is in progress.
+	CompactChunk int `json:"compact_chunk,omitempty"`
+	// Archived is how many messages compaction has moved from the registers
+	// to the task's archive (mem.Store.Archive); a reader takes that many,
+	// so a compaction committed between its two reads changes nothing.
+	Archived   int    `json:"archived,omitempty"`
+	StopReason string `json:"stop_reason,omitempty"`
+	Version    int64  `json:"version"`
 }
 
 // Clone returns a deep copy, or nil for a nil receiver. The store keeps clones
@@ -216,22 +229,30 @@ func (t *TCB) Clone() *TCB {
 			c.Tools[i] = ts
 		}
 	}
-	if t.Regs != nil {
-		c.Regs = make([]Message, len(t.Regs))
-		for i, m := range t.Regs {
-			if m.Parts != nil {
-				parts := make([]Part, len(m.Parts))
-				for j, p := range m.Parts {
-					p.Args = json.RawMessage(bytes.Clone(p.Args))
-					p.Opaque = json.RawMessage(bytes.Clone(p.Opaque))
-					parts[j] = p
-				}
-				m.Parts = parts
-			}
-			c.Regs[i] = m
-		}
-	}
+	c.Regs = CloneMessages(t.Regs)
 	return &c
+}
+
+// CloneMessages returns a deep copy of msgs (nil for nil), raw bytes
+// included.
+func CloneMessages(msgs []Message) []Message {
+	if msgs == nil {
+		return nil
+	}
+	out := make([]Message, len(msgs))
+	for i, m := range msgs {
+		if m.Parts != nil {
+			parts := make([]Part, len(m.Parts))
+			for j, p := range m.Parts {
+				p.Args = json.RawMessage(bytes.Clone(p.Args))
+				p.Opaque = json.RawMessage(bytes.Clone(p.Opaque))
+				parts[j] = p
+			}
+			m.Parts = parts
+		}
+		out[i] = m
+	}
+	return out
 }
 
 // LastAnswer returns the text of the last assistant message that has text.

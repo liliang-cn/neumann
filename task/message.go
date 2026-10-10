@@ -48,9 +48,12 @@ type Part struct {
 }
 
 // Message is one provider-neutral turn: a role and its ordered parts.
+// Summary marks the message a compaction put in place of the messages it
+// swapped out (design §5.3); adapters send it as the plain message it is.
 type Message struct {
-	Role  Role   `json:"role"`
-	Parts []Part `json:"parts"`
+	Role    Role   `json:"role"`
+	Parts   []Part `json:"parts"`
+	Summary bool   `json:"summary,omitempty"`
 }
 
 // Text builds a message holding a single text part.
