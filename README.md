@@ -534,7 +534,7 @@ Designed but not built yet:
 ```
 make check                    # gofmt, go vet, go test -race ./...
 go test ./...                 # quicker, without the race detector
-go test -race -count=20 ./internal/... .   # what core changes are held to
+go test -race -count=20 -timeout 60m ./internal/... .   # what core changes are held to
 ```
 
 Tests run offline. Package `sim` provides a scripted model with every failure
