@@ -56,6 +56,8 @@ type Sched struct {
 	closed  bool
 
 	base       context.Context
+	stopping   context.Context // ends at Close
+	stop       context.CancelFunc
 	ctl        map[string]*control
 	onDeadline func(id string)
 	onWake     func(id string)
@@ -90,8 +92,14 @@ func New(clock Clock, aging time.Duration) *Sched {
 		ctl:     map[string]*control{},
 	}
 	s.cond = sync.NewCond(&s.mu)
+	s.stopping, s.stop = context.WithCancel(context.Background())
 	return s
 }
+
+// Stopping ends when Close is called: work that only waits (a vCore waiting
+// for room in a limiter, with nothing committed yet) gives its task back
+// instead of holding the shutdown up.
+func (s *Sched) Stopping() context.Context { return s.stopping }
 
 // SetContext sets the context every task context derives from: ending it
 // ends them all (the machine's halt). Call it before the first Add.
@@ -451,6 +459,7 @@ func (s *Sched) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
+	s.stop()
 	for _, c := range s.ctl {
 		if c.stopTimer != nil {
 			c.stopTimer()

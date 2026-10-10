@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/internal/sched"
@@ -44,6 +45,24 @@ type Env struct {
 	// adapter can stream. It is called on the vCore's goroutine and must not
 	// block. nil: calls are not streamed.
 	Delta func(proto.Delta)
+
+	// Groups are the execution groups by class: window, breaker and
+	// limiters. A class with none calls its model with no group control.
+	Groups map[string]*Group
+
+	// The model step's retry policy (design §11): consecutive failures a task
+	// may have before it fails, and the exponential backoff between them.
+	// Zero takes the defaults. Jitter maps a backoff step to the delay used;
+	// nil is full jitter (uniform in [0, step]), tests pass the identity.
+	MaxRetries  int
+	BackoffBase time.Duration
+	BackoffMax  time.Duration
+	Jitter      func(time.Duration) time.Duration
+
+	// Guard admits work started by a timer (the half-open probe timer): ok
+	// false means the machine is stopping and the work must not start;
+	// release ends it. nil admits everything.
+	Guard func() (release func(), ok bool)
 
 	batches sync.WaitGroup
 
@@ -164,6 +183,10 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		e.Sched.Forget(t.ID)
 		return
 	}
+	if errors.Is(err, errNotStarted) {
+		e.handBack(ctx, t, nil)
+		return
+	}
 	if errors.Is(err, errStartNotCommitted) {
 		// Nothing happened yet, so the step is retried a few times. A store
 		// that keeps failing is not going to record anything else either.
@@ -192,12 +215,19 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	id := t.ID
 	allow := append([]string(nil), t.Allow...)
 	deny := append([]string(nil), t.Deny...)
+	var parked *Group
+	if t.State == task.Waiting && t.Wait == task.WaitGroup {
+		parked = e.groupOf(t.Class)
+	}
 	if !e.handBack(ctx, t, batch) {
 		return // cancelled meanwhile and finalised: the batch is never sent
 	}
 	// t now belongs to the scheduler
 	if len(batch) > 0 && e.halt().Err() == nil {
 		e.dispatch(id, allow, deny, batch)
+	}
+	if parked != nil {
+		e.afterPark(ctx, id, parked)
 	}
 }
 

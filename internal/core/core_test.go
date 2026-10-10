@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -291,7 +292,7 @@ func TestLateSteerIsDroppedWhenTheNextStepHitsTheBudget(t *testing.T) {
 }
 
 func TestLateSteerIsDroppedWhenTheNextCallFails(t *testing.T) {
-	e, s, _ := lateSteerEnv(t, func(model.Request) (model.Response, error) { return model.Response{}, errors.New("down") })
+	e, s, _ := lateSteerEnv(t, func(model.Request) (model.Response, error) { return model.Response{}, sim.Permanent() })
 	e.step(bg, newTask(t, e, s, "q"), 0)
 	e.step(bg, take(t, e), 0)
 	got := load(t, s)
@@ -342,8 +343,8 @@ func TestModelPanicFailsTheTask(t *testing.T) {
 	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { panic("boom") })
 	e.step(bg, newTask(t, e, store, "q"), 0)
 	got := load(t, store)
-	if got.State != task.Failed || got.StopReason != "model panicked: boom" {
-		t.Fatalf("task %+v", got)
+	if got.State != task.Failed || got.StopReason != "model_error" || !strings.Contains(failedError(store), "model panicked: boom") {
+		t.Fatalf("task %+v, error %q", got, failedError(store))
 	}
 	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
 		t.Fatalf("counts %d %d %d", r, w, h)
@@ -380,14 +381,16 @@ func TestBudgetEndsTheTask(t *testing.T) {
 	}
 }
 
+// A permanent rejection fails the task at once (design §11): StopReason
+// model_error, the provider's error in the failed event.
 func TestModelErrorFailsTheTask(t *testing.T) {
 	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
-		return model.Response{}, errors.New("provider down")
+		return model.Response{}, sim.Permanent()
 	})
 	e.step(bg, newTask(t, e, store, "q"), 0)
 	got := load(t, store)
-	if got.State != task.Failed || got.StopReason != "model: provider down" {
-		t.Fatalf("task %+v", got)
+	if got.State != task.Failed || got.StopReason != "model_error" || !strings.Contains(failedError(store), "scripted permanent") {
+		t.Fatalf("task %+v, error %q", got, failedError(store))
 	}
 	if k := kinds(store); k != "step,failed" {
 		t.Fatalf("events %s", k)
@@ -452,6 +455,19 @@ func TestRunVCoreFinishesTheInstructionAfterCancel(t *testing.T) {
 	}
 }
 
+// failedError is the error text of the failed event, if any.
+func failedError(store *mem.Memory) string {
+	evs, _ := store.Events(bg, 0, 0)
+	for _, ev := range evs {
+		if ev.Kind == "failed" {
+			var d map[string]string
+			json.Unmarshal(ev.Data, &d)
+			return d["error"]
+		}
+	}
+	return ""
+}
+
 func hasKind(store *mem.Memory, kind string) bool {
 	return slices.Contains(strings.Split(kinds(store), ","), kind)
 }
@@ -465,7 +481,7 @@ func addSteer(t *testing.T, store *mem.Memory, text string) {
 
 func TestModelErrorDropsTheSteersItApplied(t *testing.T) {
 	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
-		return model.Response{}, errors.New("provider down")
+		return model.Response{}, sim.Permanent()
 	})
 	tc := newTask(t, e, store, "q")
 	addSteer(t, store, "also this")

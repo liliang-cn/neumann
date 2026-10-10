@@ -363,3 +363,27 @@ func TestResolveRefusesRetryWithAResult(t *testing.T) {
 		t.Fatalf("a refused Resolve changed something: %+v %+v", tc, recs[0])
 	}
 }
+
+// A task in backoff or waiting for its group is Ready after a restart: the
+// backoff starts over from the next failure, and the group (whose breaker is
+// not durable) starts closed. Its retry count and its place in the queue
+// stay.
+func TestRecoverMakesBackoffAndGroupWaitsReady(t *testing.T) {
+	for _, w := range []task.WaitReason{task.WaitBackoff, task.WaitGroup} {
+		e, store, _ := newTestEnv(t, reply)
+		tc := newTask(t, e, store, "q")
+		since := tc.ReadySince
+		tc.State, tc.Wait, tc.WakeAt, tc.Retries, tc.Version = task.Waiting, w, time.Now().Add(time.Hour), 3, 2
+		if _, err := store.Commit(bg, mem.CommitSet{Task: tc}); err != nil {
+			t.Fatal(err)
+		}
+		if batch, err := e.Recover(bg, load(t, store)); err != nil || batch != nil {
+			t.Fatalf("%s: batch %v err %v", w, batch, err)
+		}
+		got := load(t, store)
+		if got.State != task.Ready || got.Wait != task.WaitNone || !got.WakeAt.IsZero() || got.Retries != 3 ||
+			got.PC != task.StepModel || !got.ReadySince.Equal(since) || !hasKind(store, "recovered") {
+			t.Fatalf("%s: task %+v", w, got)
+		}
+	}
+}

@@ -261,3 +261,32 @@ func TestBreakerAnsweredLeavesClosedCountAlone(t *testing.T) {
 		t.Fatal("answered reset the consecutive count")
 	}
 }
+
+// NextProbe says when a probe is next let through: the half-open time while
+// open for transients, the lost-probe replacement while half-open, never
+// while open for quota.
+func TestBreakerNextProbe(t *testing.T) {
+	clk := newFakeClock()
+	b := NewBreaker(BreakerConfig{Clock: clk})
+	if s := b.Snapshot(); !s.NextProbe.IsZero() {
+		t.Fatalf("closed: %+v", s)
+	}
+	for range 5 {
+		b.Transient()
+	}
+	open := clk.Now()
+	if s := b.Snapshot(); !s.NextProbe.Equal(open.Add(DefaultBreakerOpenFor)) {
+		t.Fatalf("open: %+v", s)
+	}
+	clk.Advance(DefaultBreakerOpenFor)
+	if ok, probe := b.Allow(); !ok || !probe {
+		t.Fatal("no probe after OpenFor")
+	}
+	if s := b.Snapshot(); s.State != HalfOpen || !s.NextProbe.Equal(clk.Now().Add(DefaultBreakerOpenFor)) {
+		t.Fatalf("half-open: %+v", s)
+	}
+	b.QuotaExhausted()
+	if s := b.Snapshot(); !s.NextProbe.IsZero() {
+		t.Fatalf("quota: %+v", s)
+	}
+}

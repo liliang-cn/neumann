@@ -18,7 +18,9 @@ import (
 
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/internal/core"
+	"github.com/liliang-cn/neumann/internal/group"
 	"github.com/liliang-cn/neumann/internal/sched"
+	"github.com/liliang-cn/neumann/limit"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
@@ -50,6 +52,24 @@ type Config struct {
 	// uses DefaultSteerFormat; pass an identity function to send the text as
 	// it is.
 	SteerFormat func(text string) string
+
+	// Limiters are the machine's rate limiters (design §7); Limits names the
+	// ones every model request of the group takes room in (all of them at
+	// once, or it waits). A limiter with no Clock runs on the machine's.
+	Limiters []limit.Config
+	Limits   []string
+
+	// The model step's retry policy (design §11): a task fails with
+	// "model_error" after MaxModelRetries consecutive overloaded or transient
+	// failures (default 8); between them it waits BackoffBase·2^(n-1), capped
+	// at BackoffMax (defaults 1s and 60s), with full jitter. BackoffJitter
+	// maps that step to the delay used; nil is full jitter, uniform in
+	// [0, step]. Rate limits wait for the provider's retry time and do not
+	// count.
+	MaxModelRetries int
+	BackoffBase     time.Duration
+	BackoffMax      time.Duration
+	BackoffJitter   func(step time.Duration) time.Duration
 }
 
 // DefaultSteerFormat tells the model that a message arrived while it was
@@ -113,6 +133,9 @@ type Machine struct {
 	started bool
 	cancel  context.CancelFunc
 	cores   sync.WaitGroup
+
+	groups   []*core.Group    // by class; one today
+	limiters []*limit.Limiter // in Config order
 }
 
 func New(cfg Config) (*Machine, error) {
@@ -146,6 +169,10 @@ func New(cfg Config) (*Machine, error) {
 	if cfg.SteerFormat == nil {
 		cfg.SteerFormat = DefaultSteerFormat
 	}
+	limiters, err := buildLimiters(cfg)
+	if err != nil {
+		return nil, err
+	}
 	b, err := bus.New(context.Background(), cfg.MaxPerDevice, cfg.Devices...)
 	if err != nil {
 		return nil, err
@@ -160,13 +187,110 @@ func New(cfg Config) (*Machine, error) {
 		hub:    newHub(),
 		deltas: newDeltaHub(),
 	}
+	// One group per class: one class today. Its window and breaker read the
+	// machine's clock, so a fake clock drives the breaker's open time too.
+	g := &core.Group{
+		Class:  cfg.Class,
+		Ctl:    group.New(group.Config{Clock: cfg.Clock}),
+		Limits: slices.Clone(cfg.Limits),
+	}
+	for _, name := range cfg.Limits {
+		g.Limiters = append(g.Limiters, limiters[name])
+	}
+	m.limiters = make([]*limit.Limiter, 0, len(cfg.Limiters))
+	for _, lc := range cfg.Limiters {
+		m.limiters = append(m.limiters, limiters[lc.Name])
+	}
+	m.groups = []*core.Group{g}
 	m.env = &core.Env{
 		Store: m.store, Sched: m.sched, Bus: b, Model: cfg.Model, Clock: cfg.Clock,
 		Commit: m.commit, Logf: cfg.Logf, SteerFormat: cfg.SteerFormat, Delta: m.deltas.publish, Halt: haltCtx,
+		Groups:     map[string]*core.Group{g.Class: g},
+		MaxRetries: cfg.MaxModelRetries, BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax, Jitter: cfg.BackoffJitter,
+		Guard: m.guard,
 	}
 	m.sched.SetContext(haltCtx)
 	m.sched.OnDeadline(m.deadline)
+	m.sched.OnWake(m.wake)
 	return m, nil
+}
+
+// buildLimiters builds cfg.Limiters by name and checks that every name in
+// cfg.Limits is one of them.
+func buildLimiters(cfg Config) (map[string]*limit.Limiter, error) {
+	out := make(map[string]*limit.Limiter, len(cfg.Limiters))
+	for _, lc := range cfg.Limiters {
+		if _, dup := out[lc.Name]; dup {
+			return nil, fmt.Errorf("neumann: two limiters named %q", lc.Name)
+		}
+		if lc.Clock == nil {
+			lc.Clock = limitClock{cfg.Clock}
+		}
+		l, err := limit.New(lc)
+		if err != nil {
+			return nil, err
+		}
+		out[lc.Name] = l
+	}
+	for _, name := range cfg.Limits {
+		if out[name] == nil {
+			return nil, fmt.Errorf("neumann: Limits names %q, which is not in Limiters", name)
+		}
+	}
+	return out, nil
+}
+
+// limitClock runs a limiter on the machine's clock: on its timers when it has
+// them (a fake clock moves limiter waits too), real ones otherwise.
+type limitClock struct{ c Clock }
+
+func (l limitClock) Now() time.Time { return l.c.Now() }
+
+func (l limitClock) After(d time.Duration) <-chan time.Time {
+	tm, ok := l.c.(sched.Timers)
+	if !ok {
+		return time.After(d)
+	}
+	ch := make(chan time.Time, 1)
+	tm.AfterFunc(d, func() { ch <- l.c.Now() })
+	return ch
+}
+
+// guard admits work a timer starts: it is refused once the machine is
+// stopping, and Stop waits for what it admitted.
+func (m *Machine) guard() (func(), bool) {
+	m.admit.Lock()
+	defer m.admit.Unlock()
+	if m.stopped {
+		return nil, false
+	}
+	m.inflight.Add(1)
+	return m.inflight.Done, true
+}
+
+// wake runs when a task's backoff is over: it is committed Ready and queued
+// with its old ReadySince, so it does not lose its place. Like a deadline, it
+// does nothing once the machine is stopping: the task stays Waiting(Backoff)
+// in the store, and the next start runs it.
+func (m *Machine) wake(id string) {
+	release, ok := m.guard()
+	if !ok {
+		return
+	}
+	defer release()
+	m.env.Wake(m.haltCtx, id, task.WaitBackoff)
+}
+
+// GroupReset brings a class's execution group back after its breaker opened
+// (design §6.2, §9.6): the breaker closes whatever opened it — an exhausted
+// quota never closes by itself — group_up is announced, and every task
+// waiting for the group runs again.
+func (m *Machine) GroupReset(ctx context.Context, class string) error {
+	if err := m.enter(false); err != nil {
+		return err
+	}
+	defer m.inflight.Done()
+	return m.env.GroupReset(ctx, class)
 }
 
 // commit is the machine's single write path for vCores and tool batches.
@@ -535,6 +659,26 @@ type Status struct {
 	Unfinished int `json:"unfinished"` // admitted and not yet terminal
 
 	DeltasDropped int64 `json:"deltas_dropped"` // streamed pieces a slow subscriber missed
+
+	Groups   []GroupStatus  `json:"groups"`
+	Limiters []limit.Status `json:"limiters"`
+}
+
+// GroupStatus is one execution group's window and breaker (design §6, §14).
+type GroupStatus struct {
+	Class  string   `json:"class"`
+	Limits []string `json:"limits,omitempty"`
+
+	W       float64 `json:"w"`      // congestion window
+	Target  int     `json:"target"` // floor(W) within [Min, Max]
+	Epoch   uint64  `json:"epoch"`  // congestion epoch: one halving each
+	Cooling bool    `json:"cooling"`
+
+	Breaker   string    `json:"breaker"`         // closed, open, half_open
+	Cause     string    `json:"cause,omitempty"` // why it is open: transient, quota
+	Failures  int       `json:"failures"`        // consecutive transient failures while closed
+	OpenedAt  time.Time `json:"opened_at,omitzero"`
+	NextProbe time.Time `json:"next_probe,omitzero"` // when a probe is next let through; zero for quota
 }
 
 // Status is a cheap snapshot: no model call, no store read.
@@ -543,7 +687,19 @@ func (m *Machine) Status() Status {
 	m.admit.Lock()
 	u := m.active
 	m.admit.Unlock()
-	return Status{Cores: m.cfg.Cores, Ready: r, Waiting: w, Held: h, Unfinished: u, DeltasDropped: m.deltas.dropped.Load()}
+	st := Status{Cores: m.cfg.Cores, Ready: r, Waiting: w, Held: h, Unfinished: u, DeltasDropped: m.deltas.dropped.Load()}
+	for _, g := range m.groups {
+		win, br := g.Ctl.Window.Snapshot(), g.Ctl.Breaker.Snapshot()
+		st.Groups = append(st.Groups, GroupStatus{
+			Class: g.Class, Limits: slices.Clone(g.Limits),
+			W: win.W, Target: win.Target, Epoch: win.Epoch, Cooling: win.Cooling,
+			Breaker: br.State.String(), Cause: string(br.Cause), Failures: br.Failures, OpenedAt: br.OpenedAt, NextProbe: br.NextProbe,
+		})
+	}
+	for _, l := range m.limiters {
+		st.Limiters = append(st.Limiters, l.Status())
+	}
+	return st
 }
 
 type recoveredDispatch struct {

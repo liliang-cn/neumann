@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/proto"
@@ -63,6 +64,8 @@ func round(t *task.TCB, recs []mem.CallRecord) []mem.CallRecord {
 //   - Running: a model request may have reached the provider. Counted as
 //     unconfirmed; the step is done again.
 //   - Waiting on I/O: the current round is settled call by call (settle).
+//   - Waiting in backoff or for its group: Ready (timers and breakers are
+//     not durable).
 //   - Anything else (Ready, waiting for reconciliation) resumes as it is.
 //
 // A task with a committed cancel is finalised instead, whatever its state.
@@ -108,6 +111,16 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 			return nil, err
 		}
 		return batch, nil
+	case t.State == task.Waiting && (t.Wait == task.WaitBackoff || t.Wait == task.WaitGroup):
+		// A backoff timer and a breaker are not durable: the task tries again
+		// now (a failure starts a new backoff from its retry count), and a
+		// restarted machine's groups start closed. ReadySince is kept: the
+		// task keeps its place in the queue.
+		from := "waiting_" + t.Wait.String()
+		t.State, t.Wait, t.WakeAt, t.PC = task.Ready, task.WaitNone, time.Time{}, task.StepModel
+		t.Version++
+		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": from, "retries": t.Retries})
+		return nil, e.Commit(ctx, mem.CommitSet{Task: t, Events: []proto.Event{ev}})
 	case t.State == task.Waiting && t.Wait == task.WaitReconcile:
 		// Still held from an earlier run. Announced again: an operator
 		// reading events from now on must learn that it waits for them.

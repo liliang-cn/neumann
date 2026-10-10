@@ -227,6 +227,11 @@ type BreakerState struct {
 	// HalfOpenAt is when a transient-opened breaker will let a probe through;
 	// zero when closed, half-open, or open for quota.
 	HalfOpenAt time.Time
+	// NextProbe is when Allow will next hand out a probe: HalfOpenAt while
+	// open for transient failures, and, while half-open, when the pending
+	// probe counts as lost and another is let through. Zero when closed or
+	// open for quota: no probe is coming.
+	NextProbe time.Time
 }
 
 // Snapshot copies the breaker's state.
@@ -234,8 +239,12 @@ func (b *Breaker) Snapshot() BreakerState {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	s := BreakerState{State: b.state, Cause: b.cause, Failures: b.failures, OpenedAt: b.openedAt}
-	if b.state == Open && b.cause == CauseTransient {
+	switch {
+	case b.state == Open && b.cause == CauseTransient:
 		s.HalfOpenAt = b.openedAt.Add(b.openFor)
+		s.NextProbe = s.HalfOpenAt
+	case b.state == HalfOpen:
+		s.NextProbe = b.probeAt.Add(b.openFor)
 	}
 	return s
 }

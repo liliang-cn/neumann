@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/liliang-cn/neumann/internal/group"
+	"github.com/liliang-cn/neumann/limit"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
@@ -17,6 +19,16 @@ import (
 // tools, the same commit records the calls as dispatched and the task as
 // waiting on I/O, and the returned batch is dispatched right after it: a tool
 // round does not queue for a vCore a second time just to hand calls over.
+//
+// Around the call (design §5.1, §6, §7): a task whose group is down waits
+// for it instead (Waiting(Group)); otherwise room is reserved in the group's
+// limiters, waiting while the vCore holds the task and before anything is
+// committed; the group admits the request (or the task waits for it after
+// all); the request is committed Running and sent; and its outcome is
+// settled with the limiters and reported to the group before the task's own
+// commit is put together. A failed call is retried, waited out or fails the
+// task by its error class (modelFailed); a turn cut off before it produced
+// anything is asked again with a larger output cap (redoTruncated).
 func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []Send, error) {
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
@@ -36,6 +48,61 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		// Not an instruction: no model call happens, so no step event.
 		return e.finish(t, c, "budget"), nil, nil
 	}
+	g := e.groupOf(t.Class)
+	if e.groupDown(g) {
+		// The group is down: no request, no reservation. The task waits for
+		// group_up (or a half-open probe) in the wait set.
+		return park(t, c), nil, nil
+	}
+
+	// The call runs under the task's own context: a cancel or deadline ends
+	// it at once, whoever holds the task. So does the wait for room in the
+	// limiters before it.
+	tctx, release := e.taskContext(t.ID)
+	defer release()
+	req := model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs, MaxOut: t.MaxOut}
+	// The wait for room also ends when the machine stops fetching: nothing
+	// is committed yet, so the task goes back as it is.
+	rctx, stopWaiting := context.WithCancel(tctx)
+	defer stopWaiting()
+	unhook := context.AfterFunc(e.Sched.Stopping(), stopWaiting)
+	res, pre, err := e.reserve(rctx, g, t.ID, req, e.maxOut(t))
+	unhook()
+	if err != nil {
+		switch {
+		case errors.Is(err, limit.ErrTooLarge):
+			return failWith(t, c, StopTooLarge, err.Error()), nil, nil
+		case e.halt().Err() != nil:
+			return mem.CommitSet{}, nil, nil // the step's halt check drops the task
+		case tctx.Err() == nil && e.Sched.Stopping().Err() != nil:
+			return mem.CommitSet{}, nil, errNotStarted
+		case tctx.Err() != nil:
+			// Cancelled, or out of time, while waiting for room: nothing ran.
+			c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, ReasonCancelled)
+			return c, nil, err
+		}
+		return failWith(t, c, StopModelError, "reserve: "+err.Error()), nil, nil
+	}
+	var ticket *group.Ticket
+	if g != nil {
+		tk, ok, _ := g.Ctl.Admit()
+		if !ok {
+			// Went down while this task waited for room (or another task took
+			// the probe): the room goes back, and the task waits for the group.
+			res.Cancel()
+			return park(t, c, pre...), nil, nil
+		}
+		ticket = &tk
+	}
+	// A request admitted and then not sent (cancelled, the start not
+	// committed) leaves its ticket unreported; a probe lost this way is
+	// replaced by the breaker after its open time.
+	unsent := func() {
+		if res != nil {
+			res.Cancel()
+		}
+	}
+
 	// Committed before the call: a restart that finds the task Running knows
 	// a request may have reached the provider. Steers are applied after this
 	// commit, so a crash cannot leave a steer in the registers that the
@@ -45,9 +112,10 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	// out, and recovery then counts one request too many as unconfirmed.
 	t.State = task.Running
 	t.Version++
-	if err := e.Commit(context.WithoutCancel(ctx), mem.CommitSet{Task: t}); err != nil {
+	if err := e.Commit(context.WithoutCancel(ctx), mem.CommitSet{Task: t, Events: pre}); err != nil {
 		t.State = task.Ready
 		t.Version--
+		unsent()
 		if errors.Is(err, mem.ErrCancelPending) {
 			// Cancelled after the interrupts were read: nothing runs.
 			c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, ReasonCancelled)
@@ -57,42 +125,82 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	}
 	e.startCommitted(t.ID)
 	if e.halt().Err() != nil {
+		unsent()
 		return mem.CommitSet{}, nil, nil // the step's halt check drops the task
 	}
 	if e.Sched.Cancelled(t.ID) {
 		// Signalled since the start commit: no request goes out.
+		unsent()
 		return e.cancelledStep(ctx, t, c, base, model.Response{}, nil, false, false)
 	}
 	c.Events = append(c.Events, proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepModel.String(), Core: core}))
 	c.Applied = applySteers(t, pending, e.frameSteer)
 
 	stepNo := t.Used.Steps + 1
-	// The call runs under the task's own context: a cancel or deadline ends
-	// it at once, whoever holds the task.
-	tctx, release := e.taskContext(t.ID)
-	defer release()
-	resp, err := e.callModel(tctx, model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs}, func(d model.Delta) {
+	req.Messages = t.Regs
+	resp, err := e.callModel(tctx, req, func(d model.Delta) {
 		e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
 	})
 	t.Used.Steps++
+	class := model.Unknown
+	var p *panicError
+	panicked := errors.As(err, &p)
+	lost := err != nil && errors.Is(err, model.ErrResponseLost)
+	if err != nil && !panicked {
+		class = model.ClassifyWith(e.Model, err)
+		if class == model.Canceled && tctx.Err() == nil {
+			// The task was not cancelled: the adapter gave up on its own (a
+			// timeout it reported as a bare deadline). The provider was slow.
+			class = model.Transient
+		}
+		if class == model.Unknown {
+			class = model.Transient
+		}
+	}
+	info := e.rateInfo(resp, err)
+	how := refundOf(err, class)
+	if panicked {
+		how = cancelAll
+	}
+	e.settleCall(g, res, how, req, resp, info)
+	if class == model.RateLimited {
+		pause(g, e.retryAt(err, info))
+	}
+	if ticket != nil && !panicked && class != model.Canceled {
+		o := group.Succeeded
+		if err != nil {
+			o = outcomeOf(class)
+		}
+		e.report(ctx, g, *ticket, o)
+	}
 	if err == nil {
 		t.Used.Add(resp.Usage)
 		c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
 	}
+	if lost {
+		// The request reached the provider and its answer never came whole:
+		// it may have been done and billed (design §4.6, §18 test 12). A
+		// request that never got out (a refused connection) is not counted.
+		t.Unconfirmed++
+	}
 	if e.halt().Err() == nil && e.Sched.Cancelled(t.ID) {
-		return e.cancelledStep(ctx, t, c, base, resp, err, true, err != nil && tctx.Err() != nil)
+		return e.cancelledStep(ctx, t, c, base, resp, err, true, err != nil && !lost && tctx.Err() != nil)
 	}
 	if err != nil {
-		// Steers applied for this call were never answered: take them back so
-		// the terminal commit reports them dropped.
+		// Steers applied for this call were never answered: take them back.
+		// They stay pending: the retry applies them again, and a terminal
+		// commit reports them dropped.
 		t.Regs = t.Regs[:base]
 		c.Applied = nil
-		reason := "model: " + err.Error()
-		var p *panicError
-		if errors.As(err, &p) {
-			reason = err.Error()
-		}
-		return e.fail(t, c, reason), nil, nil
+		return e.modelFailed(t, c, class, err, info, panicked), nil, nil
+	}
+	t.Retries = 0
+	if truncated(resp) {
+		// Nothing came back to keep: the redo sends the same turn, steers
+		// included, with a larger output cap.
+		t.Regs = t.Regs[:base]
+		c.Applied = nil
+		return e.redoTruncated(t, c), nil, nil
 	}
 
 	msg := resp.Message
@@ -187,6 +295,11 @@ func (e *Env) cancelledStep(ctx context.Context, t *task.TCB, c mem.CommitSet, b
 	c, cerr := e.cancelSet(ctx, t, c, nil, ReasonCancelled)
 	return c, nil, cerr
 }
+
+// errNotStarted marks a step given up before it changed anything: the
+// machine stopped while it waited for room in a limiter. The task goes back
+// to the scheduler as it was.
+var errNotStarted = errors.New("step not started: the machine is stopping")
 
 // errStartNotCommitted marks a step whose start could not be recorded.
 // Nothing was sent and the task is unchanged, so the step can be tried again.
