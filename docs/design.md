@@ -352,7 +352,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 
 - 触发点：`execModel` 发现本组熔断中（取到任务时、或 `Admit` 不放行时），以及调用以 `QuotaExhausted` 失败、熔断刚打开时。三处都走同一个 `groupGone`。
 - 目标沿 `Fallback` 链找：跳过熔断中的组，取第一个通过校验的。链上的组全在熔断中：留在 `Waiting(Group)` 等本组，不算迁移失败；有没熔断但校验不过的：按**本组**的 `OnMigrateFail`，`wait` 时停进 `Waiting(Group)` 并发 `migrate_refused`（`{from, to, check, detail}`），`fail` 时 `failed` 事件带 `check`、`detail`。
-- 能力取自 `model.CapsOf(适配器)`：适配器实现 `model.CapsReporter`（`Caps() Caps{Window, MaxOut, Tools, MaxTools}`）就用它；没实现的按"支持工具、数量不限、窗口未知"，窗口未知（0）不拒绝。OpenAI 兼容适配器：`ContextWindow` 默认 0（网关背后模型不定），`MaxTools` 默认 128，`NoTools`；Anthropic：`ContextWindow` 默认 200000，`MaxTools` 默认不限，`NoTools`。
+- 能力取自 `model.CapsOf(适配器)`（在 panic 保护下读，适配器 panic 即校验不过，`check = "caps"`）：适配器实现 `model.CapsReporter`（`Caps() Caps{Window, MaxOut, Tools, MaxTools}`）就用它；没实现的按"支持工具、数量不限、窗口未知"，窗口未知（0）不拒绝。OpenAI 兼容适配器：`ContextWindow` 默认 0（网关背后模型不定），`MaxTools` 默认 128，`NoTools`；Anthropic：`ContextWindow` 默认 200000，`MaxTools` 默认不限，`NoTools`。
 - 估算用 `task.EstimateTokens`：JSON 字节数 / 4 + 1，与 7.2 默认预占同一个估算；按目标服务商实际会收到的消息算（去掉外来 reasoning）。输出预留：任务的 `MaxOut`，否则目标的 `Caps.MaxOut` / `OutputCap`，否则 4096。
 - 第 3 条（能否在目标组上切块压缩）依赖 `StepCompact`，它还没有实现：放不下就按校验失败处理（`check = "context"`），不迁移后再压缩。
 - reasoning 由 vCore 在组请求时过滤（`forProvider`）：`Provider` 非空且不等于目标适配器 `Provider()` 的 reasoning 块不发，块全被去掉的消息不发；寄存器原样保留，迁回原服务商时还在。两个适配器本来也按 `Provider` 丢弃外来 reasoning（Anthropic 丢 thinking，OpenAI 兼容不渲染 reasoning），过滤在 vCore 做是为了对任何适配器成立。

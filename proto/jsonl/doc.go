@@ -54,7 +54,7 @@
 // priority), not_found, finished, not_reconciling, busy (with "count" and
 // "limit"), task_busy (class: the task is between no two instructions yet;
 // try again), incompatible (class: the group cannot take the task; "check"
-// names the failed check: tools, tool_count or context), stopped,
+// names the failed check: tools, tool_count, context or caps), stopped,
 // not_started, failed (anything else, an unknown class among them). A
 // bad line costs one error reply; the server carries on. Blank lines are
 // skipped; lines longer than Server.MaxLine (16 MiB) are refused.

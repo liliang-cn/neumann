@@ -29,6 +29,7 @@ const (
 	CheckTools     = "tools"      // the task has tools and the target's model calls none
 	CheckToolCount = "tool_count" // more tools than the target's model takes in one request
 	CheckContext   = "context"    // System + Tools + Regs + the output reserve exceed the target's window
+	CheckCaps      = "caps"       // the target's adapter panicked reporting what it can take
 )
 
 // MigrateError is a move refused by a capability check.
@@ -61,9 +62,12 @@ func (e *MigrateError) data() map[string]any {
 // does not fit is refused.
 func (e *Env) fits(t *task.TCB, target *Group) *MigrateError {
 	a := e.adapter(target)
-	caps := model.CapsOf(a)
 	refuse := func(check, detail string, args ...any) *MigrateError {
 		return &MigrateError{From: t.Class, To: target.Class, Check: check, Detail: fmt.Sprintf(detail, args...)}
+	}
+	var caps model.Caps
+	if err := guarded("Caps", func() { caps = model.CapsOf(a) }); err != nil {
+		return refuse(CheckCaps, "%v", err)
 	}
 	if len(t.Tools) > 0 && !caps.Tools {
 		return refuse(CheckTools, "the task has %d tools and %s calls none", len(t.Tools), a.Provider())

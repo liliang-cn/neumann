@@ -136,8 +136,8 @@ const (
 )
 
 // MigrateError is a move to another group refused by a capability check
-// (design §6.3); SetClass returns it. Check is "tools", "tool_count" or
-// "context".
+// (design §6.3); SetClass returns it. Check is "tools", "tool_count",
+// "context", or "caps" when the target's adapter panicked reporting them.
 type MigrateError = core.MigrateError
 
 // ErrTaskBusy is returned by SetClass for a task that is executing an
