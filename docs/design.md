@@ -334,16 +334,35 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 服务商的额度范围和模型不一定一一对应：一个组织下多个模型可能共享 TPM，一个模型可能同时受 RPM、输入 TPM、输出 TPM 限制，额度还可能按天耗尽。所以限流器是独立的对象，执行组按名字引用；一个请求要同时拿到它引用的所有限流器的额度才能发出。
 
 ```go
-type Limiter struct {
-    Name   string
-    Limits map[string]Rate // 维度名 → 速率，例如 "requests"、"tokens"、"input_tokens"、"output_tokens"
-}
-
 type Rate struct {
     Per   time.Duration // 例如 1 分钟
     Limit int64
 }
+
+type Config struct {
+    Name   string
+    Limits map[string]Rate // 维度名 → 速率，例如 "requests"、"tokens"、"input_tokens"、"output_tokens"
+    Clock  Clock           // nil = 真实时钟；测试注入假时钟（Now + After）
+}
+
+func New(cfg Config) (*Limiter, error)
+
+func (l *Limiter) Reserve(ctx context.Context, amounts map[string]int64) (*Reservation, error)
+func ReserveAll(ctx context.Context, ls []*Limiter, amounts map[string]int64) (*Reservation, error)
+func (r *Reservation) Settle(actual map[string]int64)
+func (r *Reservation) Cancel()
+func (r *Reservation) Time() time.Time // 获批时刻
+
+func (l *Limiter) Observe(info Info)       // 7.3
+func (l *Limiter) PauseUntil(t time.Time)  // 429 + retry-after
+func (l *Limiter) Status() Status          // 各维度 Limit、Used、Available、NextReset，服务商校准值
 ```
+
+**计数方式：滑动窗口日志。** 每次批准记一条（时刻, 数量），在 `Per` 之内计入该维度。由此得到的不变式是：任意长度为 `Per` 的区间里，一个维度批出的总量不超过 `Limit`。没有用令牌桶：满桶可以一次用光、再在下一个 `Per` 里补满，一个窗口里最多能发出两倍额度，对按固定或滑动窗口计数的服务商（大多数 OpenAI 兼容网关）就是 429；滑动窗口对令牌桶式的服务商（Anthropic）同样不会超。代价是突发之后额度按旧记录过期逐条回来，而不是连续回补；稳态吞吐一样是每 `Per` 一个 `Limit`。
+
+**全有或全无。** 一次预占要么在所有限流器的所有维度上同时扣下，要么什么都不扣。任何一项超过该维度 `Limit` 的预占永远放不下，立刻返回 `ErrTooLarge`。等待中 ctx 结束返回 `ctx.Err()`，不留任何预占。
+
+**公平：严格先来先到。** 有人在排队时，后来的预占即使放得下也排在后面，所以大请求不会被源源不断的小请求饿死；代价是队头阻塞，这是有意的。`ReserveAll` 按全局固定顺序给限流器上锁，并在同一步里加入所有队列，所以不同调用方以不同顺序引用同一组限流器不会死锁，各队列对谁先来的看法一致：最早的等待者在它所在的每条队列里都排第一，总能前进。
 
 ### 7.2 预占与结算由适配器定义
 
@@ -356,13 +375,19 @@ type Adapter interface {
 }
 ```
 
-不同服务商算法不同，所以不统一估算：例如有的服务商把请求里的输出上限也计入 TPM，有的把输入、输出分开限制，缓存命中的 token 可能不计入。预占在请求发出前从各限流器扣除，响应后按 `Settle` 多退少补；请求失败且服务商未处理时全额退回。
+不同服务商算法不同，所以不统一估算：例如有的服务商把请求里的输出上限也计入 TPM，有的把输入、输出分开限制，缓存命中的 token 可能不计入。预占在请求发出前从各限流器扣除，响应后按 `Settle` 多退少补；请求失败且服务商未处理时 `Cancel` 全额退回。`Settle`、`Cancel` 只有第一次生效。
+
+多退：缩小这次预占自己的那条记录，它仍按原时刻过期（已过期的没有可退的）。少补：差额按**结算时刻**新记一条，可能让窗口超出 `Limit`，从而推迟之后的预占——一个流式调用跑了九十秒才报出超额的 token，这些 token 是刚用掉的，按发出时刻记会让它们还没算进去就过期了。`actual` 里没有的维度保持预占量（例如 `requests` 总是 1）。
 
 预占发生在 vCore 取到任务、组装好请求之后（预占量取决于请求）。额度不够时，vCore 持着这个任务等待额度，等待可以被取消和 Deadline 打断；本组其他 vCore 也各自在预占处等待，所以本组实际上暂停了。其他执行组不受影响，除非它们引用了同一个限流器。发 `throttled` 事件。
 
 ### 7.3 用服务商的反馈校准
 
-适配器从响应头（剩余请求数、剩余 token、重置时间、`retry-after`）读出 `RateInfo`，限流器据此修正自己的计数：本地以为还有额度但服务商说没了，以服务商为准。重启后限流器从空开始，第一个响应就会把它校准。
+适配器从响应头（剩余请求数、剩余 token、重置时间、`retry-after`）读出 `RateInfo`，转成 `limit.Info{Dims: map[string]limit.Observed{维度: {Remaining, ResetAt}}}` 交给 `Observe`，限流器据此修正自己的计数：本地以为还有额度但服务商说没了，以服务商为准——该维度的可用量封顶为服务商报的剩余量，直到它给的 `ResetAt`；期间批出的预占从这个数里扣，这些预占的退款也退回这个数。服务商报的比本地多的忽略：响应乱序到达，晚到的响应头描述的是更早的时刻。没有未来 `ResetAt` 的报告也忽略：不知道该信多久。同一个响应先 `Settle` 再 `Observe`，否则这次请求的用量会被算两遍。
+
+`RateLimited`（第 11 节）用 `PauseUntil(retry-after)`：在那之前不批任何预占，暂停只会延长不会缩短。`Overload` 不归限流器管，是执行组拥塞窗口的事（6.1）。
+
+重启后限流器从空开始，第一个响应就会把它校准。
 
 ## 8. 并发规则
 
