@@ -639,7 +639,7 @@ type Event struct {
 }
 ```
 
-任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`migrated`、`reconcile_needed`、`done`、`failed`、`cancelled`、`steer_dropped`。
+任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`done`、`failed`、`cancelled`、`steer_dropped`。
 
 `migrated`：`{from, to, reason}`，`reason` 为 `group_down` 或 `manual`。`migrate_refused`：`{from, to, check, detail}`，本组熔断、`Fallback` 校验不过、任务留下等本组。`tool_result` 来自 L2 时带 `cached: true`。
 
