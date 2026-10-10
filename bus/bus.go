@@ -31,6 +31,10 @@ type ToolDef struct {
 	Schema      json.RawMessage
 	Effect      Effect
 	Timeout     time.Duration // 0 = DefaultTimeout
+	// ReportUnknown: when a restart leaves this SideEffect tool's outcome
+	// unknown, tell the model so instead of waiting for an operator to
+	// resolve it. Leave false for anything a person must check.
+	ReportUnknown bool
 }
 
 // DeviceCall is one call as a device receives it. Key is the idempotency key
@@ -153,10 +157,18 @@ func (b *Bus) Specs(allow, deny []string) []task.ToolSpec {
 
 // Effect is a tool's declared effect; unknown names are SideEffect.
 func (b *Bus) Effect(name string) Effect {
+	e, _ := b.Recovery(name)
+	return e
+}
+
+// Recovery is what a restart needs to know about a tool: its effect, and
+// whether an unknown outcome may be reported to the model. Unknown names are
+// SideEffect and not reported.
+func (b *Bus) Recovery(name string) (Effect, bool) {
 	if r, ok := b.routes[name]; ok {
-		return r.def.Effect
+		return r.def.Effect, r.def.ReportUnknown
 	}
-	return SideEffect
+	return SideEffect, false
 }
 
 // Call runs one tool call, waiting in the device's queue for a free slot. It

@@ -11,9 +11,9 @@ import (
 
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/bus/builtin"
+	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
-	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/sim"
 	"github.com/liliang-cn/neumann/task"
 )
@@ -98,7 +98,7 @@ func TestModelStepAnswers(t *testing.T) {
 	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.Reply("hello"), nil })
 	e.step(bg, newTask(t, e, store, "hi"), 0)
 	got := load(t, store)
-	if got.State != task.Done || got.StopReason != "end_turn" || got.LastAnswer() != "hello" || got.Version != 2 {
+	if got.State != task.Done || got.StopReason != "end_turn" || got.LastAnswer() != "hello" || got.Version != 3 {
 		t.Fatalf("task %+v", got)
 	}
 	if k := kinds(store); k != "step,usage,answer,done" {
@@ -357,7 +357,7 @@ func TestCompleteWithoutCheckoutPanics(t *testing.T) {
 			t.Fatalf("recovered %v", r)
 		}
 	}()
-	e.complete(bg, "ghost", nil, nil)
+	e.complete(bg, "ghost", nil, nil, nil)
 }
 
 func TestBudgetEndsTheTask(t *testing.T) {
@@ -597,7 +597,10 @@ func TestHaltDuringModelCallCommitsNothing(t *testing.T) {
 	e.Sched.Add(load(t, store))
 	e.step(bg, take(t, e), 0)
 	got := load(t, store)
-	if got.Version != before || got.State != task.Ready || hasKind(store, "step") {
+	// Only the start of the step is committed: the task is Running, which tells
+	// recovery a request may have reached the provider. Nothing of the
+	// interrupted call itself is committed.
+	if got.Version != before+1 || got.State != task.Running || len(got.Regs) != 1 || hasKind(store, "step") {
 		t.Fatalf("a halted step committed: %+v events %s", got, kinds(store))
 	}
 	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
@@ -628,5 +631,62 @@ func TestHaltDuringToolCallSkipsResultCommits(t *testing.T) {
 	}
 	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
 		t.Fatalf("counts %d %d %d", r, w, h)
+	}
+}
+
+func TestRunningIsCommittedBeforeTheModelCallWithoutSteers(t *testing.T) {
+	var store *mem.Memory
+	var atCall *task.TCB
+	e, s, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+		atCall = load(t, store)
+		return sim.Reply("ok"), nil
+	})
+	store = s
+	tc := newTask(t, e, s, "q")
+	addSteer(t, s, "later")
+	e.step(bg, tc, 0)
+	if atCall.State != task.Running || len(atCall.Regs) != 1 {
+		t.Fatalf("stored during the call: state %s, %d regs (the steer must not be in the start commit)", atCall.State, len(atCall.Regs))
+	}
+	if p, _ := s.Interrupts(bg, "t1", true); len(p) != 0 {
+		t.Fatalf("steer still pending after the step: %+v", p)
+	}
+}
+
+func TestPlannedCallsRecordTheirEffect(t *testing.T) {
+	dev := builtin.New("dev").
+		Add(bus.ToolDef{Name: "read", Effect: bus.ReadOnly}, func(context.Context, bus.DeviceCall) (string, error) { return "r", nil }).
+		Add(bus.ToolDef{Name: "pay", ReportUnknown: true}, func(context.Context, bus.DeviceCall) (string, error) { return "p", nil })
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+		return sim.CallTools("dev_read", "dev_pay"), nil
+	}, dev)
+	e.step(bg, newTask(t, e, store, "go"), 0)
+	e.WaitBatches()
+	recs, _ := store.Calls(bg, "t1")
+	if recs[0].Effect != task.ReadOnly || recs[0].ReportUnknown || recs[1].Effect != task.SideEffect || !recs[1].ReportUnknown {
+		t.Fatalf("records %+v", recs)
+	}
+}
+
+func TestLostResultEventIsPublishedWithTheCompletion(t *testing.T) {
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.CallTools("dev_echo"), nil }, echoDev())
+	inner := e.Commit
+	e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+		if c.Task == nil && len(c.Calls) > 0 {
+			return errors.New("injected: per-result commit lost")
+		}
+		return inner(ctx, c)
+	}
+	e.step(bg, newTask(t, e, store, "go"), 0)
+	e.WaitBatches()
+	evs, _ := store.Events(bg, 0, 0)
+	n := 0
+	for _, ev := range evs {
+		if ev.Kind == "tool_result" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("tool_result events %d, want 1: %s", n, kinds(store))
 	}
 }

@@ -162,9 +162,13 @@ type TCB struct {
 	// CallSeq is how many tool call ids the task has handed out; the next one
 	// is c-<CallSeq+1>. It never decreases, so ids stay unique after compaction
 	// removes old messages.
-	CallSeq    int    `json:"call_seq"`
-	StopReason string `json:"stop_reason,omitempty"`
-	Version    int64  `json:"version"`
+	CallSeq int `json:"call_seq"`
+	// Unconfirmed counts model requests that were sent but whose response was
+	// never received (a crash or halt during the call). The provider may have
+	// processed and billed them; their tokens are unknown, so not in Used.
+	Unconfirmed int    `json:"unconfirmed,omitempty"`
+	StopReason  string `json:"stop_reason,omitempty"`
+	Version     int64  `json:"version"`
 }
 
 // Clone returns a deep copy, or nil for a nil receiver. The store keeps clones

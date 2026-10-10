@@ -28,6 +28,15 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		// Not an instruction: no model call happens, so no step event.
 		return e.finish(t, c, "budget"), nil, nil
 	}
+	// Committed before the call: a restart that finds the task Running knows
+	// a request may have reached the provider. Steers are applied after this
+	// commit, so a crash cannot leave a steer in the registers that the
+	// interrupt table still lists as pending.
+	t.State = task.Running
+	t.Version++
+	if err := e.Commit(context.WithoutCancel(ctx), mem.CommitSet{Task: t}); err != nil {
+		return mem.CommitSet{}, nil, fmt.Errorf("%w: %v", errNotCommitted, err)
+	}
 	c.Events = append(c.Events, proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepModel.String(), Core: core}))
 	c.Applied = applySteers(t, pending, e.frameSteer)
 
@@ -63,8 +72,10 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 			}
 			t.CallSeq++
 			p.CallID = fmt.Sprintf("c-%d", t.CallSeq)
+			effect, report := e.Bus.Recovery(p.Name)
 			batch = append(batch, dispatched(mem.CallRecord{
 				TaskID: t.ID, CallID: p.CallID, Index: t.CallSeq, Tool: p.Name, Args: p.Args, Status: mem.CallPlanned,
+				Effect: effect, ReportUnknown: report,
 			}))
 			// Args go into the event as a string: a model can emit malformed
 			// JSON, and marshalling it as raw JSON would fail.
@@ -94,6 +105,10 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	}
 	return e.finish(t, c, "end_turn"), nil, nil
 }
+
+// errNotCommitted marks a step that could not record its start: nothing was
+// sent and nothing is committed, so the task is simply not scheduled further.
+var errNotCommitted = errors.New("start of step not committed")
 
 // panicError is a model adapter's panic, recovered into a failure of its task.
 type panicError struct{ v any }

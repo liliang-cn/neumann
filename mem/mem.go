@@ -25,15 +25,20 @@ const (
 
 // CallRecord is the write-ahead log entry of one tool call.
 type CallRecord struct {
-	TaskID  string           `json:"task_id"`
-	CallID  string           `json:"call_id"`
-	Index   int              `json:"index"` // order of the call within its task
-	Tool    string           `json:"tool"`  // full name as the model sees it
-	Args    json.RawMessage  `json:"args,omitempty"`
-	Status  CallStatus       `json:"status"`
-	Attempt int              `json:"attempt"`
-	Key     string           `json:"key,omitempty"` // idempotency key: task/call/attempt
-	Result  *task.ToolResult `json:"result,omitempty"`
+	TaskID  string          `json:"task_id"`
+	CallID  string          `json:"call_id"`
+	Index   int             `json:"index"` // order of the call within its task
+	Tool    string          `json:"tool"`  // full name as the model sees it
+	Args    json.RawMessage `json:"args,omitempty"`
+	Status  CallStatus      `json:"status"`
+	Attempt int             `json:"attempt"`
+	Key     string          `json:"key,omitempty"` // idempotency key: task/call/attempt
+	// Effect and ReportUnknown are recorded when the call is planned, from
+	// the tool's declaration at that moment: recovery after a restart decides
+	// by them, not by whatever the bus declares by then.
+	Effect        task.Effect      `json:"effect"`
+	ReportUnknown bool             `json:"report_unknown,omitempty"`
+	Result        *task.ToolResult `json:"result,omitempty"`
 }
 
 const InterruptSteer = "steer"

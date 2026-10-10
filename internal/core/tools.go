@@ -68,6 +68,7 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallReco
 		ctx := e.halt() // phase 3 adds the task's own cancel context
 		commitCtx := context.WithoutCancel(ctx)
 		results := make([]task.ToolResult, len(batch))
+		recorded := make([]bool, len(batch)) // per-result commit succeeded
 		var wg sync.WaitGroup
 		for i, r := range batch {
 			wg.Add(1)
@@ -83,15 +84,17 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []mem.CallReco
 				ev := proto.NewEvent(proto.EvToolResult, taskID, map[string]any{"call_id": r.CallID, "is_error": res.IsError})
 				if err := e.Commit(commitCtx, mem.CommitSet{Calls: []mem.CallRecord{r}, Events: []proto.Event{ev}}); err != nil {
 					e.Logf("neumann: commit of result %s/%s failed: %v", taskID, r.CallID, err)
+				} else {
+					recorded[i] = true
 				}
 			}()
 		}
 		wg.Wait()
-		e.complete(commitCtx, taskID, batch, results)
+		e.complete(commitCtx, taskID, batch, results, recorded)
 	}()
 }
 
-func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecord, results []task.ToolResult) {
+func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecord, results []task.ToolResult, recorded []bool) {
 	t, ok := e.Sched.Checkout(taskID)
 	if !ok {
 		// Ownership invariant: a dispatched batch's task is in the wait set
@@ -106,22 +109,41 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 	// upsert of what the per-result commits recorded), so the model can never
 	// see a result that is not in the call log.
 	done := make([]mem.CallRecord, len(batch))
-	msg := task.Message{Role: task.RoleTool}
+	var events []proto.Event
 	for i, r := range batch {
 		res := results[i]
 		r.Status = mem.CallDone
 		r.Result = &res
 		done[i] = r
-		msg.Parts = append(msg.Parts, task.Part{
-			Kind: task.PartToolResult, CallID: r.CallID, Text: results[i].Content, IsError: results[i].IsError,
-		})
+		if !recorded[i] {
+			// Its own commit failed, so its tool_result event was never
+			// published; it goes out with the transition that records it.
+			events = append(events, proto.NewEvent(proto.EvToolResult, taskID, map[string]any{"call_id": r.CallID, "is_error": res.IsError}))
+		}
 	}
-	t.Regs = append(t.Regs, msg)
+	t.Regs = append(t.Regs, toolMessage(done))
 	e.ready(t, task.StepModel)
-	if err := e.Commit(ctx, mem.CommitSet{Task: t, Calls: done}); err != nil {
+	if err := e.Commit(ctx, mem.CommitSet{Task: t, Calls: done, Events: events}); err != nil {
 		e.Logf("neumann: commit after tools for task %s failed; it is no longer scheduled: %v", taskID, err)
 		e.Sched.Forget(taskID)
 		return
 	}
 	e.Sched.Requeue(t)
+}
+
+// toolMessage is the tool message for a finished round, built from its call
+// records in order: each record must carry its result. Recovery rebuilds a
+// round from the call log with the same function.
+func toolMessage(records []mem.CallRecord) task.Message {
+	msg := task.Message{Role: task.RoleTool}
+	for _, r := range records {
+		var res task.ToolResult
+		if r.Result != nil {
+			res = *r.Result
+		}
+		msg.Parts = append(msg.Parts, task.Part{
+			Kind: task.PartToolResult, CallID: r.CallID, Text: res.Content, IsError: res.IsError,
+		})
+	}
+	return msg
 }

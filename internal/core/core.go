@@ -4,14 +4,15 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/liliang-cn/neumann/bus"
+	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
-	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/task"
 )
 
@@ -106,6 +107,11 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	if e.halt().Err() != nil {
 		// Halted mid-instruction: the result is not committed, so the task
 		// keeps its last committed state for recovery to resume from.
+		e.Sched.Forget(t.ID)
+		return
+	}
+	if errors.Is(err, errNotCommitted) {
+		e.Logf("neumann: task %s: %v; it is no longer scheduled", t.ID, err)
 		e.Sched.Forget(t.ID)
 		return
 	}
