@@ -233,7 +233,7 @@ func TestRateLimitedWaitsWithoutSpendingRetries(t *testing.T) {
 
 	runUntilDone(t, m, clk, 10*time.Second, a, b)
 	got := loadTask(t, m, a)
-	if got.State != task.Done || got.Retries != 0 || got.Used.Steps != 4 {
+	if got.State != task.Done || got.Retries != 0 || got.Used.Steps != 1 {
 		t.Fatalf("A ended %s %q, retries %d, steps %d", got.State, got.StopReason, got.Retries, got.Used.Steps)
 	}
 	rs := retries(t, m, a)
@@ -340,9 +340,26 @@ func TestOnlyALostResponseIsUnconfirmed(t *testing.T) {
 	a := submit(t, m, proto.Instruction{Input: "A"})
 	runUntilDone(t, m, clk, time.Second, a)
 	got := loadTask(t, m, a)
-	if got.State != task.Done || got.Unconfirmed != 1 || got.Used.Steps != 4 ||
+	if got.State != task.Done || got.Unconfirmed != 1 || got.Used.Steps != 1 ||
 		got.Used.PromptTokens != 10 || got.Used.CompletionTokens != 5 {
 		t.Fatalf("A ended %s, unconfirmed %d, used %+v", got.State, got.Unconfirmed, got.Used)
+	}
+}
+
+// Used.Steps counts answered calls only: twenty rate-limited replies do not
+// spend a budget of three steps, and the task finishes.
+func TestRateLimitStormDoesNotSpendTheBudget(t *testing.T) {
+	m, clk, sc := errMachine(t, neumann.Config{})
+	var storm []error
+	for range 20 {
+		storm = append(storm, sim.RateLimited(time.Second))
+	}
+	sc.plan["A"] = fails(storm...)
+	a := submit(t, m, proto.Instruction{Input: "A", Budget: &task.Budget{MaxSteps: 3}})
+	runUntilDone(t, m, clk, time.Second, a)
+	got := loadTask(t, m, a)
+	if got.State != task.Done || got.StopReason != "end_turn" || got.Used.Steps != 1 || len(sc.of("A")) != 21 {
+		t.Fatalf("A ended %s %q, steps %d, calls %d", got.State, got.StopReason, got.Used.Steps, len(sc.of("A")))
 	}
 }
 

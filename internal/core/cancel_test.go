@@ -126,7 +126,7 @@ func TestCancelStopsAModelCall(t *testing.T) {
 		t.Fatal("the model call was not interrupted")
 	}
 	got := load(t, store)
-	if got.State != task.Cancelled || got.Unconfirmed != 1 || got.Used.Steps != 1 {
+	if got.State != task.Cancelled || got.Unconfirmed != 1 || got.Used.Steps != 0 {
 		t.Fatalf("task %s unconfirmed=%d steps=%d", got.State, got.Unconfirmed, got.Used.Steps)
 	}
 	if k := kinds(store); k != "step,cancelled" {

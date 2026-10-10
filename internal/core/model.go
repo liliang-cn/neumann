@@ -141,7 +141,6 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	resp, err := e.callModel(tctx, req, func(d model.Delta) {
 		e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
 	})
-	t.Used.Steps++
 	class := model.Unknown
 	var p *panicError
 	panicked := errors.As(err, &p)
@@ -174,6 +173,10 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		e.report(ctx, g, *ticket, o)
 	}
 	if err == nil {
+		// Used.Steps counts answered calls only (design §4.6): a failed call
+		// is bounded by the retry limit, a lost one is unconfirmed, and
+		// neither spends the task's step budget.
+		t.Used.Steps++
 		t.Used.Add(resp.Usage)
 		c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
 	}

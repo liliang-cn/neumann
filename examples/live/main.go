@@ -251,11 +251,18 @@ func main() {
 	}
 
 	events, _ := m.EventLog(ctx, 0, 0)
-	modelSteps, dropped := 0, 0
+	// A model-step event is one call attempt; Used.Steps counts only the
+	// answered ones. Each failed attempt is a model_retry (other than a
+	// truncation redo, whose call was answered) or a model_error failure.
+	modelSteps, failedCalls, dropped := 0, 0, 0
 	steerSeen := false
 	for _, ev := range events {
 		if ev.Kind == proto.EvStep && strings.Contains(string(ev.Data), `"pc":"model"`) {
 			modelSteps++
+		}
+		if (ev.Kind == proto.EvModelRetry && !strings.Contains(string(ev.Data), `"class":"truncated"`)) ||
+			(ev.Kind == proto.EvFailed && strings.Contains(string(ev.Data), `"stop_reason":"model_error"`)) {
+			failedCalls++
 		}
 		if ev.Kind == proto.EvSteerDropped {
 			dropped++
@@ -279,7 +286,7 @@ func main() {
 		fmt.Printf("[%s] %s\n", mark, what)
 	}
 	check(int64(modelSteps) == adapter.calls.Load(), fmt.Sprintf("model calls (%d) == model-step events (%d)", adapter.calls.Load(), modelSteps))
-	check(steps == modelSteps, fmt.Sprintf("sum of task steps (%d) == model-step events", steps))
+	check(steps+failedCalls == modelSteps, fmt.Sprintf("answered steps (%d) + failed calls (%d) == model-step events", steps, failedCalls))
 	check(steerSeen != (dropped > 0), fmt.Sprintf("steer to T3 delivered=%v, dropped events=%d (exactly one)", steerSeen, dropped))
 	fmt.Printf("\nwall time %.1fs; confirmed tokens: prompt %d (cached %d), completion %d, reasoning %d\n",
 		elapsed.Seconds(), used.PromptTokens, used.CachedTokens, used.CompletionTokens, used.ReasoningTokens)

@@ -104,8 +104,8 @@ type TCB struct {
     Regs       []Message
     Allow      []string        // 页表
     Deny       []string
-    Budget     Budget          // MaxSteps、Deadline（绝对时间）、MaxTokens
-    Used       Usage           // 已确认的用量（见 4.6）
+    Budget     Budget          // MaxSteps、Deadline（绝对时间）、MaxTokens；MaxSteps 约束 Used.Steps + Unconfirmed
+    Used       Usage           // 已确认的用量（见 4.6）；Used.Steps = 有回答的模型调用数
     Unconfirmed int            // 已发出、但没有拿到响应的模型请求数
     CallSeq    int             // 已分配的工具调用 id 数；下一个是 c-<CallSeq+1>，只增不减，压缩后 id 也不重复
     Retries    int             // 连续的可重试模型失败（过载、临时错误）；成功清零；限流不计
@@ -233,8 +233,9 @@ type CallRecord struct {
 
 ### 4.6 计量
 
-- `Used` 只累计**已确认**的用量，也就是从服务商响应里读到的。
-- 请求已发出但没拿到响应（超时、连接断开、进程崩溃），服务商可能已经处理并计费，本地无法知道。这种情况计入 `Unconfirmed`，不估算 token。
+- `Used` 只累计**已确认**的用量，也就是从服务商响应里读到的。`Used.Steps` 是**有回答的**模型调用数：最终答案、要工具的一轮、被截断后重做的那一次都算；以任何错误类别失败的调用（限流、过载、临时、永久、额度耗尽、`Unknown`、panic、被取消打断）都不算。失败的调用由 `MaxModelRetries` 约束，所以限流风暴不会让任务以 `budget` 结束。
+- 请求已发出但没拿到响应（响应丢失、调用被取消打断、进程崩溃），服务商可能已经处理并计费，本地无法知道。这种情况只计入 `Unconfirmed`，不计入 `Steps`（不重复计数），不估算 token。
+- 预算按 `Used.Steps + Unconfirmed` 计。`step` 事件是每次调用尝试一个（失败的也有），所以 `step` 事件数 = 适配器调用次数 = `Used.Steps` + 失败的调用数（每个失败的调用对应一个非截断的 `model_retry`，或一个 `model_error` 的 `failed`，或一个取消）。
 - `Status` 和 `usage` 事件给出的是已确认用量和未确认请求数，两者分开报告。
 
 ## 5. vCore 循环
@@ -270,7 +271,7 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
    - **有工具调用**：assistant 消息原样追加，调用记录写为 `planned`，`PC = StepTools`。
    - **最终文本**：调用期间到达了插话，则文本作为 assistant 轮次，`PC = StepModel`，**插话留在中断表里不合并**：下一条模型指令开头再送达，若下一步因预算或模型出错而结束，它由终态提交报告为 `steer_dropped`。没有插话则 `Done`。
    - 模型调用 panic 等同于永久错误：任务 `Failed`，`StopReason = "model_error"`，事件里的错误是 `model panicked: …`；不报给执行组（说明不了服务商的状况）。
-   - **截断且没有内容**（`finish_reason = "length"`，没有文本也没有工具调用）：`MaxOut` 乘 4 重做（`MaxOut` 为 0 时从适配器的 `model.OutputCap` 起算，没有则 4096），整个任务最多两次，第三次 `Failed`，`StopReason = "truncated"`。重做是一条计数的指令（`Used.Steps + 1`），发 `model_retry`（`class = "truncated"`，带新的 `max_out`），这一步合并的插话退回未送达，重做时再送达。放大后的 `MaxOut` 留在任务上。
+   - **截断且没有内容**（`finish_reason = "length"`，没有文本也没有工具调用）：`MaxOut` 乘 4 重做（`MaxOut` 为 0 时从适配器的 `model.OutputCap` 起算，没有则 4096），整个任务最多两次，第三次 `Failed`，`StopReason = "truncated"`。重做的那次调用有回答，计入 `Used.Steps`，发 `model_retry`（`class = "truncated"`，带新的 `max_out`），这一步合并的插话退回未送达，重做时再送达。放大后的 `MaxOut` 留在任务上。
 5. 提交里带 `usage` 事件（已确认用量）。成功（包括截断）清零 `Retries`。出错见第 11、13 节。
 
 ### 5.2 execTools
@@ -548,7 +549,7 @@ type RateReporter interface{ RateInfo(resp *Response, err error) *RateInfo }
 | `Transient` | 其余 5xx、网络错误、超时 | 计入熔断 | 见 7.2 | 退避后重试，计重试次数；响应丢失时 `Unconfirmed + 1` |
 | `Permanent` | 其余 4xx | — | 退还预占 | `Failed`，`StopReason = "model_error"` |
 
-退避：第 n 次连续失败等 `min(60s, 1s·2^(n-1))` 的全抖动（在 0 到该值之间均匀取），不短于服务商的 `RetryAfter`；第 8 次（`Config.MaxModelRetries`）连续失败时任务 `Failed`，`StopReason = "model_error"`，错误文字在 `failed` 事件里。`Retries` 记在 TCB 上随提交持久化，成功（包括截断）清零。每个重试决定都是一次提交：`Waiting(Backoff)` + `WakeAt` + `model_retry` 事件（`{class, attempt, delay_ms, wait, error}`，`attempt` 是计入的重试次数，限流时不变），提交之后调度器才挂定时器；`QuotaExhausted` 同样发 `model_retry`（`wait = "group"`）。每次失败的调用都是一条指令（`Used.Steps + 1`，包括限流），所以 `MaxSteps` 也约束重试。`Unknown`（谁也解释不了的错误）按 `Transient` 处理：网络抖动比请求本身有错更常见，重试上限兜住判断错的代价。适配器报了 `Canceled` 而任务并没有被取消（适配器自己超时、报成裸的 `DeadlineExceeded`）也按 `Transient`。
+退避：第 n 次连续失败等 `min(60s, 1s·2^(n-1))` 的全抖动（在 0 到该值之间均匀取），不短于服务商的 `RetryAfter`；第 8 次（`Config.MaxModelRetries`）连续失败时任务 `Failed`，`StopReason = "model_error"`，错误文字在 `failed` 事件里。`Retries` 记在 TCB 上随提交持久化，成功（包括截断）清零。每个重试决定都是一次提交：`Waiting(Backoff)` + `WakeAt` + `model_retry` 事件（`{class, attempt, delay_ms, wait, error}`，`attempt` 是计入的重试次数，限流时不变），提交之后调度器才挂定时器；`QuotaExhausted` 同样发 `model_retry`（`wait = "group"`）。失败的调用仍是一条指令（发 `step` 事件），但不计入 `Used.Steps`（4.6），`MaxSteps` 不约束它们，约束它们的是重试上限；限流不计重试次数，由服务商的重试时刻和限流器暂停节制。`Unknown`（谁也解释不了的错误）按 `Transient` 处理：网络抖动比请求本身有错更常见，重试上限兜住判断错的代价。适配器报了 `Canceled` 而任务并没有被取消（适配器自己超时、报成裸的 `DeadlineExceeded`）也按 `Transient`。
 
 `Unconfirmed` 只在 `errors.Is(err, ErrResponseLost)` 时加一（以及原有的：调用被取消打断、重启时发现 `Running`）；连接被拒绝不加（18.12）。
 
@@ -628,7 +629,7 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 | 工具出错 / 超时 / 越权 | 错误文本作为该调用的结果交给模型 |
 | 提交失败 | 记 ERROR；这次状态转换不存在，任务不再调度，发不出事件（因为事件也没提交）；`Status` 里标出该任务和错误 |
 | 进程崩溃 | 按 4.5 恢复 |
-| 超出 MaxSteps / MaxTokens | `Done`，`StopReason = "budget"` |
+| 超出 MaxSteps / MaxTokens | `Done`，`StopReason = "budget"`（`Used.Steps + Unconfirmed`：只算有回答的调用和未确认的请求，失败的调用不算） |
 | Deadline | `Failed`，`StopReason = "deadline"`（9.4） |
 | vCore panic | 恢复 panic，该任务 `Failed` 并带 panic 信息，这个 vCore 退役 |
 
@@ -696,6 +697,7 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
 4. **自适应伸缩、限流器与迁移**：拥塞窗口、限流器、错误分类、熔断、迁移校验、第二个适配器。
    已完成（错误处理接进 vCore 循环，vCore 数仍固定、仍只有一个组）：`execModel` 用 `model.ClassifyWith` 分类，按第 11 节处理每一类；`Waiting(Backoff)` 带 `WakeAt` 提交后由调度器挂定时器，到点提交 `Ready`、`ReadySince` 不变；`Retries` 持久化、成功清零、默认 8 次；截断无内容按 `MaxOut` × 4 重做两次（`model.Request.MaxOut`，两个适配器都发 `max_tokens`）；`Config.Limiters` / `Config.Limits`，调用前 `ReserveAll`（等额度在 `Running` 提交之前、可被取消/Deadline 打断、`Stop` 时原样交还），调用后先结算再校准，按 7.2 的表退还，`RateLimited` 暂停限流器；每个类一个 `core.Group`（`internal/group` 的窗口与熔断），调用前 `Admit`、调用后 `Report`，熔断时任务惰性转 `Waiting(Group)`，半开定时器唤醒最早的任务去探测，`group_up` 唤醒全部，`m.GroupReset` 复位额度熔断；`Status` 带每组窗口/熔断和每个限流器的快照；重启时 `Waiting(Backoff)` / `Waiting(Group)` 直接就绪。新提交路径（退避、等组、截断重做、唤醒）都遵守 4.1 规则 4。
    验证：`TestRateLimitedWaitsWithoutSpendingRetries`、`TestOverloadAndTransientBackOff`、`TestModelRetriesRunOut`、`TestPermanentFailsAtOnce`、`TestOnlyALostResponseIsUnconfirmed`（第 18 节 12）、`TestTruncatedTurnIsRedoneWithALargerCap`、`TestQuotaExhaustedHoldsTheGroupUntilReset`（第 18 节 16）、`TestTransientFailuresOpenTheBreaker`、`TestSharedLimiterSerialisesCalls`、`TestCancelAndDeadlineWhileWaiting`（第 18 节 10 的退避、熔断等待，外加等额度）、`TestCrashAtEveryCommitPointWithModelFailures`（同一任务里临时错误 + 限流，每个提交点前后各崩一次）、`TestSettleBeforeObserve`、`TestRetryCommitsYieldToACommittedCancel`。
+   `Used.Steps` 只计有回答的调用，失败的调用不计、响应丢失只计 `Unconfirmed`（`TestRateLimitStormDoesNotSpendTheBudget`：20 次限流、`MaxSteps = 3` 仍完成；`TestFailedCallsAreNotSteps`）。
    留给下一步：弹性 vCore（`Scaler`、`core_up` / `core_down`、`SetCores` / `AutoScale`）、窗口真正限制并发（现在 `W` 只记录不约束）、多个执行组与 `Fallback` 迁移、`Config.Groups`。
 
 ## 18. 测试
@@ -709,7 +711,7 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
 3. 工具在途时，即使只有 1 个 vCore，也能推进其他任务。
 4. 后台任务在持续的交互负载下，`AgingAfter` 之后仍会被执行。
 5. 插话在任何状态下送达，或以 `steer_dropped` 报告。
-6. 模型调用次数 = `StepModel` + `StepCompact` 指令数。
+6. 模型调用次数 = `StepModel` + `StepCompact` 指令数（= `step` 事件数，每次调用尝试一个；`Used.Steps` 只是其中有回答的那些，见 4.6）。
 
 持久化与恢复（阶段 2、3）：
 
@@ -737,5 +739,5 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
 
 1. 第 18 节全部通过，`go test -race ./...` 为绿。
 2. 真实模型上，一个带 `SideEffect` 工具的多轮任务在工具执行中途 `kill -9`：重启后任务进入 `Waiting(Reconcile)`，`resolve` 之后完成；工具实际只执行了一次。
-3. 真实网关上，同时提交 200 个短任务（单组、自动伸缩、`Max = 0`）：全部完成；出现过载后窗口回落再增长；计费代理统计到的模型请求数 = 已确认的模型指令数 + `Unconfirmed`。
+3. 真实网关上，同时提交 200 个短任务（单组、自动伸缩、`Max = 0`）：全部完成；出现过载后窗口回落再增长；计费代理统计到的模型请求数 = 各任务 `Used.Steps` 之和 + `Unconfirmed` + 带回答失败的调用数（4.6；连接被拒绝的请求代理看不到）。
 4. agentbench core-30 + hard-15（rubric 判定、2 轮）：通过数不低于 harness-rs 减 2；每题 total token 不高于 harness-rs 的 1.1 倍。

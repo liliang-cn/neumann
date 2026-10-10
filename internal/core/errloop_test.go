@@ -39,7 +39,11 @@ func TestRetryCommitsYieldToACommittedCancel(t *testing.T) {
 			e.Groups = map[string]*Group{"default": {Class: "default", Ctl: group.New(group.Config{})}}
 			e.step(bg, newTask(t, e, s, "q"), 0)
 			got := load(t, s)
-			if got.State != task.Cancelled || got.StopReason != ReasonCancelled || got.Used.Steps != 1 || sm.Calls() != 1 {
+			steps := 0 // only an answered call is a step
+			if name == "truncated" {
+				steps = 1
+			}
+			if got.State != task.Cancelled || got.StopReason != ReasonCancelled || got.Used.Steps != steps || sm.Calls() != 1 {
 				t.Fatalf("task %s %q, steps %d, calls %d", got.State, got.StopReason, got.Used.Steps, sm.Calls())
 			}
 			if hasKind(s, "model_retry") || !hasKind(s, "step") {
@@ -89,5 +93,26 @@ func TestWakeOnlyTakesItsOwnWait(t *testing.T) {
 	}
 	if got := load(t, s); got.State != task.Waiting || got.Version != 2 {
 		t.Fatalf("task %s v%d", got.State, got.Version)
+	}
+}
+
+// A lost response counts once, as unconfirmed, never as a step; a failed call
+// with an answer (any error class) counts as neither.
+func TestFailedCallsAreNotSteps(t *testing.T) {
+	for name, c := range map[string]struct {
+		err         error
+		unconfirmed int
+	}{
+		"lost":      {sim.Lost(), 1},
+		"transient": {sim.Transient(), 0},
+		"ratelimit": {sim.RateLimited(time.Second), 0},
+		"permanent": {sim.Permanent(), 0},
+	} {
+		e, s, sm := newTestEnv(t, func(model.Request) (model.Response, error) { return model.Response{}, c.err })
+		e.step(bg, newTask(t, e, s, "q"), 0)
+		got := load(t, s)
+		if got.Used.Steps != 0 || got.Unconfirmed != c.unconfirmed || sm.Calls() != 1 || !hasKind(s, "step") {
+			t.Fatalf("%s: steps %d, unconfirmed %d, calls %d, events %s", name, got.Used.Steps, got.Unconfirmed, sm.Calls(), kinds(s))
+		}
 	}
 }

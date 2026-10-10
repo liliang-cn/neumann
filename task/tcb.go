@@ -121,7 +121,10 @@ func (w *WaitReason) UnmarshalText(b []byte) error {
 
 // Budget bounds a task.
 type Budget struct {
-	MaxSteps int `json:"max_steps,omitempty"` // model instructions; 0 = unlimited
+	// MaxSteps bounds answered model calls plus unconfirmed ones
+	// (Used.Steps + Unconfirmed); 0 = unlimited. Failed calls are bounded by
+	// the machine's retry limit instead.
+	MaxSteps int `json:"max_steps,omitempty"`
 	// Deadline is an absolute time: once it passes, the task is cancelled
 	// whatever state it is in and ends Failed with StopReason "deadline"
 	// (design §9.4). Zero means none. It survives a restart.
@@ -130,7 +133,11 @@ type Budget struct {
 
 // Usage is confirmed usage: only what a provider's response reported.
 type Usage struct {
-	Steps            int `json:"steps,omitempty"` // model instructions; a provider response leaves it 0
+	// Steps counts answered model calls: a response came back (a final
+	// answer, a tool-call turn, a truncated turn that is redone). A call that
+	// failed with an error is not a step, and a lost response is counted in
+	// TCB.Unconfirmed instead. A provider response leaves it 0.
+	Steps            int `json:"steps,omitempty"`
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	ReasoningTokens  int `json:"reasoning_tokens"`
