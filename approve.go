@@ -99,14 +99,22 @@ func (m *Machine) Approve(ctx context.Context, taskID, callID string, d Approval
 		return err
 	}
 	defer m.inflight.Done()
-	t, ok := m.sched.CheckoutIf(taskID, func(t *task.TCB) bool {
-		return t.State == task.Waiting && t.Wait == task.WaitApproval
-	})
+	awaiting := func(t *task.TCB) bool { return t.State == task.Waiting && t.Wait == task.WaitApproval }
+	t, ok := m.sched.CheckoutIf(taskID, awaiting)
 	if !ok {
-		if _, err := m.store.Load(ctx, taskID); err != nil {
+		stored, err := m.store.Load(ctx, taskID)
+		if err != nil {
 			return err
 		}
-		return fmt.Errorf("neumann: task %s: %w", taskID, ErrNotAwaitingApproval)
+		if awaiting(stored) {
+			// Committed as waiting, and not handed back yet: by the vCore
+			// whose commit announced approval_needed, or by an operator
+			// deciding another call of the round. Either lets go at once.
+			t, ok = m.sched.CheckoutWait(ctx, taskID, awaiting)
+		}
+		if !ok {
+			return fmt.Errorf("neumann: task %s: %w", taskID, ErrNotAwaitingApproval)
+		}
 	}
 	batch, err := m.env.Approve(ctx, t, callID, d)
 	if errors.Is(err, mem.ErrCancelPending) {

@@ -639,14 +639,18 @@ func TestApproveOverTheWire(t *testing.T) {
 	var evs []out
 	mustOK(t, h.do(`{"kind":"submit","task_id":"p","input":"pay"}`, &evs), proto.KindSubmit)
 	held := map[string]map[string]any{}
-	for len(held) < 3 {
-		o := h.next()
-		if o.Kind != proto.EvApprovalNeeded {
-			continue
+	note := func(o out) {
+		if o.Kind == proto.EvApprovalNeeded {
+			var d map[string]any
+			json.Unmarshal(o.Data, &d)
+			held[d["call_id"].(string)] = d
 		}
-		var d map[string]any
-		json.Unmarshal(o.Data, &d)
-		held[d["call_id"].(string)] = d
+	}
+	for _, o := range evs { // events can come before the submit's reply
+		note(o)
+	}
+	for len(held) < 3 {
+		note(h.next())
 	}
 	if d := held["c-2"]; d["tool"] != "bank_pay" || d["device"] != "bank" || d["effect"] != "side_effect" || d["args"] != `{"n":1}` || d["reason"] != `a payment of {"n":1}` {
 		t.Fatalf("approval_needed %v", d)
@@ -654,14 +658,15 @@ func TestApproveOverTheWire(t *testing.T) {
 	var st struct {
 		Approval int `json:"approval"`
 	}
-	r := h.do(`{"kind":"status"}`, nil)
-	json.Unmarshal(r.Status, &st)
-	if st.Approval != 1 {
-		t.Fatalf("status %s", r.Status)
+	for begin := time.Now(); st.Approval != 1; { // the task is handed back after the event
+		if time.Since(begin) > wait {
+			t.Fatal("status never counted the task as awaiting approval")
+		}
+		json.Unmarshal(h.do(`{"kind":"status"}`, nil).Status, &st)
 	}
 	mustFail(t, h.do(`{"kind":"approve","task_id":"p","call_id":"c-9","decision":{"verdict":"allow"}}`, nil), CodeNotAwaiting)
 	mustFail(t, h.do(`{"kind":"resolve","task_id":"p","call_id":"c-1","outcome":{"result":"x"}}`, nil), CodeNotReconciling)
-	r = h.do(`{"id":"a1","kind":"approve","task_id":"p","call_id":"c-1","decision":{"verdict":"allow"}}`, &evs)
+	r := h.do(`{"id":"a1","kind":"approve","task_id":"p","call_id":"c-1","decision":{"verdict":"allow"}}`, &evs)
 	mustOK(t, r, KindApprove)
 	if r.TaskID != "p" || string(r.ID) != `"a1"` {
 		t.Fatalf("approve reply %+v", r)

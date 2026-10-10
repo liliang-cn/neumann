@@ -473,6 +473,38 @@ func (s *Sched) CheckoutIf(id string, ok func(*task.TCB) bool) (*task.TCB, bool)
 	return t, true
 }
 
+// CheckoutWait is CheckoutIf for a task that may be held elsewhere for a
+// moment: a holder that has committed the task's wait but not handed it back
+// yet, or another operator. While the task is held, it waits for the
+// hand-back (or for ctx to end); a task that is neither held nor in the wait
+// set, or that ok refuses once it is there, is not taken.
+func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) bool) (*task.TCB, bool) {
+	stop := context.AfterFunc(ctx, func() {
+		s.mu.Lock()
+		s.cond.Broadcast()
+		s.mu.Unlock()
+	})
+	defer stop()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		if t, found := s.waiting[id]; found {
+			if !ok(t) {
+				return nil, false
+			}
+			delete(s.waiting, id)
+			delete(s.loc, id)
+			s.out[id] = true
+			s.disarmWakeLocked(s.ctl[id])
+			return t, true
+		}
+		if !s.out[id] || ctx.Err() != nil {
+			return nil, false
+		}
+		s.cond.Wait()
+	}
+}
+
 // Take is CheckoutIf that also looks in the ready queues: an operator moving
 // a task to another class (SetClass) may take it from either, but never from
 // a vCore or a tool batch, which hold it out of both.
@@ -545,6 +577,7 @@ func (s *Sched) Forget(id string) {
 	defer s.mu.Unlock()
 	delete(s.out, id)
 	s.dropLocked(id)
+	s.cond.Broadcast() // a CheckoutWait for it gives up
 }
 
 // Close makes every Next return false and stops every deadline and backoff

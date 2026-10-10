@@ -265,8 +265,10 @@ func TestApprovalAllowDenyEdit(t *testing.T) {
 	if d := need["c-2"]; d["tool"] != "dev_b" || d["device"] != "dev" || d["effect"] != "side_effect" || d["args"] != `{"n":1}` || d["reason"] != "money moves" {
 		t.Fatalf("approval_needed %v", d)
 	}
-	if st := m.Status(); st.Approval != 1 || st.Groups[0].Approval != 1 {
-		t.Fatalf("status counts %d awaiting approval, group %d", st.Approval, st.Groups[0].Approval)
+	// The event is committed before the vCore hands the task back.
+	waitFor(t, func() bool { return m.Status().Approval == 1 })
+	if st := m.Status(); st.Groups[0].Approval != 1 {
+		t.Fatalf("status counts group %d awaiting approval", st.Groups[0].Approval)
 	}
 	if q := m.Queue(); q.Classes[0].Approval != 1 || q.Classes[0].Waiting != 1 {
 		t.Fatalf("queue %+v", q)
@@ -585,4 +587,65 @@ func TestApprovalSurvivesARestart(t *testing.T) {
 		t.Fatalf("the restarted machine asked the policy again about %v", a)
 	}
 	toolMessage(t, got)
+}
+
+// An operator that answers approval_needed the moment it is published, and
+// two operators deciding two calls of one round at once, are never told the
+// task is not waiting: the commit that announces the calls comes before the
+// vCore hands the task back, and Approve waits for that hand-back.
+func TestApproveRightAfterTheAnnouncement(t *testing.T) {
+	p := &policy{by: map[string]neumann.Decision{"dev_a": neumann.RequireApproval(""), "dev_b": neumann.RequireApproval("")}}
+	m, _ := start(t, neumann.Config{Devices: []bus.Device{(&recDev{}).device()}, ToolPolicy: p.decide}, oneRound("dev_a", "dev_b"))
+	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
+	defer cancel()
+	events := m.Events(ctx, 0)
+	const tasks = 30
+	ids := map[string]bool{}
+	for i := 0; i < tasks; i++ {
+		ids[submit(t, m, proto.Instruction{Input: fmt.Sprint("t", i)})] = true
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2*tasks)
+	pending := map[string][]string{}
+	done := 0
+	for ev := range events {
+		if !ids[ev.TaskID] {
+			continue
+		}
+		if ev.Kind == proto.EvApprovalNeeded {
+			var d struct {
+				CallID string `json:"call_id"`
+			}
+			json.Unmarshal(ev.Data, &d)
+			pending[ev.TaskID] = append(pending[ev.TaskID], d.CallID)
+			if len(pending[ev.TaskID]) == 2 {
+				// Both calls at once, from two operators.
+				for _, call := range pending[ev.TaskID] {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						if err := m.Approve(bg, ev.TaskID, call, neumann.ApprovalDecision{}); err != nil {
+							errs <- fmt.Errorf("%s/%s: %w", ev.TaskID, call, err)
+						}
+					}()
+				}
+			}
+		}
+		if ev.Terminal() {
+			if ev.Kind != proto.EvDone {
+				t.Fatalf("task %s ended with %s", ev.TaskID, ev.Kind)
+			}
+			if done++; done == tasks {
+				break
+			}
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if done != tasks {
+		t.Fatalf("%d of %d tasks finished", done, tasks)
+	}
 }
