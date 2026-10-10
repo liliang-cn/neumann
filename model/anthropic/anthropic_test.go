@@ -570,3 +570,48 @@ func TestMaxOutWinsOverTheDefault(t *testing.T) {
 	}
 	var _ model.OutputCap = a
 }
+
+// Registers after a compaction (design §5.3): the task's request, then the
+// summary as a second user message, then the rounds kept. They render with
+// the roles alternating: the summary joins the request's user turn, and the
+// kept round's results still lead their turn. A compaction request is the
+// fixed prompt as system, one user message, no tools, its own max_tokens.
+func TestCompactedRegistersRender(t *testing.T) {
+	s := newServer(t, 200, textReply)
+	a := New(s.URL+"/v1", "k", "claude-x")
+	call(t, a, model.Request{
+		System: "be brief",
+		Tools:  []task.ToolSpec{{Name: "look"}},
+		Messages: []task.Message{
+			task.Text(task.RoleUser, "find the bill"),
+			task.SummaryMessage("rounds=3: the bill is #42"),
+			{Role: task.RoleAssistant, Parts: []task.Part{{Kind: task.PartToolCall, CallID: "c-7", Name: "look", Args: json.RawMessage(`{}`)}}},
+			{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-7", Text: "due friday"}}},
+			task.Text(task.RoleUser, "and pay it"),
+		},
+	})
+	msgs := s.messages(t, 0)
+	if roles(msgs) != "user,assistant,user" {
+		t.Fatalf("roles %s", roles(msgs))
+	}
+	first := msgs[0].Content
+	if len(first) != 2 || block(t, first[0])["text"] != "find the bill" || !strings.HasPrefix(block(t, first[1])["text"].(string), task.SummaryHeader) {
+		t.Fatalf("the request and the summary share the first turn: %s", first)
+	}
+	if b := block(t, msgs[2].Content[0]); b["type"] != "tool_result" || b["tool_use_id"] != "c-7" {
+		t.Fatalf("the kept round's result leads its turn: %s", msgs[2].Content)
+	}
+
+	chunk := []task.Message{
+		{Role: task.RoleAssistant, Parts: []task.Part{{Kind: task.PartToolCall, CallID: "c-1", Name: "look", Args: json.RawMessage(`{}`)}}},
+		{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: "bill #42"}}},
+	}
+	call(t, a, model.Request{System: task.CompactSystem, Messages: task.CompactMessages(chunk), MaxOut: 512})
+	b := s.body(1)
+	if b["system"] != task.CompactSystem || b["max_tokens"] != float64(512) || b["tools"] != nil {
+		t.Fatalf("compaction request: system %v, max_tokens %v, tools %v", b["system"], b["max_tokens"], b["tools"])
+	}
+	if m := s.messages(t, 1); roles(m) != "user" || len(m[0].Content) != 1 || !strings.Contains(block(t, m[0].Content[0])["text"].(string), "[result of c-1]\nbill #42") {
+		t.Fatalf("compaction request messages %+v", m)
+	}
+}

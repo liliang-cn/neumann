@@ -85,7 +85,8 @@ func fullJitter(d time.Duration) time.Duration {
 }
 
 // outcomeOf maps a call's error class onto its group's outcome, one to one.
-// Unknown is taken as Transient, as everywhere else in the model step.
+// Unknown is taken as Transient, as everywhere else in the model step; a
+// context-length rejection is an answer about the request, like Permanent.
 func outcomeOf(class model.ErrClass) group.Outcome {
 	switch class {
 	case model.RateLimited:
@@ -94,7 +95,7 @@ func outcomeOf(class model.ErrClass) group.Outcome {
 		return group.QuotaExhausted
 	case model.Overload:
 		return group.Overload
-	case model.Permanent:
+	case model.Permanent, model.ContextLength:
 		return group.Permanent
 	}
 	return group.Transient
@@ -155,10 +156,11 @@ func (e *Env) modelFailed(t *task.TCB, c mem.CommitSet, class model.ErrClass, er
 	return e.backoff(t, c, class, e.Clock.Now().Add(e.backoffDelay(t.Retries, floor)), text)
 }
 
-// backoff describes t waiting until at before it calls the model again.
+// backoff describes t waiting until at before it calls the model again, at
+// the same model instruction (a compaction is tried again as one).
 func (e *Env) backoff(t *task.TCB, c mem.CommitSet, class model.ErrClass, at time.Time, text string) mem.CommitSet {
 	delay := max(at.Sub(e.Clock.Now()), 0)
-	t.State, t.Wait, t.PC = task.Waiting, task.WaitBackoff, task.StepModel
+	t.State, t.Wait, t.PC = task.Waiting, task.WaitBackoff, modelPC(t)
 	t.WakeAt = at
 	t.Version++
 	c.Task = t

@@ -219,3 +219,55 @@ func TestMaxOutIsSentAsMaxTokens(t *testing.T) {
 	}
 	var _ model.OutputCap = a
 }
+
+// Registers after a compaction (design §5.3) render with the summary as a
+// user message right after the request (consecutive user messages are
+// valid here), and the kept round's call and result paired. A compaction
+// request is the fixed prompt as system, one user message, no tools, its
+// own max_tokens.
+func TestCompactedRegistersRender(t *testing.T) {
+	s := newServer(t, 200, textReply)
+	a := New(s.URL+"/v1", "k", "m1")
+	if _, err := a.Call(context.Background(), model.Request{
+		System: "be brief",
+		Tools:  []task.ToolSpec{{Name: "look"}},
+		Messages: []task.Message{
+			task.Text(task.RoleUser, "find the bill"),
+			task.SummaryMessage("rounds=3: the bill is #42"),
+			{Role: task.RoleAssistant, Parts: []task.Part{{Kind: task.PartToolCall, CallID: "c-7", Name: "look", Args: json.RawMessage(`{}`)}}},
+			{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-7", Text: "due friday"}}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	msgs := s.body(0)["messages"].([]any)
+	var roles []string
+	for _, m := range msgs {
+		roles = append(roles, m.(map[string]any)["role"].(string))
+	}
+	if strings.Join(roles, ",") != "system,user,user,assistant,tool" {
+		t.Fatalf("roles %v", roles)
+	}
+	if c := msgs[2].(map[string]any)["content"].(string); !strings.HasPrefix(c, task.SummaryHeader) {
+		t.Fatalf("summary %q", c)
+	}
+	if msgs[3].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["id"] != "c-7" || msgs[4].(map[string]any)["tool_call_id"] != "c-7" {
+		t.Fatalf("the kept round is not paired: %v %v", msgs[3], msgs[4])
+	}
+
+	chunk := []task.Message{
+		{Role: task.RoleAssistant, Parts: []task.Part{{Kind: task.PartToolCall, CallID: "c-1", Name: "look", Args: json.RawMessage(`{}`)}}},
+		{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: "bill #42"}}},
+	}
+	if _, err := a.Call(context.Background(), model.Request{System: task.CompactSystem, Messages: task.CompactMessages(chunk), MaxOut: 512}); err != nil {
+		t.Fatal(err)
+	}
+	b := s.body(1)
+	cm := b["messages"].([]any)
+	if len(cm) != 2 || cm[0].(map[string]any)["content"] != task.CompactSystem || b["tools"] != nil || b["max_tokens"] != float64(512) {
+		t.Fatalf("compaction request %v", b)
+	}
+	if c := cm[1].(map[string]any)["content"].(string); !strings.Contains(c, "[result of c-1]\nbill #42") {
+		t.Fatalf("transcript %q", c)
+	}
+}

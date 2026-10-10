@@ -29,7 +29,7 @@ const StopMigrateIncompatible = "migrate_incompatible"
 const (
 	CheckTools     = "tools"      // the task has tools and the target's model calls none
 	CheckToolCount = "tool_count" // more tools than the target's model takes in one request
-	CheckContext   = "context"    // System + Tools + Regs + the output reserve exceed the target's window
+	CheckContext   = "context"    // System + Tools + Regs + the output reserve exceed the target's window, and compaction cannot make them fit
 	CheckCaps      = "caps"       // the target's adapter panicked reporting what it can take
 )
 
@@ -56,41 +56,40 @@ func (e *MigrateError) data() map[string]any {
 //  2. the estimated System + Tools + Regs (as the target would be sent them,
 //     without foreign reasoning) plus the output reserve (the task's MaxOut,
 //     else the target's output cap, else DefaultMaxOut) must fit the target's
-//     window. An unknown window (0) is never refused.
-//
-// The design's third check, whether chunked compaction on the target could
-// make the task fit, needs StepCompact, which does not exist yet: a task that
-// does not fit is refused.
-func (e *Env) fits(t *task.TCB, target *Group) *MigrateError {
+//     window. An unknown window (0) is never refused;
+//  3. failing that, chunked compaction on the target must be able to make it
+//     fit (canCompact: what is always kept fits with a summary, and every
+//     round to swap out fits a compaction request in the target's window):
+//     then compact is true, and the move makes the task's first instruction
+//     there a compaction.
+func (e *Env) fits(t *task.TCB, target *Group) (compact bool, refused *MigrateError) {
 	a := e.adapter(target)
 	refuse := func(check, detail string, args ...any) *MigrateError {
 		return &MigrateError{From: t.Class, To: target.Class, Check: check, Detail: fmt.Sprintf(detail, args...)}
 	}
 	var caps model.Caps
 	if err := guarded("Caps", func() { caps = model.CapsOf(a) }); err != nil {
-		return refuse(CheckCaps, "%v", err)
+		return false, refuse(CheckCaps, "%v", err)
 	}
 	if len(t.Tools) > 0 && !caps.Tools {
-		return refuse(CheckTools, "the task has %d tools and %s calls none", len(t.Tools), a.Provider())
+		return false, refuse(CheckTools, "the task has %d tools and %s calls none", len(t.Tools), a.Provider())
 	}
 	if caps.MaxTools > 0 && len(t.Tools) > caps.MaxTools {
-		return refuse(CheckToolCount, "the task has %d tools and %s takes at most %d", len(t.Tools), a.Provider(), caps.MaxTools)
+		return false, refuse(CheckToolCount, "the task has %d tools and %s takes at most %d", len(t.Tools), a.Provider(), caps.MaxTools)
 	}
-	if caps.Window > 0 {
-		out := t.MaxOut
-		if out <= 0 {
-			out = caps.MaxOut
-		}
-		if out <= 0 {
-			out = DefaultMaxOut
-		}
-		in := task.EstimateTokens(t.System, t.Tools, forProvider(t.Regs, a.Provider()))
-		if in+int64(out) > int64(caps.Window) {
-			return refuse(CheckContext, "about %d tokens with %d reserved for output do not fit the window of %d, and compaction is not available",
-				in, out, caps.Window)
-		}
+	sz, known := sizeFor(target, caps, 0, t.MaxOut)
+	if !known {
+		return false, nil
 	}
-	return nil
+	in := task.EstimateTokens(t.System, t.Tools, forProvider(t.Regs, a.Provider()))
+	if in+sz.reserve <= sz.window {
+		return false, nil
+	}
+	if err := canCompact(t.System, t.Tools, t.Regs, a.Provider(), sz); err != nil {
+		return false, refuse(CheckContext, "about %d tokens with %d reserved for output do not fit the window of %d, and compaction cannot make them fit: %v",
+			in, sz.reserve, sz.window, err)
+	}
+	return true, nil
 }
 
 // groupGone is what becomes of t when its group g is down (design §6.2,
@@ -105,10 +104,10 @@ func (e *Env) groupGone(t *task.TCB, c mem.CommitSet, g *Group, evs ...proto.Eve
 	if g == nil || g.Fallback == "" || t.PinClass {
 		return park(t, c, evs...)
 	}
-	target, refused := e.fallbackFor(t, g)
+	target, compact, refused := e.fallbackFor(t, g)
 	switch {
 	case target != nil:
-		return migrate(t, c, target.Class, "group_down", evs...)
+		return migrate(t, c, target.Class, "group_down", compact, evs...)
 	case refused == nil:
 		return park(t, c, evs...)
 	case g.OnMigrateFail == MigrateFail:
@@ -126,9 +125,10 @@ func (e *Env) groupGone(t *task.TCB, c mem.CommitSet, g *Group, evs ...proto.Eve
 }
 
 // fallbackFor walks g's fallback chain (acyclic: the machine checks) for the
-// first group that is up and can take t. It returns the first refusal when
-// no group could, and neither when every group along the chain is down.
-func (e *Env) fallbackFor(t *task.TCB, g *Group) (*Group, *MigrateError) {
+// first group that is up and can take t, and whether t must compact there
+// first. It returns the first refusal when no group could, and neither when
+// every group along the chain is down.
+func (e *Env) fallbackFor(t *task.TCB, g *Group) (*Group, bool, *MigrateError) {
 	seen := map[string]bool{g.Class: true}
 	var first *MigrateError
 	for name := g.Fallback; name != "" && !seen[name]; {
@@ -138,9 +138,9 @@ func (e *Env) fallbackFor(t *task.TCB, g *Group) (*Group, *MigrateError) {
 			break
 		}
 		if !e.groupDown(tg) {
-			err := e.fits(t, tg)
+			compact, err := e.fits(t, tg)
 			if err == nil {
-				return tg, nil
+				return tg, compact, nil
 			}
 			if first == nil {
 				first = err
@@ -148,18 +148,24 @@ func (e *Env) fallbackFor(t *task.TCB, g *Group) (*Group, *MigrateError) {
 		}
 		name = tg.Fallback
 	}
-	return nil, first
+	return nil, false, first
 }
 
-// migrate describes t moved to class: Ready for its next model step there,
-// with its ReadySince kept so it does not go to the back of the new queue.
-// Nothing else changes: the first request to the new provider leaves the old
-// one's reasoning out (forProvider), so the provider's prompt cache misses
-// once.
-func migrate(t *task.TCB, c mem.CommitSet, class, reason string, evs ...proto.Event) mem.CommitSet {
+// migrate describes t moved to class: Ready for its next model step there
+// (a compaction first when it must compact to fit, compact), with its
+// ReadySince kept so it does not go to the back of the new queue. A window
+// learned from the old provider, and a compaction pass sized for it, are
+// dropped. Nothing else changes: the first request to the new provider
+// leaves the old one's reasoning out (forProvider), so the provider's prompt
+// cache misses once.
+func migrate(t *task.TCB, c mem.CommitSet, class, reason string, compact bool, evs ...proto.Event) mem.CommitSet {
 	from := t.Class
 	t.Class = class
 	t.State, t.Wait, t.PC, t.WakeAt = task.Ready, task.WaitNone, task.StepModel, time.Time{}
+	if compact {
+		t.PC = task.StepCompact
+	}
+	t.Window, t.CompactChunk = 0, 0
 	t.Version++
 	c.Task = t
 	c.Events = append(c.Events, evs...)
@@ -182,11 +188,14 @@ func (e *Env) SetClass(ctx context.Context, t *task.TCB, class string) error {
 	if t.Class == class {
 		return nil
 	}
-	if err := e.fits(t, target); err != nil {
-		return err
+	compact, refused := e.fits(t, target)
+	if refused != nil {
+		return refused
 	}
 	moved := t.Clone()
 	moved.Class = class
+	moved.Window, moved.CompactChunk = 0, 0
+	moved.PC = movedPC(moved.PC, compact)
 	if moved.State == task.Waiting && moved.Wait == task.WaitGroup {
 		moved.State, moved.Wait = task.Ready, task.WaitNone
 	}
@@ -214,7 +223,8 @@ func (e *Env) Rehome(ctx context.Context, t *task.TCB, class string) error {
 	if target == nil {
 		return fmt.Errorf("neumann: unknown class %q", class)
 	}
-	if refused := e.fits(t, target); refused != nil {
+	compact, refused := e.fits(t, target)
+	if refused != nil {
 		in := mem.Interrupt{TaskID: t.ID, Kind: mem.InterruptCancel, Text: ReasonClassRemoved}
 		return e.Commit(ctx, mem.CommitSet{
 			NewInterrupts: []mem.Interrupt{in},
@@ -223,6 +233,8 @@ func (e *Env) Rehome(ctx context.Context, t *task.TCB, class string) error {
 	}
 	moved := t.Clone()
 	moved.Class = class
+	moved.Window, moved.CompactChunk = 0, 0
+	moved.PC = movedPC(moved.PC, compact)
 	moved.Version++
 	ev := proto.NewEvent(proto.EvMigrated, t.ID, map[string]any{"from": t.Class, "to": class, "reason": ReasonClassRemoved})
 	err := e.Commit(ctx, mem.CommitSet{Task: moved, Events: []proto.Event{ev}})
@@ -234,6 +246,20 @@ func (e *Env) Rehome(ctx context.Context, t *task.TCB, class string) error {
 	}
 	*t = *moved
 	return nil
+}
+
+// movedPC is the PC of a task moved between instructions: a task about to
+// call its model compacts first when it must to fit its new group (compact),
+// and a compaction pass sized for the old group ends; one at its tools keeps
+// them (its next model step measures it against the new window).
+func movedPC(pc task.PC, compact bool) task.PC {
+	switch {
+	case pc == task.StepTools:
+		return pc
+	case compact:
+		return task.StepCompact
+	}
+	return task.StepModel
 }
 
 // forProvider is msgs as a request to provider carries them: a reasoning

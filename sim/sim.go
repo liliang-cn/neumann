@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -198,4 +199,61 @@ func Truncated() model.Response {
 		FinishReason: "length",
 		Usage:        task.Usage{PromptTokens: 10, CompletionTokens: 50, ReasoningTokens: 50},
 	}
+}
+
+// ContextTooLong is the provider rejecting a request as longer than the
+// model's context window (a 400, context_length_exceeded).
+func ContextTooLong() error {
+	return &model.Error{Class: model.ContextLength, Status: 400, Provider: "sim", Msg: "scripted context_length_exceeded"}
+}
+
+// IsCompaction reports whether req is a compaction request (design §5.3):
+// the fixed compaction prompt, no tools.
+func IsCompaction(req model.Request) bool {
+	return req.System == task.CompactSystem && len(req.Tools) == 0
+}
+
+// summaryRounds reads the "rounds=N" a Summarize summary starts with.
+func summaryRounds(text string) int {
+	var n int
+	fmt.Sscanf(text, "rounds=%d", &n)
+	return n
+}
+
+// Summarize answers a compaction request the way a faithful model would, in
+// a form tests can read back: "rounds=N", where N counts the tool rounds the
+// summarised span stood for (the rounds of a summary inside it, plus each
+// tool message), then how many blocks the transcript had. It stays short
+// however much it stands for.
+func Summarize(req model.Request) model.Response {
+	text := ""
+	if len(req.Messages) > 0 {
+		text = req.Messages[len(req.Messages)-1].TextContent()
+	}
+	n, blocks := 0, 0
+	for _, block := range strings.Split(text, "\n\n### ") {
+		block = strings.TrimPrefix(block, "### ")
+		blocks++
+		switch {
+		case strings.HasPrefix(block, "summary of earlier work\n"):
+			n += summaryRounds(strings.TrimPrefix(block, "summary of earlier work\n"))
+		case strings.HasPrefix(block, "tool results"):
+			n++
+		}
+	}
+	return Reply(fmt.Sprintf("rounds=%d (from %d blocks of transcript)", n, blocks))
+}
+
+// Rounds is the tool rounds a task has completed by the time of req: those
+// still in its messages (ToolRounds) plus those its compaction summaries
+// (Summarize's) stand for. Scripted models that act by round use it, so
+// they keep their place across compactions.
+func Rounds(req model.Request) int {
+	n := ToolRounds(req)
+	for _, m := range req.Messages {
+		if m.Summary {
+			n += summaryRounds(task.SummaryText(m))
+		}
+	}
+	return n
 }

@@ -64,12 +64,12 @@ func (panickyCaps) Caps() model.Caps { panic("no caps") }
 func TestFitsSurvivesAPanickingCaps(t *testing.T) {
 	e, _, _ := newTestEnv(t, nil)
 	target := &Group{Class: "x", Model: panickyCaps{&sim.Model{}}}
-	err := e.fits(&task.TCB{Class: "y"}, target)
+	_, err := e.fits(&task.TCB{Class: "y"}, target)
 	if err == nil || err.Check != CheckCaps || err.To != "x" || err.From != "y" {
 		t.Fatalf("fits: %v", err)
 	}
 	ok := &Group{Class: "z", Model: &sim.Model{Info: &model.Caps{Tools: true, Window: 100000}}}
-	if err := e.fits(&task.TCB{Class: "y", Regs: []task.Message{task.Text(task.RoleUser, "q")}}, ok); err != nil {
+	if _, err := e.fits(&task.TCB{Class: "y", Regs: []task.Message{task.Text(task.RoleUser, "q")}}, ok); err != nil {
 		t.Fatalf("fits a small task: %v", err)
 	}
 }

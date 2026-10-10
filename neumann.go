@@ -133,6 +133,16 @@ type GroupConfig struct {
 	// bounds the machine's; 0 = no bound of its own. A task moved here by
 	// migration is never refused.
 	MaxQueued int
+
+	// Compaction (design §5.3): a task whose request, with its output
+	// reserve, takes more than CompactAt of the model's window (Caps.Window)
+	// is compacted before its next model step, keeping its newest rounds
+	// within CompactKeep of the window verbatim. 0 takes the defaults, 0.8
+	// and 0.3; CompactKeep must stay below CompactAt. A model whose window
+	// is unknown is compacted only once its provider rejects a request as
+	// too long.
+	CompactAt   float64
+	CompactKeep float64
 }
 
 // What a task does when its group is down and the fallback cannot take it.
@@ -296,6 +306,8 @@ func New(cfg Config) (*Machine, error) {
 			OpenFor:       gc.BreakerOpenFor,
 			Fallback:      gc.Fallback,
 			OnMigrateFail: gc.OnMigrateFail,
+			CompactAt:     gc.CompactAt,
+			CompactKeep:   gc.CompactKeep,
 		}
 		for _, name := range gc.Limits {
 			g.Limiters = append(g.Limiters, limiters[name])
@@ -360,6 +372,8 @@ func groupConfigs(cfg Config) ([]GroupConfig, int, error) {
 			return nil, 0, fmt.Errorf("neumann: group %q has a negative setting", g.Class)
 		case g.Max > 0 && g.Max < g.Min:
 			return nil, 0, fmt.Errorf("neumann: group %q has Max %d below Min %d", g.Class, g.Max, g.Min)
+		case g.CompactAt < 0 || g.CompactAt > 1 || g.CompactKeep < 0 || g.CompactKeep >= compactAt(g):
+			return nil, 0, fmt.Errorf("neumann: group %q: CompactAt %v and CompactKeep %v must satisfy 0 <= CompactKeep < CompactAt <= 1", g.Class, g.CompactAt, g.CompactKeep)
 		case g.OnMigrateFail != "" && g.OnMigrateFail != MigrateWait && g.OnMigrateFail != MigrateFail:
 			return nil, 0, fmt.Errorf("neumann: group %q: OnMigrateFail %q is neither %q nor %q", g.Class, g.OnMigrateFail, MigrateWait, MigrateFail)
 		}
@@ -386,6 +400,14 @@ func groupConfigs(cfg Config) ([]GroupConfig, int, error) {
 		}
 	}
 	return groups, pinned, nil
+}
+
+// compactAt is a group's compaction threshold, the default for 0.
+func compactAt(g GroupConfig) float64 {
+	if g.CompactAt > 0 {
+		return g.CompactAt
+	}
+	return core.DefaultCompactAt
 }
 
 // buildLimiters builds cfg.Limiters by name and checks that every name a
@@ -851,6 +873,35 @@ func (m *Machine) Events(ctx context.Context, fromSeq int64) <-chan proto.Event 
 // EventLog reads committed events with Seq > afterSeq; limit 0 means all.
 func (m *Machine) EventLog(ctx context.Context, afterSeq int64, limit int) ([]proto.Event, error) {
 	return m.store.Events(ctx, afterSeq, limit)
+}
+
+// History is every message a task has had in its registers, in order, as
+// if nothing had ever been compacted: its request, the messages compaction
+// swapped out (from the store's archive), then the registers after the
+// summary, with no summary in it (design §5.3). It reads the committed
+// task first and takes as many archived messages as that task says were
+// archived, so a compaction committed between the two reads changes
+// nothing.
+func (m *Machine) History(ctx context.Context, id string) ([]task.Message, error) {
+	t, err := m.store.Load(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	archived, err := m.store.Archive(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(archived) < t.Archived {
+		return nil, fmt.Errorf("neumann: task %s has archived %d messages, the store holds %d", id, t.Archived, len(archived))
+	}
+	head, _ := task.Units(t.Regs)
+	out := slices.Concat(t.Regs[:head], archived[:t.Archived])
+	for _, msg := range t.Regs[head:] {
+		if !msg.Summary {
+			out = append(out, msg)
+		}
+	}
+	return out, nil
 }
 
 // Load returns the committed state of a task.

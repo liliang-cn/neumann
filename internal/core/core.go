@@ -172,7 +172,9 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		return
 	}
 	switch t.PC {
-	case task.StepModel:
+	case task.StepModel, task.StepCompact:
+		// A compaction pass decides afresh at each of its instructions
+		// (execModel → windowFor → execCompact).
 		c, batch, err = e.execModel(ctx, t, core)
 	case task.StepTools:
 		c, batch, err = e.execTools(ctx, t, core)

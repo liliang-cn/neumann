@@ -62,7 +62,7 @@ func round(t *task.TCB, recs []mem.CallRecord) []mem.CallRecord {
 // it to the scheduler after Recover returns nil, and only then dispatches.
 //
 //   - Running: a model request may have reached the provider. Counted as
-//     unconfirmed; the step is done again.
+//     unconfirmed; the step (a model step or a compaction) is done again.
 //   - Waiting on I/O: the current round is settled call by call (settle).
 //   - Waiting in backoff or for its group: Ready (timers and breakers are
 //     not durable).
@@ -93,8 +93,11 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 	}
 	switch {
 	case t.State == task.Running:
+		// Running is committed before a model call or a compaction call; the
+		// instruction its PC names is done again (a compaction never half
+		// applied: its result is one commit).
 		t.Unconfirmed++
-		e.ready(t, task.StepModel)
+		e.ready(t, modelPC(t))
 		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "running", "unconfirmed": t.Unconfirmed})
 		return nil, e.Commit(ctx, mem.CommitSet{Task: t, Events: []proto.Event{ev}})
 	case t.State == task.Waiting && t.Wait == task.WaitIO:
@@ -128,7 +131,7 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 		// restarted machine's groups start closed. ReadySince is kept: the
 		// task keeps its place in the queue.
 		from := "waiting_" + t.Wait.String()
-		t.State, t.Wait, t.WakeAt, t.PC = task.Ready, task.WaitNone, time.Time{}, task.StepModel
+		t.State, t.Wait, t.WakeAt, t.PC = task.Ready, task.WaitNone, time.Time{}, modelPC(t)
 		t.Version++
 		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": from, "retries": t.Retries})
 		return nil, e.Commit(ctx, mem.CommitSet{Task: t, Events: []proto.Event{ev}})

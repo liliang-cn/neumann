@@ -35,6 +35,13 @@ type Group struct {
 	Fallback      string
 	OnMigrateFail string
 
+	// CompactAt is the share of the model's window above which a task is
+	// compacted before its next model step, CompactKeep the share its
+	// newest rounds kept verbatim may take (design §5.3); 0 takes
+	// DefaultCompactAt and DefaultCompactKeep.
+	CompactAt   float64
+	CompactKeep float64
+
 	mu   sync.Mutex
 	kick func() bool // the half-open timer, armed while tasks wait for the group
 }
@@ -74,9 +81,10 @@ func (e *Env) groupDown(g *Group) bool {
 }
 
 // park describes t waiting for its group to come back (Waiting(Group)): no
-// model call is made. Its next instruction is the same model step.
+// model call is made. Its next instruction is the same model instruction (a
+// compaction pass resumes where it was).
 func park(t *task.TCB, c mem.CommitSet, evs ...proto.Event) mem.CommitSet {
-	t.State, t.Wait, t.PC = task.Waiting, task.WaitGroup, task.StepModel
+	t.State, t.Wait, t.PC = task.Waiting, task.WaitGroup, modelPC(t)
 	t.WakeAt = time.Time{}
 	t.Version++
 	c.Task = t

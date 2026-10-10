@@ -20,15 +20,21 @@ import (
 // waiting on I/O, and the returned batch is dispatched right after it: a tool
 // round does not queue for a vCore a second time just to hand calls over.
 //
-// Around the call (design §5.1, §6, §7): a task whose group is down waits
-// for it instead (Waiting(Group)); otherwise room is reserved in the group's
-// limiters, waiting while the vCore holds the task and before anything is
-// committed; the group admits the request (or the task waits for it after
-// all); the request is committed Running and sent; and its outcome is
-// settled with the limiters and reported to the group before the task's own
-// commit is put together. A failed call is retried, waited out or fails the
-// task by its error class (modelFailed); a turn cut off before it produced
-// anything is asked again with a larger output cap (redoTruncated).
+// Before the call, the task's context is measured against its group's
+// window (windowFor, design §5.3): a task over the threshold, or in the middle
+// of a compaction pass (PC StepCompact), runs a compaction instead
+// (execCompact), and one that cannot be made to fit fails with
+// context_overflow without a call.
+//
+// Around the call (modelCall, design §5.1, §6, §7): a task whose group is
+// down waits for it instead (Waiting(Group)); otherwise room is reserved in
+// the group's limiters, waiting while the vCore holds the task and before
+// anything is committed; the group admits the request (or the task waits for
+// it after all); the request is committed Running and sent; and its outcome
+// is settled with the limiters and reported to the group before the task's
+// own commit is put together. A failed call is retried, waited out or fails
+// the task by its error class (modelFailed); a turn cut off before it
+// produced anything is asked again with a larger output cap (redoTruncated).
 func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []Send, error) {
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
@@ -40,7 +46,6 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, reason)
 		return c, nil, err
 	}
-	base := len(t.Regs)
 	var c mem.CommitSet
 	// Unconfirmed requests count too: they may have reached the provider, and
 	// a task that keeps crashing mid-call must not re-send past its budget.
@@ -56,13 +61,120 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		return e.groupGone(t, c, g), nil, nil
 	}
 	a := e.adapter(g)
+	switch d := e.windowFor(t, g, a, false); {
+	case d.overflow != "":
+		// Not an instruction either: nothing is sent.
+		return failWith(t, c, StopContextOverflow, d.overflow), nil, nil
+	case d.compact:
+		return e.execCompact(ctx, t, core, g, a, d)
+	}
+	t.CompactChunk = 0 // a pass that found nothing more to swap out is over
+
+	base := len(t.Regs)
+	req := model.Request{System: t.System, Tools: t.Tools, Messages: forProvider(t.Regs, a.Provider()), MaxOut: e.sendOut(g, t)}
+	resp, c, out := e.modelCall(ctx, t, core, g, a, task.StepModel, req, func(c *mem.CommitSet) model.Request {
+		// Steers are applied after the Running commit, so a crash cannot
+		// leave a steer in the registers that the interrupt table still
+		// lists as pending.
+		c.Applied = applySteers(t, pending, e.frameSteer)
+		req.Messages = forProvider(t.Regs, a.Provider())
+		return req
+	})
+	if out != nil {
+		return out.c, out.batch, out.err
+	}
+	t.Retries = 0
+	if truncated(resp) {
+		// Nothing came back to keep: the redo sends the same turn, steers
+		// included, with a larger output cap.
+		t.Regs = t.Regs[:base]
+		c.Applied = nil
+		return e.redoTruncated(g, t, c), nil, nil
+	}
+	// Answered, and not cut off: a cap raised for a truncated turn is
+	// dropped, and the next call goes back to the task's own.
+	t.Truncations = 0
+
+	msg := resp.Message
+	msg.Parts = slices.Clone(msg.Parts) // the adapter's slice is not ours to write
+	msg.Role = task.RoleAssistant
+	if len(msg.ToolCalls()) > 0 {
+		recs := e.plan(t, &msg)
+		for _, r := range recs {
+			// Args go into the event as a string: a model can emit malformed
+			// JSON, and marshalling it as raw JSON would fail.
+			c.Events = append(c.Events, proto.NewEvent(proto.EvToolCall, t.ID,
+				map[string]any{"call_id": r.CallID, "tool": r.Tool, "args": string(r.Args)}))
+		}
+		t.Regs = append(t.Regs, msg)
+		// The tool policy decides each call here, before the commit that
+		// dispatches it, and its decisions go into that commit (design §9.7).
+		// It runs under the task's context, as the call did.
+		tctx, release := e.taskContext(t.ID)
+		c.Events = append(c.Events, e.decide(tctx, t, recs)...)
+		release()
+		batch := e.startRound(t, recs)
+		c.Calls = recs
+		c.Task = t
+		// No re-read of the interrupts here: a cancel committed since then
+		// makes the store refuse this commit, and the step finalises.
+		return c, sends(batch), nil
+	}
+
+	t.Regs = append(t.Regs, msg)
+	// A steer committed while the model was answering turns this answer into
+	// a turn: the task goes on instead of finishing over it. The steer stays
+	// pending: the next model step applies it at its start and sends it, or
+	// that step's terminal commit reports it dropped.
+	late, err := e.Store.Interrupts(ctx, t.ID, true)
+	if err != nil {
+		return c, nil, fmt.Errorf("read interrupts: %w", err)
+	}
+	if _, ok := cancelReason(late); ok {
+		return e.cancelledStep(ctx, t, c, base, resp, nil, true, false)
+	}
+	if late = withoutApplied(late, c.Applied); hasSteer(late) {
+		e.ready(t, task.StepModel)
+		c.Task = t
+		return c, nil, nil
+	}
+	return e.finish(t, c, "end_turn"), nil, nil
+}
+
+// stepOut is how a model call's instruction ends when the call did not
+// come back with an answer to use: the commit to make (or the error that
+// stops the step), and the batch to dispatch after it.
+type stepOut struct {
+	c     mem.CommitSet
+	batch []Send
+	err   error
+}
+
+// modelCall is one request to t's group, for a model step or a compaction
+// alike (pc): reserve room in the group's limiters, be admitted by the
+// group, commit Running (with pc as the task's PC), send the request, and
+// settle its outcome with the limiters and the group. apply runs after the
+// Running commit and before the call, and returns the request to send (a
+// model step applies its steers there); nil sends req as it is.
+//
+// It returns the response and the commit set so far (the step and usage
+// events, the steers applied) when the call was answered. Otherwise it
+// returns how the instruction ends: not started, cancelled, waiting for
+// the group or a backoff, failed, or compacting after a context-length
+// rejection.
+func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a model.Adapter, pc task.PC, req model.Request,
+	apply func(c *mem.CommitSet) model.Request) (model.Response, mem.CommitSet, *stepOut) {
+	var c mem.CommitSet
+	base := len(t.Regs)
+	end := func(c mem.CommitSet, err error) (model.Response, mem.CommitSet, *stepOut) {
+		return model.Response{}, mem.CommitSet{}, &stepOut{c: c, err: err}
+	}
 
 	// The call runs under the task's own context: a cancel or deadline ends
 	// it at once, whoever holds the task. So does the wait for room in the
 	// limiters before it.
 	tctx, release := e.taskContext(t.ID)
 	defer release()
-	req := model.Request{System: t.System, Tools: t.Tools, Messages: forProvider(t.Regs, a.Provider()), MaxOut: e.sendOut(g, t)}
 	// The wait for room also ends when the machine stops fetching: nothing
 	// is committed yet, so the task goes back as it is.
 	rctx, stopWaiting := context.WithCancel(tctx)
@@ -77,17 +189,16 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	if err != nil {
 		switch {
 		case errors.Is(err, limit.ErrTooLarge):
-			return failWith(t, c, StopTooLarge, err.Error()), nil, nil
+			return end(failWith(t, c, StopTooLarge, err.Error()), nil)
 		case e.halt().Err() != nil:
-			return mem.CommitSet{}, nil, nil // the step's halt check drops the task
+			return end(mem.CommitSet{}, nil) // the step's halt check drops the task
 		case tctx.Err() == nil && e.Sched.Stopping().Err() != nil:
-			return mem.CommitSet{}, nil, errNotStarted
+			return end(mem.CommitSet{}, errNotStarted)
 		case tctx.Err() != nil:
 			// Cancelled, or out of time, while waiting for room: nothing ran.
-			c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, ReasonCancelled)
-			return c, nil, err
+			return end(e.cancelSet(ctx, t, mem.CommitSet{}, nil, ReasonCancelled))
 		}
-		return failWith(t, c, StopModelError, "reserve: "+err.Error()), nil, nil
+		return end(failWith(t, c, StopModelError, "reserve: "+err.Error()), nil)
 	}
 	var ticket *group.Ticket
 	if g != nil {
@@ -99,7 +210,7 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 			if res != nil {
 				res.Cancel()
 			}
-			return e.groupGone(t, c, g, pre...), nil, nil
+			return end(e.groupGone(t, c, g, pre...), nil)
 		}
 		ticket = &tk
 	}
@@ -113,43 +224,49 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	}
 
 	// Committed before the call: a restart that finds the task Running knows
-	// a request may have reached the provider. Steers are applied after this
-	// commit, so a crash cannot leave a steer in the registers that the
-	// interrupt table still lists as pending.
+	// a request may have reached the provider, and redoes the instruction
+	// its PC names.
 	// Running means "a request may have been sent": a halt that lands after
 	// this commit and before the call leaves it Running though nothing went
 	// out, and recovery then counts one request too many as unconfirmed.
-	t.State = task.Running
+	prevPC := t.PC
+	t.State, t.PC = task.Running, pc
 	t.Version++
 	if err := e.Commit(context.WithoutCancel(ctx), mem.CommitSet{Task: t, Events: pre}); err != nil {
-		t.State = task.Ready
+		t.State, t.PC = task.Ready, prevPC
 		t.Version--
 		unsent()
 		if errors.Is(err, mem.ErrCancelPending) {
 			// Cancelled after the interrupts were read: nothing runs.
-			c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, ReasonCancelled)
-			return c, nil, err
+			return end(e.cancelSet(ctx, t, mem.CommitSet{}, nil, ReasonCancelled))
 		}
-		return mem.CommitSet{}, nil, fmt.Errorf("%w: %v", errStartNotCommitted, err)
+		return end(mem.CommitSet{}, fmt.Errorf("%w: %v", errStartNotCommitted, err))
 	}
 	e.startCommitted(t.ID)
 	if e.halt().Err() != nil {
 		unsent()
-		return mem.CommitSet{}, nil, nil // the step's halt check drops the task
+		return end(mem.CommitSet{}, nil) // the step's halt check drops the task
 	}
 	if e.Sched.Cancelled(t.ID) {
 		// Signalled since the start commit: no request goes out.
 		unsent()
-		return e.cancelledStep(ctx, t, c, base, model.Response{}, nil, false, false)
+		cs, batch, err := e.cancelledStep(ctx, t, c, base, model.Response{}, nil, false, false)
+		return model.Response{}, mem.CommitSet{}, &stepOut{cs, batch, err}
 	}
-	c.Events = append(c.Events, proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepModel.String(), Core: core}))
-	c.Applied = applySteers(t, pending, e.frameSteer)
+	c.Events = append(c.Events, proto.NewEvent(proto.EvStep, t.ID, stepData{PC: pc.String(), Core: core}))
+	if apply != nil {
+		req = apply(&c)
+	}
 
-	stepNo := t.Used.Steps + 1
-	req.Messages = forProvider(t.Regs, a.Provider())
-	resp, err := e.callModel(tctx, a, req, func(d model.Delta) {
-		e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
-	})
+	var emit func(model.Delta)
+	if pc == task.StepModel {
+		// A compaction's summary is not an answer: it is not streamed.
+		stepNo := t.Used.Steps + 1
+		emit = func(d model.Delta) {
+			e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
+		}
+	}
+	resp, err := e.callModel(tctx, a, req, emit)
 	class := model.Unknown
 	var p *panicError
 	panicked := errors.As(err, &p)
@@ -198,7 +315,8 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	if err == nil {
 		// Used.Steps counts answered calls only (design §4.6): a failed call
 		// is bounded by the retry limit, a lost one is unconfirmed, and
-		// neither spends the task's step budget.
+		// neither spends the task's step budget. A compaction is a call like
+		// any other.
 		t.Used.Steps++
 		t.Used.Add(resp.Usage)
 		c.Events = append(c.Events, proto.NewEvent(proto.EvUsage, t.ID, resp.Usage))
@@ -210,7 +328,12 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		t.Unconfirmed++
 	}
 	if e.halt().Err() == nil && e.Sched.Cancelled(t.ID) {
-		return e.cancelledStep(ctx, t, c, base, resp, err, true, err != nil && !lost && tctx.Err() != nil)
+		kept := resp
+		if pc != task.StepModel {
+			kept = model.Response{} // a summary is never kept
+		}
+		cs, batch, cerr := e.cancelledStep(ctx, t, c, base, kept, err, true, err != nil && !lost && tctx.Err() != nil)
+		return model.Response{}, mem.CommitSet{}, &stepOut{cs, batch, cerr}
 	}
 	if err != nil {
 		// Steers applied for this call were never answered: take them back.
@@ -218,61 +341,12 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		// commit reports them dropped.
 		t.Regs = t.Regs[:base]
 		c.Applied = nil
-		return e.modelFailed(t, c, class, err, info, panicked), nil, nil
-	}
-	t.Retries = 0
-	if truncated(resp) {
-		// Nothing came back to keep: the redo sends the same turn, steers
-		// included, with a larger output cap.
-		t.Regs = t.Regs[:base]
-		c.Applied = nil
-		return e.redoTruncated(g, t, c), nil, nil
-	}
-	// Answered, and not cut off: a cap raised for a truncated turn is
-	// dropped, and the next call goes back to the task's own.
-	t.Truncations = 0
-
-	msg := resp.Message
-	msg.Parts = slices.Clone(msg.Parts) // the adapter's slice is not ours to write
-	msg.Role = task.RoleAssistant
-	if len(msg.ToolCalls()) > 0 {
-		recs := e.plan(t, &msg)
-		for _, r := range recs {
-			// Args go into the event as a string: a model can emit malformed
-			// JSON, and marshalling it as raw JSON would fail.
-			c.Events = append(c.Events, proto.NewEvent(proto.EvToolCall, t.ID,
-				map[string]any{"call_id": r.CallID, "tool": r.Tool, "args": string(r.Args)}))
+		if class == model.ContextLength && !panicked {
+			return end(e.contextRejected(t, c, g, a, req, err), nil)
 		}
-		t.Regs = append(t.Regs, msg)
-		// The tool policy decides each call here, before the commit that
-		// dispatches it, and its decisions go into that commit (design §9.7).
-		c.Events = append(c.Events, e.decide(tctx, t, recs)...)
-		batch := e.startRound(t, recs)
-		c.Calls = recs
-		c.Task = t
-		// No re-read of the interrupts here: a cancel committed since then
-		// makes the store refuse this commit, and the step finalises.
-		return c, sends(batch), nil
+		return end(e.modelFailed(t, c, class, err, info, panicked), nil)
 	}
-
-	t.Regs = append(t.Regs, msg)
-	// A steer committed while the model was answering turns this answer into
-	// a turn: the task goes on instead of finishing over it. The steer stays
-	// pending: the next model step applies it at its start and sends it, or
-	// that step's terminal commit reports it dropped.
-	late, err := e.Store.Interrupts(ctx, t.ID, true)
-	if err != nil {
-		return c, nil, fmt.Errorf("read interrupts: %w", err)
-	}
-	if _, ok := cancelReason(late); ok {
-		return e.cancelledStep(ctx, t, c, base, resp, nil, true, false)
-	}
-	if late = withoutApplied(late, c.Applied); hasSteer(late) {
-		e.ready(t, task.StepModel)
-		c.Task = t
-		return c, nil, nil
-	}
-	return e.finish(t, c, "end_turn"), nil, nil
+	return resp, c, nil
 }
 
 // plan gives each tool call in msg its id and returns their planned call
@@ -362,15 +436,15 @@ func guarded(in string, f func()) (err error) {
 	return nil
 }
 
-// callModel calls the adapter, streaming through emit when the adapter can
-// and a Delta sink is set; a panic in it fails the task, not the process.
+// callModel calls the adapter, streaming through emit when the adapter can,
+// a Delta sink is set and emit is not nil; a panic in it fails the task, not the process.
 func (e *Env) callModel(ctx context.Context, a model.Adapter, req model.Request, emit func(model.Delta)) (resp model.Response, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			resp, err = model.Response{}, &panicError{v: r}
 		}
 	}()
-	if s, ok := a.(model.Streamer); ok && e.Delta != nil {
+	if s, ok := a.(model.Streamer); ok && e.Delta != nil && emit != nil {
 		return s.Stream(ctx, req, emit)
 	}
 	return a.Call(ctx, req)

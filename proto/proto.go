@@ -84,6 +84,12 @@ const (
 	EvToolRewritten  = "tool_rewritten"
 	EvApprovalNeeded = "approval_needed"
 	EvApproved       = "approved"
+
+	// A compaction swapped the oldest rounds of a task's registers out into
+	// one summary message (design §5.3): {rounds, messages_before,
+	// messages_after, tokens_before_est, tokens_after_est, chunk, chunks}:
+	// chunk i of the pass's n (n as projected when the chunk was cut).
+	EvCompacted = "compacted"
 )
 
 // Event is something that happened, published only after it was committed.
