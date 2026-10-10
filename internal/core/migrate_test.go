@@ -3,7 +3,9 @@ package core
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
+	"github.com/liliang-cn/neumann/internal/group"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/sim"
 	"github.com/liliang-cn/neumann/task"
@@ -69,5 +71,24 @@ func TestFitsSurvivesAPanickingCaps(t *testing.T) {
 	ok := &Group{Class: "z", Model: &sim.Model{Info: &model.Caps{Tools: true, Window: 100000}}}
 	if err := e.fits(&task.TCB{Class: "y", Regs: []task.Message{task.Text(task.RoleUser, "q")}}, ok); err != nil {
 		t.Fatalf("fits a small task: %v", err)
+	}
+}
+
+// A group with no limiters whose probe is taken between the "is it down"
+// check and Admit (another vCore got there first) parks the task: there is
+// no reservation to give back. Driven here by a breaker whose clock is a
+// second behind the machine's, so the probe looks due and is then refused.
+func TestAdmitRefusedWithoutALimiter(t *testing.T) {
+	e, store, sm := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.Reply("x"), nil })
+	t0 := time.Date(2026, 10, 10, 8, 0, 0, 0, time.UTC)
+	behind := sim.NewClock(t0)
+	ctl := group.New(group.Config{Clock: behind, BreakerThreshold: 1, BreakerOpenFor: time.Minute})
+	ctl.Breaker.Transient() // open at t0; a probe is due at t0+1m
+	e.Clock = sim.NewClock(t0.Add(time.Minute))
+	e.Groups = map[string]*Group{"default": {Class: "default", Ctl: ctl}}
+	e.Sched.Add(newTask(t, e, store, "q"))
+	e.step(bg, take(t, e), 0)
+	if got := load(t, store); got.State != task.Waiting || got.Wait != task.WaitGroup || sm.Calls() != 0 {
+		t.Fatalf("task %s/%s after %d calls", got.State, got.Wait, sm.Calls())
 	}
 }

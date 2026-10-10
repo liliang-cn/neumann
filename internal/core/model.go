@@ -95,8 +95,10 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		if !ok {
 			// Went down while this task waited for room (or another task took
 			// the probe): the room goes back, and the task moves or waits for
-			// the group.
-			res.Cancel()
+			// the group. A group with no limiters has no room to give back.
+			if res != nil {
+				res.Cancel()
+			}
 			return e.groupGone(t, c, g, pre...), nil, nil
 		}
 		ticket = &tk
