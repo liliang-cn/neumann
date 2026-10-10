@@ -229,18 +229,19 @@ func (e *Env) rateInfo(resp model.Response, err error) *model.RateInfo {
 	return nil
 }
 
-// retryAt is when a rate-limited request may be sent again: the provider's
-// retry-after, else the instant its rate info gives, else the latest reset
-// of a dimension it reported exhausted, else one backoff step from now.
-func (e *Env) retryAt(err error, info *model.RateInfo) time.Time {
+// retryAt is when a rate-limited request may be sent again, as the provider
+// said: its retry-after, else the instant its rate info gives, else the
+// latest reset of a dimension it reported exhausted. ok is false when it
+// said none of these.
+func (e *Env) retryAt(err error, info *model.RateInfo) (at time.Time, ok bool) {
 	now := e.Clock.Now()
 	var me *model.Error
 	if errors.As(err, &me) && me.RetryAfter > 0 {
-		return now.Add(me.RetryAfter)
+		return now.Add(me.RetryAfter), true
 	}
 	if info != nil {
 		if info.RetryAt.After(now) {
-			return info.RetryAt
+			return info.RetryAt, true
 		}
 		var at time.Time
 		for _, d := range info.Dims {
@@ -249,10 +250,10 @@ func (e *Env) retryAt(err error, info *model.RateInfo) time.Time {
 			}
 		}
 		if at.After(now) {
-			return at
+			return at, true
 		}
 	}
-	return now.Add(e.backoffBase())
+	return time.Time{}, false
 }
 
 // pause stops every limiter of the group granting anything before at: the

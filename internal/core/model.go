@@ -167,7 +167,9 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	}
 	e.settleCall(g, res, how, req, resp, info)
 	if class == model.RateLimited {
-		pause(g, e.retryAt(err, info))
+		if at, ok := e.retryAt(err, info); ok {
+			pause(g, at)
+		}
 	}
 	if ticket != nil && !panicked && class != model.Canceled {
 		o := group.Succeeded

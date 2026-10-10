@@ -97,9 +97,13 @@ func outcomeOf(class model.ErrClass) group.Outcome {
 // taken back the steers the call carried.
 //
 //   - Permanent, and a panic in the adapter: the task fails, "model_error".
-//   - RateLimited: Waiting(Backoff) until the provider's retry time. Not
-//     counted against the task's retries: a rate limit is the provider
-//     pacing the account, not the request failing.
+//   - RateLimited with a hint (retry-after, a retry instant, an exhausted
+//     dimension's reset): Waiting(Backoff) until then. Not counted against
+//     the task's retries: a rate limit is the provider pacing the account,
+//     not the request failing. One with no hint at all cannot be told from a
+//     misclassified quota error, so it is backed off and counted like a
+//     transient failure: a provider that keeps saying it ends the task
+//     rather than looping forever.
 //   - QuotaExhausted: the group's breaker is open until an operator resets
 //     it; the task waits for the group, Waiting(Group).
 //   - Overload, Transient and Unknown: Waiting(Backoff) with exponential
@@ -117,7 +121,9 @@ func (e *Env) modelFailed(t *task.TCB, c mem.CommitSet, class model.ErrClass, er
 	}
 	switch class {
 	case model.RateLimited:
-		return e.backoff(t, c, class, e.retryAt(err, info), text)
+		if at, ok := e.retryAt(err, info); ok {
+			return e.backoff(t, c, class, at, text)
+		}
 	case model.QuotaExhausted:
 		if e.groupOf(t.Class) == nil {
 			return failWith(t, c, StopModelError, text)
@@ -133,7 +139,7 @@ func (e *Env) modelFailed(t *task.TCB, c mem.CommitSet, class model.ErrClass, er
 	if errors.As(err, &me) {
 		floor = me.RetryAfter
 	}
-	if class != model.Overload {
+	if class != model.Overload && class != model.RateLimited {
 		class = model.Transient
 	}
 	return e.backoff(t, c, class, e.Clock.Now().Add(e.backoffDelay(t.Retries, floor)), text)

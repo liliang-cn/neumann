@@ -437,6 +437,29 @@ func TestTruncationRedoThatCannotGrowFails(t *testing.T) {
 	}
 }
 
+// A 429 with no hint at all (no retry-after, no reset) cannot be told from a
+// misclassified quota error: it counts toward the retries and backs off
+// exponentially, so a provider that keeps saying it fails the task instead
+// of looping forever.
+func TestRateLimitWithoutAHintCountsAsARetry(t *testing.T) {
+	m, clk, sc := errMachine(t, neumann.Config{MaxModelRetries: 3})
+	bare := sim.Fail(model.RateLimited, 0)
+	sc.plan["A"] = fails(bare, bare, bare, bare)
+	a := submit(t, m, proto.Instruction{Input: "A"})
+	runUntilDone(t, m, clk, time.Second, a)
+	got := loadTask(t, m, a)
+	if got.State != task.Failed || got.StopReason != "model_error" || len(sc.of("A")) != 3 {
+		t.Fatalf("A ended %s %q after %d calls", got.State, got.StopReason, len(sc.of("A")))
+	}
+	rs := retries(t, m, a)
+	if len(rs) != 2 || rs[0].Attempt != 1 || rs[0].DelayMS != 1000 || rs[1].Attempt != 2 || rs[1].DelayMS != 2000 || rs[0].Class != "rate_limited" {
+		t.Fatalf("model_retry events %+v", rs)
+	}
+	if st := m.Status().Limiters; len(st) != 0 {
+		t.Fatalf("limiters %+v", st)
+	}
+}
+
 // design §18 test 16, through a machine: an exhausted quota opens the
 // group's breaker for good. Its tasks wait for the group without calling the
 // model, an hour later still, until an operator's GroupReset brings it back.
