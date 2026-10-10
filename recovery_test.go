@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -341,7 +342,12 @@ func quiesce(t *testing.T, m *neumann.Machine, store mem.Store, id string) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("machine never went quiet: %+v", m.Status())
+	// Seen once under heavy load in a -count=20 run and never reproduced:
+	// keep the evidence a stall would leave, so the next one can be read.
+	var stacks strings.Builder
+	pprof.Lookup("goroutine").WriteTo(&stacks, 2)
+	tc, err := store.Load(bg, id)
+	t.Fatalf("machine never went quiet: %+v\ntask: %+v (err %v)\ngoroutines:\n%s", m.Status(), tc, err, stacks.String())
 }
 
 func stop(t *testing.T, m *neumann.Machine) {
