@@ -21,7 +21,8 @@ const DefaultMaxOut = 4096
 // reported (a throttled event): shorter waits are ordinary queueing.
 const throttleReport = 50 * time.Millisecond
 
-// maxOut is the output cap t's next model call is sent with, or would be.
+// maxOut is the task's own output cap: its MaxOut, else what the adapter
+// sends by default, else DefaultMaxOut. A truncation redo raises from it.
 func (e *Env) maxOut(t *task.TCB) int {
 	if t.MaxOut > 0 {
 		return t.MaxOut
@@ -30,6 +31,47 @@ func (e *Env) maxOut(t *task.TCB) int {
 		return oc.MaxOut()
 	}
 	return DefaultMaxOut
+}
+
+// sendOut is the output cap t's next request carries: its own MaxOut (0:
+// the adapter's default) or, after Truncations redos in a row, the task's
+// cap raised fourfold that many times.
+func (e *Env) sendOut(g *Group, t *task.TCB) int {
+	if t.Truncations == 0 {
+		return t.MaxOut
+	}
+	return e.raisedOut(g, t, t.Truncations)
+}
+
+// raisedOut is the task's cap raised fourfold n times, but never above what
+// the group's limiters could ever grant one request in output: a raise past
+// that would make the request too large to send at all.
+func (e *Env) raisedOut(g *Group, t *task.TCB, n int) int {
+	v := int64(e.maxOut(t))
+	for range n {
+		v *= 4
+	}
+	if c := outCeiling(g); c > 0 && v > c {
+		v = c
+	}
+	return int(v)
+}
+
+// outCeiling is the smallest Limit of an output_tokens or tokens dimension
+// among the group's limiters; 0 when none has one.
+func outCeiling(g *Group) int64 {
+	if g == nil {
+		return 0
+	}
+	var ceil int64
+	for _, l := range g.Limiters {
+		for _, dim := range []string{model.DimOutputTokens, model.DimTokens} {
+			if d, ok := l.Status().Dims[dim]; ok && (ceil == 0 || d.Limit < ceil) {
+				ceil = d.Limit
+			}
+		}
+	}
+	return ceil
 }
 
 // reserveAmounts is what a request takes from its limiters before it is

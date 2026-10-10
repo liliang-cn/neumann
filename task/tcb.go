@@ -185,9 +185,11 @@ type TCB struct {
 	// retrying (overload, transient); a success resets it. Rate limits do not
 	// count. At the machine's limit the task fails with "model_error".
 	Retries int `json:"retries,omitempty"`
-	// MaxOut is the output cap the task's model calls send; 0 is the
-	// adapter's default. A turn cut off before it produced anything raises it
-	// fourfold, at most twice (Truncations), design §13.
+	// MaxOut is the task's own output cap; 0 is the adapter's default. A turn
+	// cut off before it produced anything is redone with that cap raised
+	// fourfold per redo in a row (Truncations, at most 2, design §13); the
+	// first call answered without being cut off resets Truncations, and the
+	// raise with it.
 	MaxOut      int    `json:"max_out,omitempty"`
 	Truncations int    `json:"truncations,omitempty"`
 	StopReason  string `json:"stop_reason,omitempty"`

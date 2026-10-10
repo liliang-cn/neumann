@@ -163,18 +163,27 @@ func truncated(resp model.Response) bool {
 }
 
 // redoTruncated asks again with a fourfold output cap, at most
-// maxTruncationRedos times in a task's life; after that the task fails with
-// "truncated". The redo is a step like any other (it was counted), and its
-// model_retry event says how large the new cap is.
-func (e *Env) redoTruncated(t *task.TCB, c mem.CommitSet) mem.CommitSet {
-	sent := e.maxOut(t)
+// maxTruncationRedos times in a row, the cap never above what the group's
+// limiters could grant. After that, or when the cap cannot grow any more,
+// the task fails with "truncated": a redo that would carry the same cap is
+// not sent. The redo was an answered call (counted), and its model_retry
+// event says how large the new cap is. The raise lasts until a call is
+// answered without being cut off (Truncations goes back to 0).
+func (e *Env) redoTruncated(g *Group, t *task.TCB, c mem.CommitSet) mem.CommitSet {
+	sent := e.sendOut(g, t)
+	if sent == 0 {
+		sent = e.maxOut(t)
+	}
 	if t.Truncations >= maxTruncationRedos {
 		return failWith(t, c, StopTruncated, fmt.Sprintf("the answer was cut off at %d output tokens with nothing in it, %d times", sent, t.Truncations+1))
 	}
+	next := e.raisedOut(g, t, t.Truncations+1)
+	if next <= sent {
+		return failWith(t, c, StopTruncated, fmt.Sprintf("the answer was cut off at %d output tokens with nothing in it, and the limiters allow no more", sent))
+	}
 	t.Truncations++
-	t.MaxOut = sent * 4
 	c.Events = append(c.Events, proto.NewEvent(proto.EvModelRetry, t.ID, map[string]any{
-		"class": "truncated", "attempt": t.Truncations, "delay_ms": 0, "wait": "none", "max_out": t.MaxOut,
+		"class": "truncated", "attempt": t.Truncations, "delay_ms": 0, "wait": "none", "max_out": next,
 		"error": fmt.Sprintf("cut off at %d output tokens with nothing produced", sent),
 	}))
 	e.ready(t, task.StepModel)

@@ -60,13 +60,17 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	// limiters before it.
 	tctx, release := e.taskContext(t.ID)
 	defer release()
-	req := model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs, MaxOut: t.MaxOut}
+	req := model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs, MaxOut: e.sendOut(g, t)}
 	// The wait for room also ends when the machine stops fetching: nothing
 	// is committed yet, so the task goes back as it is.
 	rctx, stopWaiting := context.WithCancel(tctx)
 	defer stopWaiting()
 	unhook := context.AfterFunc(e.Sched.Stopping(), stopWaiting)
-	res, pre, err := e.reserve(rctx, g, t.ID, req, e.maxOut(t))
+	out := req.MaxOut
+	if out == 0 {
+		out = e.maxOut(t)
+	}
+	res, pre, err := e.reserve(rctx, g, t.ID, req, out)
 	unhook()
 	if err != nil {
 		switch {
@@ -203,8 +207,11 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		// included, with a larger output cap.
 		t.Regs = t.Regs[:base]
 		c.Applied = nil
-		return e.redoTruncated(t, c), nil, nil
+		return e.redoTruncated(g, t, c), nil, nil
 	}
+	// Answered, and not cut off: a cap raised for a truncated turn is
+	// dropped, and the next call goes back to the task's own.
+	t.Truncations = 0
 
 	msg := resp.Message
 	msg.Parts = slices.Clone(msg.Parts) // the adapter's slice is not ours to write

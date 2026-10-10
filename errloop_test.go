@@ -390,8 +390,50 @@ func TestTruncatedTurnIsRedoneWithALargerCap(t *testing.T) {
 	if len(rs) != 2 || rs[0].Class != "truncated" || rs[0].MaxOut != 16384 || rs[1].MaxOut != 65536 {
 		t.Fatalf("model_retry events %+v", rs)
 	}
-	if got := loadTask(t, m, b); got.State != task.Done || got.MaxOut != 16384 || got.LastAnswer() != "B done" {
-		t.Fatalf("B ended %s with cap %d", got.State, got.MaxOut)
+	if got := loadTask(t, m, b); got.State != task.Done || got.MaxOut != 0 || got.Truncations != 0 || got.LastAnswer() != "B done" {
+		t.Fatalf("B ended %s with cap %d, truncations %d", got.State, got.MaxOut, got.Truncations)
+	}
+}
+
+// The raised cap lasts only until a call is answered without being cut off:
+// the next call goes back to the task's own cap.
+func TestRaisedCapIsDroppedAfterAnAnswer(t *testing.T) {
+	m, clk, sc := errMachine(t, neumann.Config{})
+	sc.plan["A"] = []func() (model.Response, error){
+		func() (model.Response, error) { return sim.Truncated(), nil },
+		func() (model.Response, error) { return sim.CallTools("dev_missing"), nil },
+	}
+	a := submit(t, m, proto.Instruction{Input: "A"})
+	runUntilDone(t, m, clk, time.Second, a)
+	var caps []int
+	for _, c := range sc.of("A") {
+		caps = append(caps, c.maxOut)
+	}
+	if got := loadTask(t, m, a); got.State != task.Done || !slices.Equal(caps, []int{0, 16384, 0}) {
+		t.Fatalf("A ended %s with caps %v", got.State, caps)
+	}
+}
+
+// A redo that could not raise the cap (the limiter's output dimension
+// already allows no more) is not sent: the task fails "truncated" at once.
+func TestTruncationRedoThatCannotGrowFails(t *testing.T) {
+	m, clk, sc := errMachine(t, neumann.Config{
+		Limiters: []limit.Config{{Name: "gw", Limits: map[string]limit.Rate{"output_tokens": {Per: time.Minute, Limit: 16384}}}},
+		Limits:   []string{"gw"},
+	})
+	trunc := func() (model.Response, error) { return sim.Truncated(), nil }
+	sc.plan["A"] = []func() (model.Response, error){trunc, trunc, trunc}
+	a := submit(t, m, proto.Instruction{Input: "A"})
+	runUntilDone(t, m, clk, time.Minute, a)
+	var caps []int
+	for _, c := range sc.of("A") {
+		caps = append(caps, c.maxOut)
+	}
+	if got := loadTask(t, m, a); got.State != task.Failed || got.StopReason != "truncated" || !slices.Equal(caps, []int{0, 16384}) {
+		t.Fatalf("A ended %s %q with caps %v", got.State, got.StopReason, caps)
+	}
+	if rs := retries(t, m, a); len(rs) != 1 {
+		t.Fatalf("model_retry events %+v: a redo that is never sent must not be announced", rs)
 	}
 }
 
