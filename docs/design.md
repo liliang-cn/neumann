@@ -229,7 +229,7 @@ type CallRecord struct {
 2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`）。`Running` 在模型调用之前提交，含义是"请求可能已经发出"：提交之后、调用之前被停机打断时，会多算一次未确认。这一步要送达的插话在 `Running` 提交之后才合并，崩溃不会留下"上下文里有、中断表里却还未送达"的插话。预算按 `Used.Steps + Unconfirmed` 计，反复崩溃的任务不会越过预算重发。
 3. 调用记录按 4.2 的表处理。
 4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；所有未结束任务重设 Deadline 定时器。`Waiting(Backoff)` 和 `Waiting(Group)` 提交为 `Ready`（`ReadySince` 不变，`Retries` 保留）：退避定时器和熔断状态都不持久，重启后各组从闭合开始，退避从下一次失败重新起算。
-5. 每个执行组按 `Min` 启动 vCore，`W` 回到 `Initial`；限流器从空状态开始，由服务商响应头重新校准（7.3）。
+5. 各执行组的 `W` 回到 `Initial`，vCore 按恢复出的就绪队列启动（6.1：有积压才启动，`Min` 只是空闲回收的下限）；限流器从空状态开始，由服务商响应头重新校准（7.3）。
 
 ### 4.6 计量
 
@@ -285,7 +285,7 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
 ## 6. 执行组与弹性 vCore
 
 ```go
-type ExecGroup struct {
+type GroupConfig struct {
     Class      string
     Model      model.Adapter
     Limits     []string      // 引用的限流器名字，可以多个（例如组织级 + 模型级）
@@ -293,11 +293,18 @@ type ExecGroup struct {
     Max        int           // 0 = 不设上限
     Initial    float64       // 初始窗口，默认 2
     IdleRetire time.Duration // 默认 30s
+    Cooldown   time.Duration // 减半后不增长的时间，默认 10s
+    BreakerThreshold int           // 默认 5
+    BreakerOpenFor   time.Duration // 默认 30s
     Fallback   string        // 熔断时迁往的组
     OnMigrateFail string     // "wait"（默认）或 "fail"
-    MaxQueued  int
+    MaxQueued  int           // 本组未结束任务上限，0 = 只受全局限制；迁入的任务不受它限制
 }
 ```
+
+`New` 时校验：类名非空、不重复、不含 `/`；每组有 `Model`；`Limits` 里的名字都在 `Config.Limiters` 里；`Fallback` 指向存在的组，沿 `Fallback` 链走不会回到起点（无环）；`OnMigrateFail` 只能是 `wait` / `fail`；`Max > 0` 时不小于 `Min`。`Config.Default` 是不带 `Class` 提交的任务的类，空则取第一个组。
+
+单组简写：`Config.Groups` 为空时，`Model`、`Class`（默认 `default`）、`Cores`（默认 4）、`Limits` 构成一个组，窗口用 `SetCores(Cores)` 固定：至多 `Cores` 个 vCore、有活才启动，和以前的固定 vCore 数一致；`AutoScale(class, true)` 可让它自适应。简写字段与 `Groups` 同时出现是配置错误。
 
 ### 6.1 拥塞窗口只管并发
 
@@ -312,6 +319,15 @@ type ExecGroup struct {
 - **手动**：`SetCores(class, n)` 固定 `W = n` 并关闭自动调整；`AutoScale(class, true)` 恢复。
 
 vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`、`idle`、`manual`、`shutdown`。
+
+实现（`internal/core/cores.go`，计数和决策全在 `internal/group` 的 `Scaler`）：
+
+- `Grow(class)`：`Scaler.Grow(就绪队列长度)` 给出要启动的个数 k（积压、全忙、`n < floor(W)`），立即计入存活，启动 k 个 goroutine。三处调用：任务进入本类就绪队列（调度器 `OnReady`，在调度器锁外）；vCore 取到指令 `Acquire` 之后（取指和 `Acquire` 之间别的 `Grow` 看到"有空闲 vCore"而不扩，这里补上）；vCore 空闲退役之后（退役那一刻到达的任务不会没人取）。`SetCores` / `AutoScale` 之后也调一次。
+- vCore 循环：`NextIdle(class, IdleRetire)` 取指；取到 → `Acquire` → 执行一条指令 → `Release`，`Release` 说退役就退出（`overload`，窗口被操作员固定时 `manual`）；等满 `IdleRetire` 没活 → `IdleTimeout(空闲时长)`，`n > Min` 才退役（`idle`），否则接着等；调度器关闭或取指 context 结束 → `Stop`（`shutdown`）。所以 vCore 只在两条指令之间退役。
+- 不预先启动 `Min` 个 vCore：没活的组不占 goroutine，`Min` 只是空闲回收的下限。
+- 窗口约束并发的方式就是 vCore 数：一个 vCore 同一时刻至多一个模型请求，`n` 只在 `n < floor(W)` 时增长、`n > floor(W)` 时最先执行完的退役。窗口刚缩小时、或 `SetCores` 调低时空闲的 vCore，可能再执行一条指令才退役，超出是暂时的。
+- `core_up` / `core_down` 是机器事件 `{class, core, reason, live}`，由该 vCore 自己的 goroutine 单独提交（`core_up` 在第一次取指之前），不阻塞触发扩容的一方；提交失败只记日志。`core` 是全机唯一的编号，和 `step` 事件里的 `core` 对得上。
+- `Stop`：先禁止启动新 vCore，再关调度器，等全部 vCore 退出（`core_down` `shutdown`）。
 
 ### 6.2 熔断
 
@@ -331,6 +347,17 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 4. 都不满足：按 `OnMigrateFail`，`wait` 则留在 `Waiting(Group)`，`fail` 则 `Failed`，`StopReason = "migrate_incompatible"`，事件里带不满足的那一条。
 
 校验通过：提交 `Class` 改变、`ReadySince` 保留（不重新排队尾）、`migrated` 事件。迁移后第一次请求丢掉原服务商的 `reasoning` 块，L1 必然不命中。
+
+实现中的决定（`internal/core/migrate.go`）：
+
+- 触发点：`execModel` 发现本组熔断中（取到任务时、或 `Admit` 不放行时），以及调用以 `QuotaExhausted` 失败、熔断刚打开时。三处都走同一个 `groupGone`。
+- 目标沿 `Fallback` 链找：跳过熔断中的组，取第一个通过校验的。链上的组全在熔断中：留在 `Waiting(Group)` 等本组，不算迁移失败；有没熔断但校验不过的：按**本组**的 `OnMigrateFail`，`wait` 时停进 `Waiting(Group)` 并发 `migrate_refused`（`{from, to, check, detail}`），`fail` 时 `failed` 事件带 `check`、`detail`。
+- 能力取自 `model.CapsOf(适配器)`：适配器实现 `model.CapsReporter`（`Caps() Caps{Window, MaxOut, Tools, MaxTools}`）就用它；没实现的按"支持工具、数量不限、窗口未知"，窗口未知（0）不拒绝。OpenAI 兼容适配器：`ContextWindow` 默认 0（网关背后模型不定），`MaxTools` 默认 128，`NoTools`；Anthropic：`ContextWindow` 默认 200000，`MaxTools` 默认不限，`NoTools`。
+- 估算用 `task.EstimateTokens`：JSON 字节数 / 4 + 1，与 7.2 默认预占同一个估算；按目标服务商实际会收到的消息算（去掉外来 reasoning）。输出预留：任务的 `MaxOut`，否则目标的 `Caps.MaxOut` / `OutputCap`，否则 4096。
+- 第 3 条（能否在目标组上切块压缩）依赖 `StepCompact`，它还没有实现：放不下就按校验失败处理（`check = "context"`），不迁移后再压缩。
+- reasoning 由 vCore 在组请求时过滤（`forProvider`）：`Provider` 非空且不等于目标适配器 `Provider()` 的 reasoning 块不发，块全被去掉的消息不发；寄存器原样保留，迁回原服务商时还在。两个适配器本来也按 `Provider` 丢弃外来 reasoning（Anthropic 丢 thinking，OpenAI 兼容不渲染 reasoning），过滤在 vCore 做是为了对任何适配器成立。
+- 迁移提交：`State = Ready`、`PC = StepModel`、`ReadySince` 不变、`Retries` 不变、`migrated`（`{from, to, reason: "group_down"}`）；交还后进新组的就绪队列，触发新组扩容。准入计数随之从旧类移到新类。
+- 手动迁移 `m.SetClass(ctx, id, class)`：同样的校验，不通过返回 `*MigrateError`（`Check`、`Detail`），什么都不提交；`PinClass` 只禁止自动迁移，不拦操作员。只能在指令之间移动：任务在就绪队列、`Waiting(Group / Backoff / Reconcile)`、`Suspended` 时取出、提交、交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试。等旧组的 `Waiting(Group)` 改为 `Ready`，其他状态不变（退避保留 `WakeAt`）；`migrated` 的 `reason` 为 `manual`。
 
 ## 7. 限流器
 
@@ -519,7 +546,7 @@ type ToolDef struct {
   - 清空看完成，不看派发：非 `ReadOnly` 调用在设备返回时（结果交出之前）清空本任务缓存；总线因超时或取消不再等它时也清一次，因为它可能仍会生效。查询时记下任务的代数，期间有写完成的，那次读的结果不存（它可能读到写之前的状态）。
   - `CacheTTL` 到期后不再命中（0 = 直到被清空），查到时惰性删除；时钟可注入（`cache.Config.Now`）。
   - 内存有界：每任务最多 256 条（`DefaultMaxEntriesPerTask`），全局 64 MiB（`DefaultMaxBytes`，按键 + 内容 + 每条 160 字节估算），各按 LRU 淘汰；单条超过全局上限的不存。
-  - 任务结束时由机器调用 `bus.ForgetTask(id)`（即 `L2.Forget`）丢掉它的缓存，在途的未命中也不会再填回；没调用之前，结束任务的条目只受上限和 TTL 约束。总线默认带一个默认上限的 L2，`SetCache(nil)` 关闭；`CacheStats()` 给出命中、未命中、填入、淘汰、过期、清空次数和当前条目、字节、任务数，供 `m.Status()` 使用。
+  - 任务结束时由机器调用 `bus.ForgetTask(id)`（即 `L2.Forget`）丢掉它的缓存，在途的未命中也不会再填回：机器在每个带终态事件的提交成功后调用。工具批次用 `RunCached` 派发，命中的那次 `tool_result` 事件带 `cached: true`。总线默认带一个默认上限的 L2，`SetCache(nil)` 关闭；`CacheStats()` 给出命中、未命中、填入、淘汰、过期、清空次数和当前条目、字节、任务数，供 `m.Status()` 使用。
 - 第一版设备：`builtin`、`mcp`（`github.com/modelcontextprotocol/go-sdk`）、`skills`。
 
 ## 11. 模型适配器
@@ -613,9 +640,13 @@ type Event struct {
 
 任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`migrated`、`reconcile_needed`、`done`、`failed`、`cancelled`、`steer_dropped`。
 
-机器事件（`task_id` 为空）：`core_up`、`core_down`、`throttled`（`{task, class, waited_ms}`）、`group_down`（`{class, cause}`）、`group_up`（`{class}`，操作员复位时带 `reset`）。
+`migrated`：`{from, to, reason}`，`reason` 为 `group_down` 或 `manual`。`migrate_refused`：`{from, to, check, detail}`，本组熔断、`Fallback` 校验不过、任务留下等本组。`tool_result` 来自 L2 时带 `cached: true`。
+
+机器事件（`task_id` 为空）：`core_up` / `core_down`（`{class, core, reason, live}`）、`throttled`（`{task, class, waited_ms}`）、`group_down`（`{class, cause}`）、`group_up`（`{class}`，操作员复位时带 `reset`）。
 
 stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。
+
+操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`suspend`、`resume`、`priority` 仍回 `unsupported`。
 
 实现在 `proto/jsonl`（线格式的完整说明在它的包文档里），`cmd/neumann` 把它接到 stdin/stdout。回复和事件共用 stdout，每行第一个字段 `"type"` 是 `"reply"` 或 `"event"`：宿主进程（Node、Python）天然只有 stdout，多开一个 fd 两边都别扭；共用一个流还给出了顺序，`subscribe` 的回复恰好落在旧流最后一个事件和新流第一个事件之间。指令可带 `"id"`，回复原样带回；指令按到达顺序逐条执行。读得慢的一方不阻塞机器：事件按输出写出的速度从主存读，回复优先于积压的事件写出。
 
@@ -635,17 +666,17 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 
 ## 14. 观测
 
-`m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态（当前实现：`Status.Groups` 给出窗口与熔断，含下一次放探测的时刻；`Status.Limiters` 给出各限流器的 `limit.Status`）；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
+`m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态（当前实现：`Status.Groups` 每组给出模型、`Fallback`、`W` / `Target` / `Min` / `Max` / `Auto` / `epoch` / 冷却、存活与忙碌的 vCore 数、就绪数、等待数（其中等本组的）、最老就绪任务已等多久、熔断状态与下一次放探测的时刻；`Status.Cores` 是全部存活 vCore 数；`Status.Limiters` 给出各限流器的 `limit.Status`；`Status.Cache` 是总线 L2 的 `CacheStats`；`m.Queue()` 按类给出就绪数、其中后台数、等待数、最长等待）；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
 
 ## 15. 公开 API
 
 ```go
 m, err := neumann.New(neumann.Config{
-    Groups: []neumann.ExecGroup{
+    Groups: []neumann.GroupConfig{
         {Class: "big",    Model: anthropic, Limits: []string{"anthropic-org"}, Fallback: "little"},
         {Class: "little", Model: flash,     Limits: []string{"gw"}, Min: 2, Max: 64},
     },
-    Limiters: []limit.Limiter{
+    Limiters: []limit.Config{
         {Name: "anthropic-org", Limits: map[string]limit.Rate{"requests": {time.Minute, 50}, "input_tokens": {time.Minute, 40000}}},
         {Name: "gw", Limits: map[string]limit.Rate{"requests": {time.Minute, 600}}},
     },
@@ -659,13 +690,22 @@ err = m.Start(ctx)                         // 按 4.5 恢复，然后启动 vCor
 id, err := m.Submit(ctx, neumann.Instruction{Kind: "submit", Input: "...", Class: "big"}) // 返回即已持久化
 sub := m.Events(ctx, fromSeq)              // 可补读；m.EventLog / m.Load / m.Calls 直接读主存
 err = m.Stop(ctx)                          // 停止取指，等在途指令和工具批次提交；ctx 到期则取消它们（被打断的不提交），再等 2 秒后关闭
+
+err = m.SetCores("little", 8)              // 固定窗口；多出的 vCore 执行完当前指令后退役
+err = m.AutoScale("little", true)          // 恢复自适应
+err = m.SetClass(ctx, id, "little")        // 手动迁移：*MigrateError / ErrTaskBusy / ErrFinished / ErrNotFound
+err = m.GroupReset(ctx, "big")             // 额度耗尽熔断后复位
+q := m.Queue()                             // 各类队列
 ```
+
+`Submit` 超过本组 `MaxQueued` 时返回 `*CapacityError{Class: ...}`（`errors.Is(err, ErrBusy)`）。
 
 ## 16. 包结构
 
 ```
-neumann/            Machine、Config、公开 API、操作员控制（Resolve）
-  internal/core/    vCore 循环、execModel / execTools、恢复与结算、执行组、拥塞窗口、熔断、迁移校验
+neumann/            Machine、Config、公开 API、操作员控制（Resolve、SetClass、SetCores、AutoScale、GroupReset、Queue）
+  internal/core/    vCore 循环与弹性 vCore、execModel / execTools、恢复与结算、执行组、熔断、迁移与能力校验
+  internal/group/   拥塞窗口、Scaler、熔断器（只做计数和决策）
   internal/sched/   就绪队列、等待集合、Deadline 与退避定时器（internal：外部代码不能绕过所有权规则）
   limit/            限流器
   task/             TCB、中立消息、寄存器组装、token 估算
@@ -699,7 +739,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
    验证：`TestRateLimitedWaitsWithoutSpendingRetries`、`TestOverloadAndTransientBackOff`、`TestModelRetriesRunOut`、`TestPermanentFailsAtOnce`、`TestOnlyALostResponseIsUnconfirmed`（第 18 节 12）、`TestTruncatedTurnIsRedoneWithALargerCap`、`TestQuotaExhaustedHoldsTheGroupUntilReset`（第 18 节 16）、`TestTransientFailuresOpenTheBreaker`、`TestSharedLimiterSerialisesCalls`、`TestCancelAndDeadlineWhileWaiting`（第 18 节 10 的退避、熔断等待，外加等额度）、`TestCrashAtEveryCommitPointWithModelFailures`（同一任务里临时错误 + 限流，每个提交点前后各崩一次）、`TestSettleBeforeObserve`、`TestRetryCommitsYieldToACommittedCancel`。
    `Used.Steps` 只计有回答的调用，失败的调用不计、响应丢失只计 `Unconfirmed`（`TestRateLimitStormDoesNotSpendTheBudget`：20 次限流、`MaxSteps = 3` 仍完成；`TestFailedCallsAreNotSteps`）。
    评审后修正：`WaitingFor` 在锁内复制排序键（数据竞争）；截断重做的上限受限流器约束、放不大就直接 `truncated`、有回答后清零；无提示的 429 计入重试；适配器钩子的 panic 不再拖垮进程；退避步长防溢出。`TestCrashAtEveryCommitPointWithTheGroupDown`：额度耗尽后崩溃，重启从 `Waiting(Group)` 恢复。
-   留给下一步：弹性 vCore（`Scaler`、`core_up` / `core_down`、`SetCores` / `AutoScale`）、窗口真正限制并发（现在 `W` 只记录不约束）、多个执行组与 `Fallback` 迁移、`Config.Groups`。
+   弹性 vCore 与多执行组（阶段 4 完成）：`Config.Groups`（单组字段保留为简写，窗口固定在 `Cores`）；每组的 `Scaler` 接进 vCore 循环（6.1 的实现说明），窗口通过 vCore 数真正约束并发；`IdleRetire` 空闲回收到 `Min`；`core_up` / `core_down` 带原因；`m.SetCores` / `m.AutoScale`；熔断时按 `Fallback` 链迁移，能力校验（`model.Caps`、`task.EstimateTokens`），失败按 `OnMigrateFail`；`m.SetClass` 手动迁移；`PinClass`；发往新服务商的请求不带外来 reasoning；多个组共享限流器；每组 `MaxQueued`；`m.Queue()`、`Status` 的每组 vCore 与队列；L2 接进机器（终态提交后 `ForgetTask`、派发用 `RunCached`、命中的 `tool_result` 带 `cached`、`Status.Cache`）；stdio 前端接上 `class` / `cores` / `autoscale` / `group_reset` / `queue`。
+   验证：`TestCoresTrackProviderCapacity`（第 18 节 13，机器层，K = 4）、`TestOneEpochOfOverloadsHalvesTheWindowOnce`（14）、`TestTwoGroupsShareALimiter`（15）、`TestMigrationToTheFallbackGroup` / `TestMigrationRefusedByEachCheck`（17：成功、三种校验 × `wait` / `fail`、`PinClass`）、`TestCoresRetireOnlyBetweenInstructions`（19）、`TestSetClassMovesATask`、`TestSetCoresAndAutoScale`、`TestIdleCoresRetireDownToMin`、`TestStopShutsEveryCoreDown`（`shutdown`，goroutine 数回落）、`TestGroupConfigIsValidated`、`TestGroupMaxQueued`、`TestCachedToolResultThroughTheMachine`、`TestCrashAtEveryCommitPointWithAMigration`（两组，任务中途迁移，每个提交点前后各崩一次）。
+   没做：`StepCompact`（迁移的第 3 条校验因此总是"放不下"）、`suspend` / `resume` / `priority`。
 
 ## 18. 测试
 
@@ -725,11 +767,11 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve）
 
 伸缩、限流与迁移（阶段 4）：
 
-13. 脚本服务商在并发超过 K 时返回 `Overload`：稳定后存活 vCore 在 K 附近振荡，不超过 2K。
+13. 脚本服务商在并发超过 K 时返回 `Overload`：稳定后存活 vCore 在 K 附近振荡，不超过 2K。（`internal/group` 里有离散事件版本，K = 8；机器层版本 K = 4、300 个短任务、假时钟推进。）
 14. 同一周期内 10 个在途请求同时返回 `Overload`，窗口只减半一次。
 15. 两个执行组共享一个限流器：两组合计的请求速率不超过限流器的额度。
 16. `RateLimited` 不改变窗口；`QuotaExhausted` 熔断且不自动半开。
-17. 迁移校验：目标窗口放不下且无法切块压缩时，按 `OnMigrateFail` 处理；迁移成功时发往新服务商的请求不含原服务商的 reasoning 块。
+17. 迁移校验：目标窗口放不下且无法切块压缩时，按 `OnMigrateFail` 处理；迁移成功时发往新服务商的请求不含原服务商的 reasoning 块。（切块压缩尚未实现，放不下即失败；断言在目标模拟模型实际收到的请求上做。）
 18. 中立格式经 OpenAI 和 Anthropic 适配器各往返一次，与原文一致（reasoning 块按规则保留或丢弃，`ProviderCallID` 按规则使用）。
 19. vCore 只在指令之间退役。
 20. 32 个并发 `Submit` 对 `MaxQueued = 4`：恰好 4 个被接受。
