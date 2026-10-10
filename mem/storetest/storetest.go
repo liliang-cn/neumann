@@ -56,6 +56,7 @@ func Run(t *testing.T, newStore Factory) {
 		{"CancelledAndLateCallsRoundTrip", testCancelledAndLateCallsRoundTrip},
 		{"PendingCancelRefusesEverythingButItsFinalCommit", testPendingCancelRefusesEverythingButItsFinalCommit},
 		{"CancelDecidedByCommitOrder", testCancelDecidedByCommitOrder},
+		{"EventTimesAreCommitTimes", testEventTimesAreCommitTimes},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore) })
@@ -594,5 +595,54 @@ func testCancelDecidedByCommitOrder(t *testing.T, newStore Factory) {
 	}
 	if mem.CancelReason(mem.Interrupt{Kind: mem.InterruptCancel}) != "cancelled" {
 		t.Fatal("a cancel without a reason is a plain cancel")
+	}
+}
+
+// testEventTimesAreCommitTimes: the store stamps every event of a commit set
+// with one instant, in UTC, never earlier than the set before it, and gives
+// back exactly what it stored.
+func testEventTimesAreCommitTimes(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	var live []proto.Event
+	tc := newTask("a")
+	live = append(live, mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true, Events: []proto.Event{
+		proto.NewEvent(proto.EvAccepted, "a", nil),
+		proto.NewEvent(proto.EvStep, "a", nil),
+	}})...)
+	live = append(live, mustCommit(t, s, mem.CommitSet{Events: []proto.Event{proto.NewEvent(proto.EvCoreUp, "", nil)}})...)
+	mustCommit(t, s, steer("a", "dropped")) // no events
+	tc.Version, tc.State = 2, task.Done
+	// The steer_dropped event the store adds belongs to the same set.
+	live = append(live, mustCommit(t, s, mem.CommitSet{Task: tc, Events: []proto.Event{proto.NewEvent(proto.EvDone, "a", nil)}})...)
+	if len(live) != 5 || live[4].Kind != proto.EvSteerDropped {
+		t.Fatalf("committed %+v", live)
+	}
+	sets := [][]int{{0, 1}, {2}, {3, 4}}
+	for _, set := range sets {
+		for _, i := range set {
+			if live[i].Time.IsZero() || live[i].Time.Location() != time.UTC {
+				t.Fatalf("event %d: time %v, want a UTC commit time", i, live[i].Time)
+			}
+			if !live[i].Time.Equal(live[set[0]].Time) {
+				t.Fatalf("events %d and %d of one commit set: %v and %v", set[0], i, live[set[0]].Time, live[i].Time)
+			}
+		}
+	}
+	for i := 1; i < len(live); i++ {
+		if live[i].Time.Before(live[i-1].Time) {
+			t.Fatalf("event %d at %v is before event %d at %v", live[i].Seq, live[i].Time, live[i-1].Seq, live[i-1].Time)
+		}
+	}
+	stored, err := s.Events(ctx, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != len(live) {
+		t.Fatalf("read %d events, committed %d", len(stored), len(live))
+	}
+	for i := range live {
+		if stored[i].Time != live[i].Time || stored[i].Seq != live[i].Seq {
+			t.Fatalf("event %d: committed at %v (%d), read back %v (%d)", i, live[i].Time, live[i].Seq, stored[i].Time, stored[i].Seq)
+		}
 	}
 }

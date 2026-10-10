@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
@@ -16,7 +17,12 @@ import (
 // Memory is an in-process Store. It is not durable; it exists for phase 1 and
 // for tests, and it implements exactly the semantics the SQLite store will.
 type Memory struct {
+	// Now is the clock that stamps event times (proto.Event.Time); nil is
+	// time.Now. Set it before the first Commit.
+	Now func() time.Time
+
 	mu         sync.Mutex
+	stamped    time.Time // the time of the last commit set with events
 	tasks      map[string]*task.TCB
 	calls      map[string][]CallRecord
 	interrupts map[string][]Interrupt
@@ -81,7 +87,15 @@ func (m *Memory) Commit(ctx context.Context, c CommitSet) ([]proto.Event, error)
 			}
 		}
 	}
+	if len(events) > 0 {
+		now := time.Now
+		if m.Now != nil {
+			now = m.Now
+		}
+		m.stamped = CommitTime(now(), m.stamped)
+	}
 	for i := range events {
+		events[i].Time = m.stamped
 		m.taskSeq[events[i].TaskID]++
 		events[i].Seq = int64(len(m.events)) + 1
 		events[i].TaskSeq = m.taskSeq[events[i].TaskID]

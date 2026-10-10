@@ -2,6 +2,7 @@ package proto
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/liliang-cn/neumann/task"
 )
@@ -73,11 +74,18 @@ const (
 
 // Event is something that happened, published only after it was committed.
 // Seq is global and TaskSeq is per task; the store assigns both.
+//
+// Time is when the event was committed, in UTC, also assigned by the store:
+// one instant for every event of a commit set, never earlier than the set
+// committed before it, and stored durably, so a replay reads the same value.
+// It is zero for events a store wrote before it kept times; a consumer must
+// treat zero as unknown.
 type Event struct {
 	Kind    string          `json:"kind"`
 	TaskID  string          `json:"task_id,omitempty"`
 	Seq     int64           `json:"seq"`
 	TaskSeq int64           `json:"task_seq"`
+	Time    time.Time       `json:"time,omitzero"`
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 

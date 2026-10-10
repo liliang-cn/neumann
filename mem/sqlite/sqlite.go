@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -82,6 +83,18 @@ type Store struct {
 	closed bool
 	reqs   chan *request
 	done   chan struct{} // closed when the writer has exited
+
+	now     func() time.Time // stamps event times
+	stamped time.Time        // the last stamp; the writer's alone
+}
+
+// Option configures a Store at Open.
+type Option func(*Store)
+
+// WithClock sets the clock that stamps event times (proto.Event.Time); the
+// default is time.Now.
+func WithClock(now func() time.Time) Option {
+	return func(s *Store) { s.now = now }
 }
 
 var _ mem.Store = (*Store)(nil)
@@ -103,7 +116,11 @@ type request struct {
 // path+".lock" and fails with ErrLocked while another Store holds it. Where
 // the platform has no flock this is not enforced. ":memory:" and "" are
 // rejected, since every pooled connection would get a database of its own.
-func Open(path string) (*Store, error) {
+//
+// Every event is stamped with its commit time (proto.Event.Time), stored as
+// Unix nanoseconds. A database written before events had times gets the
+// column at Open; its old events read back with a zero time.
+func Open(path string, opts ...Option) (*Store, error) {
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file::memory:") {
 		return nil, fmt.Errorf("sqlite: open %q: need a file path (an in-memory database is per connection)", path)
 	}
@@ -125,9 +142,39 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return fail(fmt.Errorf("sqlite: create schema: %w", err))
 	}
-	s := &Store{db: db, lock: lock, reqs: make(chan *request, maxBatch), done: make(chan struct{})}
+	s := &Store{db: db, lock: lock, reqs: make(chan *request, maxBatch), done: make(chan struct{}), now: time.Now}
+	for _, o := range opts {
+		o(s)
+	}
+	if s.stamped, err = eventTimes(db); err != nil {
+		db.Close()
+		return fail(fmt.Errorf("sqlite: event times: %w", err))
+	}
 	go s.writer()
 	return s, nil
+}
+
+// eventTimes adds the events' time column to a database created before it
+// existed, and returns the latest time stored, which new stamps never go
+// below.
+func eventTimes(db *sql.DB) (time.Time, error) {
+	var has int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = 'time'").Scan(&has); err != nil {
+		return time.Time{}, err
+	}
+	if has == 0 {
+		if _, err := db.Exec("ALTER TABLE events ADD COLUMN time INTEGER"); err != nil {
+			return time.Time{}, err
+		}
+	}
+	var last sql.NullInt64
+	if err := db.QueryRow("SELECT MAX(time) FROM events").Scan(&last); err != nil {
+		return time.Time{}, err
+	}
+	if !last.Valid {
+		return time.Time{}, nil
+	}
+	return time.Unix(0, last.Int64).UTC(), nil
 }
 
 // dsn builds the connection string. The path goes into a file: URI, so every
@@ -226,7 +273,7 @@ func (s *Store) write(batch []*request) {
 			fail(fmt.Errorf("sqlite: savepoint: %w", err))
 			return
 		}
-		evs, err := apply(ctx, tx, r.c)
+		evs, err := s.apply(ctx, tx, r.c)
 		if err != nil {
 			r.err = err
 			if _, rerr := tx.ExecContext(ctx, "ROLLBACK TO c"); rerr != nil {
@@ -251,7 +298,7 @@ func (s *Store) write(batch []*request) {
 
 // apply validates c against the state before it, then writes it, exactly as
 // mem.Memory does (the conformance suite holds both to the same rules).
-func apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto.Event, error) {
+func (s *Store) apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto.Event, error) {
 	if c.NewTask && c.Task == nil {
 		return nil, errors.New("mem: NewTask requires Task")
 	}
@@ -382,15 +429,19 @@ func apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto.Event, err
 			}
 		}
 	}
+	if len(events) > 0 {
+		s.stamped = mem.CommitTime(s.now(), s.stamped)
+	}
 	for i := range events {
+		events[i].Time = s.stamped
 		events[i].Data = bytes.Clone(events[i].Data)
 		if err := tx.QueryRowContext(ctx,
 			`INSERT INTO task_seqs (task_id, n) VALUES (?, 1)
 			 ON CONFLICT (task_id) DO UPDATE SET n = n + 1 RETURNING n`, events[i].TaskID).Scan(&events[i].TaskSeq); err != nil {
 			return nil, err
 		}
-		res, err := tx.ExecContext(ctx, "INSERT INTO events (task_id, task_seq, kind, data) VALUES (?, ?, ?, ?)",
-			events[i].TaskID, events[i].TaskSeq, events[i].Kind, []byte(events[i].Data))
+		res, err := tx.ExecContext(ctx, "INSERT INTO events (task_id, task_seq, kind, data, time) VALUES (?, ?, ?, ?, ?)",
+			events[i].TaskID, events[i].TaskSeq, events[i].Kind, []byte(events[i].Data), events[i].Time.UnixNano())
 		if err != nil {
 			return nil, err
 		}
@@ -530,7 +581,7 @@ func (s *Store) Events(ctx context.Context, afterSeq int64, limit int) ([]proto.
 		limit = -1 // SQLite: no limit
 	}
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT seq, task_id, task_seq, kind, data FROM events WHERE seq > ? ORDER BY seq LIMIT ?", afterSeq, limit)
+		"SELECT seq, task_id, task_seq, kind, data, time FROM events WHERE seq > ? ORDER BY seq LIMIT ?", afterSeq, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -539,8 +590,12 @@ func (s *Store) Events(ctx context.Context, afterSeq int64, limit int) ([]proto.
 	for rows.Next() {
 		var e proto.Event
 		var data []byte
-		if err := rows.Scan(&e.Seq, &e.TaskID, &e.TaskSeq, &e.Kind, &data); err != nil {
+		var at sql.NullInt64
+		if err := rows.Scan(&e.Seq, &e.TaskID, &e.TaskSeq, &e.Kind, &data, &at); err != nil {
 			return nil, err
+		}
+		if at.Valid {
+			e.Time = time.Unix(0, at.Int64).UTC()
 		}
 		if len(data) > 0 {
 			e.Data = data
