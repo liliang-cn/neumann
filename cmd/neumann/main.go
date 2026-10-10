@@ -59,6 +59,9 @@ type config struct {
 	cores, maxQueued, maxTokens   int
 	echo                          bool
 	stopTimeout                   time.Duration
+
+	observeAddr, observeToken string
+	metrics, pprof            bool
 }
 
 // parse reads flags over environment defaults. The key comes only from env.
@@ -96,9 +99,14 @@ func parse(args []string, getenv func(string) string, stderr io.Writer) (config,
 	fs.IntVar(&c.maxTokens, "max-tokens", envInt("NEUMANN_MAX_TOKENS", 0), "output token limit per model call; 0: the adapter's default [NEUMANN_MAX_TOKENS]")
 	fs.BoolVar(&c.echo, "echo", getenv("NEUMANN_ECHO") == "1", "attach a builtin device with one tool, util_echo, for testing [NEUMANN_ECHO=1]")
 	fs.DurationVar(&c.stopTimeout, "stop-timeout", envDur("NEUMANN_STOP_TIMEOUT", jsonl.DefaultStopTimeout), "how long a graceful stop may take [NEUMANN_STOP_TIMEOUT]")
+	fs.StringVar(&c.observeAddr, "observe-addr", getenv("NEUMANN_OBSERVE_ADDR"), "serve the read-only observe HTTP view (/status, /queue, /tasks/{id}, /events) here, e.g. 127.0.0.1:43517; empty: off. It shows task content: keep it private or set NEUMANN_OBSERVE_TOKEN [NEUMANN_OBSERVE_ADDR]")
+	fs.BoolVar(&c.metrics, "metrics", getenv("NEUMANN_METRICS") == "1", "also serve Prometheus metrics at /metrics on -observe-addr [NEUMANN_METRICS=1]")
+	fs.BoolVar(&c.pprof, "pprof", getenv("NEUMANN_PPROF") == "1", "also serve runtime profiles at /debug/pprof/ on -observe-addr [NEUMANN_PPROF=1]")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "usage: neumann [flags]\n\nInstructions on stdin, replies and events on stdout, one JSON object per line.\n"+
-			"The API key is read from NEUMANN_API_KEY, else OPENAI_API_KEY / ANTHROPIC_API_KEY.\n\n")
+			"The API key is read from NEUMANN_API_KEY, else OPENAI_API_KEY / ANTHROPIC_API_KEY.\n"+
+			"NEUMANN_OBSERVE_TOKEN, if set, is required as a bearer token by the observe HTTP view.\n"+
+			"OTEL_EXPORTER_OTLP_ENDPOINT (and the other standard OTEL_ variables), if set, exports traces and metrics over OTLP/HTTP.\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -128,6 +136,10 @@ func (c *config) resolve(getenv func(string) string) error {
 	if c.cores <= 0 || c.maxQueued <= 0 || c.maxTokens < 0 || c.stopTimeout <= 0 {
 		return errors.New("-cores, -max-queued and -stop-timeout must be positive, -max-tokens not negative")
 	}
+	if (c.metrics || c.pprof) && c.observeAddr == "" {
+		return errors.New("-metrics and -pprof are served on -observe-addr: set it too")
+	}
+	c.observeToken = getenv("NEUMANN_OBSERVE_TOKEN")
 	return nil
 }
 
@@ -218,9 +230,19 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdin i
 		logger.Printf("neumann: start: %v", err)
 		return 1
 	}
+	obs, err := startObserving(ctx, c, getenv, m, logger.Printf)
+	if err != nil {
+		logger.Printf("neumann: observe: %v", err)
+		sctx, cancel := context.WithTimeout(context.Background(), c.stopTimeout)
+		defer cancel()
+		m.Stop(sctx)
+		return 1
+	}
 	logger.Printf("neumann: ready: provider %s, model %s, %d vCores, store %s", c.provider, c.model, c.cores, where)
 	srv := &jsonl.Server{Machine: m, StopTimeout: c.stopTimeout, Logf: logger.Printf}
-	if err := srv.Serve(ctx, stdin, stdout); err != nil {
+	err = srv.Serve(ctx, stdin, stdout)
+	obs.stop() // the machine has stopped: observers read to the end and flush
+	if err != nil {
 		logger.Printf("neumann: %v", err)
 		return 1
 	}

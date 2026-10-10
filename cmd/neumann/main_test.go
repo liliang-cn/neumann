@@ -215,7 +215,7 @@ func launch(t *testing.T, env []string, args ...string) *proc {
 func cleanEnv() []string {
 	var out []string
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "NEUMANN_") || strings.HasPrefix(kv, "OPENAI_") || strings.HasPrefix(kv, "ANTHROPIC_") {
+		if strings.HasPrefix(kv, "NEUMANN_") || strings.HasPrefix(kv, "OPENAI_") || strings.HasPrefix(kv, "ANTHROPIC_") || strings.HasPrefix(kv, "OTEL_") {
 			continue
 		}
 		out = append(out, kv)
@@ -415,6 +415,8 @@ func TestStartupFailuresExitNonZero(t *testing.T) {
 		"bad store":       {env: env(f), args: []string{"-store", filepath.Join(t.TempDir(), "no", "such", "dir", "x.db")}, code: 1},
 		"bad system file": {env: env(f), args: []string{"-system-file", filepath.Join(t.TempDir(), "missing")}, code: 1},
 		"bad flag":        {env: env(f), args: []string{"-no-such-flag"}, code: 2},
+		"metrics alone":   {env: env(f), args: []string{"-metrics"}, code: 1},
+		"bad listen addr": {env: env(f), args: []string{"-observe-addr", "no-such-host.invalid:1"}, code: 1},
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := launch(t, c.env, c.args...)
