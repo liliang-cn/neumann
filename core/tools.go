@@ -15,7 +15,9 @@ import (
 func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []mem.CallRecord, error) {
 	recs, err := e.Store.Calls(ctx, t.ID)
 	if err != nil {
-		return mem.CommitSet{}, nil, fmt.Errorf("read calls: %w", err)
+		return mem.CommitSet{Events: []proto.Event{
+			proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepTools.String(), Core: core}),
+		}}, nil, fmt.Errorf("read calls: %w", err)
 	}
 	c := mem.CommitSet{Events: []proto.Event{
 		proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepTools.String(), Core: core}),
@@ -78,15 +80,23 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []mem.CallRecor
 		e.Logf("neumann: task %s was not waiting when its tools finished", taskID)
 		return
 	}
+	// The final transition carries the finished records too (an idempotent
+	// upsert of what the per-result commits recorded), so the model can never
+	// see a result that is not in the call log.
+	done := make([]mem.CallRecord, len(batch))
 	msg := task.Message{Role: task.RoleTool}
 	for i, r := range batch {
+		res := results[i]
+		r.Status = mem.CallDone
+		r.Result = &res
+		done[i] = r
 		msg.Parts = append(msg.Parts, task.Part{
 			Kind: task.PartToolResult, CallID: r.CallID, Text: results[i].Content, IsError: results[i].IsError,
 		})
 	}
 	t.Regs = append(t.Regs, msg)
 	e.ready(t, task.StepModel)
-	if err := e.Commit(ctx, mem.CommitSet{Task: t}); err != nil {
+	if err := e.Commit(ctx, mem.CommitSet{Task: t, Calls: done}); err != nil {
 		e.Logf("neumann: commit after tools for task %s failed; it is no longer scheduled: %v", taskID, err)
 		e.Sched.Forget(taskID)
 		return

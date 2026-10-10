@@ -129,11 +129,17 @@ func TestToolsAreCommittedBeforeDispatch(t *testing.T) {
 	var store *mem.Memory
 	var mu sync.Mutex
 	var seen []mem.CallStatus
+	var taskStates []string
 	dev := builtin.New("dev").Add(bus.ToolDef{Name: "check"}, func(ctx context.Context, c bus.DeviceCall) (string, error) {
 		parts := strings.Split(c.Key, "/") // task/call/attempt
 		recs, err := store.Calls(ctx, parts[0])
 		if err != nil {
 			return "", err
+		}
+		if st, err := store.Load(ctx, parts[0]); err == nil {
+			mu.Lock()
+			taskStates = append(taskStates, st.State.String()+"/"+st.Wait.String())
+			mu.Unlock()
 		}
 		for _, r := range recs {
 			if r.CallID == parts[1] {
@@ -165,6 +171,9 @@ func TestToolsAreCommittedBeforeDispatch(t *testing.T) {
 	}
 	if !slices.Equal(seen, []mem.CallStatus{mem.CallDispatched, mem.CallDispatched}) {
 		t.Fatalf("device saw statuses %v, want dispatched twice", seen)
+	}
+	if !slices.Equal(taskStates, []string{"waiting/io", "waiting/io"}) {
+		t.Fatalf("task states seen by the device: %v", taskStates)
 	}
 	recs, _ := s.Calls(bg, "t1")
 	if recs[0].Status != mem.CallDone || recs[0].Attempt != 1 || recs[0].Key != "t1/c-1/1" {
@@ -252,5 +261,203 @@ func TestModelErrorFailsTheTask(t *testing.T) {
 	}
 	if k := kinds(store); k != "step,failed" {
 		t.Fatalf("events %s", k)
+	}
+}
+
+func TestCompletionCommitsResultsWithTheTask(t *testing.T) {
+	e, store, _ := newTestEnv(t, func(req model.Request) (model.Response, error) {
+		return sim.CallTools("dev_echo", "dev_echo"), nil
+	}, echoDev())
+	inner := e.Commit
+	e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+		if c.Task == nil && len(c.Calls) > 0 {
+			return errors.New("injected: per-result commit lost")
+		}
+		return inner(ctx, c)
+	}
+	e.step(bg, newTask(t, e, store, "go"), 0)
+	e.step(bg, take(t, e), 0)
+	e.WaitBatches()
+	got := load(t, store)
+	if got.State != task.Ready || got.PC != task.StepModel {
+		t.Fatalf("task %s/%s", got.State, got.PC)
+	}
+	msg := got.Regs[len(got.Regs)-1]
+	recs, _ := store.Calls(bg, "t1")
+	if len(recs) != 2 || len(msg.Parts) != 2 {
+		t.Fatalf("records %+v message %+v", recs, msg)
+	}
+	for i, r := range recs {
+		if r.Status != mem.CallDone || r.Result == nil || r.Result.Content != msg.Parts[i].Text {
+			t.Fatalf("record %d %+v does not match tool message %+v", i, r, msg.Parts[i])
+		}
+	}
+}
+
+func TestRunVCoreFinishesTheInstructionAfterCancel(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+		close(started)
+		<-release
+		return sim.Reply("late"), nil
+	})
+	e.Sched.Add(newTask(t, e, store, "q"))
+	ctx, cancel := context.WithCancel(bg)
+	done := make(chan struct{})
+	go func() { e.RunVCore(ctx, "default", 0); close(done) }()
+	<-started
+	cancel()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunVCore did not return")
+	}
+	got := load(t, store)
+	if got.State != task.Done || got.LastAnswer() != "late" {
+		t.Fatalf("task %+v", got)
+	}
+	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
+		t.Fatalf("counts %d %d %d", r, w, h)
+	}
+}
+
+func hasKind(store *mem.Memory, kind string) bool {
+	return slices.Contains(strings.Split(kinds(store), ","), kind)
+}
+
+func addSteer(t *testing.T, store *mem.Memory, text string) {
+	t.Helper()
+	if _, err := store.Commit(bg, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "t1", Kind: mem.InterruptSteer, Text: text}}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestModelErrorDropsTheSteersItApplied(t *testing.T) {
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+		return model.Response{}, errors.New("provider down")
+	})
+	tc := newTask(t, e, store, "q")
+	addSteer(t, store, "also this")
+	e.step(bg, tc, 0)
+	got := load(t, store)
+	if got.State != task.Failed || len(got.Regs) != 1 {
+		t.Fatalf("task %s regs %+v", got.State, got.Regs)
+	}
+	if !hasKind(store, "steer_dropped") {
+		t.Fatalf("events %s", kinds(store))
+	}
+}
+
+func TestToolResultsKeepCallOrder(t *testing.T) {
+	dev := builtin.New("dev").Add(bus.ToolDef{Name: "slow"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
+		if strings.Contains(string(c.Args), `"n":0`) {
+			time.Sleep(80 * time.Millisecond)
+		}
+		return "r" + string(c.Args), nil
+	})
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+		return sim.CallTools("dev_slow", "dev_slow"), nil
+	}, dev)
+	e.step(bg, newTask(t, e, store, "go"), 0)
+	e.step(bg, take(t, e), 0)
+	e.WaitBatches()
+	msg := load(t, store).Regs[2]
+	if len(msg.Parts) != 2 || msg.Parts[0].CallID != "c-1" || msg.Parts[1].CallID != "c-2" ||
+		msg.Parts[0].Text != `r{"n":0}` || msg.Parts[1].Text != `r{"n":1}` {
+		t.Fatalf("tool message %+v", msg)
+	}
+}
+
+func TestSteerDuringToolTurnIsAppliedAfterTheToolMessage(t *testing.T) {
+	var store *mem.Memory
+	e, s, _ := newTestEnv(t, func(req model.Request) (model.Response, error) {
+		if sim.ToolRounds(req) == 0 {
+			addSteer(t, store, "mid")
+			return sim.CallTools("dev_echo"), nil
+		}
+		return sim.Reply("done"), nil
+	}, echoDev())
+	store = s
+	e.step(bg, newTask(t, e, s, "go"), 0)
+	if p, _ := s.Interrupts(bg, "t1", true); len(p) != 1 {
+		t.Fatalf("pending after tool turn %+v", p)
+	}
+	e.step(bg, take(t, e), 0)
+	e.WaitBatches()
+	if p, _ := s.Interrupts(bg, "t1", true); len(p) != 1 {
+		t.Fatalf("pending after tools %+v", p)
+	}
+	e.step(bg, take(t, e), 0)
+	got := load(t, s)
+	if len(got.Regs) < 5 || got.Regs[2].Role != task.RoleTool || got.Regs[3].TextContent() != "mid" || got.State != task.Done {
+		t.Fatalf("task %s regs %+v", got.State, got.Regs)
+	}
+}
+
+func TestBudgetDropsPendingSteers(t *testing.T) {
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.Reply("x"), nil })
+	tc := newTask(t, e, store, "q")
+	tc.Budget.MaxSteps = 1
+	tc.Used.Steps = 1
+	addSteer(t, store, "late")
+	e.step(bg, tc, 0)
+	if got := load(t, store); got.StopReason != "budget" || !hasKind(store, "steer_dropped") {
+		t.Fatalf("task %+v events %s", got, kinds(store))
+	}
+}
+
+func TestOnlySteersAreConsumed(t *testing.T) {
+	var store *mem.Memory
+	e, s, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+		if _, err := store.Commit(bg, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "t1", Kind: "other"}}}); err != nil {
+			return model.Response{}, err
+		}
+		return sim.Reply("a"), nil
+	})
+	store = s
+	e.step(bg, newTask(t, e, s, "q"), 0)
+	if got := load(t, s); got.State != task.Done {
+		t.Fatalf("a non-steer interrupt kept the task going: %s", got.State)
+	}
+}
+
+func TestStepCommitFailureForgetsTheTaskAndDispatchesNothing(t *testing.T) {
+	ran := 0
+	dev := builtin.New("dev").Add(bus.ToolDef{Name: "x"}, func(context.Context, bus.DeviceCall) (string, error) {
+		ran++
+		return "", nil
+	})
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.CallTools("dev_x"), nil }, dev)
+	inner := e.Commit
+	e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+		if c.Task != nil && c.Task.State == task.Waiting {
+			return errors.New("injected")
+		}
+		return inner(ctx, c)
+	}
+	e.step(bg, newTask(t, e, store, "go"), 0)
+	e.step(bg, take(t, e), 0)
+	e.WaitBatches()
+	if r, w, h := e.Sched.Counts(); r+w+h != 0 || ran != 0 {
+		t.Fatalf("counts %d %d %d, device ran %d times", r, w, h, ran)
+	}
+}
+
+func TestCompleteCommitFailureForgetsTheTask(t *testing.T) {
+	e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) { return sim.CallTools("dev_echo"), nil }, echoDev())
+	inner := e.Commit
+	e.Commit = func(ctx context.Context, c mem.CommitSet) error {
+		if c.Task != nil && c.Task.State == task.Ready && c.Task.PC == task.StepModel && len(c.Calls) > 0 {
+			return errors.New("injected")
+		}
+		return inner(ctx, c)
+	}
+	e.step(bg, newTask(t, e, store, "go"), 0)
+	e.step(bg, take(t, e), 0)
+	e.WaitBatches()
+	if r, w, h := e.Sched.Counts(); r+w+h != 0 {
+		t.Fatalf("counts %d %d %d", r, w, h)
 	}
 }

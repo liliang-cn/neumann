@@ -18,6 +18,7 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	if err != nil {
 		return mem.CommitSet{}, fmt.Errorf("read interrupts: %w", err)
 	}
+	base := len(t.Regs)
 	c := mem.CommitSet{Events: []proto.Event{
 		proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepModel.String(), Core: core}),
 	}}
@@ -29,6 +30,10 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	resp, err := e.Model.Call(ctx, model.Request{System: t.System, Tools: t.Tools, Messages: t.Regs})
 	t.Used.Steps++
 	if err != nil {
+		// Steers applied for this call were never answered: take them back so
+		// the terminal commit reports them dropped.
+		t.Regs = t.Regs[:base]
+		c.Applied = nil
 		return e.fail(t, c, "model: "+err.Error()), nil
 	}
 	t.Used.Add(resp.Usage)
@@ -63,9 +68,9 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	// a turn: the task goes on instead of finishing over it.
 	late, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
-		return mem.CommitSet{}, fmt.Errorf("read interrupts: %w", err)
+		return c, fmt.Errorf("read interrupts: %w", err)
 	}
-	if late = withoutApplied(late, c.Applied); len(late) > 0 {
+	if late = withoutApplied(late, c.Applied); hasSteer(late) {
 		c.Applied = append(c.Applied, applySteers(t, late)...)
 		e.ready(t, task.StepModel)
 		c.Task = t
@@ -75,13 +80,14 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 }
 
 // applySteers appends each pending steer as a user message and returns the
-// interrupt sequence numbers it consumed.
+// interrupt sequence numbers it consumed. Other kinds stay pending.
 func applySteers(t *task.TCB, pending []mem.Interrupt) []int64 {
 	var seqs []int64
 	for _, in := range pending {
-		if in.Kind == mem.InterruptSteer {
-			t.Regs = append(t.Regs, task.Text(task.RoleUser, in.Text))
+		if in.Kind != mem.InterruptSteer {
+			continue
 		}
+		t.Regs = append(t.Regs, task.Text(task.RoleUser, in.Text))
 		seqs = append(seqs, in.Seq)
 	}
 	return seqs
@@ -95,4 +101,8 @@ func withoutApplied(list []mem.Interrupt, applied []int64) []mem.Interrupt {
 		}
 	}
 	return out
+}
+
+func hasSteer(list []mem.Interrupt) bool {
+	return slices.ContainsFunc(list, func(in mem.Interrupt) bool { return in.Kind == mem.InterruptSteer })
 }

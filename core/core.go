@@ -38,14 +38,16 @@ type stepData struct {
 }
 
 // RunVCore is one vCore. It returns when the scheduler closes or ctx ends,
-// and only ever between two instructions.
+// and only ever between two instructions. Cancelling ctx stops fetching; an
+// instruction already started runs to its commit, so a shutdown never loses
+// or fails the task it was holding.
 func (e *Env) RunVCore(ctx context.Context, class string, core int) {
 	for {
 		t, ok := e.Sched.Next(ctx, class)
 		if !ok {
 			return
 		}
-		e.step(ctx, t, core)
+		e.step(context.WithoutCancel(ctx), t, core)
 	}
 }
 
@@ -68,7 +70,7 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		err = fmt.Errorf("instruction %s is not implemented", t.PC)
 	}
 	if err != nil {
-		c, batch = e.fail(t, mem.CommitSet{}, err.Error()), nil
+		c, batch = e.fail(t, c, err.Error()), nil
 	}
 	if err := e.Commit(ctx, c); err != nil {
 		e.Logf("neumann: commit for task %s failed; it is no longer scheduled: %v", t.ID, err)
