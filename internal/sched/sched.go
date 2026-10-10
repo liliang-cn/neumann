@@ -74,6 +74,11 @@ type control struct {
 	stopTimer func() bool // nil: no timer set
 	stopWake  func() bool // the backoff timer while the task is in Waiting(Backoff)
 	backs     uint64      // hand-backs so far: CheckoutWait sees a task come back and leave again
+	// The state and wait reason of the last hand-back, for CheckoutWait to
+	// judge a hand-back it slept through.
+	backClass string
+	backState task.State
+	backWait  task.WaitReason
 }
 
 func New(clock Clock, aging time.Duration) *Sched {
@@ -212,6 +217,7 @@ func (s *Sched) requeueLocked(t *task.TCB) (ok, ready bool, class string) {
 		s.armLocked(t, c)
 	}
 	c.backs++
+	c.backClass, c.backState, c.backWait = t.Class, t.State, t.Wait
 	delete(s.out, t.ID)
 	s.cond.Broadcast()
 	return true, ready, class
@@ -482,10 +488,14 @@ func (s *Sched) CheckoutIf(id string, ok func(*task.TCB) bool) (*task.TCB, bool)
 // CheckoutWait is CheckoutIf for a task that may be held elsewhere for a
 // moment: a holder that has committed the task's wait but not handed it back
 // yet, or another operator. While the task is held, it waits for the
-// hand-back (or for ctx to end), and only that one: a task that is neither
-// held nor in the wait set, that ok refuses once it is there, or that was
-// handed back and taken again (by a vCore, for its next instruction) before
-// the waiter woke, is not taken.
+// hand-back (or for ctx to end). A task that is neither held nor in the wait
+// set, or that ok refuses once it is there, is not taken. Nor is one that was
+// handed back in a state ok refuses and taken again before the waiter woke (a
+// vCore running its next instruction): the waiter gives up rather than wait
+// through that instruction. One handed back in a state ok accepts and taken
+// again by another waiter (operators deciding calls of one round at once) is
+// waited for again. For a hand-back it slept through, ok is shown a TCB with
+// only ID, Class, State and Wait set.
 func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) bool) (*task.TCB, bool) {
 	stop := context.AfterFunc(ctx, func() {
 		s.mu.Lock()
@@ -511,8 +521,16 @@ func (s *Sched) CheckoutWait(ctx context.Context, id string, ok func(*task.TCB) 
 			s.disarmWakeLocked(s.ctl[id])
 			return t, true
 		}
-		if c := s.ctl[id]; !s.out[id] || ctx.Err() != nil || c == nil || c != c0 || c.backs != backs {
+		c := s.ctl[id]
+		if !s.out[id] || ctx.Err() != nil || c == nil || c != c0 {
 			return nil, false
+		}
+		if c.backs != backs {
+			// Handed back and held again since the waiter last looked.
+			if !ok(&task.TCB{ID: id, Class: c.backClass, State: c.backState, Wait: c.backWait}) {
+				return nil, false
+			}
+			backs = c.backs
 		}
 		s.cond.Wait()
 	}
