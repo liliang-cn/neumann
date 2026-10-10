@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -275,6 +276,15 @@ func (e *Env) cancelInstead(ctx context.Context, t *task.TCB, c mem.CommitSet) {
 		switch ev.Kind {
 		case proto.EvStep, proto.EvUsage, proto.EvToolResult:
 			f.Events = append(f.Events, ev)
+		case proto.EvToolDenied:
+			// A denial of a call already in the log is kept below, and its
+			// event with it; one of a call new in c becomes cancelled.
+			var d struct {
+				CallID string `json:"call_id"`
+			}
+			if json.Unmarshal(ev.Data, &d) == nil && logged(d.CallID) {
+				f.Events = append(f.Events, ev)
+			}
 		}
 	}
 	for _, r := range c.Calls {
