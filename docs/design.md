@@ -87,7 +87,7 @@ type Part struct {
 ```go
 type State int      // Ready, Running, Waiting, Suspended, Done, Failed, Cancelled
 type PC int         // StepModel, StepTools, StepCompact
-type WaitReason int // WaitIO, WaitBackoff, WaitReconcile, WaitGroup
+type WaitReason int // WaitIO, WaitBackoff, WaitReconcile, WaitGroup, WaitApproval
 
 type TCB struct {
     ID         string
@@ -171,12 +171,18 @@ type CallRecord struct {
     Attempt  int
     Key      string          // 幂等键：taskID/callID/attempt，作为参数旁的元数据传给设备
     Result   *ToolResult
+
+    // 工具策略与人工批准（9.7），在第一次派发之前决定，与调用同一次提交
+    Policy   string          // allow / deny / rewrite / approval；空 = 规划时没有配置策略
+    Approval string          // pending / allowed / denied / edited：操作员的回答
+    Reason   string          // 被拒或待批准的原因
+    OrigArgs json.RawMessage // 策略或操作员换掉参数时，模型原来的参数；Args 是发给设备的
 }
 ```
 
 生命周期：
 
-1. 模型返回工具调用时，`execModel` 的同一次提交里写入这些调用，状态直接是 `dispatched`（`Attempt = 1`），任务转 `Waiting(IO)`；提交成功、任务交还调度器之后，同一个 vCore 立刻把调用交给总线。一轮工具不需要再排一次队等 vCore：实测在 cpa 上，派发曾因此等了 8 秒。
+1. 模型返回工具调用时，先由工具策略逐个决定（9.7），`execModel` 的同一次提交里写入这些调用，状态直接是 `dispatched`（`Attempt = 1`），任务转 `Waiting(IO)`（被拒的调用直接 `done`；有调用要批准时整轮留在 `planned`，任务转 `Waiting(Approval)`）；提交成功、任务交还调度器之后，同一个 vCore 立刻把调用交给总线。一轮工具不需要再排一次队等 vCore：实测在 cpa 上，派发曾因此等了 8 秒。
 2. `planned` 状态留给"已规划、从未派发"的调用（重启恢复时出现）；`execTools` 处理这种任务：**先提交** `dispatched`、`Attempt + 1`，任务转 `Waiting(IO)`，**然后**派发。
 3. 每个调用完成后，调度器提交 `done` 和结果，同一事务里带上 `tool_result` 事件。
 4. 全部 `done` 时，调度器提交：按调用顺序把结果追加成 tool 消息，任务转 `Ready`、`PC = StepModel`。这次提交把所有 `done` 记录和任务一起再写一遍（幂等），保证模型看到的每个结果都在调用记录里，即使第 3 步的某次单条提交失败过。
@@ -185,7 +191,7 @@ type CallRecord struct {
 
 | 状态 | 处理 |
 |---|---|
-| `planned` | 从未离开进程，正常派发 |
+| `planned` | 从未离开进程，正常派发；从没决定过的先问工具策略（9.7）。`Approval = pending` 的这一轮不在 `Waiting(IO)` 里，见 9.7 |
 | `dispatched`，`Effect` 为 `ReadOnly` 或 `Idempotent` | 用同一个 `Key` 重新派发（`Attempt` 不变） |
 | `dispatched`，`Effect` 为 `SideEffect` | 状态改为 `unknown`。工具声明了 `ReportUnknown` 的，把"结果未知"作为错误结果交给模型；否则任务转 `Waiting(Reconcile)`，发 `reconcile_needed` 事件（带调用 id、工具、参数、幂等键）。不自动重试，也不假装失败。同一轮里只要有一个调用在等核对，这一轮什么都不发 |
 | `done` | 已有结果，不再执行 |
@@ -228,7 +234,7 @@ type CallRecord struct {
 1. 加载所有未结束的 TCB、它们的调用记录和未送达的中断。
 2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`）。`Running` 在模型调用之前提交，含义是"请求可能已经发出"：提交之后、调用之前被停机打断时，会多算一次未确认。这一步要送达的插话在 `Running` 提交之后才合并，崩溃不会留下"上下文里有、中断表里却还未送达"的插话。预算按 `Used.Steps + Unconfirmed` 计，反复崩溃的任务不会越过预算重发。
 3. 调用记录按 4.2 的表处理。
-4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；所有未结束任务重设 Deadline 定时器。`Waiting(Backoff)` 和 `Waiting(Group)` 提交为 `Ready`（`ReadySince` 不变，`Retries` 保留）：退避定时器和熔断状态都不持久，重启后各组从闭合开始，退避从下一次失败重新起算。
+4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；所有未结束任务重设 Deadline 定时器。`Waiting(Reconcile)` 和 `Waiting(Approval)` 保持原状，各自再宣布一次等待的调用（9.7）。`Waiting(Backoff)` 和 `Waiting(Group)` 提交为 `Ready`（`ReadySince` 不变，`Retries` 保留）：退避定时器和熔断状态都不持久，重启后各组从闭合开始，退避从下一次失败重新起算。
 5. `Class` 已不在配置里的任务（换了配置重启），在第 2、3 步之前移到 `Config.Default` 的组：先做 6.3 的能力校验，通过则提交 `Class` 改变（状态不变）和 `migrated`（`reason = "class_removed"`）；不通过则提交一个原因为 `class_removed` 的取消中断和 `migrate_refused`（带不满足的那一条），随后按取消做最终提交（调用照 9.5 处理），任务 `Failed`，`StopReason = "class_removed"`。不留没有 vCore 会取的任务。
 6. 各执行组的 `W` 回到 `Initial`，vCore 按恢复出的就绪队列启动（6.1：有积压才启动，`Min` 只是空闲回收的下限）；限流器从空状态开始，由服务商响应头重新校准（7.3）。
 
@@ -277,7 +283,7 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
 
 ### 5.2 execTools
 
-只用于调用处于 `planned`、从未派发的任务（重启恢复）。提交调用记录 `dispatched` 和任务 `Waiting(IO)`；提交成功后派发。vCore 不等结果。正常路径上，模型那一步已经派发了自己的调用（4.2 第 1 步）。
+只用于调用处于 `planned`、从未派发的任务（重启恢复）。从没决定过的调用先问工具策略（9.7）；提交调用记录 `dispatched` 和任务 `Waiting(IO)`；提交成功后派发。vCore 不等结果。正常路径上，模型那一步已经派发了自己的调用（4.2 第 1 步）。
 
 ### 5.3 execCompact
 
@@ -454,7 +460,7 @@ type RateReporter interface { // 可选
 | 队列 | 内容 | 持久化在哪 |
 |---|---|---|
 | 就绪队列 | 每组一条，分交互、后台两级 | 由 TCB 的 `State/Class/Priority/ReadySince` 重建 |
-| 等待集合 | `Waiting(IO / Backoff / Reconcile / Group)`、`Suspended` | 由 TCB 重建 |
+| 等待集合 | `Waiting(IO / Backoff / Reconcile / Group / Approval)`、`Suspended` | 由 TCB 重建 |
 | 中断表 | 每个任务未送达的外部输入 | 中断表本身 |
 | 设备队列 | 等待设备的工具调用，每个设备一条 FIFO | 调用记录（`dispatched`） |
 | 事件流 | 全局有序的事件 | 事件表；内存环形缓冲只是加速 |
@@ -469,7 +475,7 @@ type RateReporter interface { // 可选
 
 ### 9.4 Deadline
 
-调度器为每个有 Deadline 的任务维护一个定时器，**与任务处于什么状态无关**：就绪、等待工具、退避、待核对、熔断等待、挂起、正在某个 vCore 上执行（包括在限流器上等额度），都会触发。触发时按"取消"处理（9.5），`StopReason = "deadline"`，终态为 `Failed`。
+调度器为每个有 Deadline 的任务维护一个定时器，**与任务处于什么状态无关**：就绪、等待工具、退避、待核对、待批准、熔断等待、挂起、正在某个 vCore 上执行（包括在限流器上等额度），都会触发。触发时按"取消"处理（9.5），`StopReason = "deadline"`，终态为 `Failed`。
 
 退避定时器也归调度器：任务以 `Waiting(Backoff)` 交还时按 `WakeAt` 挂上，到点由唤醒方取出、提交 `Ready`（`ReadySince` 不变）、交还；被取消、取出或调度器关闭时停掉。唤醒提交被取消拒绝（`ErrCancelPending`）时就地做最终提交。机器停止后不再唤醒，任务留在 `Waiting(Backoff)`，下次启动按 4.5 就绪。
 
@@ -485,7 +491,7 @@ type RateReporter interface { // 可选
    - 任务转 `Cancelled`，未送达的插话各一个 `steer_dropped`。
 4. 取消之后才到达的工具结果，调用记录标为 `late` 并保存结果，不进入寄存器，发 `tool_late` 事件。
 
-挂起、退避和熔断等待中的任务取消时没有在途调用，由取消方从等待集合取出、直接做最终提交（退避定时器一并停掉）。在限流器上等额度的任务归 vCore 持有：取消信号打断等待，vCore 做最终提交。
+挂起、退避、熔断等待和待批准中的任务取消时没有在途调用，由取消方从等待集合取出、直接做最终提交（退避定时器一并停掉；待批准这一轮的 `planned` 调用全部 `cancelled`）。在限流器上等额度的任务归 vCore 持有：取消信号打断等待，vCore 做最终提交。
 
 与任务自己的结束同时到达的取消：任务按它自己的提交结束，取消中断随终态提交被标为已送达，不产生效果。
 
@@ -499,12 +505,55 @@ m.SetPriority(id, p)
 m.SetClass(id, class)           // 手动迁移，同样做 6.3 的校验
 m.Cancel(id)
 m.Resolve(id, callID, outcome)  // 处理 Waiting(Reconcile)
+m.Approve(id, callID, decision) // 处理 Waiting(Approval)（9.7）
 m.SetCores(class, n) / m.AutoScale(class, on)
 m.GroupReset(class)             // 额度耗尽熔断后手动恢复
 m.Queue() QueueStatus
 ```
 
 每个控制都是一条指令，提交后返回，也可以通过协议发出。
+
+### 9.7 工具策略与人工批准
+
+```go
+type ToolPolicy func(ctx context.Context, info ToolCallInfo) Decision // Config.ToolPolicy
+
+type ToolCallInfo struct {
+    TaskID, CallID string
+    Tool    string          // 完整工具名
+    Device  string
+    Effect  Effect
+    Args    json.RawMessage // 副本；模型原样给出，可能不是合法 JSON
+    Class   string
+    Attempt int             // 将以第几次尝试派发：新调用为 1
+}
+
+type Decision struct { // 零值 = Allow
+    Verdict Verdict         // Allow / Deny / Rewrite / RequireApproval
+    Reason  string
+    Args    json.RawMessage // Rewrite
+}
+// 构造：Allow()、Deny(reason)、RewriteArgs(args)、RequireApproval(reason)
+
+err = m.Approve(ctx, taskID, callID, ApprovalDecision{Verdict: ApproveAllow}) // 或 ApproveDeny + Reason、ApproveEdit + Args
+```
+
+**第一层：同步策略钩子。**
+
+- 每个调用第一次派发之前问一次，由持有任务的一方调用（`execModel` 所在的 vCore；`execTools`；恢复时只问从没决定过的 `planned` 调用），在把调用写成 `dispatched` 的那次提交之前。决定写进调用记录（`Policy`、`Approval`、`Reason`、`OrigArgs`），与调用同一次提交：先提交，后动作。提交失败则决定作废，重做那一步时再问；已提交决定的调用（`Policy` 非空）永远不再问，重发（`Attempt > 0`：重启后同 `Key` 重发、`Resolve` 的重试）也不问。页表拒绝的调用不问，由总线派发时拒绝。没有配置策略时什么都不记。
+- 钩子必须快、没有副作用：它运行时 vCore 持着任务，它的结论可能随提交失败作废。panic 按 `Deny` 处理，原因是 panic 信息，进程不受影响。未知的 `Verdict` 也按 `Deny`。
+- `Allow`：照常派发。`Deny`：不执行；调用记录直接 `done`、`IsError`，结果文字带原因，`Attempt` 仍是 0；发 `tool_denied`（`{call_id, tool, reason, by: "policy"}`），它代替这个调用的 `tool_result`。`RewriteArgs`：参数换掉，模型的参数存进 `OrigArgs`，发 `tool_rewritten`（`{call_id, tool, original, args}`）；新参数不是合法 JSON 时按 `Deny`。`tool_call` 事件里始终是模型的原始参数。
+
+**第二层：人工批准。**
+
+- 一轮里只要有一个调用 `RequireApproval`，整轮都不派发：任务转 `Waiting(Approval)`（`PC = StepTools`），待批准的调用 `planned` + `Approval = pending`，被放行的留在 `planned`（`Policy = allow`），被拒的已是 `done`；每个待批准的调用一个 `approval_needed`（`{call_id, tool, device, effect, args, reason}`）。
+- **整轮作为一个单元在批准后派发**，不是先派发放行的、只扣住待批准的。理由：`Waiting(Approval)` 里没有在途调用，所以它对取消、Deadline、`Stop`、恢复、`SetClass` 的行为与 `Waiting(Reconcile)` 完全相同，不需要"一半等 I/O、一半等人"的第三种状态，所有权规则不变；操作员做决定时这一轮还没有任何东西生效；代价只是放行的调用多等一会儿，而人工批准本来就以秒到小时计。tool 消息仍按调用顺序组装，每个调用恰好一个结果（4.2）。
+- `m.Approve(ctx, taskID, callID, d)`：经 `enter()` 准入（`Start` 前 `ErrNotStarted`，停机后 `ErrStopped`），只从等待集合取出 `Waiting(Approval)` 的任务，提交这个决定后返回。`ApproveAllow` → `Approval = allowed`，`approved`（`{call_id}`）；`ApproveEdit` → 参数换成 `d.Args`（必须是合法 JSON），原参数存进 `OrigArgs`，`Approval = edited`，`approved`（`{call_id, original, args}`）；`ApproveDeny` → `done`、`IsError`、`Approval = denied`，`tool_denied`（`by: "operator"`）。决定这一轮最后一个待批准调用的那次提交，同时把全部 `planned` 调用写成 `dispatched`、任务转 `Waiting(IO)`（全被拒则直接组装 tool 消息、`Ready`）；交还调度器后才派发。任务不在 `Waiting(Approval)`、或调用不是待批准的：`ErrNotAwaitingApproval`（像 `ErrNotReconciling`）；未知任务 `ErrNotFound`；决定本身不合法（编辑参数不是合法 JSON、非编辑带参数）返回错误，什么都不变。
+- 取消、Deadline：取消方从等待集合取出任务、直接做最终提交：这一轮的 `planned` 调用（待批准的和随轮等待的）全部 `cancelled`，从未派发；被拒的保持 `done`。与 `Approve` 竞争时先提交的赢（4.1 规则 4）：`Approve` 的提交被 `ErrCancelPending` 拒绝，就地最终提交并返回 `ErrNotAwaitingApproval`；`Approve` 先提交、交还时发现已取消，按交还被拒处理（刚写成 `dispatched` 的调用 `cancelled`）。模型那一步的提交被取消拒绝时，它规划的调用（含待批准、被拒的）同样记 `cancelled`。
+- `Stop`：没有在途的东西，任务留在 `Waiting(Approval)`。
+- 恢复：仍是 `Waiting(Approval)`，不问钩子；发 `recovered`（`{from: "waiting_approval", pending}`），并为每个待批准调用再发一次 `approval_needed`（带 `recovered: true`）。
+- 插话：留在中断表，这一轮结束后下一条模型指令开头送达，排在 tool 消息之后。
+- `Status.Approval`、`GroupStatus.Approval`、`ClassQueue.Approval`（JSON `approval`）：等批准的任务数。
 
 ## 10. 总线与设备
 
@@ -617,7 +666,7 @@ Anthropic 原生适配器（`model/anthropic`，标准库实现，传输层复�
 ```go
 type Instruction struct {
     Kind     string          `json:"kind"`
-    // submit / steer / cancel / suspend / resume / priority / class / resolve
+    // submit / steer / cancel / suspend / resume / priority / class / resolve / approve
     TaskID   string          `json:"task_id,omitempty"`
     Input    string          `json:"input,omitempty"`
     Class    string          `json:"class,omitempty"`
@@ -628,6 +677,7 @@ type Instruction struct {
     Deny     []string        `json:"deny,omitempty"`
     CallID   string          `json:"call_id,omitempty"` // resolve
     Outcome  *ResolveOutcome `json:"outcome,omitempty"` // resolve：done(result) / failed / retry
+    Decision *Decision       `json:"decision,omitempty"` // approve：{verdict: allow / deny / edit, reason, args}
 }
 
 type Event struct {
@@ -642,7 +692,7 @@ type Event struct {
 
 `Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
-任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`done`、`failed`、`cancelled`、`steer_dropped`。
+任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`done`、`failed`、`cancelled`、`steer_dropped`。
 
 `migrated`：`{from, to, reason}`，`reason` 为 `group_down` 或 `manual`。`migrate_refused`：`{from, to, check, detail}`，本组熔断、`Fallback` 校验不过、任务留下等本组。`tool_result` 来自 L2 时带 `cached: true`。
 
@@ -650,7 +700,7 @@ type Event struct {
 
 stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。
 
-操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`suspend`、`resume`、`priority` 仍回 `unsupported`。
+操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`suspend`、`resume`、`priority` 仍回 `unsupported`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
 
 实现在 `proto/jsonl`（线格式的完整说明在它的包文档里），`cmd/neumann` 把它接到 stdin/stdout。回复和事件共用 stdout，每行第一个字段 `"type"` 是 `"reply"` 或 `"event"`：宿主进程（Node、Python）天然只有 stdout，多开一个 fd 两边都别扭；共用一个流还给出了顺序，`subscribe` 的回复恰好落在旧流最后一个事件和新流第一个事件之间。指令可带 `"id"`，回复原样带回；指令按到达顺序逐条执行。读得慢的一方不阻塞机器：事件按输出写出的速度从主存读，回复优先于积压的事件写出。
 
@@ -670,7 +720,7 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 
 ## 14. 观测
 
-`m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态（当前实现：`Status.Groups` 每组给出模型、`Fallback`、`W` / `Target` / `Min` / `Max` / `Auto` / `epoch` / 冷却、存活与忙碌的 vCore 数、就绪数、等待数（其中等本组的）、最老就绪任务已等多久、熔断状态与下一次放探测的时刻；`Status.Cores` 是全部存活 vCore 数；`Status.Limiters` 给出各限流器的 `limit.Status`；`Status.Cache` 是总线 L2 的 `CacheStats`；`m.Queue()` 按类给出就绪数、其中后台数、等待数、最长等待）；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
+`m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态（当前实现：`Status.Groups` 每组给出模型、`Fallback`、`W` / `Target` / `Min` / `Max` / `Auto` / `epoch` / 冷却、存活与忙碌的 vCore 数、就绪数、等待数（其中等本组的）、最老就绪任务已等多久、熔断状态与下一次放探测的时刻；`Status.Cores` 是全部存活 vCore 数；`Status.Limiters` 给出各限流器的 `limit.Status`；`Status.Cache` 是总线 L2 的 `CacheStats`；`Status.Approval` 等批准的任务数；`m.Queue()` 按类给出就绪数、其中后台数、等待数（其中等批准的）、最长等待）；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
 
 `observe` 包只用公开 API（`Events`、`EventLog`、`Status`、`Queue`、`Load`、`Calls`），任何宿主都能挂；不挂就没有任何开销。事件从主存按序号读，消费方慢只会落后，不会挡住机器；`Follow` 返回最后读到的 `Seq`，宿主存下来重启后接着读；`Head` 用 O(log n) 次单条读找到日志末尾，只想统计"从现在起"的就从那里开始。
 
@@ -697,6 +747,7 @@ m, err := neumann.New(neumann.Config{
     Default:   "little",
     Store:     store,
     Devices:   []bus.Device{builtin, mcpGitHub, skillsDir},
+    ToolPolicy: policy,                    // 可选：每个调用第一次派发前的决定（9.7）
     System:    "You are ...",
     MaxQueued: 1000,
 })
@@ -709,6 +760,7 @@ err = m.SetCores("little", 8)              // 固定窗口；多出的 vCore 执
 err = m.AutoScale("little", true)          // 恢复自适应
 err = m.SetClass(ctx, id, "little")        // 手动迁移：*MigrateError / ErrTaskBusy / ErrFinished / ErrNotFound
 err = m.GroupReset(ctx, "big")             // 额度耗尽熔断后复位
+err = m.Approve(ctx, id, "c-3", neumann.ApprovalDecision{Verdict: neumann.ApproveAllow}) // 回答待批准的调用：ErrNotAwaitingApproval / ErrNotFound
 q := m.Queue()                             // 各类队列
 ```
 
@@ -758,6 +810,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
    验证：`TestCoresTrackProviderCapacity`（第 18 节 13，机器层，K = 4）、`TestOneEpochOfOverloadsHalvesTheWindowOnce`（14）、`TestTwoGroupsShareALimiter`（15）、`TestMigrationToTheFallbackGroup` / `TestMigrationRefusedByEachCheck`（17：成功、三种校验 × `wait` / `fail`、`PinClass`）、`TestCoresRetireOnlyBetweenInstructions`（19）、`TestSetClassMovesATask`、`TestSetCoresAndAutoScale`、`TestIdleCoresRetireDownToMin`、`TestStopShutsEveryCoreDown`（`shutdown`，goroutine 数回落）、`TestGroupConfigIsValidated`、`TestGroupMaxQueued`、`TestCachedToolResultThroughTheMachine`、`TestCrashAtEveryCommitPointWithAMigration`（两组，任务中途迁移，每个提交点前后各崩一次）。
    评审后修正：后备组恢复时唤醒链上停着的任务（`TestParkedTaskMigratesWhenItsFallbackReturns`：本组额度熔断；`TestParkedBacklogMovesWhenTheFallbackComesBack`：本组临时错误熔断，积压在后备组恢复后立刻迁走，不再每个半开周期一个）；类已删除的恢复任务移到默认组或以 `class_removed` 失败（`TestRecoveredTaskOfARemovedClass`）；`forProvider` 去掉空消息后合并同角色邻居。
    没做：`StepCompact`（迁移的第 3 条校验因此总是"放不下"）、`suspend` / `resume` / `priority`。
+
+5. **工具策略与人工批准**（9.7）：`Config.ToolPolicy` 在每个调用第一次派发之前决定（放行、拒绝、改参数、要批准），决定与调用同一次提交、写在调用记录上，恢复不再问；`Waiting(Approval)` 整轮等待，`m.Approve` 允许、拒绝或编辑，最后一个决定的提交派发这一轮；取消、Deadline、`Stop`、恢复、插话、`Status` / `Queue`；stdio 的 `approve`、`not_awaiting_approval`；`examples/approval`。
+   验证：`TestToolPolicyDecidesEachCall`（放行、拒绝、改参数、改成非法 JSON：调用记录、事件、设备只见放行的、tool 消息顺序）、`TestToolPolicyPanicDenies`、`TestApprovalAllowDenyEdit`、`TestMixedRoundKeepsOrderAndPairing`（放行、待批准、拒绝混在一轮：批准前什么都不跑，之后顺序与配对不变）、`TestApproveErrors`、`TestCancelWhileAwaitingApproval`、`TestDeadlineWhileAwaitingApproval`、`TestSteerWaitsForTheApprovedRound`、`TestApprovalSurvivesARestart`（`Stop` 立即返回，重启后再宣布、不再问钩子）、`TestCrashAtEveryCommitPointWithAnApproval`（支付要批准，每个提交点前后各崩一次，批准在重启前或重启后给出，钩子不重问已决定的调用，支付至多一次）、`TestApproveOverTheWire`。
 
 ## 18. 测试
 
