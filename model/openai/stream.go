@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/model/internal/httperr"
 )
 
 var _ model.Streamer = (*Adapter)(nil)
@@ -177,6 +178,6 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 	if err != nil {
 		return model.Response{}, err
 	}
-	out.Rate = rateInfo(resp.Header, a.now())
+	out.Rate = httperr.RateInfo(resp.Header, a.now())
 	return out, nil
 }

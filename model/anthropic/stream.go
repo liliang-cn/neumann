@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/model/internal/httperr"
 )
 
 var _ model.Streamer = (*Adapter)(nil)
@@ -30,7 +31,6 @@ type streamEvent struct {
 		CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
 		OutputTokens             *int `json:"output_tokens"`
 	} `json:"usage"`
-	Error json.RawMessage `json:"error"`
 }
 
 type blockDelta struct {
@@ -184,7 +184,9 @@ func (b *blockAcc) object() (json.RawMessage, error) {
 
 // Stream is Call over server-sent events: text and thinking are reported to
 // emit as they arrive, and the assembled turn is returned at the end. A
-// stream that ends before message_stop is an error, not a short answer.
+// stream that ends before message_stop is an error, not a short answer: a
+// Transient one wrapping model.ErrResponseLost. An error event is classified
+// from its error.type like a status error.
 func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
 	resp, err := a.post(ctx, req, true)
 	if err != nil {
@@ -203,7 +205,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 	handle := func(raw string) (bool, error) {
 		var ev streamEvent
 		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
-			return false, fmt.Errorf("anthropic: decode stream event: %w: %s", err, a.snippet([]byte(raw)))
+			return false, a.lostError("decode stream event: "+a.snippet([]byte(raw)), err)
 		}
 		switch ev.Type {
 		case "message_start":
@@ -213,17 +215,17 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		case "content_block_start":
 			acc, err := newBlockAcc(ev.ContentBlock)
 			if err != nil {
-				return false, fmt.Errorf("anthropic: decode content block: %w", err)
+				return false, a.lostError("decode content block", err)
 			}
 			blocks[ev.Index] = acc
 		case "content_block_delta":
 			acc := blocks[ev.Index]
 			if acc == nil {
-				return false, fmt.Errorf("anthropic: delta for content block %d before its start", ev.Index)
+				return false, a.lostError(fmt.Sprintf("delta for content block %d before its start", ev.Index), nil)
 			}
 			var d blockDelta
 			if err := json.Unmarshal(ev.Delta, &d); err != nil {
-				return false, fmt.Errorf("anthropic: decode content block delta: %w", err)
+				return false, a.lostError("decode content block delta", err)
 			}
 			acc.add(d)
 			switch {
@@ -236,7 +238,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 			var d blockDelta
 			if len(ev.Delta) > 0 {
 				if err := json.Unmarshal(ev.Delta, &d); err != nil {
-					return false, fmt.Errorf("anthropic: decode message delta: %w", err)
+					return false, a.lostError("decode message delta", err)
 				}
 			}
 			if d.StopReason != "" {
@@ -251,7 +253,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		case "message_stop":
 			return true, nil
 		case "error":
-			return false, fmt.Errorf("anthropic: %s stream error: %s", a.Model, a.snippet(ev.Error))
+			return false, a.streamError([]byte(raw), resp.Header)
 		}
 		return false, nil // ping, content_block_stop, and event types added later
 	}
@@ -260,7 +262,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 	for !done {
 		line, err := r.ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
-			return model.Response{}, fmt.Errorf("anthropic: read stream: %w", err)
+			return model.Response{}, a.ioError(ctx, "read stream", err, true, resp.Header)
 		}
 		eof := err != nil
 		line = strings.TrimRight(line, "\r\n")
@@ -284,7 +286,10 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		}
 	}
 	if !done {
-		return model.Response{}, fmt.Errorf("anthropic: %s stream ended before message_stop", a.Model)
+		if err := ctx.Err(); err != nil {
+			return model.Response{}, a.ioError(ctx, "read stream", err, true, resp.Header)
+		}
+		return model.Response{}, a.lostError("stream ended before message_stop", nil)
 	}
 
 	idxs := make([]int, 0, len(blocks))
@@ -296,11 +301,16 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 	for _, i := range idxs {
 		obj, err := blocks[i].object()
 		if err != nil {
-			return model.Response{}, fmt.Errorf("anthropic: assemble content block: %w", err)
+			return model.Response{}, a.lostError("assemble content block", err)
 		}
 		objs = append(objs, obj)
 	}
-	return a.response(objs, stop, usage.usage())
+	out, err := a.response(objs, stop, usage.usage())
+	if err != nil {
+		return model.Response{}, err
+	}
+	out.Rate = httperr.RateInfo(resp.Header, a.now())
+	return out, nil
 }
 
 func setIf(dst *int, v *int) {

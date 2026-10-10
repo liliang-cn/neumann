@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/model/internal/httperr"
 	"github.com/liliang-cn/neumann/model/openai"
 	"github.com/liliang-cn/neumann/task"
 )
@@ -33,6 +33,8 @@ type Adapter struct {
 	// positive. It must be below MaxTokens.
 	ThinkingBudget int
 	HTTP           *http.Client
+	// Now is the clock rate-limit resets are read against; nil: time.Now.
+	Now func() time.Time
 }
 
 var (
@@ -93,13 +95,18 @@ func (a *Adapter) Call(ctx context.Context, req model.Request) (model.Response, 
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return model.Response{}, fmt.Errorf("anthropic: read response: %w", err)
+		return model.Response{}, a.ioError(ctx, "read response", err, true, resp.Header)
 	}
 	var w wireResp
 	if err := json.Unmarshal(data, &w); err != nil {
-		return model.Response{}, fmt.Errorf("anthropic: decode response: %w: %s", err, a.snippet(data))
+		return model.Response{}, a.lostError("decode response: "+a.snippet(data), err)
 	}
-	return a.response(w.Content, w.StopReason, w.Usage.usage())
+	out, err := a.response(w.Content, w.StopReason, w.Usage.usage())
+	if err != nil {
+		return model.Response{}, err
+	}
+	out.Rate = httperr.RateInfo(resp.Header, a.now())
+	return out, nil
 }
 
 func (a *Adapter) setHeaders(h http.Header) {
@@ -110,7 +117,8 @@ func (a *Adapter) setHeaders(h http.Header) {
 }
 
 // post sends a Messages request and returns the response once its status is
-// known to be 2xx.
+// known to be 2xx. Every failure past building the request is a classified
+// *model.Error.
 func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
 	raw, err := a.body(req, stream)
 	if err != nil {
@@ -127,26 +135,14 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 	a.setHeaders(hreq.Header)
 	resp, err := a.HTTP.Do(hreq)
 	if err != nil {
-		return nil, fmt.Errorf("anthropic: %w", err)
+		return nil, a.ioError(ctx, "send request", err, false, nil)
 	}
 	if resp.StatusCode/100 != 2 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, fmt.Errorf("anthropic: %s returned %d%s: %s", a.Model, resp.StatusCode, statusNote(resp.StatusCode), a.snippet(data))
+		return nil, a.statusError(resp.StatusCode, resp.Header, data)
 	}
 	return resp, nil
-}
-
-// statusNote names the two statuses later phases must tell apart: 429 is a
-// rate limit on this key, 529 is Anthropic as a whole being overloaded.
-func statusNote(code int) string {
-	switch code {
-	case http.StatusTooManyRequests:
-		return " (rate limited)"
-	case 529:
-		return " (overloaded)"
-	}
-	return ""
 }
 
 // response assembles the neutral turn from the provider's content blocks.
@@ -164,11 +160,11 @@ func (a *Adapter) response(blocks []json.RawMessage, stop string, u task.Usage) 
 			Input    json.RawMessage `json:"input"`
 		}
 		if err := json.Unmarshal(rb, &b); err != nil {
-			return model.Response{}, fmt.Errorf("anthropic: decode content block: %w", err)
+			return model.Response{}, a.lostError("decode content block", err)
 		}
 		opaque, err := compact(rb)
 		if err != nil {
-			return model.Response{}, fmt.Errorf("anthropic: decode content block: %w", err)
+			return model.Response{}, a.lostError("decode content block", err)
 		}
 		switch b.Type {
 		case "text":
@@ -180,7 +176,7 @@ func (a *Adapter) response(blocks []json.RawMessage, stop string, u task.Usage) 
 			args := json.RawMessage(`{}`)
 			if len(b.Input) > 0 {
 				if args, err = compact(b.Input); err != nil {
-					return model.Response{}, fmt.Errorf("anthropic: decode tool input: %w", err)
+					return model.Response{}, a.lostError("decode tool input", err)
 				}
 			}
 			msg.Parts = append(msg.Parts, task.Part{
@@ -205,7 +201,7 @@ func (a *Adapter) response(blocks []json.RawMessage, stop string, u task.Usage) 
 	}
 	finish := finishReason(stop)
 	if !answered && finish != "length" {
-		return model.Response{}, errors.New("anthropic: response has neither text nor tool calls")
+		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls"}
 	}
 	return model.Response{Message: msg, FinishReason: finish, Usage: u}, nil
 }

@@ -504,21 +504,19 @@ func TestHTTPErrorsDoNotLeakTheKey(t *testing.T) {
 }
 
 func TestRateLimitAndOverloadAreDistinguishable(t *testing.T) {
-	errFor := func(status int, body string) string {
+	classOf := func(status int, body string) model.ErrClass {
 		s := newServer(t, status, body)
 		_, err := New(s.URL+"/v1", "k", "m").Call(context.Background(), model.Request{Messages: []task.Message{task.Text(task.RoleUser, "hi")}})
 		if err == nil {
 			t.Fatalf("%d accepted", status)
 		}
-		return err.Error()
+		return model.Classify(err)
 	}
-	rl := errFor(429, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`)
-	ov := errFor(529, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)
-	if !strings.Contains(rl, "429") || !strings.Contains(rl, "rate limited") || strings.Contains(rl, "overloaded") {
-		t.Fatalf("429: %s", rl)
+	if c := classOf(429, `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`); c != model.RateLimited {
+		t.Fatalf("429: %s", c)
 	}
-	if !strings.Contains(ov, "529") || !strings.Contains(ov, "overloaded") || strings.Contains(ov, "rate limited") {
-		t.Fatalf("529: %s", ov)
+	if c := classOf(529, `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`); c != model.Overload {
+		t.Fatalf("529: %s", c)
 	}
 }
 
