@@ -78,7 +78,8 @@ func (c *callAcc) object() (json.RawMessage, error) {
 
 // Stream is Call over server-sent events: text and reasoning are reported to
 // emit as they arrive, and the assembled turn is returned at the end. A stream
-// that ends before a finish reason or [DONE] is an error, not a short answer.
+// that ends before a finish reason or [DONE] is an error, not a short answer:
+// a Transient one wrapping model.ErrResponseLost.
 func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
 	resp, err := a.post(ctx, req, true)
 	if err != nil {
@@ -100,7 +101,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return model.Response{}, fmt.Errorf("openai: read stream: %w", err)
+			return model.Response{}, a.ioError(ctx, "read stream", err, true, resp.Header)
 		}
 		line = strings.TrimRight(line, "\r\n")
 		data, ok := strings.CutPrefix(line, "data:")
@@ -114,10 +115,10 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		}
 		var ch streamChunk
 		if err := json.Unmarshal([]byte(data), &ch); err != nil {
-			return model.Response{}, fmt.Errorf("openai: decode stream chunk: %w: %s", err, snippet([]byte(data)))
+			return model.Response{}, a.lostError("decode stream chunk: "+snippet([]byte(data)), err)
 		}
 		if len(ch.Error) > 0 && string(ch.Error) != "null" {
-			return model.Response{}, fmt.Errorf("openai: %s stream error: %s", a.Model, snippet(ch.Error))
+			return model.Response{}, a.streamError(ch.Error, resp.Header)
 		}
 		if ch.Usage != nil {
 			usage = *ch.Usage
@@ -136,7 +137,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 					Index int `json:"index"`
 				}
 				if err := json.Unmarshal(raw, &idx); err != nil {
-					return model.Response{}, fmt.Errorf("openai: decode tool call delta: %w", err)
+					return model.Response{}, a.lostError("decode tool call delta", err)
 				}
 				acc := calls[idx.Index]
 				if acc == nil {
@@ -144,7 +145,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 					calls[idx.Index] = acc
 				}
 				if err := acc.add(raw); err != nil {
-					return model.Response{}, fmt.Errorf("openai: decode tool call delta: %w", err)
+					return model.Response{}, a.lostError("decode tool call delta", err)
 				}
 			}
 			if c.FinishReason != nil && *c.FinishReason != "" {
@@ -153,7 +154,10 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		}
 	}
 	if !done && finish == "" {
-		return model.Response{}, fmt.Errorf("openai: %s stream ended before the answer was complete", a.Model)
+		if err := ctx.Err(); err != nil {
+			return model.Response{}, a.ioError(ctx, "read stream", err, true, resp.Header)
+		}
+		return model.Response{}, a.lostError("stream ended before the answer was complete", nil)
 	}
 
 	idxs := make([]int, 0, len(calls))
@@ -169,5 +173,10 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		}
 		objs = append(objs, obj)
 	}
-	return a.response(text.String(), objs, finish, usage.usage())
+	out, err := a.response(text.String(), objs, finish, usage.usage())
+	if err != nil {
+		return model.Response{}, err
+	}
+	out.Rate = rateInfo(resp.Header, a.now())
+	return out, nil
 }

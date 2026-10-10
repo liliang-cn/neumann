@@ -5,8 +5,10 @@ package sim
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/task"
@@ -47,6 +49,19 @@ func (m *Model) Stream(ctx context.Context, req model.Request, emit func(model.D
 		}
 	}
 	return resp, nil
+}
+
+// RateInfo reports the limits a scripted failure carries (see RateLimited),
+// or a scripted response's Rate.
+func (m *Model) RateInfo(resp *model.Response, err error) *model.RateInfo {
+	if resp != nil && resp.Rate != nil {
+		return resp.Rate
+	}
+	var me *model.Error
+	if errors.As(err, &me) {
+		return me.Rate
+	}
+	return nil
 }
 
 // Calls is how many times Call or Stream was invoked.
@@ -108,4 +123,89 @@ func ToolRounds(req model.Request) int {
 		}
 	}
 	return n
+}
+
+// failStatus is the HTTP status a real provider would send for each class.
+var failStatus = map[model.ErrClass]int{
+	model.RateLimited:    429,
+	model.QuotaExhausted: 429,
+	model.Overload:       529,
+	model.Transient:      502,
+	model.Permanent:      400,
+}
+
+// Fail is a scripted model failure of the given class, as an adapter would
+// report it. A RateLimited failure with retryAfter > 0 also carries a
+// RateInfo whose RetryAt is that far from the wall clock.
+func Fail(class model.ErrClass, retryAfter time.Duration) error {
+	e := &model.Error{
+		Class: class, Status: failStatus[class], RetryAfter: retryAfter,
+		Provider: "sim", Msg: "scripted " + class.String(),
+	}
+	if class == model.RateLimited && retryAfter > 0 {
+		now := time.Now()
+		e.Rate = &model.RateInfo{RetryAt: now.Add(retryAfter), At: now}
+	}
+	return e
+}
+
+// RateLimited is a 429 with a retry-after hint.
+func RateLimited(retryAfter time.Duration) error { return Fail(model.RateLimited, retryAfter) }
+
+// QuotaExhausted is the account out of quota or credit.
+func QuotaExhausted() error { return Fail(model.QuotaExhausted, 0) }
+
+// Overload is a 529: the provider is overloaded.
+func Overload() error { return Fail(model.Overload, 0) }
+
+// Transient is a 502: a failure worth retrying after backoff.
+func Transient() error { return Fail(model.Transient, 0) }
+
+// Permanent is a 400: the provider rejected the request.
+func Permanent() error { return Fail(model.Permanent, 0) }
+
+// Lost is a call that reached the provider whose response never came back:
+// the call counts as made (Calls includes it), the error is Transient and
+// wraps model.ErrResponseLost.
+func Lost() error {
+	return &model.Error{Class: model.Transient, Provider: "sim", Msg: "scripted lost response", Err: model.ErrResponseLost}
+}
+
+// Truncated is a turn cut off by the output limit before it produced
+// anything: finish reason "length", no text, no tool calls, but tokens spent.
+func Truncated() model.Response {
+	return model.Response{
+		Message:      task.Message{Role: task.RoleAssistant},
+		FinishReason: "length",
+		Usage:        task.Usage{PromptTokens: 10, CompletionTokens: 50, ReasoningTokens: 50},
+	}
+}
+
+// Clock is a fake clock that moves only when told to. It satisfies any
+// interface{ Now() time.Time }.
+type Clock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func NewClock(start time.Time) *Clock { return &Clock{now: start} }
+
+func (c *Clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+// Advance moves the clock forward by d.
+func (c *Clock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+// Set moves the clock to t.
+func (c *Clock) Set(t time.Time) {
+	c.mu.Lock()
+	c.now = t
+	c.mu.Unlock()
 }

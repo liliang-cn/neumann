@@ -498,11 +498,14 @@ type Adapter interface {
     Provider() string
     Caps() Caps // 窗口、最大输出、是否支持工具调用、单次工具数上限
     Call(ctx context.Context, req Request) (Response, error)
-    Classify(err error, resp *Response) ErrClass
     Reserve(req Request) map[string]int64
     Settle(req Request, resp Response) map[string]int64
-    RateInfo(resp *Response, err error) *RateInfo
 }
+
+// 可选：适配器比 model.Classify 更懂自己服务商的错误时实现
+type Classifier interface{ Classify(err error) ErrClass }
+// 可选：从响应头读剩余额度和重置时间（7.3）
+type RateReporter interface{ RateInfo(resp *Response, err error) *RateInfo }
 ```
 
 错误分类：
@@ -516,6 +519,23 @@ type Adapter interface {
 | `Permanent` | 其余 4xx | — | 退还预占 | `Failed` |
 
 `context.Canceled` 永远不是可重试错误。永久错误的判断优先于报错文字里的"timeout"之类字样。
+
+实现（`model`）：`ErrClass` 取值 `Unknown`（零值）/ `RateLimited` / `QuotaExhausted` / `Overload` / `Transient` / `Permanent` / `Canceled`，`Retryable()` 只对 `RateLimited`、`Overload`、`Transient` 为真。适配器能解释的失败一律返回 `*model.Error{Class, Status, RetryAfter, Provider, Msg, Err, Rate}`，`Msg` 是状态码之外的响应片段，服务端回显的 key 会被抹掉。`model.Classify(err)` 按顺序判断：链上有 `context.Canceled` → `Canceled`（适配器说什么都不改变这一条）；链上有 `*model.Error` 且类别不是 `Unknown` → 用它的类别（所以永久错误不会被文字里的"timeout"翻案——这里根本不读文字）；`context.DeadlineExceeded` → `Canceled`；`net.Error`、`io.ErrUnexpectedEOF`、连接被重置 / 拒绝、`EPIPE`、`model.ErrResponseLost` → `Transient`；其余 `Unknown`。`model.ClassifyWith(adapter, err)` 先排除取消，再问适配器的 `Classifier`，答 `Unknown` 时回落到 `Classify`。
+
+**调用方的 Deadline 和单次请求超时是两回事。** 到达 `Classify` 的裸 `DeadlineExceeded` 是调用方的 ctx 到期，也就是任务的 Deadline（9.4），重试只会越过它，所以算 `Canceled`。单次请求超时（`http.Client.Timeout`、流读到一半卡住）发生时调用方还有时间，是服务商慢，算 `Transient`。两者在错误链上都表现为 `DeadlineExceeded`，只有适配器分得清：出错时看自己调用方的 `ctx.Err()`，非空就是 `Canceled`（`Err` 设为 `ctx.Err()`），为空就包成 `*model.Error{Class: Transient}`。
+
+**响应丢失**：请求已经到达服务商、但响应没有完整回来（body 中途断开、流在 finish_reason / `[DONE]` 之前结束、2xx 的 body 解析不了），错误包裹 `model.ErrResponseLost`，类别 `Transient`。服务商可能已经做完并计费，这一点和连接被拒绝（请求根本没出去，不包 `ErrResponseLost`）不同，`Unconfirmed` 只应在前者增加（18.12）。
+
+OpenAI 兼容适配器的分类，状态码先定，正文只在 429/403/402 里区分额度和限流、在 5xx 里区分过载：
+
+- 402 → `QuotaExhausted`。
+- 429 / 403 / 流内错误：服务商给的等待时间（`retry-after-ms`、`Retry-After` 秒数或 HTTP 日期、正文里 Google 的 `retryDelay`、"Resets in 120h41m12s"、"try again in 6m0s"，取最长）超过 1 小时 → `QuotaExhausted`，`RetryAfter` 带上这个时间；正文有 `insufficient_quota` / billing / credit balance / quota reached → `QuotaExhausted`；正文只说 quota 或 RESOURCE_EXHAUSTED、却没有短窗口的迹象（retry 头、正文里的等待时间、per minute / per second）→ `QuotaExhausted`。实测 CLIProxyAPI 在凭证全部冷却时回 429 + `rate_limit_error`，内层是上游的 "Individual quota reached … Resets in 120h41m12s"：外层说限流，实际是五天后才重置的额度耗尽，重试没有意义。Gemini 的每分钟配额同样说 "Quota exceeded"，但带 `retryDelay` 和 PerMinute，归 `RateLimited`。
+- 429 其余：有 `retry-after` 类头或正文等待时间 → `RateLimited`；只有 `x-ratelimit-*` / `anthropic-ratelimit-*` 头 → `RateLimited`，`RetryAfter` 取已耗尽维度里最晚的重置时间；什么都没有 → `Overload`。
+- 529 → `Overload`；5xx 正文含 overload → `Overload`；其余 5xx、408 → `Transient`；其余 4xx → `Permanent`。
+- 流内错误 `{"error":{...}}` 的数字 `code` 当作状态码；没有数字 code 时含 overload / rate limit → `Overload`，否则 `Transient`。
+- 网络错误、单次请求超时 → `Transient`；响应丢失同上。
+
+`RateInfo` 在成功（`Response.Rate`）和失败（`Error.Rate`）时都解析：`Dims` 以 `requests` / `tokens` / `input_tokens` / `output_tokens` 为键，每维 `Limit`、`Remaining`、`ResetAt`（只有报了 `remaining` 的维度才出现）；`RetryAt` 是 retry-after 换算成的时刻，`At` 是读取时刻。重置值接受 OpenAI 的时长（`6m0s`、`1s`、`120ms`，以及 `1d2h`）、秒数、Unix 时间戳、RFC 3339、HTTP 日期。适配器的 `Now` 字段可以换成假时钟。
 
 第一版两个适配器：OpenAI 兼容（`/chat/completions`）和 Anthropic 原生（`/v1/messages`）。
 

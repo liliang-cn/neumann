@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +23,8 @@ type Adapter struct {
 	Model     string
 	MaxTokens int // 0: let the provider decide
 	HTTP      *http.Client
+	// Now is the clock rate-limit resets are read against; nil: time.Now.
+	Now func() time.Time
 }
 
 var _ model.Adapter = (*Adapter)(nil)
@@ -97,13 +98,18 @@ func (a *Adapter) Call(ctx context.Context, req model.Request) (model.Response, 
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return model.Response{}, fmt.Errorf("openai: read response: %w", err)
+		return model.Response{}, a.ioError(ctx, "read response", err, true, resp.Header)
 	}
-	return a.parse(data)
+	out, err := a.parse(data)
+	if err != nil {
+		return model.Response{}, err
+	}
+	out.Rate = rateInfo(resp.Header, a.now())
+	return out, nil
 }
 
 // post sends a chat-completions request and returns the response once its
-// status is known to be 2xx.
+// status is known to be 2xx. Every failure is a classified *model.Error.
 func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
 	msgs, err := a.messages(req)
 	if err != nil {
@@ -137,12 +143,12 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 	}
 	resp, err := a.HTTP.Do(hreq)
 	if err != nil {
-		return nil, fmt.Errorf("openai: %w", err)
+		return nil, a.ioError(ctx, "send request", err, false, nil)
 	}
 	if resp.StatusCode/100 != 2 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, fmt.Errorf("openai: %s returned %d: %s", a.Model, resp.StatusCode, snippet(data))
+		return nil, a.statusError(resp.StatusCode, resp.Header, data)
 	}
 	return resp, nil
 }
@@ -150,10 +156,12 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 func (a *Adapter) parse(data []byte) (model.Response, error) {
 	var w wireResp
 	if err := json.Unmarshal(data, &w); err != nil {
-		return model.Response{}, fmt.Errorf("openai: decode response: %w: %s", err, snippet(data))
+		return model.Response{}, a.lostError("decode response: "+snippet(data), err)
 	}
 	if len(w.Choices) == 0 {
-		return model.Response{}, fmt.Errorf("openai: response has no choices: %s", snippet(data))
+		// Some gateways answer 200 with no choices when their upstream
+		// failed; the provider produced nothing to retry against.
+		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has no choices: " + a.redact(snippet(data))}
 	}
 	ch := w.Choices[0]
 	text := ""
@@ -173,7 +181,7 @@ func (a *Adapter) response(text string, calls []json.RawMessage, finish string, 
 	for _, rc := range calls {
 		var c wireCall
 		if err := json.Unmarshal(rc, &c); err != nil {
-			return model.Response{}, fmt.Errorf("openai: decode tool call: %w", err)
+			return model.Response{}, a.lostError("decode tool call", err)
 		}
 		msg.Parts = append(msg.Parts, task.Part{
 			Kind:           task.PartToolCall,
@@ -185,7 +193,7 @@ func (a *Adapter) response(text string, calls []json.RawMessage, finish string, 
 		})
 	}
 	if len(msg.Parts) == 0 && finish != "length" {
-		return model.Response{}, errors.New("openai: response has neither text nor tool calls")
+		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls"}
 	}
 	return model.Response{Message: msg, FinishReason: finish, Usage: u}, nil
 }
