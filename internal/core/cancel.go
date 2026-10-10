@@ -284,7 +284,7 @@ func (e *Env) cancelInstead(ctx context.Context, t *task.TCB, c mem.CommitSet) {
 		switch {
 		case unsent && !logged(r.CallID):
 			r.Status, r.Attempt, r.Key, r.Result = mem.CallCancelled, 0, "", nil
-		case r.Status == mem.CallDispatched:
+		case r.Status == mem.CallDispatched || r.Status == mem.CallPlanned:
 			continue // settled by cancelSet from the log
 		}
 		f.Calls = append(f.Calls, r)
