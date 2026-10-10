@@ -15,6 +15,7 @@ import (
 	"github.com/liliang-cn/neumann"
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/bus/builtin"
+	"github.com/liliang-cn/neumann/limit"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/mem/sqlite"
 	"github.com/liliang-cn/neumann/model"
@@ -69,6 +70,9 @@ type world struct {
 
 	deadline  time.Time    // the task's, if it has one
 	afterDead atomic.Int32 // device calls that started once the deadline had passed
+
+	flaky bool         // the machines meter their calls through a limiter, and time runs
+	fails atomic.Int32 // model calls after the tool round so far (flakyModel)
 }
 
 func (w *world) setStore(s mem.Store) {
@@ -166,6 +170,7 @@ type crashScenario struct {
 	deadline time.Duration // from the world clock's start; 0 = none
 	ends     map[task.State]string
 	maxPays  int32
+	flaky    bool // time runs, and calls go through a limiter
 }
 
 func fixed(fn modelFn) func(*world) modelFn { return func(*world) modelFn { return fn } }
@@ -203,7 +208,50 @@ var (
 	// re-sendable, and must not send it.
 	expireScenario = crashScenario{name: "expire", model: fixed(lookThenPay("dev_xlook")), deadline: 30 * time.Minute,
 		ends: map[task.State]string{task.Failed: "deadline"}}
+	// After the payment, the provider fails once transiently and then rate
+	// limits the task: two backoffs, a limiter pause and two wake-ups, each a
+	// commit point.
+	flakyScenario = crashScenario{name: "flaky", model: flakyModel, flaky: true, maxPays: 1,
+		ends: map[task.State]string{task.Done: "end_turn"}}
 )
+
+// flakyModel pays, then fails transiently, then is rate limited, then
+// answers. The failures are counted in the world, so a restart does not
+// repeat the ones already seen.
+func flakyModel(w *world) modelFn {
+	return func(req model.Request) (model.Response, error) {
+		if sim.ToolRounds(req) == 0 {
+			return sim.CallTools("dev_pay", "dev_look"), nil
+		}
+		switch w.fails.Add(1) {
+		case 1:
+			return model.Response{}, sim.Transient()
+		case 2:
+			return model.Response{}, sim.RateLimited(time.Second)
+		}
+		return sim.Reply("done"), nil
+	}
+}
+
+// tick moves the world's clock a second every millisecond, so backoffs and
+// limiter pauses run out, until stop is called.
+func (w *world) tick() (stop func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(time.Millisecond):
+				w.clock.Advance(time.Second)
+			}
+		}
+	}()
+	return func() { close(done); wg.Wait() }
+}
 
 func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Machine {
 	t.Helper()
@@ -211,10 +259,16 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 		fn = payModel
 	}
 	w.setStore(store)
-	m, err := neumann.New(neumann.Config{
+	cfg := neumann.Config{
 		Model: &sim.Model{Fn: fn}, Store: store, Devices: w.devices(), Cores: 2, Clock: w.clock,
 		SteerFormat: func(s string) string { return s }, Logf: func(string, ...any) {},
-	})
+		BackoffJitter: func(d time.Duration) time.Duration { return d },
+	}
+	if w.flaky {
+		cfg.Limiters = []limit.Config{{Name: "gw", Limits: map[string]limit.Rate{"requests": {Per: time.Minute, Limit: 100}}}}
+		cfg.Limits = []string{"gw"}
+	}
+	m, err := neumann.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,10 +304,11 @@ func stop(t *testing.T, m *neumann.Machine) {
 
 // crashRun is what one run of the sweep saw.
 type crashRun struct {
-	commits   int64 // made by the first machine
-	resolved  bool  // the second machine needed an operator
-	recovered bool  // the second machine finished a cancel the first one committed
-	unsent    bool  // a read-only call it may have re-sent was not, and is unknown
+	commits   int64    // made by the first machine
+	resolved  bool     // the second machine needed an operator
+	recovered bool     // the second machine finished a cancel the first one committed
+	unsent    bool     // a read-only call it may have re-sent was not, and is unknown
+	retries   []string // the classes of the model_retry events, in order
 }
 
 // runAndCrash runs sc on a machine that dies after n commits (after: right
@@ -262,6 +317,10 @@ type crashRun struct {
 func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crashRun) {
 	path := filepath.Join(t.TempDir(), "neumann.db")
 	w := newWorld()
+	if sc.flaky {
+		w.flaky = true
+		defer w.tick()()
+	}
 
 	s1, err := sqlite.Open(path)
 	if err != nil {
@@ -351,8 +410,8 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	if reason, ok := sc.ends[got.State]; !ok || reason != got.StopReason {
 		t.Fatalf("crash after %d commits (after=%v): task ended %s %q", n, after, got.State, got.StopReason)
 	}
-	if got.State == task.Done && got.LastAnswer() != "done" {
-		t.Fatalf("crash after %d commits: answer %q", n, got.LastAnswer())
+	if got.State == task.Done && (got.LastAnswer() != "done" || got.Retries != 0) {
+		t.Fatalf("crash after %d commits: answer %q, retries %d", n, got.LastAnswer(), got.Retries)
 	}
 	if p := w.pays.Load(); p > sc.maxPays {
 		t.Fatalf("crash after %d commits (after=%v): the payment ran %d times", n, after, p)
@@ -382,6 +441,16 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	w.mu.Unlock()
 	checkEventsHaveState(t, s2, id)
+	all, _ := s2.Events(bg, 0, 0)
+	for _, ev := range all {
+		if ev.Kind == proto.EvModelRetry {
+			var d struct {
+				Class string `json:"class"`
+			}
+			json.Unmarshal(ev.Data, &d)
+			run.retries = append(run.retries, d.Class)
+		}
+	}
 	return run
 }
 
@@ -466,6 +535,9 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 	clean := runAndCrash(t, sc, 1<<30, false) // a clean run: how many commits there are
 	if clean.commits < 3 {
 		t.Fatalf("a clean run made only %d commits", clean.commits)
+	}
+	if sc.flaky && strings.Join(clean.retries, ",") != "transient,rate_limited" {
+		t.Fatalf("the clean run retried %v", clean.retries)
 	}
 	var mu sync.Mutex
 	for _, after := range []bool{false, true} {
@@ -567,6 +639,17 @@ func TestCrashAtEveryCommitPointWithACancelInTheGap(t *testing.T) {
 			t.Logf("%d crash points; recovery finished the cancel at %d of them", points, recovered)
 		})
 	}
+}
+
+// The same sweep with the model failing transiently and then rate limited
+// after the payment: a crash at every commit of the backoffs and wake-ups,
+// before and after it lands, still finishes the task once, paying once.
+func TestCrashAtEveryCommitPointWithModelFailures(t *testing.T) {
+	points, held, _ := sweep(t, flakyScenario)
+	if held == 0 {
+		t.Fatal("no crash point left the payment's outcome unknown")
+	}
+	t.Logf("%d crash points; the operator was needed at %d of them", points, held)
 }
 
 // The same sweep with the deadline passing inside a read-only call, so that
