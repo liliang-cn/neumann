@@ -42,8 +42,8 @@ A change that touches `internal/core`, `internal/sched`, `internal/group`,
    go test -race -count=20 -timeout 60m ./internal/... .
    ```
 
-   Add the packages you touched (for example `./mem/...`). It takes about ten
-   minutes, longer than `go test`'s default 10m timeout, hence `-timeout`.
+   Add the packages you touched (for example `./mem/...`). It can take ten
+   minutes or more, past `go test`'s default 10m timeout, hence `-timeout`.
    Green once is not enough: the interleavings that matter are rare.
 2. **An independent review** by someone who did not write the change, with
    the invariants it must keep listed for the reviewer (design §4, §8, §18).
