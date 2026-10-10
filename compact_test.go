@@ -638,3 +638,27 @@ func TestSteerDuringCompactionReachesTheNextStep(t *testing.T) {
 		t.Fatalf("compacted at event %d, steer at history %d", compacted, applied)
 	}
 }
+
+// A group's compaction settings: shares of the window, the kept share below
+// the threshold (else every step would compact again).
+func TestCompactionSettingsAreValidated(t *testing.T) {
+	a := &adapter{name: "a", fn: reply("a")}
+	for name, g := range map[string]neumann.GroupConfig{
+		"negative at":   {CompactAt: -0.1},
+		"at above one":  {CompactAt: 1.5},
+		"negative keep": {CompactKeep: -0.1},
+		"keep at at":    {CompactAt: 0.5, CompactKeep: 0.5},
+		"keep above":    {CompactKeep: 0.9},
+	} {
+		g.Class, g.Model = "x", a
+		if _, err := neumann.New(neumann.Config{Groups: []neumann.GroupConfig{g}}); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	for _, g := range []neumann.GroupConfig{{CompactAt: 1, CompactKeep: 0.9}, {CompactKeep: 0.5}, {CompactAt: 0.4}} {
+		g.Class, g.Model = "x", a
+		if _, err := neumann.New(neumann.Config{Groups: []neumann.GroupConfig{g}}); err != nil {
+			t.Errorf("%+v: %v", g, err)
+		}
+	}
+}
