@@ -61,6 +61,7 @@ type Sched struct {
 	ctl        map[string]*control
 	onDeadline func(id string)
 	onWake     func(id string)
+	onReady    func(class string)
 }
 
 // control is what reaches a task whoever owns it: its context, whether it has
@@ -128,6 +129,16 @@ func (s *Sched) OnWake(f func(id string)) {
 	s.onWake = f
 }
 
+// OnReady sets what runs after a task joins a class's ready queue: the
+// machine grows that class's vCores there (design §6.1). f runs on the
+// goroutine that queued the task, holds no lock and owns nothing; it must not
+// block. Set it before the first Add.
+func (s *Sched) OnReady(f func(class string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onReady = f
+}
+
 // AfterFunc runs f after d on the scheduler's clock: on its timers when it
 // has them, real ones otherwise. stop cancels it.
 func (s *Sched) AfterFunc(d time.Duration, f func()) (stop func() bool) {
@@ -150,6 +161,19 @@ func (s *Sched) Add(t *task.TCB) bool { return s.Requeue(t) }
 // it as terminal) or Forget it. Deciding this under the lock that Cancel takes
 // means a cancel is never lost between the holder's commit and its hand-back.
 func (s *Sched) Requeue(t *task.TCB) bool {
+	ok, ready, class := s.requeue(t)
+	if ready {
+		s.mu.Lock()
+		f := s.onReady
+		s.mu.Unlock()
+		if f != nil {
+			f(class)
+		}
+	}
+	return ok
+}
+
+func (s *Sched) requeue(t *task.TCB) (ok, ready bool, class string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, dup := s.loc[t.ID]; dup {
@@ -158,12 +182,13 @@ func (s *Sched) Requeue(t *task.TCB) bool {
 	c := s.controlLocked(t.ID)
 	if c.cancelled && !t.State.Terminal() {
 		s.out[t.ID] = true
-		return false
+		return false, false, ""
 	}
 	switch t.State {
 	case task.Ready:
 		s.ready[t.Class] = append(s.ready[t.Class], t)
 		s.loc[t.ID] = inReady
+		ready, class = true, t.Class
 	case task.Waiting, task.Suspended:
 		// Cancel takes a task in backoff like any other wait that no batch
 		// will come back for, and stops its wake-up timer.
@@ -183,7 +208,7 @@ func (s *Sched) Requeue(t *task.TCB) bool {
 	}
 	delete(s.out, t.ID)
 	s.cond.Broadcast()
-	return true
+	return true, ready, class
 }
 
 func (s *Sched) controlLocked(id string) *control {
@@ -337,23 +362,53 @@ func (s *Sched) Cancel(id string) (*task.TCB, bool) {
 // Next blocks until a task of class is ready and hands it to the caller. It
 // returns false once the scheduler is closed or ctx ends.
 func (s *Sched) Next(ctx context.Context, class string) (*task.TCB, bool) {
+	t, ok, _ := s.NextIdle(ctx, class, 0)
+	return t, ok
+}
+
+// NextIdle is Next for an elastic vCore: it also gives up when no task of
+// class has come for idle on the scheduler's clock (idle <= 0: never), and
+// then reports idle true, so the vCore can ask whether it should retire
+// (design §6.1). A task that is ready when the wait ends is always taken
+// first.
+func (s *Sched) NextIdle(ctx context.Context, class string, idle time.Duration) (t *task.TCB, ok, timedOut bool) {
 	stop := context.AfterFunc(ctx, func() {
 		s.mu.Lock()
 		s.cond.Broadcast()
 		s.mu.Unlock()
 	})
 	defer stop()
+	fired := false // guarded by s.mu
+	if idle > 0 {
+		stopTimer := s.AfterFunc(idle, func() {
+			s.mu.Lock()
+			fired = true
+			s.cond.Broadcast()
+			s.mu.Unlock()
+		})
+		defer stopTimer() // after s.mu is released: the timer takes it
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
 		if s.closed || ctx.Err() != nil {
-			return nil, false
+			return nil, false, false
 		}
 		if t := s.pickLocked(class); t != nil {
-			return t, true
+			return t, true, false
+		}
+		if fired {
+			return nil, false, true
 		}
 		s.cond.Wait()
 	}
+}
+
+// ReadyLen is how many tasks of class are in its ready queue.
+func (s *Sched) ReadyLen(class string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.ready[class])
 }
 
 func (s *Sched) pickLocked(class string) *task.TCB {
@@ -415,6 +470,40 @@ func (s *Sched) CheckoutIf(id string, ok func(*task.TCB) bool) (*task.TCB, bool)
 	delete(s.loc, id)
 	s.out[id] = true
 	s.disarmWakeLocked(s.ctl[id])
+	return t, true
+}
+
+// Take is CheckoutIf that also looks in the ready queues: an operator moving
+// a task to another class (SetClass) may take it from either, but never from
+// a vCore or a tool batch, which hold it out of both.
+func (s *Sched) Take(id string, ok func(*task.TCB) bool) (*task.TCB, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var t *task.TCB
+	switch s.loc[id] {
+	case inWaiting:
+		if t = s.waiting[id]; !ok(t) {
+			return nil, false
+		}
+		delete(s.waiting, id)
+		s.disarmWakeLocked(s.ctl[id])
+	case inReady:
+		for class, q := range s.ready {
+			i := slices.IndexFunc(q, func(t *task.TCB) bool { return t.ID == id })
+			if i < 0 {
+				continue
+			}
+			if t = q[i]; !ok(t) {
+				return nil, false
+			}
+			s.ready[class] = slices.Delete(q, i, i+1)
+			break
+		}
+	default:
+		return nil, false
+	}
+	delete(s.loc, id)
+	s.out[id] = true
 	return t, true
 }
 
@@ -483,4 +572,45 @@ func (s *Sched) Counts() (ready, waiting, held int) {
 		ready += len(q)
 	}
 	return ready, len(s.waiting), len(s.out)
+}
+
+// Queue is one class's share of the scheduler (design §9.1, §14).
+type Queue struct {
+	Ready      int       // in the ready queue
+	Background int       // ...of which background priority
+	Oldest     time.Time // the earliest ReadySince in the ready queue; zero when it is empty
+	Waiting    int       // in the wait set, for any reason
+	ForGroup   int       // ...of which waiting for their group (Waiting(Group))
+}
+
+// Queues reports every class that has a task ready or waiting.
+func (s *Sched) Queues() map[string]Queue {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]Queue{}
+	for class, q := range s.ready {
+		if len(q) == 0 {
+			continue
+		}
+		c := out[class]
+		for _, t := range q {
+			c.Ready++
+			if t.Priority > 0 {
+				c.Background++
+			}
+			if c.Oldest.IsZero() || t.ReadySince.Before(c.Oldest) {
+				c.Oldest = t.ReadySince
+			}
+		}
+		out[class] = c
+	}
+	for _, t := range s.waiting {
+		c := out[t.Class]
+		c.Waiting++
+		if t.State == task.Waiting && t.Wait == task.WaitGroup {
+			c.ForGroup++
+		}
+		out[t.Class] = c
+	}
+	return out
 }
