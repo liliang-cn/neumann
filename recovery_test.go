@@ -257,3 +257,26 @@ func TestStopHonoursItsDeadlineWithASubmitInFlight(t *testing.T) {
 		t.Fatalf("Stop took %v with a 100ms deadline", d)
 	}
 }
+
+func TestNothingIsAcceptedBeforeStart(t *testing.T) {
+	m, err := neumann.New(neumann.Config{Model: &sim.Model{Fn: payModel}, Store: mem.NewMemory(), Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x"}); !errors.Is(err, neumann.ErrNotStarted) {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := m.Steer(bg, "t1", "x"); !errors.Is(err, neumann.ErrNotStarted) {
+		t.Fatalf("steer: %v", err)
+	}
+	if err := m.Resolve(bg, "t1", "c-1", neumann.Outcome{Result: "x"}); !errors.Is(err, neumann.ErrNotStarted) {
+		t.Fatalf("resolve: %v", err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	defer stop(t, m)
+	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x"}); err != nil {
+		t.Fatalf("submit after start: %v", err)
+	}
+}

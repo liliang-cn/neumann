@@ -263,3 +263,103 @@ func TestBudgetCountsUnconfirmedRequests(t *testing.T) {
 		t.Fatalf("task %+v, model calls %d", got, sm.Calls())
 	}
 }
+
+func TestRoundIsOnlyTheLastTurn(t *testing.T) {
+	call := func(id string) task.Part { return task.Part{Kind: task.PartToolCall, CallID: id, Name: "dev_read"} }
+	tc := &task.TCB{ID: "t1", Regs: []task.Message{
+		task.Text(task.RoleUser, "q"),
+		{Role: task.RoleAssistant, Parts: []task.Part{call("c-1")}},
+		{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: "r"}}},
+		{Role: task.RoleAssistant, Parts: []task.Part{call("c-3"), call("c-2")}},
+	}}
+	recs := []mem.CallRecord{
+		{CallID: "c-1", Index: 1, Status: mem.CallDone},
+		{CallID: "c-3", Index: 3, Status: mem.CallPlanned},
+		{CallID: "c-2", Index: 2, Status: mem.CallDispatched},
+	}
+	rs := round(tc, recs)
+	if len(rs) != 2 || rs[0].CallID != "c-2" || rs[1].CallID != "c-3" {
+		t.Fatalf("round %+v", rs)
+	}
+	tc.Regs = tc.Regs[:3] // the last round is answered
+	if rs := round(tc, recs); rs != nil {
+		t.Fatalf("an answered round is not current: %+v", rs)
+	}
+}
+
+func TestRecoverRefusesACallLogItCannotSettle(t *testing.T) {
+	for name, rec := range map[string]mem.CallRecord{
+		"done without a result": {Tool: "dev_read", Status: mem.CallDone, Attempt: 1, Effect: task.ReadOnly},
+		"foreign status":        {Tool: "dev_read", Status: mem.CallStatus("cancelled"), Attempt: 1, Effect: task.ReadOnly},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var runs atomic.Int32
+			e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
+			crashSite(t, store, rec)
+			before := load(t, store)
+			batch, err := e.Recover(bg, before)
+			if err == nil || !strings.Contains(err.Error(), "t1") || batch != nil {
+				t.Fatalf("batch %v err %v", batch, err)
+			}
+			if got := load(t, store); got.Version != before.Version || got.State != task.Waiting || runs.Load() != 0 {
+				t.Fatalf("a refused recovery changed the task: %+v (runs %d)", got, runs.Load())
+			}
+		})
+	}
+}
+
+func TestHeldCallIsAnnouncedAgainOnTheNextRestart(t *testing.T) {
+	var runs atomic.Int32
+	e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
+	crashSite(t, store, mem.CallRecord{Tool: "dev_pay", Args: json.RawMessage(`{"amount":5}`), Status: mem.CallDispatched, Attempt: 1, Effect: task.SideEffect, Device: "dev"})
+	if _, err := e.Recover(bg, load(t, store)); err != nil {
+		t.Fatal(err)
+	}
+	held := load(t, store)
+	batch, err := e.Recover(bg, held) // the machine restarts again before anyone resolved it
+	if err != nil || batch != nil {
+		t.Fatalf("batch %v err %v", batch, err)
+	}
+	if got := load(t, store); got.Version != held.Version || got.Wait != task.WaitReconcile {
+		t.Fatalf("re-announcing must not change the task: %+v", got)
+	}
+	evs, _ := store.Events(bg, 0, 0)
+	last := evs[len(evs)-1]
+	var d struct {
+		From string `json:"from"`
+		Held []struct {
+			CallID string `json:"call_id"`
+			Device string `json:"device"`
+			Key    string `json:"key"`
+		} `json:"held"`
+	}
+	if err := json.Unmarshal(last.Data, &d); err != nil {
+		t.Fatal(err)
+	}
+	if last.Kind != "recovered" || d.From != "reconcile" || len(d.Held) != 1 || d.Held[0].CallID != "c-1" || d.Held[0].Device != "dev" || d.Held[0].Key != "t1/c-1/1" {
+		t.Fatalf("event %s %s", last.Kind, last.Data)
+	}
+	if runs.Load() != 0 {
+		t.Fatal("a held call ran")
+	}
+}
+
+func TestResolveRefusesRetryWithAResult(t *testing.T) {
+	var runs atomic.Int32
+	e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
+	crashSite(t, store, mem.CallRecord{Tool: "dev_pay", Status: mem.CallDispatched, Attempt: 1, Effect: task.SideEffect})
+	tc := load(t, store)
+	if _, err := e.Recover(bg, tc); err != nil {
+		t.Fatal(err)
+	}
+	before := *tc
+	for _, o := range []Outcome{{Retry: true, Result: "paid"}, {Retry: true, IsError: true}} {
+		if batch, err := e.Resolve(bg, tc, "c-1", o); err == nil || batch != nil {
+			t.Fatalf("%+v: batch %v err %v", o, batch, err)
+		}
+	}
+	recs, _ := store.Calls(bg, "t1")
+	if tc.Version != before.Version || tc.State != before.State || recs[0].Status != mem.CallUnknown || runs.Load() != 0 {
+		t.Fatalf("a refused Resolve changed something: %+v %+v", tc, recs[0])
+	}
+}
