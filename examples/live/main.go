@@ -27,6 +27,7 @@ import (
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/mem/sqlite"
 	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/model/anthropic"
 	"github.com/liliang-cn/neumann/model/openai"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
@@ -110,7 +111,11 @@ func main() {
 	if base == "" || key == "" || modelName == "" {
 		log.Fatal("set OPENAI_BASE_URL, OPENAI_API_KEY and OPENAI_MODEL (or the LLM_ equivalents)")
 	}
-	adapter := &counting{Adapter: openai.New(base, key, modelName)}
+	var inner model.Adapter = openai.New(base, key, modelName)
+	if os.Getenv("NEUMANN_PROVIDER") == "anthropic" {
+		inner = anthropic.New(base, key, modelName)
+	}
+	adapter := &counting{Adapter: inner}
 	var store mem.Store // nil: in memory
 	if path := os.Getenv("NEUMANN_DB"); path != "" {
 		db, err := sqlite.Open(path)
