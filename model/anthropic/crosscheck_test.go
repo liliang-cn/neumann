@@ -44,6 +44,8 @@ func TestAdaptersAgreeOnNeutralFailures(t *testing.T) {
 		{502, nil, `bad gateway`},
 		{408, nil, `request timeout`},
 		{400, nil, `{"error":{"message":"timeout must be at most 600"}}`},
+		{400, nil, `{"error":{"message":"This model's maximum context length is 8192 tokens.","code":"context_length_exceeded"}}`},
+		{400, nil, `{"error":{"message":"prompt is too long: 210541 tokens > 200000 maximum"}}`},
 		{401, nil, `{"error":{"message":"bad key"}}`},
 		{404, nil, `upstream timed out looking for model`},
 	}

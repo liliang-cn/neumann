@@ -24,7 +24,9 @@ const QuotaWindow = time.Hour
 // the provider's retry hint. status 0 is an error sent inside a stream with
 // no numeric code. The status decides first: the body is read only to tell
 // quota from rate limit among 429/403/402, and overload from other 5xx — so
-// a 4xx whose text says "timeout" stays Permanent.
+// a 4xx whose text says "timeout" stays Permanent. A 4xx other than 429 (or
+// an in-stream error) whose body says the request is longer than the model's
+// context window is ContextLength (ContextTooLong).
 func Classify(status int, h http.Header, body []byte, now time.Time) (model.ErrClass, time.Duration) {
 	flat := strings.NewReplacer(" ", "", "_", "", "-", "", "\\n", "", "\n", "").Replace(strings.ToLower(string(body)))
 	headerAfter, hasHeader := RetryAfterHeader(h, now)
@@ -42,6 +44,10 @@ func Classify(status int, h http.Header, body []byte, now time.Time) (model.ErrC
 		if hint > QuotaWindow || strong || (weak && !short) {
 			return model.QuotaExhausted, hint
 		}
+	}
+
+	if (status == 0 || (status >= 400 && status < 500 && status != 429)) && ContextTooLong(flat) {
+		return model.ContextLength, hint
 	}
 
 	switch {
@@ -70,6 +76,17 @@ func Classify(status int, h http.Header, body []byte, now time.Time) (model.ErrC
 	default:
 		return model.Permanent, hint
 	}
+}
+
+// ContextTooLong reports whether a flattened error body (lower case, no
+// spaces, '_' or '-', as Classify flattens it) says the request does not fit
+// the model's context window: OpenAI's code context_length_exceeded and its
+// "maximum context length is N tokens", Anthropic's "prompt is too long" and
+// "input length and max_tokens exceed context limit". Classify asks only for
+// a 4xx other than 429, or an in-stream error: a rate limit or a 5xx that
+// happens to say these words is not a rejection of the request's size.
+func ContextTooLong(flat string) bool {
+	return ContainsAny(flat, "contextlengthexceeded", "maximumcontextlength", "promptistoolong", "exceedcontextlimit", "exceedsthecontextwindow")
 }
 
 func ContainsAny(s string, subs ...string) bool {

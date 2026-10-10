@@ -26,6 +26,10 @@ func hdr(kv ...string) http.Header {
 	return h
 }
 
+// openaiContextLength is OpenAI's rejection of a request that does not fit
+// the model's context window.
+const openaiContextLength = `{"error":{"message":"This model's maximum context length is 128000 tokens. However, your messages resulted in 130512 tokens. Please reduce the length of the messages.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}`
+
 const openaiBilling = `{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}`
 
 // cpaCoolingDown was observed live on a CLIProxyAPI gateway: the outer type
@@ -84,6 +88,9 @@ func TestAdapterClassifiesStatusErrors(t *testing.T) {
 		{429, nil, `{"error":{"message":"busy"}}`, model.Overload, 0},
 		{502, nil, `bad gateway`, model.Transient, 0},
 		{400, nil, `{"error":{"message":"timeout too large"}}`, model.Permanent, 0},
+		{400, nil, openaiContextLength, model.ContextLength, 0},
+		{400, nil, `{"error":{"message":"This model's maximum context length is 8192 tokens. However, your messages resulted in 9001 tokens."}}`, model.ContextLength, 0},
+		{413, nil, `{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}`, model.ContextLength, 0},
 	}
 	for _, c := range cases {
 		ts := statusServer(t, c.status, c.h, c.body)

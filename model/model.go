@@ -149,9 +149,16 @@ const (
 	// Canceled: the caller's context was cancelled or reached its deadline.
 	// Never retried.
 	Canceled
+	// ContextLength: the provider rejected the request because it does not
+	// fit the model's context window (OpenAI's context_length_exceeded,
+	// Anthropic's "prompt is too long"). Sending it again as it is would be
+	// rejected again, so it is not retried: the machine compacts the task's
+	// context (design §5.3) and sends the smaller request. The group sees an
+	// answer, as for Permanent.
+	ContextLength
 )
 
-var errClassNames = [...]string{"unknown", "rate_limited", "quota_exhausted", "overload", "transient", "permanent", "canceled"}
+var errClassNames = [...]string{"unknown", "rate_limited", "quota_exhausted", "overload", "transient", "permanent", "canceled", "context_length"}
 
 func (c ErrClass) String() string {
 	if c >= 0 && int(c) < len(errClassNames) {

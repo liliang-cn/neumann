@@ -22,6 +22,7 @@ func TestErrClassString(t *testing.T) {
 		Transient:      "transient",
 		Permanent:      "permanent",
 		Canceled:       "canceled",
+		ContextLength:  "context_length",
 		ErrClass(99):   "ErrClass(99)",
 	}
 	for c, s := range want {
@@ -34,7 +35,7 @@ func TestErrClassString(t *testing.T) {
 			t.Errorf("%s must be retryable", c)
 		}
 	}
-	for _, c := range []ErrClass{Unknown, QuotaExhausted, Permanent, Canceled} {
+	for _, c := range []ErrClass{Unknown, QuotaExhausted, Permanent, Canceled, ContextLength} {
 		if c.Retryable() {
 			t.Errorf("%s must not be retryable", c)
 		}

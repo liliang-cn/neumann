@@ -49,6 +49,9 @@ func (a *Adapter) redact(s string) string {
 // classify is the shared classifier (httperr.Classify) plus what Anthropic
 // says in its error body, {"type":"error","error":{"type":...}}:
 //
+//   - The shared quota and context-length rules come first: "prompt is too
+//     long" and "input length and max_tokens exceed context limit", sent as
+//     invalid_request_error, are ContextLength, not Permanent.
 //   - The shared quota rules come first, so a gateway that answers
 //     rate_limit_error for a quota that resets in five days (CLIProxyAPI)
 //     is QuotaExhausted, and so is a wait longer than httperr.QuotaWindow.
@@ -66,7 +69,7 @@ func (a *Adapter) redact(s string) string {
 // status 0 is an error event inside a stream.
 func classify(status int, h http.Header, body []byte, now time.Time) (model.ErrClass, time.Duration) {
 	class, hint := httperr.Classify(status, h, body, now)
-	if class == model.QuotaExhausted || status == 529 {
+	if class == model.QuotaExhausted || class == model.ContextLength || status == 529 {
 		return class, hint
 	}
 	typ, msg := errorType(body)
