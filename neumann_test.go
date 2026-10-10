@@ -334,7 +334,17 @@ func TestStopDrainsInFlightToolBatch(t *testing.T) {
 		}
 		sawResult <- false
 	}()
-	go func() { time.Sleep(100 * time.Millisecond); release() }()
+	go func() {
+		// Release the tool only once Stop has marked the machine stopped.
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if errors.Is(m.Steer(bg, "nope", "x"), neumann.ErrStopped) {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		release()
+	}()
 	if err := m.Stop(ctx); err != nil {
 		t.Fatalf("stop: %v", err)
 	}

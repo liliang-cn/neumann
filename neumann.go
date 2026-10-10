@@ -192,7 +192,9 @@ func (m *Machine) Start(ctx context.Context) error {
 // calls are cancelled and their results are not committed; those tasks keep
 // their last committed state) and waits at most 2s more. In every case it
 // then closes the event hub and the devices. It returns ctx.Err() when the
-// deadline was hit and is idempotent: later calls return nil.
+// deadline was hit and is idempotent: later calls return nil. A model adapter
+// or device that ignores its context can outlive Stop, but whatever it
+// returns after the halt is not committed.
 func (m *Machine) Stop(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
@@ -214,12 +216,20 @@ func (m *Machine) Stop(ctx context.Context) error {
 		}()
 		select {
 		case <-done:
-		case <-ctx.Done():
-			err = ctx.Err()
-			m.haltCancel()
+		default:
 			select {
 			case <-done:
-			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				select {
+				case <-done: // drained as the deadline hit: still a clean stop
+				default:
+					err = ctx.Err()
+					m.haltCancel()
+					select {
+					case <-done:
+					case <-time.After(2 * time.Second):
+					}
+				}
 			}
 		}
 		m.cancel()
@@ -298,10 +308,10 @@ func (m *Machine) Steer(ctx context.Context, taskID, text string) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("neumann: steer needs text")
 	}
+	// Held across the commit, as in Submit, so no steer commits after Stop.
 	m.admit.Lock()
-	stopped := m.stopped
-	m.admit.Unlock()
-	if stopped {
+	defer m.admit.Unlock()
+	if m.stopped {
 		return ErrStopped
 	}
 	_, err := m.store.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{
