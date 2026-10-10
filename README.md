@@ -28,8 +28,8 @@ before v1.
   output-per-minute limiters that several groups can share, calibrated from the
   provider's rate-limit headers.
 - **Cancellation and deadlines that always work.** A cancel or a deadline
-  reaches a task in any state, interrupts its model call at once, and is
-  committed before the call returns.
+  reaches a task in any state and interrupts its model call at once;
+  `Cancel` returns once the cancel is committed, and it holds across a crash.
 - **A replayable event log.** Everything that happens is an event with a
   global sequence number. A client that reconnects with the last number it
   saw gets exactly what it missed.
@@ -40,8 +40,9 @@ before v1.
 
 neumann is a runtime, not a prompt framework. It does not write prompts, plan,
 chain, or evaluate. Version 0.1 has no long-term memory or RAG, no sub-agents,
-no teams or orchestration layer, no multimodal input and no HTTP server (there
-is an in-process Go API and a stdio JSON Lines frontend). If you need one agent
+no teams or orchestration layer, no multimodal input and no HTTP API for
+submitting work (there is an in-process Go API and a stdio JSON Lines
+frontend). If you need one agent
 answering one request in a script, a plain loop around a model SDK is simpler.
 
 ## Quick start (offline, no API key)
