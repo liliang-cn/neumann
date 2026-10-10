@@ -6,6 +6,7 @@
 //	OPENAI_BASE_URL=https://host/v1 OPENAI_API_KEY=... OPENAI_MODEL=... go run ./examples/live
 //
 // LLM_BASE_URL / LLM_API_KEY / LLM_MODEL are used when the OPENAI_ ones are unset.
+// NEUMANN_DB=path keeps the machine's state in SQLite instead of memory.
 package main
 
 import (
@@ -24,6 +25,7 @@ import (
 	"github.com/liliang-cn/neumann/bus"
 	"github.com/liliang-cn/neumann/bus/builtin"
 	"github.com/liliang-cn/neumann/mem"
+	"github.com/liliang-cn/neumann/mem/sqlite"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/model/openai"
 	"github.com/liliang-cn/neumann/proto"
@@ -109,7 +111,17 @@ func main() {
 		log.Fatal("set OPENAI_BASE_URL, OPENAI_API_KEY and OPENAI_MODEL (or the LLM_ equivalents)")
 	}
 	adapter := &counting{Adapter: openai.New(base, key, modelName)}
+	var store mem.Store // nil: in memory
+	if path := os.Getenv("NEUMANN_DB"); path != "" {
+		db, err := sqlite.Open(path)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer db.Close()
+		store = db
+	}
 	m, err := neumann.New(neumann.Config{
+		Store:   store,
 		Model:   adapter,
 		Devices: devices(),
 		Cores:   cores(),

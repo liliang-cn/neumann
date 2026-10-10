@@ -150,6 +150,8 @@ type Store interface {
 3. **状态、调用记录、中断、事件在同一个事务里。** 客户端看到的任何事件，重启后都能在状态里找到对应的结果。
 4. 写入者单线程，组提交：5 毫秒内（或满 64 个）到达的 `CommitSet` 合成一个事务；每个调用方在自己所属的批次提交后才返回。
 
+两个实现：`mem.Memory`（不持久，测试用）和 `mem/sqlite`（纯 Go 驱动 `modernc.org/sqlite`，WAL，`synchronous=FULL`）。两者都必须通过 `mem/storetest` 一致性套件，它把语义钉死在同一组用例上，包括每个字段的完整往返。SQLite 版：TCB 和调用记录用 gob 编码（模型可能给出不是合法 JSON 的工具参数，要逐字节保存）；单写入者，正在写一个事务时到达的提交排队进下一个事务（组提交，不加等待窗口）；每个提交集一个 savepoint，校验失败只回滚它自己。
+
 ### 4.2 调用记录：工具的预写日志
 
 ```go
@@ -183,10 +185,12 @@ type CallRecord struct {
 |---|---|
 | `planned` | 从未离开进程，正常派发 |
 | `dispatched`，`Effect` 为 `ReadOnly` 或 `Idempotent` | 用同一个 `Key` 重新派发（`Attempt` 不变） |
-| `dispatched`，`Effect` 为 `SideEffect` | 状态改为 `unknown`，任务转 `Waiting(Reconcile)`，发 `reconcile_needed` 事件。不自动重试，也不假装失败 |
+| `dispatched`，`Effect` 为 `SideEffect` | 状态改为 `unknown`。工具声明了 `ReportUnknown` 的，把"结果未知"作为错误结果交给模型；否则任务转 `Waiting(Reconcile)`，发 `reconcile_needed` 事件（带调用 id、工具、参数、幂等键）。不自动重试，也不假装失败。同一轮里只要有一个调用在等核对，这一轮什么都不发 |
 | `done` | 已有结果，不再执行 |
 
-`Waiting(Reconcile)` 的任务由操作员用 `resolve` 指令处理（第 12 节）：给出实际结果、判定失败，或要求重试。也可以对某个设备配置 `OnUnknown: ReportToModel`，把"调用已发出、进程在收到结果前重启，结果未知"作为结果交给模型，由模型用只读工具核实。默认是等待人工核对。
+`Waiting(Reconcile)` 的任务由操作员用 `m.Resolve(ctx, taskID, callID, Outcome)` 处理：给出实际结果（`Result`，失败时 `IsError`），或要求重试（`Retry`：新的一次尝试、新的幂等键）。所有等核对的调用都处理完，这一轮就按上表重新结算。`ReportUnknown` 按工具声明（`ToolDef.ReportUnknown`），默认是等待人工核对。
+
+调用记录在规划时就记下 `Device`、`Effect` 和 `ReportUnknown`：恢复按当时的声明判断，不去问重启后的总线。`Effect` 按名字存储，不依赖常量顺序。重启时被打断的一轮，tool 消息从调用记录组装（已完成的结果加上重发得到的结果）。
 
 保证范围：**每个调用恰好一个结果**；`ReadOnly` / `Idempotent` 的调用可能执行多于一次；`SideEffect` 的调用在没有人工核对的情况下**最多自动派发一次**。外部副作用恰好一次需要设备自己利用 `Key` 去重，neumann 不承诺。
 
@@ -220,7 +224,7 @@ type CallRecord struct {
 ### 4.5 重启
 
 1. 加载所有未结束的 TCB、它们的调用记录和未送达的中断。
-2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`）。
+2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`）。`Running` 在模型调用之前提交，含义是"请求可能已经发出"：提交之后、调用之前被停机打断时，会多算一次未确认。这一步要送达的插话在 `Running` 提交之后才合并，崩溃不会留下"上下文里有、中断表里却还未送达"的插话。预算按 `Used.Steps + Unconfirmed` 计，反复崩溃的任务不会越过预算重发。
 3. 调用记录按 4.2 的表处理。
 4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；`Waiting(Backoff)` 按 `WakeAt` 重设定时器；所有未结束任务重设 Deadline 定时器。
 5. 每个执行组按 `Min` 启动 vCore，`W` 回到 `Initial`；限流器从空状态开始，由服务商响应头重新校准（7.3）。
@@ -575,15 +579,17 @@ err = m.Stop(ctx)                          // 停止取指，等在途指令和�
 ## 16. 包结构
 
 ```
-neumann/            Machine、Config、公开 API、操作员控制
-  core/             vCore 循环、execModel / execTools / execCompact、执行组、拥塞窗口、熔断、迁移校验
+neumann/            Machine、Config、公开 API、操作员控制（Resolve）
+  internal/core/    vCore 循环、execModel / execTools、恢复与结算、执行组、拥塞窗口、熔断、迁移校验
+  internal/sched/   就绪队列、等待集合、Deadline 与退避定时器（internal：外部代码不能绕过所有权规则）
   limit/            限流器
-  sched/            就绪队列、等待集合、Deadline 与退避定时器、准入、取消
   task/             TCB、中立消息、寄存器组装、token 估算
   bus/              Bus、仲裁、设备队列、页表
     builtin/  mcp/  skills/
   cache/            L2
-  mem/              Store 接口、memory 实现、sqlite 实现（组提交）、Disk 接口
+  mem/              Store 接口、memory 实现、Disk 接口
+    sqlite/         SQLite 实现（组提交）
+    storetest/      每个 Store 都要通过的一致性套件
   model/            Adapter 接口、错误分类
     openai/  anthropic/
   proto/            Instruction、Event、JSON Lines 编解码
@@ -597,15 +603,8 @@ neumann/            Machine、Config、公开 API、操作员控制
 
 1. **固定并发 + 状态机**：一个执行组、固定 vCore 数、内存版 Store；TCB 状态机、就绪队列、等待集合、工具异步派发、中断表、插话。
 2. **原子持久化与工具恢复**：SQLite Store、`Commit` 组提交、调用记录、事件表与补读、4.5 的重启流程、`Waiting(Reconcile)` 与 `resolve`。
-   第一阶段留下、这一阶段必须处理的接缝：
-   - `Running` 从未提交。强制停机打断模型调用后，库里的任务是 `Ready`；要么在调用前提交 `Running`，要么删掉 4.5 第 2 步的规则，并据此计 `Unconfirmed`。
-   - `CallRecord` 还没有 `Device` 和 `Effect`。规划调用时就要从总线记下来，不能在恢复时去问当前的总线（工具声明可能已经变了）。
-   - `Waiting(IO)` 的任务可能同时有 `done` 和 `dispatched` 记录，且没有完成提交。把 `complete` 里组装 tool 消息的部分抽成"从调用记录组装"的函数，恢复时复用。
-   - `dispatched` 的调用可能从未发出（停机发生在提交之后、派发之前）。这是预写日志固有的，`SideEffect` 调用会因此进入核对；写进运维说明。
-   - 准入计数从 0 开始。`Start` 要用 `Unfinished` 的数量初始化，否则重启后的终态提交会把它减成负数。
-   - `Submit` / `Steer` 目前在准入锁里做提交。换成 SQLite 组提交后会串行化所有提交：改成在锁里预留名额、锁外提交、失败时回滚。
-   - 单条结果提交失败时，对应的 `tool_result` 事件不会发出（完成提交会补记录，但不补事件）。
-   - 把 `core`、`sched` 移到 `internal/`，外部代码不能绕过所有权规则调用 `Requeue` / `Checkout` / `Forget`；`Config.Clock` 的类型随之移到根包。
+   第一阶段留下的 8 处接缝已全部处理：`Running` 在调用前提交；调用记录在规划时记下 `Device`、`Effect`、`ReportUnknown`；tool 消息从调用记录组装；`dispatched` 但从未发出的调用会进入核对（预写日志固有）；准入计数在 `Start` 时从未完成任务数初始化；`Submit` / `Steer` 锁内预留、锁外提交，`Stop` 带截止时间地等它们；单条结果提交失败时 `tool_result` 随完成提交补发；`core`、`sched` 已移到 `internal/`。
+   验证：`TestCrashAtEveryCommitPoint`（每个提交点注入一次崩溃，SQLite，压测 30 轮）、`TestKillNine`（真进程 SIGKILL，副作用只执行一次）。
 3. **取消、Deadline 与故障注入**：9.4、9.5；在每一个提交点前后注入崩溃。
 4. **自适应伸缩、限流器与迁移**：拥塞窗口、限流器、错误分类、熔断、迁移校验、第二个适配器。
 
