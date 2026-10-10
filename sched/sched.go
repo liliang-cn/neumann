@@ -6,6 +6,7 @@ package sched
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -18,6 +19,11 @@ type RealClock struct{}
 
 func (RealClock) Now() time.Time { return time.Now() }
 
+const (
+	inReady uint8 = iota + 1
+	inWaiting
+)
+
 const DefaultAging = 30 * time.Second
 
 type Sched struct {
@@ -28,6 +34,7 @@ type Sched struct {
 	ready   map[string][]*task.TCB
 	waiting map[string]*task.TCB
 	out     map[string]bool // held by a vCore or a tool batch
+	loc     map[string]uint8
 	closed  bool
 }
 
@@ -35,12 +42,16 @@ func New(clock Clock, aging time.Duration) *Sched {
 	if aging <= 0 {
 		aging = DefaultAging
 	}
+	if clock == nil {
+		clock = RealClock{}
+	}
 	s := &Sched{
 		clock:   clock,
 		aging:   aging,
 		ready:   map[string][]*task.TCB{},
 		waiting: map[string]*task.TCB{},
 		out:     map[string]bool{},
+		loc:     map[string]uint8{},
 	}
 	s.cond = sync.NewCond(&s.mu)
 	return s
@@ -55,13 +66,22 @@ func (s *Sched) Add(t *task.TCB) { s.Requeue(t) }
 func (s *Sched) Requeue(t *task.TCB) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.out, t.ID)
+	if _, dup := s.loc[t.ID]; dup {
+		panic(fmt.Sprintf("sched: task %s is already queued or waiting", t.ID))
+	}
 	switch t.State {
 	case task.Ready:
 		s.ready[t.Class] = append(s.ready[t.Class], t)
+		s.loc[t.ID] = inReady
 	case task.Waiting, task.Suspended:
 		s.waiting[t.ID] = t
+		s.loc[t.ID] = inWaiting
+	case task.Done, task.Failed, task.Cancelled:
+		// terminal: forgotten
+	default:
+		panic(fmt.Sprintf("sched: requeue of task %s in state %s", t.ID, t.State))
 	}
+	delete(s.out, t.ID)
 	s.cond.Broadcast()
 }
 
@@ -100,7 +120,10 @@ func (s *Sched) pickLocked(class string) *task.TCB {
 		}
 	}
 	t := q[best]
-	s.ready[class] = append(q[:best], q[best+1:]...)
+	copy(q[best:], q[best+1:])
+	q[len(q)-1] = nil
+	s.ready[class] = q[:len(q)-1]
+	delete(s.loc, t.ID)
 	s.out[t.ID] = true
 	return t
 }
@@ -132,6 +155,7 @@ func (s *Sched) Checkout(id string) (*task.TCB, bool) {
 		return nil, false
 	}
 	delete(s.waiting, id)
+	delete(s.loc, id)
 	s.out[id] = true
 	return t, true
 }

@@ -90,6 +90,7 @@ func TestNextStopsOnCancelAndClose(t *testing.T) {
 	done := make(chan bool, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _, ok := s.Next(ctx, "default"); done <- ok }()
+	time.Sleep(10 * time.Millisecond)
 	cancel()
 	select {
 	case ok := <-done:
@@ -157,4 +158,63 @@ func TestCountsAndTerminalTasksLeave(t *testing.T) {
 	if r, w, o := s.Counts(); r != 1 || w != 1 || o != 0 {
 		t.Fatalf("after done: %d/%d/%d", r, w, o)
 	}
+}
+
+func mustPanic(t *testing.T, what string, f func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("%s did not panic", what)
+		}
+	}()
+	f()
+}
+
+func TestDuplicatePlacementPanics(t *testing.T) {
+	s := sched.New(&clock{now: t0}, 30*time.Second)
+	a := tcb("a", 0, 0)
+	s.Add(a)
+	mustPanic(t, "second Add", func() { s.Add(a) })
+	r := tcb("r", 0, 0)
+	s.Add(r)
+	mustPanic(t, "ready task requeued as waiting", func() {
+		w := &task.TCB{ID: "r", State: task.Waiting, Class: "default"}
+		s.Requeue(w)
+	})
+	w := &task.TCB{ID: "w", State: task.Waiting, Class: "default"}
+	s.Requeue(w)
+	mustPanic(t, "waiting task requeued again", func() { s.Requeue(w) })
+}
+
+func TestRequeueRunningPanics(t *testing.T) {
+	s := sched.New(&clock{now: t0}, 30*time.Second)
+	mustPanic(t, "Requeue of Running", func() {
+		s.Requeue(&task.TCB{ID: "x", State: task.Running, Class: "default"})
+	})
+}
+
+func TestRequeueAfterCloseStillLands(t *testing.T) {
+	s := sched.New(&clock{now: t0}, 30*time.Second)
+	s.Close()
+	s.Requeue(tcb("a", 0, 0))
+	if r, _, _ := s.Counts(); r != 1 {
+		t.Fatalf("ready %d, want 1", r)
+	}
+	if _, ok := s.Next(context.Background(), "default"); ok {
+		t.Fatal("Next returned a task after Close")
+	}
+}
+
+func TestEqualReadySinceKeepsInsertionOrder(t *testing.T) {
+	s := sched.New(&clock{now: t0.Add(time.Second)}, 30*time.Second)
+	for _, id := range []string{"a", "b", "c", "d"} {
+		s.Add(tcb(id, 0, 0))
+	}
+	order(t, s, "a", "b", "c", "d")
+}
+
+func TestNilClockDefaultsToReal(t *testing.T) {
+	s := sched.New(nil, 0)
+	s.Add(tcb("a", 1, 0))
+	order(t, s, "a")
 }
