@@ -46,20 +46,22 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		return mem.CommitSet{}, nil, fmt.Errorf("read interrupts: %w", err)
 	}
 	c, batch, err := e.modelStep(ctx, t, core, pending)
-	return delivered(c, pending), batch, err
+	return delivered(t.ID, c, pending), batch, err
 }
 
 // delivered puts a steer_delivered event for each steer with a sender among
 // c.Applied in front of c's events, in seq order. A steer without a sender
-// is delivered silently, as before senders existed.
-func delivered(c mem.CommitSet, pending []mem.Interrupt) mem.CommitSet {
-	if len(c.Applied) == 0 || c.Task == nil {
+// is delivered silently, as before senders existed. c need not carry its
+// task yet: a step that ends in an error is committed by the run loop, which
+// sets it (fail) and keeps Applied and these events.
+func delivered(id string, c mem.CommitSet, pending []mem.Interrupt) mem.CommitSet {
+	if len(c.Applied) == 0 {
 		return c
 	}
 	var evs []proto.Event
 	for _, in := range pending {
 		if in.Kind == mem.InterruptSteer && in.From != "" && slices.Contains(c.Applied, in.Seq) {
-			evs = append(evs, proto.NewEvent(proto.EvSteerDelivered, c.Task.ID, map[string]any{"seq": in.Seq, "from": in.From}))
+			evs = append(evs, proto.NewEvent(proto.EvSteerDelivered, id, map[string]any{"seq": in.Seq, "from": in.From}))
 		}
 	}
 	if len(evs) > 0 {
