@@ -3,8 +3,10 @@ package tasks_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +33,7 @@ type world struct {
 	store   *mem.Memory
 	entered chan string // the task ids that reached gate_hold
 	release func()
+	calls   atomic.Int32 // numbers the calls made with call
 }
 
 func newWorld(t *testing.T, cfg neumann.Config, opts ...tasks.Option) *world {
@@ -48,7 +51,9 @@ func newWorld(t *testing.T, cfg neumann.Config, opts ...tasks.Option) *world {
 			return "", ctx.Err()
 		}
 	})
-	cfg.Model = &sim.Model{Fn: script}
+	if len(cfg.Groups) == 0 {
+		cfg.Model = &sim.Model{Fn: script}
+	}
 	cfg.Store = w.store
 	cfg.Devices = append(cfg.Devices, w.dev, hold)
 	cfg.SteerFormat = func(s string) string { return s }
@@ -136,12 +141,12 @@ func (w *world) done(t *testing.T, id string) *task.TCB {
 	return nil
 }
 
-// call runs one of the device's tools as task caller would, with key
-// caller/c-<n>/1.
+// call runs one of the device's tools as task caller would, as a new call
+// each time: key caller/c-<1000+n>/1.
 func (w *world) call(t *testing.T, caller, tool string, args any) task.ToolResult {
 	t.Helper()
 	b, _ := json.Marshal(args)
-	res, err := w.dev.Call(bg, bus.DeviceCall{Tool: tool, Args: b, Key: caller + "/c-99/1", Task: caller})
+	res, err := w.dev.Call(bg, bus.DeviceCall{Tool: tool, Args: b, Key: fmt.Sprintf("%s/c-%d/1", caller, 1000+w.calls.Add(1)), Task: caller})
 	if err != nil {
 		t.Fatalf("%s: %v", tool, err)
 	}
@@ -171,7 +176,7 @@ func TestSendAndList(t *testing.T) {
 	if e := list[0]; e.Class != neumann.DefaultClass || e.State != "waiting" || e.Wait != "io" || e.Title != "hold u1 then more" {
 		t.Fatalf("u1 listed as %+v", e)
 	}
-	if title := []rune(list[1].Title); len(title) != tasks.TitleLen || title[len(title)-1] != '…' || !strings.HasPrefix(long, string(title[:len(title)-1])) {
+	if title := []rune(list[1].Title); len(title) != neumann.TitleLen || title[len(title)-1] != '…' || !strings.HasPrefix(long, string(title[:len(title)-1])) {
 		t.Fatalf("u2's title %q", list[1].Title)
 	}
 
@@ -200,7 +205,7 @@ func TestSendAndList(t *testing.T) {
 	u1 := w.done(t, "u1")
 	n := 0
 	for _, msg := range u1.Regs {
-		if msg.Role == task.RoleUser && msg.TextContent() == "[message from task:c] hello" {
+		if msg.Role == task.RoleUser && msg.TextContent() == neumann.DefaultMessageFormat("task:c", "hello") {
 			n++
 		}
 	}
@@ -229,19 +234,21 @@ func TestSendIsIdempotentByKey(t *testing.T) {
 	w.submit(t, "c", "hold c")
 	w.submit(t, "u", "hold u")
 	w.held(t, 2)
+	b, _ := json.Marshal(send("u", "once"))
 	for range 3 {
-		if res := w.call(t, "c", "send", send("u", "once")); res.IsError {
-			t.Fatalf("send: %+v", res)
+		res, err := w.dev.Call(bg, bus.DeviceCall{Tool: "send", Args: b, Key: "c/c-7/1", Task: "c"})
+		if err != nil || res.IsError || res.Content != "sent to task u" {
+			t.Fatalf("send: %+v, %v", res, err)
 		}
 	}
-	if got, _ := w.store.Interrupts(bg, "u", false); len(got) != 1 || got[0].Key != "c/c-99/1" || got[0].From != "task:c" {
+	if got, _ := w.store.Interrupts(bg, "u", false); len(got) != 1 || got[0].Key != "c/c-7/1" || got[0].From != "task:c" {
 		t.Fatalf("interrupts %+v", got)
 	}
 }
 
 func TestVisibility(t *testing.T) {
 	tenant := func(id string) string { return id[:strings.IndexByte(id, '-')] }
-	w := newWorld(t, neumann.Config{}, tasks.WithVisible(func(caller, other *task.TCB) bool {
+	w := newWorld(t, neumann.Config{}, tasks.WithVisible(func(caller, other neumann.TaskInfo) bool {
 		return tenant(caller.ID) == tenant(other.ID)
 	}))
 	w.submit(t, "a-1", "hold")
@@ -313,5 +320,114 @@ func TestPageTableAndPolicyGateSending(t *testing.T) {
 	got, _ := w.store.Interrupts(bg, "target", false)
 	if len(got) != 1 || got[0].From != "task:free" {
 		t.Fatalf("target's interrupts %+v", got)
+	}
+}
+
+// Tasks see the tasks of their own class by default; All widens that.
+func TestVisibleDefaultsToTheSameClass(t *testing.T) {
+	groups := func() []neumann.GroupConfig {
+		return []neumann.GroupConfig{{Class: "red", Model: &sim.Model{Fn: script}}, {Class: "blue", Model: &sim.Model{Fn: script}}}
+	}
+	for _, c := range []struct {
+		name string
+		opts []tasks.Option
+		sees bool
+	}{{"default", nil, false}, {"all", []tasks.Option{tasks.WithVisible(tasks.All)}, true}} {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWorld(t, neumann.Config{Groups: groups()}, c.opts...)
+			w.submit(t, "r-1", "hold", proto.Instruction{Class: "red"})
+			w.submit(t, "r-2", "hold", proto.Instruction{Class: "red"})
+			w.submit(t, "b-1", "hold", proto.Instruction{Class: "blue"})
+			w.held(t, 3)
+			res := w.call(t, "r-1", "list", map[string]any{})
+			if !strings.Contains(res.Content, `"id":"r-2"`) || strings.Contains(res.Content, `"id":"b-1"`) != c.sees {
+				t.Fatalf("r-1 lists %s", res.Content)
+			}
+			res = w.call(t, "r-1", "send", send("b-1", "hi"))
+			if res.IsError == c.sees || (!c.sees && res.Content != "no task b-1") {
+				t.Fatalf("send across classes: %+v", res)
+			}
+		})
+	}
+}
+
+// A call sent again under a key that is already committed is answered as
+// the first time, before anything that changed since is looked at: the
+// receiver has finished, a Visible hides finished tasks, a lower limit.
+func TestARepeatIsAnsweredBeforeItIsChecked(t *testing.T) {
+	w := newWorld(t, neumann.Config{})
+	w.submit(t, "c", "hold c")
+	w.submit(t, "u", "hold u")
+	w.held(t, 2)
+	b, _ := json.Marshal(send("u", "a longer message"))
+	if res, err := w.dev.Call(bg, bus.DeviceCall{Tool: "send", Args: b, Key: "c/c-99/1", Task: "c"}); err != nil || res.IsError {
+		t.Fatalf("send: %+v, %v", res, err)
+	}
+	w.release()
+	w.done(t, "u")
+	strict := tasks.New("tasks", tasks.WithMaxText(4), tasks.WithMaxSends(-1),
+		tasks.WithVisible(func(_, other neumann.TaskInfo) bool { return !other.State.Terminal() }))
+	strict.Bind(w.m)
+	res, err := strict.Call(bg, bus.DeviceCall{Tool: "send", Args: b, Key: "c/c-99/1", Task: "c"})
+	if err != nil || res.IsError || res.Content != "sent to task u" {
+		t.Fatalf("the repeat: %+v, %v", res, err)
+	}
+	res, _ = strict.Call(bg, bus.DeviceCall{Tool: "send", Args: b, Key: "c/c-100/1", Task: "c"})
+	if !res.IsError {
+		t.Fatalf("a new call past the new limit: %+v", res)
+	}
+}
+
+// Two tasks that answer every message stop at their quota of sends: the
+// send past it is an error result, and the model stops.
+func TestSendsAreBoundedPerTask(t *testing.T) {
+	dev := tasks.New("tasks", tasks.WithMaxSends(3))
+	m, err := neumann.New(neumann.Config{Devices: []bus.Device{dev}, Logf: t.Logf, Model: &sim.Model{Fn: func(req model.Request) (model.Response, error) {
+		who := sim.FirstUser(req)
+		other := map[string]string{"a": "b", "b": "a"}[who]
+		last := req.Messages[len(req.Messages)-1]
+		for _, p := range last.Parts {
+			if p.Kind == task.PartToolResult && p.IsError {
+				return sim.Reply("stopped: " + p.Text), nil
+			}
+		}
+		args, _ := json.Marshal(send(other, "anything else?"))
+		return model.Response{Message: task.Message{Role: task.RoleAssistant, Parts: []task.Part{
+			{Kind: task.PartToolCall, ProviderCallID: "p", Name: "tasks_send", Args: args},
+		}}, FinishReason: "tool_calls"}, nil
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev.Bind(m)
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+		defer cancel()
+		m.Stop(ctx)
+	}()
+	w := &world{m: m}
+	for _, id := range []string{"a", "b"} {
+		if _, err := m.Submit(bg, proto.Instruction{TaskID: id, Input: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"a", "b"} {
+		w.done(t, id)
+		calls, _ := m.Calls(bg, id)
+		ok := 0
+		for _, c := range calls {
+			if c.Result != nil && !c.Result.IsError {
+				ok++
+			}
+		}
+		if ok > 3 {
+			t.Fatalf("%s sent %d messages past a quota of 3", id, ok)
+		}
+	}
+	if a, _ := m.Load(bg, "a"); !strings.Contains(a.LastAnswer(), "the limit") && !strings.Contains(a.LastAnswer(), "finished") {
+		t.Fatalf("a stopped with %q", a.LastAnswer())
 	}
 }

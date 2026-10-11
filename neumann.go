@@ -20,7 +20,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 
 	"github.com/google/uuid"
 
@@ -79,9 +78,16 @@ type Config struct {
 
 	// SteerFormat renders a steer as the user message the model sees. nil
 	// uses DefaultSteerFormat; pass an identity function to send the text as
-	// it is. A steer with a sender (SteerOptions.From) is rendered with its
-	// sender in front: SteerFormat("[message from <From>] " + text).
+	// it is. A steer with a sender (SteerOptions.From) is rendered by
+	// MessageFormat instead.
 	SteerFormat func(text string) string
+
+	// MessageFormat renders a steer with a sender (SteerOptions.From) as
+	// the user message the model sees. nil uses DefaultMessageFormat, which
+	// says the message is another sender's, not the user's, and quotes its
+	// text so that it cannot pass for the frame. A replacement must do both:
+	// such a message may come from a task that read untrusted content.
+	MessageFormat func(from, text string) string
 
 	// ToolPolicy, when set, decides every tool call before its first
 	// dispatch is committed (design §9.7): allow it, deny it, rewrite its
@@ -252,7 +258,16 @@ type Machine struct {
 	accepting bool           // set by Start once recovery is done
 	inflight  sync.WaitGroup // Submit and Steer calls admitted and still committing
 
-	keyed sync.Mutex // a keyed steer's look for its Key and its commit, together
+	// Steers with a key (SteerOptions.Key) are admitted until Stop has
+	// drained the tool batches, not only until it begins: a device's call
+	// that sends one while Stop waits for it must still land. keyedIn counts
+	// them, drained (guarded by admit) refuses them once the batches are
+	// done, and keyLocks orders the look for a key and the commit, per task.
+	keyedIn  sync.WaitGroup
+	drained  bool
+	keyLocks keyLocks
+
+	index taskIndex // id, class, state and title of every unfinished task
 
 	haltCtx    context.Context
 	haltCancel context.CancelFunc
@@ -293,6 +308,9 @@ func New(cfg Config) (*Machine, error) {
 	}
 	if cfg.SteerFormat == nil {
 		cfg.SteerFormat = DefaultSteerFormat
+	}
+	if cfg.MessageFormat == nil {
+		cfg.MessageFormat = DefaultMessageFormat
 	}
 	groups, pinned, err := groupConfigs(cfg)
 	if err != nil {
@@ -358,7 +376,7 @@ func New(cfg Config) (*Machine, error) {
 	}
 	m.env = &core.Env{
 		Store: m.store, Sched: m.sched, Bus: b, Model: m.byClass[m.defClass].Model, Clock: cfg.Clock,
-		Commit: m.commit, Logf: cfg.Logf, SteerFormat: cfg.SteerFormat, Delta: m.deltas.publish, Halt: haltCtx,
+		Commit: m.commit, Logf: cfg.Logf, SteerFormat: cfg.SteerFormat, MessageFormat: cfg.MessageFormat, Delta: m.deltas.publish, Halt: haltCtx,
 		Groups:     m.byClass,
 		MaxRetries: cfg.MaxModelRetries, BackoffBase: cfg.BackoffBase, BackoffMax: cfg.BackoffMax, Jitter: cfg.BackoffJitter,
 		Guard: m.guard,
@@ -558,6 +576,12 @@ func (m *Machine) commit(ctx context.Context, c mem.CommitSet) error {
 	for _, id := range ended {
 		m.bus.ForgetTask(id) // its L2 entries go with it (design §10)
 	}
+	if c.Task != nil {
+		m.index.put(c.Task)
+	}
+	for _, id := range ended {
+		m.index.drop(id)
+	}
 	m.hub.notify()
 	return nil
 }
@@ -666,6 +690,7 @@ func (m *Machine) Stop(ctx context.Context) error {
 			m.env.WaitCores()
 			m.env.CloseDispatch() // a late Resolve cannot start a batch while we wait
 			m.env.WaitBatches()
+			m.drainKeyed()    // steers the batches' devices sent land before the store is let go
 			m.env.CloseLate() // late results being recorded land before the store is let go
 			close(done)
 		}()
@@ -688,6 +713,8 @@ func (m *Machine) Stop(ctx context.Context) error {
 			}
 		}
 		m.cancel()
+	} else {
+		m.drainKeyed()
 	}
 	m.haltCancel()
 	m.hub.close()
@@ -703,6 +730,9 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 	}
 	if strings.TrimSpace(in.Input) == "" {
 		return "", errors.New("neumann: submit needs input")
+	}
+	if in.From != "" {
+		return "", errors.New("neumann: submit takes no from; a sender names a steer (SteerWith)")
 	}
 	if in.Priority < 0 || in.Priority > 1 {
 		return "", fmt.Errorf("neumann: priority %d out of range 0..1", in.Priority)
@@ -758,6 +788,7 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 		m.admit.Unlock()
 		return "", err
 	}
+	m.index.put(t)
 	m.sched.Add(t)
 	m.hub.notify()
 	return id, nil
@@ -849,67 +880,6 @@ func (m *Machine) Steer(ctx context.Context, taskID, text string) error {
 	return m.SteerWith(ctx, taskID, text, SteerOptions{})
 }
 
-// MaxSteerFrom bounds SteerOptions.From, in bytes.
-const MaxSteerFrom = 256
-
-// SteerOptions are a steer's optional parts (SteerWith). The zero value is
-// a plain Steer.
-type SteerOptions struct {
-	// From names the sender: "operator", "user", "task:<id>" (what the
-	// bus/tasks device sends), or any other name of at most MaxSteerFrom
-	// bytes with no control characters. It is committed with the steer; the
-	// model sees the message after "[message from <From>] ", and the
-	// steer_delivered event (sent to the model) or steer_dropped event (the
-	// task ended first) carries it as from. Empty: no sender, and nothing
-	// differs from a steer before senders existed — no prefix, no
-	// steer_delivered event, no from.
-	From string
-	// Key makes the steer idempotent: a steer whose Key the task already has
-	// (pending, delivered or dropped) is not committed again, and SteerWith
-	// returns nil as it did for the first, even once the task has ended. A
-	// device passes its call's idempotency key, so a call sent again after a
-	// restart does not steer twice. Empty: every call is a new steer.
-	Key string
-}
-
-// SteerWith is Steer with a sender and an idempotency key (SteerOptions).
-func (m *Machine) SteerWith(ctx context.Context, taskID, text string, o SteerOptions) error {
-	if strings.TrimSpace(text) == "" {
-		return errors.New("neumann: steer needs text")
-	}
-	if len(o.From) > MaxSteerFrom {
-		return fmt.Errorf("neumann: steer sender longer than %d bytes", MaxSteerFrom)
-	}
-	if strings.ContainsFunc(o.From, unicode.IsControl) {
-		return fmt.Errorf("neumann: steer sender %q has a control character", o.From)
-	}
-	if err := m.enter(); err != nil {
-		return err
-	}
-	defer m.inflight.Done()
-	if o.Key != "" {
-		// Steers with a key are few (one per tool call that sends one), so
-		// one lock keeps a repeat from slipping in between the look and the
-		// commit.
-		m.keyed.Lock()
-		defer m.keyed.Unlock()
-		had, err := m.store.Interrupts(ctx, taskID, false)
-		if err != nil {
-			return err
-		}
-		if slices.ContainsFunc(had, func(in mem.Interrupt) bool { return in.Kind == mem.InterruptSteer && in.Key == o.Key }) {
-			return nil
-		}
-	}
-	_, err := m.store.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{
-		{TaskID: taskID, Kind: mem.InterruptSteer, Text: text, From: o.From, Key: o.Key},
-	}})
-	if err == nil {
-		m.hub.notify()
-	}
-	return err
-}
-
 // Events streams committed events with Seq > fromSeq, in order. The stream
 // ends when ctx ends, or after the machine stops and the subscriber has read
 // everything committed. A slow subscriber never blocks the machine and never
@@ -989,12 +959,6 @@ func (m *Machine) History(ctx context.Context, id string) ([]task.Message, error
 // Load returns the committed state of a task.
 func (m *Machine) Load(ctx context.Context, id string) (*task.TCB, error) {
 	return m.store.Load(ctx, id)
-}
-
-// Unfinished returns the committed state of every task that has not ended,
-// ordered by id.
-func (m *Machine) Unfinished(ctx context.Context) ([]*task.TCB, error) {
-	return m.store.Unfinished(ctx)
 }
 
 // Calls returns a task's tool call records.
@@ -1264,6 +1228,9 @@ func (m *Machine) recover(ctx context.Context) ([]recoveredDispatch, error) {
 	}
 	m.admit.Unlock()
 	for _, t := range tasks {
+		if !t.State.Terminal() {
+			m.index.put(t)
+		}
 		m.sched.Add(t) // a finished one is forgotten; deadlines are armed again
 	}
 	m.admit.Lock()

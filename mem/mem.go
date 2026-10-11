@@ -93,8 +93,12 @@ func CancelReason(in Interrupt) string {
 // Interrupt is an outside input to a task, durable before it is applied.
 // From names a steer's sender ("operator", "task:<id>", ...); empty is
 // unspecified. Key, when set, is the steer's idempotency key: the machine
-// commits a steer whose Key the task already has only once. Interrupts
-// written before From and Key existed read back with both empty.
+// commits a steer whose Key the task already has only once. A store must
+// keep both as committed: the machine finds a key by reading the task's
+// interrupts back, so a store that loses Key sends a keyed steer twice after
+// a restart (and a bus/tasks send with it), and one that loses From delivers
+// a message as the user's. Interrupts written before From and Key existed
+// read back with both empty.
 type Interrupt struct {
 	TaskID  string `json:"task_id"`
 	Seq     int64  `json:"seq"` // assigned by the store
@@ -127,10 +131,7 @@ func SteerEventData(in Interrupt) map[string]any {
 //     rejected for unknown (ErrNotFound) or finished (ErrFinished) tasks, so an
 //     interrupt for a task created in the same commit is ErrNotFound.
 //   - Applied marks interrupts of Task as applied; it requires Task, and every
-//     seq must be a currently pending interrupt of that task. A steer_delivered
-//     event ({seq, from}) is added for each steer among them that has a From,
-//     in seq order, before Events (the model step that commits them sent
-//     them at its start); a steer without one is applied silently.
+//     seq must be a currently pending interrupt of that task.
 //   - When Task is terminal, every interrupt still unapplied is marked applied,
 //     and a steer_dropped event (SteerEventData) is added for each steer
 //     among them, in the same commit, after Events.

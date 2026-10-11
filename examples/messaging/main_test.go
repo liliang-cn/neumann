@@ -25,10 +25,10 @@ func TestMessaging(t *testing.T) {
 	if got := strings.Join(res.Delivered, ", "); got != "expert task:planner, planner task:expert" {
 		t.Errorf("steer_delivered events: %s", got)
 	}
-	if got := res.Saw["expert"]; got != neumann.DefaultSteerFormat("[message from task:planner] When was the Eiffel Tower completed?") {
+	if got := res.Saw["expert"]; got != neumann.DefaultMessageFormat("task:planner", "When was the Eiffel Tower completed?") {
 		t.Errorf("expert's model saw %q", got)
 	}
-	if got := res.Saw["planner"]; got != neumann.DefaultSteerFormat("[message from task:expert] The Eiffel Tower was completed in 1889.") {
+	if got := res.Saw["planner"]; got != neumann.DefaultMessageFormat("task:expert", "The Eiffel Tower was completed in 1889.") {
 		t.Errorf("planner's model saw %q", got)
 	}
 	for _, want := range []string{"tasks_list", "tasks_send", `steer_delivered  {"from":"task:planner"`} {

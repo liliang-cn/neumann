@@ -10,10 +10,11 @@
 //  2. Task "planner" looks up the other tasks (tasks_list), sends expert a
 //     question (tasks_send), and starts a long job of its own.
 //  3. When its job is done, expert's next model step finds the question in
-//     its context as "[message from task:planner] ...". It answers with
-//     tasks_send to planner, and finishes.
-//  4. planner's next model step finds "[message from task:expert] ...", and
-//     planner answers its user with it.
+//     its context, framed as a message from task:planner, not from its user
+//     (neumann.DefaultMessageFormat). It answers with tasks_send to planner,
+//     and finishes.
+//  4. planner's next model step finds expert's answer, framed the same way,
+//     and planner answers its user with it.
 //
 // Each delivery is a steer_delivered event that names its sender (from);
 // the events are printed as they stream.
@@ -220,22 +221,21 @@ func script(mu *sync.Mutex, saw map[string]string) func(model.Request) (model.Re
 	}
 }
 
-// message reads a message from another task out of a user message: the
-// machine puts "[message from <sender>] " before its text, and
-// Config.SteerFormat (by default, a note that it arrived while the task was
-// working) frames the whole.
+// message reads a message from another sender out of a user message, as
+// neumann.DefaultMessageFormat frames it: a first line naming the sender and
+// saying it is not the user, then the text, every line quoted with "> ".
 func message(s string) (from, text string, ok bool) {
-	const tag = "[message from "
-	i := strings.Index(s, tag)
-	if i < 0 {
+	const head = "[A message from "
+	end := strings.Index(s, "]\n")
+	if !strings.HasPrefix(s, head) || end < 0 {
 		return "", "", false
 	}
-	rest := s[i+len(tag):]
-	j := strings.Index(rest, "] ")
-	if j < 0 {
-		return "", "", false
+	from, _, _ = strings.Cut(s[len(head):], ",")
+	lines := strings.Split(s[end+2:], "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimPrefix(l, "> ")
 	}
-	return rest[:j], rest[j+2:], true
+	return from, strings.Join(lines, "\n"), true
 }
 
 func turn(calls ...task.Part) model.Response {

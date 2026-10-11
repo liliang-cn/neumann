@@ -7,11 +7,10 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/liliang-cn/neumann"
 	"github.com/liliang-cn/neumann/bus"
+	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/task"
 )
 
@@ -20,38 +19,52 @@ const (
 	// DefaultMaxText bounds a sent message, in bytes: it lands in the other
 	// task's context whole.
 	DefaultMaxText = 8 << 10
-	// TitleLen is how much of a task's request tasks_list shows, in runes.
-	TitleLen = 80
+	// DefaultMaxSends bounds the messages one task sends: two tasks that
+	// answer every message would otherwise talk until a budget stops them.
+	DefaultMaxSends = 32
 )
 
 // Machine is what the device needs of the machine it serves;
 // *neumann.Machine satisfies it.
 type Machine interface {
 	SteerWith(ctx context.Context, taskID, text string, o neumann.SteerOptions) error
+	HasSteer(ctx context.Context, taskID, key string) (bool, error)
+	Tasks() []neumann.TaskInfo
 	Load(ctx context.Context, id string) (*task.TCB, error)
-	Unfinished(ctx context.Context) ([]*task.TCB, error)
+	Calls(ctx context.Context, id string) ([]mem.CallRecord, error)
 }
 
 var _ Machine = (*neumann.Machine)(nil)
 
 // Visible decides whether caller may see other in a list, and send to it.
-// Both are committed states, read when the call runs; caller is the task
-// making the call.
-type Visible func(caller, other *task.TCB) bool
+// Both are as last committed; caller is the task making the call.
+type Visible func(caller, other neumann.TaskInfo) bool
+
+// SameClass is the default Visible: tasks see the tasks of their own class
+// (execution group) only.
+func SameClass(caller, other neumann.TaskInfo) bool { return caller.Class == other.Class }
+
+// All lets every task see every unfinished task of the machine.
+func All(_, _ neumann.TaskInfo) bool { return true }
 
 type config struct {
-	visible Visible
-	maxText int
+	visible  Visible
+	maxText  int
+	maxSends int
 }
 
 // Option configures a device.
 type Option func(*config)
 
-// WithVisible restricts which tasks a task sees and can send to. A task it
-// may not see is reported as unknown, exactly as a task that does not
-// exist. nil, the default: every unfinished task of the machine.
+// WithVisible sets which tasks a task sees and can send to (default
+// SameClass; All for every task). A task it may not see is reported as
+// unknown, exactly as a task that does not exist. nil keeps the default.
 func WithVisible(v Visible) Option {
-	return func(c *config) { c.visible = v }
+	return func(c *config) {
+		if v != nil {
+			c.visible = v
+		}
+	}
 }
 
 // WithMaxText bounds a sent message, in bytes; n <= 0 keeps DefaultMaxText.
@@ -59,6 +72,17 @@ func WithMaxText(n int) Option {
 	return func(c *config) {
 		if n > 0 {
 			c.maxText = n
+		}
+	}
+}
+
+// WithMaxSends bounds the messages one task may send, over its whole life
+// (counted from its call log, so a restart does not reset it); a send past
+// it is an error result. n < 0: no bound; 0 keeps DefaultMaxSends.
+func WithMaxSends(n int) Option {
+	return func(c *config) {
+		if n != 0 {
+			c.maxSends = n
 		}
 	}
 }
@@ -77,7 +101,7 @@ type bound struct{ m Machine }
 // New returns an unbound device. name is the prefix the model sees on its
 // tools: with "tasks", tasks_send and tasks_list.
 func New(name string, opts ...Option) *Device {
-	d := &Device{name: name, cfg: config{maxText: DefaultMaxText}}
+	d := &Device{name: name, cfg: config{visible: SameClass, maxText: DefaultMaxText, maxSends: DefaultMaxSends}}
 	for _, o := range opts {
 		o(&d.cfg)
 	}
@@ -150,6 +174,18 @@ func (d *Device) send(ctx context.Context, m Machine, c bus.DeviceCall) (task.To
 	if err := json.Unmarshal(c.Args, &in); err != nil {
 		return refuse("bad arguments: %v", err)
 	}
+	// A call sent again after a restart is answered as it was the first
+	// time, before anything that may have changed since (the receiver has
+	// finished, the limits are lower) is looked at.
+	if in.TaskID != "" && c.Key != "" {
+		had, err := m.HasSteer(ctx, in.TaskID, c.Key)
+		if err != nil {
+			return task.ToolResult{}, err
+		}
+		if had {
+			return sent(in.TaskID)
+		}
+	}
 	switch {
 	case in.TaskID == "":
 		return refuse("task_id is required")
@@ -159,45 +195,96 @@ func (d *Device) send(ctx context.Context, m Machine, c bus.DeviceCall) (task.To
 		return refuse("text is %d bytes, more than the limit of %d", len(in.Text), d.cfg.maxText)
 	case in.TaskID == c.Task:
 		return refuse("task %s is you: a task cannot send to itself", in.TaskID)
+	case !neumann.ValidFrom("task:" + c.Task):
+		return refuse("your task id %q cannot name a sender (only [A-Za-z0-9:._@/-])", c.Task)
 	}
-	if d.cfg.visible != nil {
-		ok, err := d.sees(ctx, m, c.Task, in.TaskID)
+	me, err := d.info(ctx, m, c.Task)
+	if err != nil {
+		return task.ToolResult{}, err
+	}
+	them, err := d.info(ctx, m, in.TaskID)
+	switch {
+	case errors.Is(err, neumann.ErrNotFound):
+		return refuse("no task %s", in.TaskID)
+	case err != nil:
+		return task.ToolResult{}, err
+	case !d.cfg.visible(me, them):
+		return refuse("no task %s", in.TaskID)
+	case them.State.Terminal():
+		return refuse("task %s has finished; it can no longer receive messages", in.TaskID)
+	}
+	if d.cfg.maxSends > 0 {
+		n, err := d.sends(ctx, m, c)
 		if err != nil {
 			return task.ToolResult{}, err
 		}
-		if !ok {
-			return refuse("no task %s", in.TaskID)
+		if n >= d.cfg.maxSends {
+			return refuse("you have sent %d messages, the limit; send no more", n)
 		}
 	}
-	err := m.SteerWith(ctx, in.TaskID, in.Text, neumann.SteerOptions{From: "task:" + c.Task, Key: c.Key})
+	err = m.SteerWith(ctx, in.TaskID, in.Text, neumann.SteerOptions{From: "task:" + c.Task, Key: c.Key})
 	switch {
 	case errors.Is(err, neumann.ErrNotFound):
 		return refuse("no task %s", in.TaskID)
 	case errors.Is(err, neumann.ErrFinished):
 		return refuse("task %s has finished; it can no longer receive messages", in.TaskID)
-	case errors.Is(err, neumann.ErrStopped):
-		return refuse("the machine is stopping; nothing was sent")
 	case err != nil:
 		return task.ToolResult{}, err
 	}
-	return task.ToolResult{Content: "sent to task " + in.TaskID}, nil
+	return sent(in.TaskID)
 }
 
-// sees reports whether caller may see other, by the device's Visible; an
-// unknown other is not seen.
-func (d *Device) sees(ctx context.Context, m Machine, caller, other string) (bool, error) {
-	me, err := m.Load(ctx, caller)
+func sent(id string) (task.ToolResult, error) {
+	return task.ToolResult{Content: "sent to task " + id}, nil
+}
+
+// info is a task as Tasks shows it, or, for one that is not there (it has
+// finished), as loaded from the store.
+func (d *Device) info(ctx context.Context, m Machine, id string) (neumann.TaskInfo, error) {
+	for _, t := range m.Tasks() {
+		if t.ID == id {
+			return t, nil
+		}
+	}
+	t, err := m.Load(ctx, id)
 	if err != nil {
-		return false, err
+		return neumann.TaskInfo{}, err
 	}
-	them, err := m.Load(ctx, other)
-	if errors.Is(err, neumann.ErrNotFound) {
-		return false, nil
-	}
+	return neumann.TaskInfo{ID: t.ID, Class: t.Class, State: t.State, Wait: t.Wait, Title: neumann.Title(t)}, nil
+}
+
+// sends counts the messages the caller sent before this call: its earlier
+// send calls (by call index) that went out or may have (done without an
+// error, dispatched, unknown). A refused send does not count, and neither
+// does this one, so a call sent again after a restart counts the same.
+func (d *Device) sends(ctx context.Context, m Machine, c bus.DeviceCall) (int, error) {
+	calls, err := m.Calls(ctx, c.Task)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	return d.cfg.visible(me, them), nil
+	me := -1
+	if parts := strings.Split(c.Key, "/"); len(parts) >= 3 {
+		for _, r := range calls {
+			if r.CallID == parts[len(parts)-2] {
+				me = r.Index
+			}
+		}
+	}
+	tool, n := bus.FullName(d.name, "send"), 0
+	for _, r := range calls {
+		if r.Tool != tool || (me >= 0 && r.Index >= me) {
+			continue
+		}
+		switch r.Status {
+		case mem.CallDone:
+			if r.Result != nil && !r.Result.IsError {
+				n++
+			}
+		case mem.CallDispatched, mem.CallUnknown:
+			n++
+		}
+	}
+	return n, nil
 }
 
 // entry is one task as tasks_list shows it.
@@ -210,29 +297,16 @@ type entry struct {
 }
 
 func (d *Device) list(ctx context.Context, m Machine, caller string) (task.ToolResult, error) {
-	all, err := m.Unfinished(ctx)
+	me, err := d.info(ctx, m, caller)
 	if err != nil {
 		return task.ToolResult{}, err
 	}
-	var me *task.TCB
-	if d.cfg.visible != nil {
-		for _, t := range all {
-			if t.ID == caller {
-				me = t
-			}
-		}
-		if me == nil { // ended since: it still sees what it would have
-			if me, err = m.Load(ctx, caller); err != nil {
-				return task.ToolResult{}, err
-			}
-		}
-	}
 	out := []entry{}
-	for _, t := range all {
-		if t.ID == caller || (me != nil && !d.cfg.visible(me, t)) {
+	for _, t := range m.Tasks() {
+		if t.ID == caller || !d.cfg.visible(me, t) {
 			continue
 		}
-		e := entry{ID: t.ID, Class: t.Class, State: t.State.String(), Title: Title(t)}
+		e := entry{ID: t.ID, Class: t.Class, State: t.State.String(), Title: t.Title}
 		if t.State == task.Waiting {
 			e.Wait = t.Wait.String()
 		}
@@ -243,21 +317,4 @@ func (d *Device) list(ctx context.Context, m Machine, caller string) (task.ToolR
 		return task.ToolResult{}, err
 	}
 	return task.ToolResult{Content: string(b)}, nil
-}
-
-// Title is the start of t's request, the first user message in its
-// registers, on one line: at most TitleLen runes, "…" marking a cut.
-func Title(t *task.TCB) string {
-	var s string
-	for _, msg := range t.Regs {
-		if msg.Role == task.RoleUser {
-			s = msg.TextContent()
-			break
-		}
-	}
-	s = strings.Join(strings.FieldsFunc(s, unicode.IsSpace), " ")
-	if utf8.RuneCountInString(s) <= TitleLen {
-		return s
-	}
-	return string([]rune(s)[:TitleLen-1]) + "…"
 }

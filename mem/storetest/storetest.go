@@ -56,7 +56,7 @@ func Run(t *testing.T, newStore Factory) {
 		{"AppliedMustBePending", testAppliedMustBePending},
 		{"NonSteerInterruptDroppedSilently", testNonSteerInterruptDroppedSilently},
 		{"SteerSenderAndKeyRoundTrip", testSteerSenderAndKeyRoundTrip},
-		{"SteerWithASenderIsReportedDeliveredOrDropped", testSteerWithASenderIsReportedDeliveredOrDropped},
+		{"SteerWithASenderIsReportedDropped", testSteerWithASenderIsReportedDropped},
 		{"FullTaskRoundTrip", testFullTaskRoundTrip},
 		{"FullCallRecordRoundTrip", testFullCallRecordRoundTrip},
 		{"UnfinishedCoversEveryNonTerminalState", testUnfinishedCoversEveryNonTerminalState},
@@ -766,12 +766,11 @@ func testSteerSenderAndKeyRoundTrip(t *testing.T, newStore Factory) {
 	}
 }
 
-// Applying a steer that has a sender adds a steer_delivered event before
-// the commit's own; one without a sender is applied silently. A terminal commit
-// reports what is left as steer_dropped, with from only for a steer that has
-// one: a steer without a sender is reported byte for byte as before senders
-// existed.
-func testSteerWithASenderIsReportedDeliveredOrDropped(t *testing.T, newStore Factory) {
+// Applying a steer adds no event, sender or not: steer_delivered is the
+// machine's, not the store's. A terminal commit reports what is left as
+// steer_dropped, with from only for a steer that has one: a steer without a
+// sender is reported byte for byte as before senders existed.
+func testSteerWithASenderIsReportedDropped(t *testing.T, newStore Factory) {
 	s := newStore(t)
 	tc := newTask("a")
 	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
@@ -779,21 +778,19 @@ func testSteerWithASenderIsReportedDeliveredOrDropped(t *testing.T, newStore Fac
 	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptSteer, Text: "from b", From: "task:b"}}})
 	tc.Version = 2
 	evs := mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{2, 1}, Events: []proto.Event{proto.NewEvent(proto.EvStep, "a", nil)}})
-	if len(evs) != 2 || evs[0].Kind != proto.EvSteerDelivered || string(evs[0].Data) != `{"from":"task:b","seq":2}` || evs[1].Kind != proto.EvStep {
+	if len(evs) != 1 || evs[0].Kind != proto.EvStep {
 		t.Fatalf("events %+v", evs)
 	}
 
 	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptSteer, Text: "late", From: "operator"}}})
 	mustCommit(t, s, steer("a", "later"))
-	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptSteer, Text: "now", From: "user"}}})
 	tc.State, tc.Version = task.Done, 3
-	evs = mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{5}, Events: []proto.Event{proto.NewEvent(proto.EvDone, "a", nil)}})
+	evs = mustCommit(t, s, mem.CommitSet{Task: tc, Events: []proto.Event{proto.NewEvent(proto.EvDone, "a", nil)}})
 	var got []string
 	for _, ev := range evs {
 		got = append(got, ev.Kind+" "+string(ev.Data))
 	}
 	want := []string{
-		proto.EvSteerDelivered + ` {"from":"user","seq":5}`,
 		proto.EvDone + " ",
 		proto.EvSteerDropped + ` {"from":"operator","seq":3,"text":"late"}`,
 		proto.EvSteerDropped + ` {"seq":4,"text":"later"}`,

@@ -3,6 +3,7 @@ package neumann_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -28,6 +29,22 @@ func sendTurn(to, text string) model.Response {
 	return model.Response{Message: task.Message{Role: task.RoleAssistant, Parts: []task.Part{
 		{Kind: task.PartToolCall, ProviderCallID: "p-send", Name: "tasks_send", Args: args},
 	}}, FinishReason: "tool_calls"}
+}
+
+// readMessage reads a message from another sender out of a user message
+// framed by neumann.DefaultMessageFormat: its sender and its text, unquoted.
+func readMessage(s string) (from, text string, ok bool) {
+	const head = "[A message from "
+	end := strings.Index(s, "]\n")
+	if !strings.HasPrefix(s, head) || end < 0 {
+		return "", "", false
+	}
+	from, _, _ = strings.Cut(s[len(head):], ",")
+	lines := strings.Split(s[end+2:], "\n")
+	for i, l := range lines {
+		lines[i] = strings.TrimPrefix(l, "> ")
+	}
+	return from, strings.Join(lines, "\n"), true
 }
 
 // lastUser is the text of the request's last user message.
@@ -81,7 +98,7 @@ func TestTwoTasksExchangeMessages(t *testing.T) {
 			switch {
 			case sim.ToolRounds(req) == 0:
 				return sim.CallTools("desk_work"), nil
-			case sim.ToolRounds(req) == 1 && strings.HasPrefix(lastUser(req), "[message from task:asker] "):
+			case sim.ToolRounds(req) == 1 && strings.HasPrefix(lastUser(req), "[A message from task:asker,"):
 				return sendTurn("asker", "42"), nil
 			}
 			return sim.Reply("answered asker"), nil
@@ -92,7 +109,8 @@ func TestTwoTasksExchangeMessages(t *testing.T) {
 			case 1:
 				return sim.CallTools("desk_work"), nil
 			}
-			return sim.Reply("helper says: " + strings.TrimPrefix(lastUser(req), "[message from task:helper] ")), nil
+			_, text, _ := readMessage(lastUser(req))
+			return sim.Reply("helper says: " + text), nil
 		}
 	})
 	// Bound before any task runs; start has already started m, which is
@@ -114,10 +132,10 @@ func TestTwoTasksExchangeMessages(t *testing.T) {
 		t.Fatalf("asker answered %q", asker.LastAnswer())
 	}
 	mu.Lock()
-	if got := strings.Join(saw["helper"], "|"); got != "helper|[message from task:asker] What is 6 × 7?" {
+	if got := strings.Join(saw["helper"], "|"); got != "helper|"+neumann.DefaultMessageFormat("task:asker", "What is 6 × 7?") {
 		t.Fatalf("helper's model saw %q", got)
 	}
-	if got := strings.Join(saw["asker"], "|"); got != "asker|[message from task:helper] 42" {
+	if got := strings.Join(saw["asker"], "|"); got != "asker|"+neumann.DefaultMessageFormat("task:helper", "42") {
 		t.Fatalf("asker's model saw %q", got)
 	}
 	mu.Unlock()
@@ -241,10 +259,171 @@ func TestSendAcrossACrashIsSentOnce(t *testing.T) {
 	if len(ints) != 1 || ints[0].From != "task:asker" || ints[0].Key != calls[0].Key || !ints[0].Applied {
 		t.Fatalf("helper's interrupts %+v (call key %s)", ints, calls[0].Key)
 	}
-	if helper.LastAnswer() != "heard: [message from task:asker] ping" {
+	if helper.LastAnswer() != "heard: "+neumann.DefaultMessageFormat("task:asker", "ping") {
 		t.Fatalf("helper answered %q", helper.LastAnswer())
 	}
 	if got := kindsData(t, m2, "helper", proto.EvSteerDelivered, proto.EvSteerDropped); len(got) != 1 || got[0] != proto.EvSteerDelivered+` {"from":"task:asker","seq":1}` {
 		t.Fatalf("helper's steer events %q", got)
+	}
+}
+
+// gateSend holds the tasks device's send until release is closed, and says
+// on entered when one has arrived.
+type gateSend struct {
+	bus.Device
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gateSend) Call(ctx context.Context, c bus.DeviceCall) (task.ToolResult, error) {
+	if c.Tool == "send" {
+		select {
+		case g.entered <- struct{}{}:
+		default:
+		}
+		<-g.release
+	}
+	return g.Device.Call(ctx, c)
+}
+
+// A tasks_send that reaches the device while Stop drains the tool batches
+// is committed, not refused: the batch's result says it was sent, and it was.
+func TestSendDuringStopIsCommitted(t *testing.T) {
+	s, err := sqlite.Open(filepath.Join(t.TempDir(), "n.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	dev := tasks.New("tasks")
+	g := &gateSend{Device: dev, entered: make(chan struct{}, 1), release: make(chan struct{})}
+	hold := make(chan struct{})
+	entered := make(chan string, 1)
+	work := builtin.New("desk").Add(bus.ToolDef{Name: "work", Effect: bus.ReadOnly}, func(ctx context.Context, c bus.DeviceCall) (string, error) {
+		entered <- c.Task
+		select {
+		case <-hold:
+		case <-ctx.Done():
+		}
+		return "w", nil
+	})
+	m, err := neumann.New(neumann.Config{Store: s, Devices: []bus.Device{g, work}, Logf: func(string, ...any) {},
+		Model: &sim.Model{Fn: func(req model.Request) (model.Response, error) {
+			switch who := sim.FirstUser(req); {
+			case who == "a" && sim.ToolRounds(req) == 0:
+				return sendTurn("b", "hello"), nil
+			case who == "b" && sim.ToolRounds(req) == 0:
+				return sim.CallTools("desk_work"), nil
+			}
+			return sim.Reply("ok"), nil
+		}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev.Bind(m)
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	submit(t, m, proto.Instruction{TaskID: "b", Input: "b"})
+	<-entered
+	submit(t, m, proto.Instruction{TaskID: "a", Input: "a"})
+	<-g.entered
+	stopped := make(chan error)
+	go func() { stopped <- m.Stop(bg) }()
+	for !errors.Is(m.Cancel(bg, "nope"), neumann.ErrStopped) { // Stop has begun
+		time.Sleep(time.Millisecond)
+	}
+	close(g.release)
+	close(hold)
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	calls, _ := s.Calls(bg, "a")
+	ints, _ := s.Interrupts(bg, "b", false)
+	if len(calls) != 1 || calls[0].Result == nil || calls[0].Result.Content != "sent to task b" || len(ints) != 1 || ints[0].Key != calls[0].Key {
+		t.Fatalf("a's calls %+v; b's interrupts %+v", calls, ints)
+	}
+}
+
+// A send whose steer landed before a crash is answered "sent" when recovery
+// sends it again, even if the receiver has finished by then, and even with a
+// Visible that hides finished tasks: the key is looked up first.
+func TestRepeatAfterTheReceiverFinished(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []tasks.Option
+	}{
+		{"default", nil},
+		{"visible unfinished", []tasks.Option{tasks.WithVisible(func(_, o neumann.TaskInfo) bool { return !o.State.Terminal() })}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "n.db")
+			script := func(req model.Request) (model.Response, error) {
+				switch who := sim.FirstUser(req); {
+				case who == "asker" && sim.ToolRounds(req) == 0:
+					return sendTurn("helper", "ping"), nil
+				case who == "helper" && sim.ToolRounds(req) == 0:
+					return sim.CallTools("desk_work"), nil
+				}
+				return sim.Reply("heard"), nil
+			}
+			boot := func(store mem.Store, gate chan struct{}, entered chan string, g *gateSend) *neumann.Machine {
+				work := builtin.New("desk").Add(bus.ToolDef{Name: "work", Effect: bus.ReadOnly}, func(ctx context.Context, c bus.DeviceCall) (string, error) {
+					entered <- c.Task
+					select {
+					case <-gate:
+						return "worked", nil
+					case <-ctx.Done():
+						return "", ctx.Err()
+					}
+				})
+				dev := tasks.New("tasks", tc.opts...)
+				g.Device = dev
+				m, err := neumann.New(neumann.Config{Model: &sim.Model{Fn: script}, Store: store, Devices: []bus.Device{g, work}, Logf: func(string, ...any) {}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				dev.Bind(m)
+				if err := m.Start(bg); err != nil {
+					t.Fatal(err)
+				}
+				return m
+			}
+			s1, err := sqlite.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dying := &dieAtSteer{Store: s1}
+			open := make(chan struct{})
+			close(open)
+			entered := make(chan string, 4)
+			m1 := boot(dying, make(chan struct{}), entered, &gateSend{entered: make(chan struct{}, 1), release: open})
+			submit(t, m1, proto.Instruction{TaskID: "helper", Input: "helper"})
+			<-entered
+			submit(t, m1, proto.Instruction{TaskID: "asker", Input: "asker"})
+			for !dying.dead.Load() {
+				time.Sleep(time.Millisecond)
+			}
+			ctx, cancel := context.WithTimeout(bg, 200*time.Millisecond)
+			m1.Stop(ctx)
+			cancel()
+			s1.Close()
+
+			s2, err := sqlite.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s2.Close()
+			g2 := &gateSend{entered: make(chan struct{}, 1), release: make(chan struct{})}
+			m2 := boot(s2, open, make(chan string, 4), g2)
+			defer stop(t, m2)
+			waitDone(t, m2, "helper") // finishes while asker's repeat is held
+			close(g2.release)
+			waitDone(t, m2, "asker")
+			calls, _ := m2.Calls(bg, "asker")
+			ints, _ := s2.Interrupts(bg, "helper", false)
+			if len(calls) != 1 || calls[0].Result.IsError || calls[0].Result.Content != "sent to task helper" || len(ints) != 1 {
+				t.Fatalf("asker's call %+v; helper's interrupts %+v", calls[0].Result, ints)
+			}
+		})
 	}
 }

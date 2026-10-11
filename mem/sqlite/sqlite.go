@@ -452,19 +452,8 @@ func (s *Store) apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto
 			for i, seq := range c.Applied {
 				args[i] = seq
 			}
-			seqs := "(?" + strings.Repeat(",?", len(args)-1) + ")"
-			// Steers with a sender are reported delivered (mem.CommitSet).
-			delivered, err := interrupts(ctx, tx, "SELECT seq, task_id, kind, text, sender, idem_key, applied FROM interrupts WHERE seq IN "+seqs+
-				" AND kind = ? AND sender != '' ORDER BY seq", append(args, mem.InterruptSteer)...)
-			if err != nil {
-				return nil, err
-			}
-			var first []proto.Event
-			for _, in := range delivered {
-				first = append(first, proto.NewEvent(proto.EvSteerDelivered, t.ID, map[string]any{"seq": in.Seq, "from": in.From}))
-			}
-			events = append(first, events...)
-			if _, err := tx.ExecContext(ctx, "UPDATE interrupts SET applied = 1 WHERE seq IN "+seqs, args...); err != nil {
+			q := "UPDATE interrupts SET applied = 1 WHERE seq IN (?" + strings.Repeat(",?", len(args)-1) + ")"
+			if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 				return nil, err
 			}
 		}

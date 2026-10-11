@@ -36,11 +36,40 @@ import (
 // own commit is put together. A failed call is retried, waited out or fails
 // the task by its error class (modelFailed); a turn cut off before it
 // produced anything is asked again with a larger output cap (redoTruncated).
+//
+// Each steer with a sender that the step's commit applies is reported by a
+// steer_delivered event ({seq, from}) at the head of that commit's events:
+// the steer went into the request at the step's start (delivered).
 func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitSet, []Send, error) {
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
 		return mem.CommitSet{}, nil, fmt.Errorf("read interrupts: %w", err)
 	}
+	c, batch, err := e.modelStep(ctx, t, core, pending)
+	return delivered(c, pending), batch, err
+}
+
+// delivered puts a steer_delivered event for each steer with a sender among
+// c.Applied in front of c's events, in seq order. A steer without a sender
+// is delivered silently, as before senders existed.
+func delivered(c mem.CommitSet, pending []mem.Interrupt) mem.CommitSet {
+	if len(c.Applied) == 0 || c.Task == nil {
+		return c
+	}
+	var evs []proto.Event
+	for _, in := range pending {
+		if in.Kind == mem.InterruptSteer && in.From != "" && slices.Contains(c.Applied, in.Seq) {
+			evs = append(evs, proto.NewEvent(proto.EvSteerDelivered, c.Task.ID, map[string]any{"seq": in.Seq, "from": in.From}))
+		}
+	}
+	if len(evs) > 0 {
+		c.Events = append(evs, c.Events...)
+	}
+	return c
+}
+
+// modelStep is execModel once the pending interrupts are read.
+func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []mem.Interrupt) (mem.CommitSet, []Send, error) {
 	if reason, ok := e.stopping(t, pending); ok {
 		// Cancelled, or out of time, before this instruction began: nothing
 		// runs.
@@ -495,36 +524,26 @@ func (e *Env) callModel(ctx context.Context, a model.Adapter, req model.Request,
 }
 
 // steerMessages are the user messages applySteers would add for pending.
-func steerMessages(pending []mem.Interrupt, frame func(string) string) []task.Message {
+func steerMessages(pending []mem.Interrupt, frame func(mem.Interrupt) string) []task.Message {
 	var out []task.Message
 	for _, in := range pending {
 		if in.Kind == mem.InterruptSteer {
-			out = append(out, task.Text(task.RoleUser, frame(steerText(in))))
+			out = append(out, task.Text(task.RoleUser, frame(in)))
 		}
 	}
 	return out
 }
 
-// steerText is what a steer says before SteerFormat frames it: its text,
-// prefixed by its sender when it has one ("[message from task:t-42] ...").
-// A steer without a sender is its text alone, as before senders existed.
-func steerText(in mem.Interrupt) string {
-	if in.From == "" {
-		return in.Text
-	}
-	return "[message from " + in.From + "] " + in.Text
-}
-
 // applySteers appends each pending steer as a user message, rendered by
 // frame, and returns the interrupt sequence numbers it consumed. Other kinds
 // stay pending.
-func applySteers(t *task.TCB, pending []mem.Interrupt, frame func(string) string) []int64 {
+func applySteers(t *task.TCB, pending []mem.Interrupt, frame func(mem.Interrupt) string) []int64 {
 	var seqs []int64
 	for _, in := range pending {
 		if in.Kind != mem.InterruptSteer {
 			continue
 		}
-		t.Regs = append(t.Regs, task.Text(task.RoleUser, frame(steerText(in))))
+		t.Regs = append(t.Regs, task.Text(task.RoleUser, frame(in)))
 		seqs = append(seqs, in.Seq)
 	}
 	return seqs

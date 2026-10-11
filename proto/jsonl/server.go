@@ -15,7 +15,8 @@ import (
 	"github.com/liliang-cn/neumann/proto"
 )
 
-// Machine is what the server drives; *neumann.Machine implements it.
+// Machine is what the server drives; *neumann.Machine implements it. It
+// has SteerWith where it had Steer before steers had senders.
 type Machine interface {
 	Submit(ctx context.Context, in proto.Instruction) (string, error)
 	SteerWith(ctx context.Context, taskID, text string, o neumann.SteerOptions) error
