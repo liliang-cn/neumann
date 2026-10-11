@@ -49,16 +49,28 @@ type Part struct {
 
 // Message is one provider-neutral turn: a role and its ordered parts.
 // Summary marks the message a compaction put in place of the messages it
-// swapped out (design §5.3); adapters send it as the plain message it is.
+// swapped out (design §5.3); Feedback marks the user message an answer check
+// gave back with an answer it rejected (design §9.8). Adapters send both as
+// the plain messages they are.
 type Message struct {
-	Role    Role   `json:"role"`
-	Parts   []Part `json:"parts"`
-	Summary bool   `json:"summary,omitempty"`
+	Role     Role   `json:"role"`
+	Parts    []Part `json:"parts"`
+	Summary  bool   `json:"summary,omitempty"`
+	Feedback bool   `json:"feedback,omitempty"`
 }
 
 // Text builds a message holding a single text part.
 func Text(role Role, s string) Message {
 	return Message{Role: role, Parts: []Part{{Kind: PartText, Text: s}}}
+}
+
+// FeedbackMessage is the message an answer check's rejection puts after the
+// answer it rejected: a user message, so the model answers again, marked
+// Feedback. Compaction treats it as the user message it is.
+func FeedbackMessage(text string) Message {
+	m := Text(RoleUser, text)
+	m.Feedback = true
+	return m
 }
 
 // ToolCalls returns the message's tool_call parts in order.

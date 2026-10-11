@@ -217,7 +217,12 @@ type TCB struct {
 	// Archived is how many messages compaction has moved from the registers
 	// to the task's archive (mem.Store.Archive); a reader takes that many,
 	// so a compaction committed between its two reads changes nothing.
-	Archived   int    `json:"archived,omitempty"`
+	Archived int `json:"archived,omitempty"`
+	// Rejections counts the final answers the machine's answer check
+	// rejected (design §9.8); the check is told it as the attempt. Each of
+	// the first Config.MaxAnswerRetries went back to the model with the
+	// check's feedback; the one after them finished the task anyway.
+	Rejections int    `json:"rejections,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
 	Version    int64  `json:"version"`
 }

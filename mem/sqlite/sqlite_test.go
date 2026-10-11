@@ -184,3 +184,48 @@ func TestCommitAfterClose(t *testing.T) {
 		t.Fatalf("second close: %v", err)
 	}
 }
+
+// A TCB written before a field existed (here Rejections, and Feedback on
+// its messages) decodes as before, the new fields zero, and is committed
+// over as usual: gob matches fields by name.
+func TestOldTaskBlobsDecode(t *testing.T) {
+	type oldMessage struct {
+		Role    task.Role
+		Parts   []task.Part
+		Summary bool
+	}
+	type oldTCB struct {
+		ID      string
+		State   task.State
+		Class   string
+		Regs    []oldMessage
+		Used    task.Usage
+		Version int64
+	}
+	old := oldTCB{ID: "a", State: task.Ready, Class: "default", Version: 3, Used: task.Usage{Steps: 2},
+		Regs: []oldMessage{{Role: task.RoleUser, Parts: []task.Part{{Kind: task.PartText, Text: "q"}}}}}
+	blob, err := encode(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := open(t, filepath.Join(t.TempDir(), "neumann.db"))
+	defer s.Close()
+	if _, err := s.db.Exec(`INSERT INTO tasks (id, version, terminal, tcb) VALUES ('a', 3, 0, ?)`, blob); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Load(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "a" || got.Version != 3 || got.Used.Steps != 2 || got.Rejections != 0 || len(got.Regs) != 1 || got.Regs[0].TextContent() != "q" || got.Regs[0].Feedback {
+		t.Fatalf("old blob decoded as %+v", got)
+	}
+	got.Rejections, got.Version = 1, 4
+	got.Regs = append(got.Regs, task.FeedbackMessage("again"))
+	if _, err := s.Commit(ctx, mem.CommitSet{Task: got}); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := s.Load(ctx, "a"); err != nil || again.Rejections != 1 || !again.Regs[1].Feedback {
+		t.Fatalf("after a commit over it: %+v, %v", again, err)
+	}
+}

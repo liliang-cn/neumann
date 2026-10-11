@@ -120,6 +120,30 @@ func TestSummaryMessage(t *testing.T) {
 	}
 }
 
+// A feedback message is an ordinary user message to compaction: a unit of
+// its own, never a summary, rendered under "### user"; an ordinary message
+// marshals no feedback flag.
+func TestFeedbackMessage(t *testing.T) {
+	m := FeedbackMessage("give the figure")
+	if m.Role != RoleUser || !m.Feedback || m.Summary || m.TextContent() != "give the figure" || SummaryText(m) != "" {
+		t.Fatalf("feedback %+v", m)
+	}
+	msgs := []Message{Text(RoleUser, "goal"), Text(RoleAssistant, "a draft"), m, Text(RoleAssistant, "final")}
+	head, units := Units(msgs)
+	if head != 1 || len(units) != 3 || units[1].Round || units[1].Summary || !units[1].Complete || units[1].Start != 2 {
+		t.Fatalf("head %d, units %+v", head, units)
+	}
+	if tr := Transcript(msgs[1:]); tr != "### assistant\na draft\n\n### user\ngive the figure\n\n### assistant\nfinal" {
+		t.Fatalf("transcript %q", tr)
+	}
+	if b, _ := json.Marshal(Text(RoleUser, "x")); strings.Contains(string(b), "feedback") {
+		t.Fatalf("an ordinary message marshals a feedback flag: %s", b)
+	}
+	if c := CloneMessages(msgs); !c[2].Feedback {
+		t.Fatal("a clone lost the feedback flag")
+	}
+}
+
 func TestCloneMessagesIsDeep(t *testing.T) {
 	orig := convo()
 	c := CloneMessages(orig)

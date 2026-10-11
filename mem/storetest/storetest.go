@@ -424,6 +424,8 @@ func fullTask(id string) *task.TCB {
 				{Kind: task.PartToolCall, CallID: "c-1", ProviderCallID: "call_9", Name: "dev_x", Args: json.RawMessage(`{"a":`), Provider: "p", Opaque: json.RawMessage(`{"id":"call_9"}`)},
 			}},
 			{Role: task.RoleTool, Parts: []task.Part{{Kind: task.PartToolResult, CallID: "c-1", Text: "boom", IsError: true}}},
+			{Role: task.RoleAssistant, Parts: []task.Part{{Kind: task.PartText, Text: "a draft"}}},
+			task.FeedbackMessage("give the figure"),
 		},
 		Allow: []string{"dev_"}, Deny: []string{"dev_y"},
 		Budget:       task.Budget{MaxSteps: 9, Deadline: time.Date(2026, 10, 10, 9, 0, 0, 0, time.UTC)},
@@ -440,6 +442,7 @@ func fullTask(id string) *task.TCB {
 		CompactRaise: 1,
 		CompactLimit: 4,
 		Archived:     5,
+		Rejections:   1,
 		StopReason:   "",
 		Version:      1,
 	}
