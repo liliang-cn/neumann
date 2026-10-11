@@ -61,7 +61,10 @@ func main() {
 			log.Fatal(err)
 		}
 		start := time.Now()
-		if err := so.Warm(ctx); err != nil { // and has it loaded: a cold load takes seconds
+		wctx, cancel := context.WithTimeout(ctx, time.Minute) // a cold load takes seconds; a stuck server, forever
+		err := so.Warm(wctx)                                  // and has it loaded
+		cancel()
+		if err != nil {
 			log.Fatal(err)
 		}
 		fmt.Printf("warmed %s in %s\n", so.Name(), time.Since(start).Round(time.Millisecond))
