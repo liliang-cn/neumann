@@ -82,6 +82,9 @@ type world struct {
 	reasked atomic.Int32    // ...and that it asked the policy about again
 
 	caps *model.Caps // what the scenario's model reports; nil: tools, unknown window
+
+	check        neumann.AnswerCheck // the machines' answer check; nil: none
+	checkRetries int
 }
 
 // approvalPolicy holds every payment for an operator and allows the rest. A
@@ -215,6 +218,14 @@ type crashScenario struct {
 	// needs it: each commit is a full fsync, and a few dozen runs at once
 	// slow every one of them past the quiesce limit.
 	wide int
+	// check, when set, is the machines' answer check (design §9.8), with
+	// checkRetries as MaxAnswerRetries; checkFailed: the task must end with
+	// its last answer rejected. rejected counts the runs whose first process
+	// committed a rejection and left the task unfinished.
+	check        neumann.AnswerCheck
+	checkRetries int
+	checkFailed  bool
+	rejected     *atomic.Int32
 	// patience is how long a process of the sweep may take to go quiet, and
 	// the restarted one to finish; 0: 5s and 10s. Every commit is a full
 	// fsync: a scenario with many of them needs more on a busy disk.
@@ -279,6 +290,15 @@ var (
 	// count of its rounds through the summaries.
 	compactScenario = crashScenario{name: "compact", model: fixed(pageModel), maxPays: 1, rounds: 6, mid: new(atomic.Int32), wide: 4, patience: 30 * time.Second,
 		caps: &model.Caps{Window: 640, MaxOut: 64, Tools: true}, ends: map[task.State]string{task.Done: "end_turn"}}
+	// After the payment, the answer check rejects the model's first answer
+	// and passes the one it gives from the feedback: the rejection's commit
+	// and the Done after it are commit points like any other.
+	checkScenario = crashScenario{name: "check", model: fixed(checkedPayModel), check: rejectDrafts, maxPays: 1, rejected: new(atomic.Int32),
+		ends: map[task.State]string{task.Done: "end_turn"}}
+	// The check rejects every answer: the second rejection, past the one
+	// retry, finishes the task with that answer, marked check_failed.
+	checkExhaustedScenario = crashScenario{name: "check_exhausted", model: fixed(checkedPayModel), check: rejectAll, checkFailed: true,
+		maxPays: 1, rejected: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
 	}, maxPays: 1, retries: "quota_exhausted", class: "little", moved: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
@@ -297,6 +317,20 @@ func pageModel(req model.Request) (model.Response, error) {
 		return sim.CallTools("dev_page"), nil
 	}
 	return sim.Reply("done"), nil
+}
+
+// checkedPayModel pays, then answers "draft" until the answer check has
+// given it feedback, and "done" after.
+func checkedPayModel(req model.Request) (model.Response, error) {
+	if sim.ToolRounds(req) == 0 {
+		return sim.CallTools("dev_pay", "dev_look"), nil
+	}
+	return draftThenFinalAs("done")(req)
+}
+
+// rejectAll is an answer check that rejects every answer.
+func rejectAll(context.Context, neumann.AnswerInfo) neumann.AnswerVerdict {
+	return neumann.AnswerVerdict{Reject: true, Reason: "never good enough", Feedback: "Try again."}
 }
 
 // bigModel pays, then is out of quota for good.
@@ -372,6 +406,7 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 	if w.approve {
 		cfg.ToolPolicy = w.approvalPolicy
 	}
+	cfg.AnswerCheck, cfg.MaxAnswerRetries = w.check, w.checkRetries
 	if w.flaky {
 		cfg.Limiters = []limit.Config{{Name: "gw", Limits: map[string]limit.Rate{"requests": {Per: time.Minute, Limit: 100}}}}
 		cfg.Limits = []string{"gw"}
@@ -462,6 +497,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	w.little = sc.little
 	w.approve = sc.approved != nil
 	w.caps = sc.caps
+	w.check, w.checkRetries = sc.check, sc.checkRetries
 	if sc.flaky {
 		w.flaky = true
 		defer w.tick()()
@@ -542,6 +578,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	if tc, err := s2.Load(bg, id); err == nil && sc.mid != nil && tc.State == task.Running && tc.PC == task.StepCompact {
 		sc.mid.Add(1)
+	}
+	if tc, err := s2.Load(bg, id); err == nil && sc.rejected != nil && tc.Rejections > 0 && !tc.State.Terminal() {
+		sc.rejected.Add(1)
 	}
 	m2 := newMachine(t, s2, w, sc.model(w))
 	finish := sweepPatience
@@ -657,6 +696,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	w.mu.Unlock()
 	checkEventsHaveState(t, s2, id)
+	if sc.check != nil {
+		checkChecked(t, s2, got, sc.checkFailed)
+	}
 	if sc.rounds > 0 {
 		checkCompacted(t, m2, got, recs, sc.rounds)
 	}
@@ -712,6 +754,48 @@ func checkCompacted(t *testing.T, m *neumann.Machine, got *task.TCB, recs []mem.
 		if !calls[r.CallID] {
 			t.Fatalf("call %s is in the log, not in the history", r.CallID)
 		}
+	}
+}
+
+// checkChecked checks a task that finished under an answer check: its done
+// event says the answer was checked, and failed the check exactly when
+// failed; every rejection the events record is the one Rejections counts,
+// and each but a final one left its feedback in the registers.
+func checkChecked(t *testing.T, s mem.Store, got *task.TCB, failed bool) {
+	t.Helper()
+	all, _ := s.Events(bg, 0, 0)
+	rejected, final := 0, 0
+	var done map[string]any
+	for _, ev := range all {
+		if ev.TaskID != got.ID {
+			continue
+		}
+		var d map[string]any
+		json.Unmarshal(ev.Data, &d)
+		switch ev.Kind {
+		case proto.EvAnswerRejected:
+			if d["attempt"] != float64(rejected) {
+				t.Fatalf("answer_rejected %d has attempt %v", rejected, d["attempt"])
+			}
+			rejected++
+			if d["final"] == true {
+				final++
+			}
+		case proto.EvDone:
+			done = d
+		}
+	}
+	if done == nil || done["checked"] != true || (done["check_failed"] == true) != failed {
+		t.Fatalf("done %v, want check_failed %v", done, failed)
+	}
+	feedback := 0
+	for _, msg := range got.Regs {
+		if msg.Feedback {
+			feedback++
+		}
+	}
+	if rejected != got.Rejections || final != map[bool]int{false: 0, true: 1}[failed] || feedback != rejected-final {
+		t.Fatalf("%d answer_rejected (%d final), %d feedback messages, Rejections %d", rejected, final, feedback, got.Rejections)
 	}
 }
 
@@ -1007,4 +1091,27 @@ func TestCrashAtEveryCommitPointWithACompaction(t *testing.T) {
 		t.Fatal("no crash point fell inside a compaction call")
 	}
 	t.Logf("%d crash points; the operator was needed at %d; the process died inside a compaction call at %d", points, held, mid)
+}
+
+// The same sweep with an answer check after the payment: it rejects the
+// first answer and passes the second, or rejects both (the second past the
+// retry, finishing the task check_failed). A crash before and after every
+// commit, the rejection's included, still finishes the task once, paying
+// once, with each rejection recorded once: a crash before the rejection
+// lands redoes the model step and asks the check again; one after it
+// resumes from the feedback, and the check is told the attempt.
+func TestCrashAtEveryCommitPointWithAnAnswerCheck(t *testing.T) {
+	for _, sc := range []crashScenario{checkScenario, checkExhaustedScenario} {
+		t.Run(sc.name, func(t *testing.T) {
+			sc.rejected.Store(0)
+			points, held, _ := sweep(t, sc)
+			if held == 0 {
+				t.Fatal("no crash point left the payment's outcome unknown")
+			}
+			if sc.rejected.Load() == 0 {
+				t.Fatal("no crash point fell between a rejection and the answer after it")
+			}
+			t.Logf("%d crash points; the operator was needed at %d; the restart resumed after a rejection at %d", points, held, sc.rejected.Load())
+		})
+	}
 }

@@ -87,6 +87,19 @@ type Config struct {
 	// it has no timeout, and one that blocks stalls a vCore, or Start.
 	ToolPolicy ToolPolicy
 
+	// AnswerCheck, when set, is asked about every final answer before its
+	// task is finished (design §9.8): pass it, or reject it with feedback
+	// the model answers again from. nil: answers are not checked, and
+	// nothing about checks is recorded. AnswerCheckTimeout bounds one call
+	// of it (default 3s, wall-clock time); a check that times out or panics
+	// passes the answer. MaxAnswerRetries is how many rejected answers of a
+	// task go back to the model (default 1; negative: none); a rejection
+	// past them finishes the task with that answer anyway, marked
+	// check_failed. See AnswerCheck.
+	AnswerCheck        AnswerCheck
+	AnswerCheckTimeout time.Duration
+	MaxAnswerRetries   int
+
 	// Limiters are the machine's rate limiters (design §7). A group names
 	// the ones every one of its model requests takes room in (all of them at
 	// once, or it waits); groups that name the same limiter share it. A
@@ -347,6 +360,7 @@ func New(cfg Config) (*Machine, error) {
 		Guard: m.guard,
 	}
 	m.env.Policy = cfg.ToolPolicy
+	m.env.Check, m.env.CheckTimeout, m.env.CheckRetries = cfg.AnswerCheck, cfg.AnswerCheckTimeout, cfg.MaxAnswerRetries
 	m.sched.SetContext(haltCtx)
 	m.sched.OnDeadline(m.deadline)
 	m.sched.OnWake(m.wake)

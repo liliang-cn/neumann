@@ -271,3 +271,29 @@ func TestCompactedRegistersRender(t *testing.T) {
 		t.Fatalf("transcript %q", c)
 	}
 }
+
+// An answer check's feedback (design §9.8) goes as the plain user message
+// it is, after the answer it rejected.
+func TestFeedbackRendersAsAUserMessage(t *testing.T) {
+	s := newServer(t, 200, textReply)
+	a := New(s.URL+"/v1", "k", "m1")
+	if _, err := a.Call(context.Background(), model.Request{Messages: []task.Message{
+		task.Text(task.RoleUser, "what is the total?"),
+		task.Text(task.RoleAssistant, "a draft"),
+		task.FeedbackMessage("Give the final figure."),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	msgs := s.body(0)["messages"].([]any)
+	var roles []string
+	for _, m := range msgs {
+		roles = append(roles, m.(map[string]any)["role"].(string))
+	}
+	if strings.Join(roles, ",") != "user,assistant,user" {
+		t.Fatalf("roles %v", roles)
+	}
+	last := msgs[2].(map[string]any)
+	if last["content"] != "Give the final figure." || len(last) != 2 {
+		t.Fatalf("feedback %v", last)
+	}
+}

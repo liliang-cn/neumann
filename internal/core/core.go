@@ -69,6 +69,15 @@ type Env struct {
 	// (design §9.7). nil allows every call and records no decision.
 	Policy Policy
 
+	// Check is asked about each final answer before its task is finished
+	// (design §9.8); nil finishes every answer unchecked. CheckTimeout bounds
+	// one call of it (0: DefaultCheckTimeout); CheckRetries is how many
+	// rejected answers of a task go back to the model (0:
+	// DefaultCheckRetries, negative: none).
+	Check        AnswerCheck
+	CheckTimeout time.Duration
+	CheckRetries int
+
 	batches sync.WaitGroup
 	cores   cores // elastic vCores: StartCores, Grow, CloseCores, WaitCores
 
@@ -256,13 +265,26 @@ func (e *Env) ready(t *task.TCB, pc task.PC) {
 }
 
 func (e *Env) finish(t *task.TCB, c mem.CommitSet, reason string) mem.CommitSet {
+	return e.finishWith(t, c, reason, nil)
+}
+
+// finishWith is finish for an answer the answer check saw (design §9.8):
+// check is what the done event adds about it; the answer event takes its
+// checked and check_failed.
+func (e *Env) finishWith(t *task.TCB, c mem.CommitSet, reason string, check map[string]any) mem.CommitSet {
 	t.State = task.Done
 	t.StopReason = reason
 	t.Version++
 	c.Task = t
-	c.Events = append(c.Events,
-		proto.NewEvent(proto.EvAnswer, t.ID, map[string]string{"text": e.lastAnswer(t)}),
-		proto.NewEvent(proto.EvDone, t.ID, map[string]string{"stop_reason": reason}))
+	answer := map[string]any{"text": e.lastAnswer(t)}
+	done := map[string]any{"stop_reason": reason}
+	for k, v := range check {
+		done[k] = v
+		if k == "checked" || k == "check_failed" {
+			answer[k] = v
+		}
+	}
+	c.Events = append(c.Events, proto.NewEvent(proto.EvAnswer, t.ID, answer), proto.NewEvent(proto.EvDone, t.ID, done))
 	return c
 }
 

@@ -615,3 +615,22 @@ func TestCompactedRegistersRender(t *testing.T) {
 		t.Fatalf("compaction request messages %+v", m)
 	}
 }
+
+// An answer check's feedback (design §9.8) goes as the plain user turn it
+// is, after the answer it rejected.
+func TestFeedbackRendersAsAUserTurn(t *testing.T) {
+	s := newServer(t, 200, textReply)
+	a := New(s.URL+"/v1", "k", "claude-x")
+	call(t, a, model.Request{Messages: []task.Message{
+		task.Text(task.RoleUser, "what is the total?"),
+		task.Text(task.RoleAssistant, "a draft"),
+		task.FeedbackMessage("Give the final figure."),
+	}})
+	msgs := s.messages(t, 0)
+	if roles(msgs) != "user,assistant,user" {
+		t.Fatalf("roles %s", roles(msgs))
+	}
+	if c := msgs[2].Content; len(c) != 1 || block(t, c[0])["type"] != "text" || block(t, c[0])["text"] != "Give the final figure." {
+		t.Fatalf("feedback turn %s", c)
+	}
+}

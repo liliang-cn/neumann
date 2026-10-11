@@ -90,6 +90,17 @@ const (
 	EvApprovalNeeded = "approval_needed"
 	EvApproved       = "approved"
 
+	// The answer check (design §9.8) rejected a final answer: {reason,
+	// feedback, attempt}, attempt 0 for the task's first checked answer. The
+	// answer and the feedback, as a user message, are in the registers and
+	// the model answers again. With final: true no retry was left: the
+	// task finishes with that answer anyway, and its answer and done events
+	// carry check_failed: true ({reason, attempt, final}, no feedback). When
+	// a check is configured, the answer and done events of an answer it saw
+	// carry checked: true; done adds check_reason (the check's reason, if
+	// any) or check_error (it timed out or panicked, and the answer passed).
+	EvAnswerRejected = "answer_rejected"
+
 	// A compaction swapped the oldest rounds of a task's registers out into
 	// one summary message (design §5.3): {rounds, messages_before,
 	// messages_after, tokens_before_est, tokens_after_est, chunk, chunks}:

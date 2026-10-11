@@ -122,23 +122,46 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	}
 
 	t.Regs = append(t.Regs, msg)
-	// A steer committed while the model was answering turns this answer into
-	// a turn: the task goes on instead of finishing over it. The steer stays
-	// pending: the next model step applies it at its start and sends it, or
-	// that step's terminal commit reports it dropped.
+	if out := e.arrived(ctx, t, c, base, resp); out != nil {
+		return out.c, out.batch, out.err
+	}
+	if e.Check == nil {
+		return e.finish(t, c, "end_turn"), nil, nil
+	}
+	// The answer check sees the answer before the commit that finishes the
+	// task (design §9.8); its verdict exists only through that commit. What
+	// arrived while it ran counts as if it had arrived during the call: a
+	// cancel ends the task and a steer makes the answer a turn, and the
+	// verdict is dropped either way.
+	v := e.checkAnswer(t, msg.TextContent())
+	if out := e.arrived(ctx, t, c, base, resp); out != nil {
+		return out.c, out.batch, out.err
+	}
+	return e.answerChecked(t, c, v), nil, nil
+}
+
+// arrived ends a model step whose final answer is in hand (the last of t's
+// registers, appended after base) when outside input arrived for t during
+// it; nil lets the answer stand. A cancel ends the task, the answer
+// discarded. A steer turns the answer into a turn: the task goes on instead
+// of finishing over it. The steer stays pending: the next model step
+// applies it at its start and sends it, or that step's terminal commit
+// reports it dropped.
+func (e *Env) arrived(ctx context.Context, t *task.TCB, c mem.CommitSet, base int, resp model.Response) *stepOut {
 	late, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
-		return c, nil, fmt.Errorf("read interrupts: %w", err)
+		return &stepOut{c: c, err: fmt.Errorf("read interrupts: %w", err)}
 	}
 	if _, ok := cancelReason(late); ok {
-		return e.cancelledStep(ctx, t, c, base, resp, nil, true, false)
+		cs, batch, err := e.cancelledStep(ctx, t, c, base, resp, nil, true, false)
+		return &stepOut{cs, batch, err}
 	}
 	if late = withoutApplied(late, c.Applied); hasSteer(late) {
 		e.ready(t, task.StepModel)
 		c.Task = t
-		return c, nil, nil
+		return &stepOut{c: c}
 	}
-	return e.finish(t, c, "end_turn"), nil, nil
+	return nil
 }
 
 // stepOut is how a model call's instruction ends when the call did not
