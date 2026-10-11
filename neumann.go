@@ -1,7 +1,13 @@
 // Package neumann is a resident agent runtime organised like a von Neumann
 // machine: vCores fetch, execute and commit one instruction at a time; tools
 // sit on a bus and run as asynchronous I/O; every state change is committed
-// before anything acts on it. See docs/design.md.
+// before anything acts on it.
+//
+// To start: build a Machine with New (a model adapter, devices, optionally a
+// durable store such as mem/sqlite), call Start once, Submit tasks, read their
+// progress with Events (a replayable log) or Load, and Stop once at the end.
+// See Example, examples/hello (offline), README.md and docs/overview.md; the
+// full design is docs/design.md (in Chinese).
 package neumann
 
 import (
@@ -181,7 +187,10 @@ type Clock interface{ Now() time.Time }
 var ErrNotStarted = errors.New("neumann: machine not started")
 
 var (
-	ErrBusy     = errors.New("neumann: at capacity")
+	// ErrBusy is matched by every *CapacityError: admission refused a new
+	// task because MaxQueued (machine or group) unfinished tasks exist.
+	ErrBusy = errors.New("neumann: at capacity")
+	// ErrStopped is returned by every instruction once Stop has begun.
 	ErrStopped  = errors.New("neumann: machine stopped")
 	ErrFinished = mem.ErrFinished
 	ErrNotFound = mem.ErrNotFound
@@ -204,6 +213,9 @@ func (e *CapacityError) Error() string {
 
 func (e *CapacityError) Is(target error) bool { return target == ErrBusy }
 
+// Machine is a running agent runtime: execution groups of vCores over one
+// store and one bus. Build it with New, Start it once and Stop it once; every
+// method is safe for concurrent use.
 type Machine struct {
 	cfg    Config
 	store  mem.Store
@@ -239,6 +251,10 @@ type Machine struct {
 	limiters []*limit.Limiter // in Config order
 }
 
+// New validates cfg and attaches the devices to a bus (closing them if
+// attaching fails). It does not touch the store or start anything: Start
+// recovers unfinished tasks and starts the vCores. A config error found before
+// the bus is built leaves the devices to the caller.
 func New(cfg Config) (*Machine, error) {
 	if cfg.Store == nil {
 		cfg.Store = mem.NewMemory()
@@ -914,6 +930,8 @@ func (m *Machine) Calls(ctx context.Context, id string) ([]mem.CallRecord, error
 	return m.store.Calls(ctx, id)
 }
 
+// Status is a cheap snapshot of the machine (design §14), returned by
+// Machine.Status: no model call, no store read.
 type Status struct {
 	Cores      int `json:"cores"`      // live vCores, every group
 	Ready      int `json:"ready"`      // in ready queues

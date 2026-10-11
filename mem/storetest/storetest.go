@@ -1,6 +1,12 @@
 // Package storetest is the conformance suite every mem.Store must pass: the
 // in-memory store and the SQLite store run the same cases, so they cannot
 // drift apart in the semantics the machine relies on (design §4).
+//
+// A new Store runs it from a test:
+//
+//	func TestConformance(t *testing.T) {
+//		storetest.Run(t, func(t *testing.T) mem.Store { return newMyStore(t) })
+//	}
 package storetest
 
 import (

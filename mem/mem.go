@@ -147,6 +147,11 @@ var (
 	ErrCancelPending = errors.New("mem: task has a pending cancel")
 )
 
+// Store is main memory. Commit applies a CommitSet atomically and durably
+// (as durable as the implementation is) and returns its events with their
+// sequence numbers and times; the read methods return committed state only.
+// Every implementation must pass mem/storetest. NewMemory is the in-process
+// one for tests; mem/sqlite is the durable one.
 type Store interface {
 	Commit(ctx context.Context, c CommitSet) ([]proto.Event, error)
 	Load(ctx context.Context, id string) (*task.TCB, error)

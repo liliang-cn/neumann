@@ -9,6 +9,10 @@
 //
 // TCBs, call records and archived messages are stored gob-encoded: a model can emit tool
 // arguments that are not valid JSON, and they must round-trip byte for byte.
+//
+// Use: s, err := sqlite.Open(path); pass s as neumann.Config.Store; Close it
+// after Machine.Stop. One process owns a database file at a time (a second
+// Open fails with ErrLocked).
 package sqlite
 
 import (
