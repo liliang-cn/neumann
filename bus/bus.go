@@ -47,11 +47,14 @@ type ToolDef struct {
 }
 
 // DeviceCall is one call as a device receives it. Key is the idempotency key
-// (task/call/attempt); a device may use it to drop a repeat.
+// (task/call/attempt); a device may use it to drop a repeat. Task is the id of
+// the task that made the call, the task part of Key; empty when Key names
+// none.
 type DeviceCall struct {
 	Tool string
 	Args json.RawMessage
 	Key  string
+	Task string
 }
 
 // Device is anything that serves tools: Tools lists them once, when the
@@ -385,7 +388,7 @@ func (b *Bus) RunCached(ctx context.Context, name string, args json.RawMessage, 
 					o = outcome{res: task.ToolResult{Content: fmt.Sprintf("tool %s panicked: %v", name, p), IsError: true}}
 				}
 			}()
-			res, err := r.dev.Call(cctx, DeviceCall{Tool: r.tool, Args: args, Key: key})
+			res, err := r.dev.Call(cctx, DeviceCall{Tool: r.tool, Args: args, Key: key, Task: taskID})
 			return outcome{res, err}
 		}()
 		invalidate() // before the result is handed over: the write is done
