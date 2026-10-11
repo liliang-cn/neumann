@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -135,29 +136,73 @@ type Usage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
-// Decide asks every question about state in one request. The questions go
-// in name order: System One answers them in the order sent, and an answer
-// can lean on those before it, so a caller that wants one question settled
-// first names it to sort first.
-func (s *SystemOne) Decide(ctx context.Context, state string, qs map[string]Question) (map[string]Answer, error) {
-	a, _, err := s.DecideUsage(ctx, state, qs)
+// MaxBody is the largest request body System One takes, in bytes: the
+// state, the questions and the rest of the JSON together.
+const MaxBody = 64 << 10
+
+// Warm loads the model by asking it one small question, so the first real
+// request does not pay for the load (seconds, for tev1:4b: far longer than
+// a tool policy waits). It ignores the client's Timeout, which a load can
+// outlast; ctx bounds it. Ready only lists the models and loads nothing.
+func (s *SystemOne) Warm(ctx context.Context) error {
+	w := *s
+	w.timeout = -1
+	_, err := w.Decide(ctx, "ready", []Ask{{Name: "ready", Question: Noul("Is this text a single word?")}})
+	return err
+}
+
+// Decide asks every question about state in one request, in the order
+// given: that order is the order of the request's questions object, and
+// System One answers them in it.
+//
+// The state must fit the model's context, which System One never truncates
+// (tev1:4b takes 2050 tokens, state and questions together: some 6 to 7 KB
+// of English). A request it refuses as too long is sent once more with the
+// state cut, keeping its start and its end, to about the share of it the
+// server's limit allows; a second refusal is the error.
+func (s *SystemOne) Decide(ctx context.Context, state string, asks []Ask) (map[string]Answer, error) {
+	a, _, err := s.DecideUsage(ctx, state, asks)
 	return a, err
 }
 
 // DecideUsage is Decide that also returns the request's usage.
-func (s *SystemOne) DecideUsage(ctx context.Context, state string, qs map[string]Question) (map[string]Answer, Usage, error) {
-	if err := Validate(qs); err != nil {
+func (s *SystemOne) DecideUsage(ctx context.Context, state string, asks []Ask) (map[string]Answer, Usage, error) {
+	if err := Validate(asks); err != nil {
 		return nil, Usage{}, err
 	}
 	if strings.TrimSpace(state) == "" {
 		return nil, Usage{}, fmt.Errorf("decide: empty state")
 	}
-	if len(state) > MaxState {
-		return nil, Usage{}, fmt.Errorf("decide: the state is %d bytes, over the %d System One takes", len(state), MaxState)
+	out, usage, err := s.send(ctx, state, asks)
+	if over, ok := err.(*overContext); ok {
+		// Cut by what the server says, with a tenth to spare: the questions
+		// count against the limit too, and they are not cut.
+		n := int(float64(len(state)) * float64(over.limit) / float64(over.tokens) * 0.9)
+		out, usage, err = s.send(ctx, clipMiddle(state, n), asks)
 	}
-	body, err := s.encode(state, qs)
+	return out, usage, err
+}
+
+// overContext is System One refusing a request longer than the model's
+// context: "prompt 0 has N tokens; expected 1–M (input is never truncated)".
+type overContext struct {
+	name          string
+	tokens, limit int
+	msg           string
+}
+
+func (e *overContext) Error() string { return fmt.Sprintf("decide: %s: %s", e.name, e.msg) }
+
+var overContextRE = regexp.MustCompile(`has (\d+) tokens; expected \d+\D{1,3}(\d+)`)
+
+// send makes one request.
+func (s *SystemOne) send(ctx context.Context, state string, asks []Ask) (map[string]Answer, Usage, error) {
+	body, err := s.encode(state, asks)
 	if err != nil {
 		return nil, Usage{}, err
+	}
+	if len(body) > MaxBody {
+		return nil, Usage{}, fmt.Errorf("decide: the request is %d bytes, over the %d System One takes", len(body), MaxBody)
 	}
 	ctx, cancel := s.bound(ctx)
 	defer cancel()
@@ -175,7 +220,15 @@ func (s *SystemOne) DecideUsage(ctx context.Context, state string, qs map[string
 	if res.StatusCode != http.StatusOK {
 		// Ollama says exactly what it refused (too many options, too long a
 		// state, an unknown model); a bare status would leave it to guessing.
-		return nil, Usage{}, fmt.Errorf("decide: %s: %s: %s", s.Name(), res.Status, errorText(res.Body))
+		msg := errorText(res.Body)
+		if m := overContextRE.FindStringSubmatch(msg); res.StatusCode == http.StatusBadRequest && m != nil {
+			n, _ := strconv.Atoi(m[1])
+			limit, _ := strconv.Atoi(m[2])
+			if n > limit && limit > 0 {
+				return nil, Usage{}, &overContext{name: s.Name(), tokens: n, limit: limit, msg: res.Status + ": " + msg}
+			}
+		}
+		return nil, Usage{}, fmt.Errorf("decide: %s: %s: %s", s.Name(), res.Status, msg)
 	}
 	var reply struct {
 		Answers map[string]wireAnswer `json:"answers"`
@@ -184,17 +237,17 @@ func (s *SystemOne) DecideUsage(ctx context.Context, state string, qs map[string
 	if err := json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&reply); err != nil {
 		return nil, Usage{}, fmt.Errorf("decide: %s: reading the answer: %w", s.Name(), err)
 	}
-	out := make(map[string]Answer, len(qs))
-	for name, q := range qs {
-		w, ok := reply.Answers[name]
+	out := make(map[string]Answer, len(asks))
+	for _, a := range asks {
+		w, ok := reply.Answers[a.Name]
 		if !ok {
-			return nil, Usage{}, fmt.Errorf("decide: %s did not answer %q", s.Name(), name)
+			return nil, Usage{}, fmt.Errorf("decide: %s did not answer %q", s.Name(), a.Name)
 		}
-		a, err := w.answer(q)
+		ans, err := w.answer(a.Question)
 		if err != nil {
-			return nil, Usage{}, fmt.Errorf("decide: %s: question %q: %w", s.Name(), name, err)
+			return nil, Usage{}, fmt.Errorf("decide: %s: question %q: %w", s.Name(), a.Name, err)
 		}
-		out[name] = a
+		out[a.Name] = ans
 	}
 	return out, reply.Usage, nil
 }
@@ -221,24 +274,42 @@ type wireQuestion struct {
 }
 
 type wireRequest struct {
-	Model     string                  `json:"model"`
-	State     string                  `json:"state"`
-	Questions map[string]wireQuestion `json:"questions"`
-	KeepAlive string                  `json:"keep_alive,omitempty"`
+	Model string `json:"model"`
+	State string `json:"state"`
+	// Questions is an object in the caller's order, written by hand: a Go
+	// map would sort it.
+	Questions json.RawMessage `json:"questions"`
+	KeepAlive string          `json:"keep_alive,omitempty"`
 }
 
-// encode is the request body for qs, which Validate has passed.
-func (s *SystemOne) encode(state string, qs map[string]Question) ([]byte, error) {
-	r := wireRequest{Model: s.model, State: state, Questions: make(map[string]wireQuestion, len(qs))}
+// encode is the request body for asks, which Validate has passed.
+func (s *SystemOne) encode(state string, asks []Ask) ([]byte, error) {
+	var qs bytes.Buffer
+	qs.WriteByte('{')
+	for i, a := range asks {
+		c, err := criteria(a.Question)
+		if err != nil {
+			return nil, fmt.Errorf("decide: question %q: %w", a.Name, err)
+		}
+		k, err := json.Marshal(a.Name)
+		if err != nil {
+			return nil, err
+		}
+		v, err := json.Marshal(wireQuestion{Type: a.Question.Type, Instructions: a.Question.Instructions, Criteria: c})
+		if err != nil {
+			return nil, err
+		}
+		if i > 0 {
+			qs.WriteByte(',')
+		}
+		qs.Write(k)
+		qs.WriteByte(':')
+		qs.Write(v)
+	}
+	qs.WriteByte('}')
+	r := wireRequest{Model: s.model, State: state, Questions: qs.Bytes()}
 	if s.keepAlive != 0 {
 		r.KeepAlive = s.keepAlive.String() // Ollama parses Go durations; negative keeps the model loaded
-	}
-	for name, q := range qs {
-		c, err := criteria(q)
-		if err != nil {
-			return nil, fmt.Errorf("decide: question %q: %w", name, err)
-		}
-		r.Questions[name] = wireQuestion{Type: q.Type, Instructions: q.Instructions, Criteria: c}
 	}
 	return json.Marshal(r)
 }

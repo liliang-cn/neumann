@@ -45,6 +45,11 @@
 //	class, _, _ := router.Route(ctx, input) // the default class if the engine fails
 //	id, err := m.Submit(ctx, proto.Instruction{Input: input, Class: class})
 //
+// A decision model reads little: tev1:4b takes 2050 tokens, questions
+// included, and System One never truncates. Policy, Router and Checker cut
+// what they show it to a byte budget each, marking the cut, and SystemOne
+// retries a request refused as too long once with a shorter state.
+//
 // An engine's error means it gave no answer. Callers degrade to a fixed
 // choice (Policy's Fallback, Router's Default, a Checker's pass); they never
 // guess an answer.

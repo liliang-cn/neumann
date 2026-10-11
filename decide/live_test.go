@@ -1,10 +1,13 @@
 package decide_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,18 +36,18 @@ func TestLive(t *testing.T) {
 	if err := e.Ready(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// The first request loads the model; time the ones after it.
+	// Warm loads the model if it is not loaded; time the requests after it.
 	start := time.Now()
-	if _, err := e.Decide(ctx, "warm up", map[string]decide.Question{"q": decide.Noul("Is this a greeting?")}); err != nil {
+	if err := e.Warm(ctx); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("%s at %s: first request %s", e.Name(), e.URL(), time.Since(start).Round(time.Millisecond))
+	t.Logf("%s at %s: warm %s", e.Name(), e.URL(), time.Since(start).Round(time.Millisecond))
 
 	t.Run("three types", func(t *testing.T) {
-		qs := map[string]decide.Question{
-			"risky":  decide.Noul("Is this request dangerous to carry out?"),
-			"route":  decide.Choice("Which model should handle it?", "fast", "strong").Describe("fast", "short factual answers").Describe("strong", "multi-step reasoning and writing"),
-			"effort": decide.Score("How many steps does it take?", "one step", "a few steps", "many steps"),
+		qs := []decide.Ask{
+			{Name: "risky", Question: decide.Noul("Is this request dangerous to carry out?")},
+			{Name: "route", Question: decide.Choice("Which model should handle it?", "fast", "strong").Describe("fast", "short factual answers").Describe("strong", "multi-step reasoning and writing")},
+			{Name: "effort", Question: decide.Score("How many steps does it take?", "one step", "a few steps", "many steps")},
 		}
 		start := time.Now()
 		got, usage, err := e.DecideUsage(ctx, "Draft a migration plan for moving our billing database to a new region with no downtime.", qs)
@@ -56,6 +59,17 @@ func TestLive(t *testing.T) {
 			a := got[name]
 			t.Logf("  %-6s %-12s confidence %.2f score %.2f p %v", name, a.Label, a.Confidence, a.Score, a.Probabilities)
 		}
+	})
+
+	t.Run("long state", func(t *testing.T) {
+		// Over the model's context: refused once, then sent again cut.
+		state := strings.Repeat("The quick brown fox jumps over the lazy dog. ", 200) // 9000 bytes, ~2100 tokens
+		start := time.Now()
+		got, usage, err := e.DecideUsage(ctx, state, []decide.Ask{{Name: "fox", Question: decide.Noul("Is this text about a fox?")}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("  %d bytes: %s, %d input tokens on the second try, fox=%s p=%.2f", len(state), time.Since(start).Round(time.Millisecond), usage.InputTokens, got["fox"].Label, got["fox"].P("yes"))
 	})
 
 	t.Run("policy", func(t *testing.T) {
@@ -78,6 +92,15 @@ func TestLive(t *testing.T) {
 			if d.Verdict != c.want {
 				t.Errorf("%s: %s, want %s", c.tool, d.Verdict, c.want)
 			}
+		}
+		// 4 KiB of base64 in the arguments: cut to DefaultMaxArgs, answered.
+		blob := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xde, 0xad, 0xbe}, 1400))
+		info := neumann.ToolCallInfo{TaskID: "live", CallID: "c-2", Tool: "files_upload", Device: "files", Effect: bus.SideEffect, Args: json.RawMessage(`{"name":"a.bin","data":"` + blob + `"}`), Attempt: 1}
+		start := time.Now()
+		d := p(ctx, info)
+		t.Logf("  %-13s %-16s %6s  %s (%d bytes of arguments)", info.Tool, d.Verdict, time.Since(start).Round(time.Millisecond), d.Reason, len(info.Args))
+		if strings.Contains(d.Reason, "no answer") {
+			t.Errorf("long arguments got no answer: %s", d.Reason)
 		}
 	})
 
@@ -102,6 +125,14 @@ func TestLive(t *testing.T) {
 			if err != nil || class != want {
 				t.Errorf("routed to %q (%v), want %q", class, err, want)
 			}
+		}
+		// 300 sentences, far past the context: routed on its start and end.
+		long := strings.Repeat("Compare the two contracts clause by clause and list every difference in liability. ", 300)
+		start := time.Now()
+		class, ans, err := r.Route(ctx, long)
+		t.Logf("  %-6s confidence %.2f %6s  (%d bytes)", class, ans.Confidence, time.Since(start).Round(time.Millisecond), len(long))
+		if err != nil || ans.Label == "" {
+			t.Errorf("a long input got no route: %v", err)
 		}
 	})
 
@@ -131,6 +162,14 @@ func TestLive(t *testing.T) {
 			if !slices.Equal(res.Failed, x.failed) {
 				t.Errorf("%s: failed %v, want %v", x.name, res.Failed, x.failed)
 			}
+		}
+		// An 8 KB answer: checked on its start and end, not failed open.
+		long := "Here are the files, largest first:\n" + strings.Repeat("data/part-0001.parquet  12 MB\n", 270) + "That is the full listing."
+		start := time.Now()
+		res, err := c.Check(ctx, request, long)
+		t.Logf("  long      pass=%v failed=%v %s (%d bytes)", res.Pass, res.Failed, time.Since(start).Round(time.Millisecond), len(long))
+		if err != nil || res.Answers == nil {
+			t.Errorf("a long answer was not checked: %v", err)
 		}
 	})
 }

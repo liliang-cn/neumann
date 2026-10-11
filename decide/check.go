@@ -2,10 +2,7 @@ package decide
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"maps"
-	"slices"
 	"strings"
 	"time"
 )
@@ -17,47 +14,57 @@ const (
 	CheckRefuses  = "refuses"   // fails when the answer refuses or evades
 )
 
-// DefaultCheckTimeout bounds each engine request a Checker makes.
-const DefaultCheckTimeout = 3 * time.Second
-
-// DefaultCheckFloor is the confidence a failing answer needs, by default, to
-// fail its check: a probability of at least 0.65 for the failing side. A
-// small engine is often unsure about a good answer, and its doubt should not
-// fail it.
-const DefaultCheckFloor = 0.3
+// Checker defaults.
+const (
+	DefaultCheckTimeout = 5 * time.Second
+	// DefaultCheckFloor is the confidence a failing answer needs to fail its
+	// check: a probability of at least 0.65 for the failing side. A small
+	// engine is often unsure about a good answer, and its doubt should not
+	// fail it.
+	DefaultCheckFloor = 0.3
+	// DefaultMaxCheckState is how many bytes of request, answer and
+	// evidence together the engine is shown, which fits tev1:4b's
+	// 2050-token context with room for the default checks, for English.
+	DefaultMaxCheckState = 4096
+)
 
 // Check is one thing a Checker asks about an answer: a noul, the answer to
 // it that fails the check, and the sentence that says so in
 // CheckResult.Feedback.
 type Check struct {
+	Name     string
 	Question Question // a noul
 	FailOn   bool     // true: a yes fails the check; false: a no does
 	Feedback string   // one sentence, addressed to the model that wrote the answer
 }
 
 // DefaultChecks are the checks a Checker runs unless CheckerConfig.Checks
-// replaces them: is the answer about the request, is it only a plan or a
-// promise, does it refuse or evade. The map is new on every call; add to it
-// or change it freely.
+// replaces them, in the order they are asked: is the answer about the
+// request, is it only a plan or a promise, does it refuse or evade. The
+// slice is new on every call; change it freely.
 //
-// The wording was tuned against tev1:4b, and so were the names: System One
-// answers questions in the order they are sent, which is name order (see
-// SystemOne.Decide), and these are answered best in this one.
-func DefaultChecks() map[string]Check {
-	return map[string]Check{
-		CheckOnTopic: {
+// The wording and the order were tuned against tev1:4b, which answers the
+// questions of a request one after another: asked alone, the plan question
+// scored a plain promise ("I'll start by scanning the directory...") 0.19;
+// asked after the topic question, 0.93.
+func DefaultChecks() []Check {
+	return []Check{
+		{
+			Name: CheckOnTopic,
 			Question: Noul("Is the assistant's reply about what the user asked for (the same task or question), whether or not it finishes it?").
 				Describe("yes", "it deals with the user's request").
 				Describe("no", "it talks about something unrelated to the request"),
 			FailOn:   false,
 			Feedback: "Your answer did not respond to the request: answer what was asked.",
 		},
-		CheckPlanOnly: {
+		{
+			Name:     CheckPlanOnly,
 			Question: Noul("Does the reply talk about work in the future tense (I will, I'll, first I'm going to) instead of reporting a result?"),
 			FailOn:   true,
 			Feedback: "Your answer described a plan or promised the work without doing it: do the work now and give the result.",
 		},
-		CheckRefuses: {
+		{
+			Name: CheckRefuses,
 			Question: Noul("Does the assistant decline or refuse to help with the request?").
 				Describe("yes", "it says it cannot or will not help").
 				Describe("no", "it tries to help"),
@@ -67,16 +74,25 @@ func DefaultChecks() map[string]Check {
 	}
 }
 
-// CheckerConfig configures a Checker.
+// CheckerConfig configures a Checker. As in PolicyConfig and RouterConfig, a
+// zero number takes the package default and a negative one turns the bound
+// off.
 type CheckerConfig struct {
-	// Checks are asked by name in one request (default DefaultChecks()).
-	Checks map[string]Check
-	// Floor is the confidence a failing answer needs to fail its check,
-	// below 1 (default DefaultCheckFloor; negative: any failing answer
-	// fails it).
+	// Checks are asked in one request, in order (nil: DefaultChecks()).
+	Checks []Check
+	// Floor is the confidence a failing answer needs to fail its check
+	// (zero: DefaultCheckFloor; negative: every failing answer fails it).
+	// It must be below 1.
 	Floor float64
-	// Timeout bounds each engine request (default DefaultCheckTimeout).
+	// Timeout bounds each engine request (zero: DefaultCheckTimeout; it
+	// cannot be turned off).
 	Timeout time.Duration
+	// MaxState is how many bytes of request, answer and evidence the engine
+	// is shown (zero: DefaultMaxCheckState; negative: all of them). The
+	// request and the evidence get up to a quarter each, cut at the end;
+	// the answer gets the rest, and a longer one keeps its start and its
+	// end, with a marker where the middle was cut.
+	MaxState int
 }
 
 // Checker checks a finished task's answer against its request. It runs in
@@ -85,12 +101,12 @@ type CheckerConfig struct {
 // feedback, steer, tell a person) is the host's choice. It is safe for
 // concurrent use.
 type Checker struct {
-	engine  Engine
-	checks  map[string]Check
-	names   []string // sorted: the order of Failed and of Feedback
-	qs      map[string]Question
-	floor   float64
-	timeout time.Duration
+	engine   Engine
+	checks   []Check
+	asks     []Ask
+	floor    float64
+	timeout  time.Duration
+	maxState int
 }
 
 // NewChecker checks cfg and builds a Checker on engine.
@@ -98,38 +114,34 @@ func NewChecker(engine Engine, cfg CheckerConfig) (*Checker, error) {
 	if engine == nil {
 		return nil, fmt.Errorf("decide: a checker needs an engine")
 	}
-	checks := maps.Clone(cfg.Checks)
-	if checks == nil {
+	checks := append([]Check(nil), cfg.Checks...)
+	if cfg.Checks == nil {
 		checks = DefaultChecks()
 	}
-	qs := make(map[string]Question, len(checks))
-	for name, c := range checks {
+	asks := make([]Ask, 0, len(checks))
+	for _, c := range checks {
 		if c.Question.Type != TypeNoul {
-			return nil, fmt.Errorf("decide: check %q asks a %q, not a noul", name, c.Question.Type)
+			return nil, fmt.Errorf("decide: check %q asks a %q, not a noul", c.Name, c.Question.Type)
 		}
 		if strings.TrimSpace(c.Feedback) == "" {
-			return nil, fmt.Errorf("decide: check %q has no feedback", name)
+			return nil, fmt.Errorf("decide: check %q has no feedback", c.Name)
 		}
-		qs[name] = c.Question
+		asks = append(asks, Ask{Name: c.Name, Question: c.Question})
 	}
-	if err := Validate(qs); err != nil {
+	if err := Validate(asks); err != nil {
 		return nil, err
 	}
-	switch {
-	case cfg.Floor >= 1:
-		return nil, fmt.Errorf("decide: checker floor %v is not below 1", cfg.Floor)
-	case cfg.Floor == 0:
-		cfg.Floor = DefaultCheckFloor
-	case cfg.Floor < 0:
-		cfg.Floor = 0
+	floor, err := bound("checker floor", cfg.Floor, DefaultCheckFloor)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultCheckTimeout
 	}
-	return &Checker{
-		engine: engine, checks: checks, names: slices.Sorted(maps.Keys(checks)), qs: qs,
-		floor: cfg.Floor, timeout: cfg.Timeout,
-	}, nil
+	if cfg.MaxState == 0 {
+		cfg.MaxState = DefaultMaxCheckState
+	}
+	return &Checker{engine: engine, checks: checks, asks: asks, floor: floor, timeout: cfg.Timeout, maxState: cfg.MaxState}, nil
 }
 
 // CheckOption adds to one Check call.
@@ -146,7 +158,7 @@ func WithEvidence(text ...string) CheckOption {
 // CheckResult is what a Checker found.
 type CheckResult struct {
 	Pass bool
-	// Failed names the checks that failed, sorted.
+	// Failed names the checks that failed, in the order they were asked.
 	Failed []string
 	// Feedback is the failed checks' sentences, in Failed's order, for the
 	// host to send back to the model (as a new task, or a Steer); empty
@@ -165,39 +177,22 @@ type CheckResult struct {
 // the timeout) the result passes, and the error is returned to say why. A
 // small classifier's doubt is not a reason to hold back a large model's
 // answer, and a missing doubt even less so.
-//
-// The engine is shown the request, the answer and any evidence, each cut
-// short enough that together they fit MaxState.
 func (c *Checker) Check(ctx context.Context, request, answer string, opts ...CheckOption) (CheckResult, error) {
 	var in checkInput
 	for _, o := range opts {
 		o(&in)
 	}
-	state := checkState(request, answer, in.evidence)
-	actx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	answers, err := c.engine.Decide(actx, state, c.qs)
-	if err == nil {
-		for _, name := range c.names {
-			if _, ok := answers[name]; !ok {
-				err = fmt.Errorf("decide: %s did not answer %q", c.engine.Name(), name)
-				break
-			}
-		}
-	}
+	answers, err := ask(ctx, c.engine, c.timeout, checkState(request, answer, in.evidence, c.maxState), c.asks)
 	if err != nil {
-		if ctx.Err() == nil && errors.Is(actx.Err(), context.DeadlineExceeded) {
-			err = fmt.Errorf("decide: %s gave no answer within %s: %w", c.engine.Name(), c.timeout, err)
-		}
 		return CheckResult{Pass: true}, err
 	}
 	res := CheckResult{Pass: true, Answers: answers}
 	var feedback []string
-	for _, name := range c.names {
-		a, chk := answers[name], c.checks[name]
+	for _, chk := range c.checks {
+		a := answers[chk.Name]
 		if a.Yes == chk.FailOn && a.Confidence >= c.floor {
 			res.Pass = false
-			res.Failed = append(res.Failed, name)
+			res.Failed = append(res.Failed, chk.Name)
 			feedback = append(feedback, strings.TrimSpace(chk.Feedback))
 		}
 	}
@@ -205,18 +200,20 @@ func (c *Checker) Check(ctx context.Context, request, answer string, opts ...Che
 	return res, nil
 }
 
-// checkState lays out what a Checker shows the engine. The request and the
-// evidence get at most 8 KiB each; the answer gets what is left.
-func checkState(request, answer string, evidence []string) string {
-	const part = 8 << 10
-	var b strings.Builder
-	fmt.Fprintf(&b, "A user asked an AI assistant:\n\"%s\"\n\n", clip(strings.TrimSpace(request), part))
-	ev := ""
-	if len(evidence) > 0 {
-		ev = fmt.Sprintf("\n\nTool results the assistant had:\n\"%s\"", clip(strings.TrimSpace(strings.Join(evidence, "\n---\n")), part))
+// checkState lays out what a Checker shows the engine, within max bytes of
+// text (no limit if max is negative).
+func checkState(request, answer string, evidence []string, max int) string {
+	request, answer = strings.TrimSpace(request), strings.TrimSpace(answer)
+	ev := strings.TrimSpace(strings.Join(evidence, "\n---\n"))
+	if max >= 0 {
+		request = clipHead(request, max/4)
+		ev = clipHead(ev, max/4)
+		answer = clipMiddle(answer, max-len(request)-len(ev))
 	}
-	const head = "The assistant replied:\n\""
-	room := MaxState - b.Len() - len(head) - len(ev) - 64 // 64: the quote and clip's note
-	fmt.Fprintf(&b, "%s%s\"%s", head, clip(strings.TrimSpace(answer), room), ev)
+	var b strings.Builder
+	fmt.Fprintf(&b, "A user asked an AI assistant:\n\"%s\"\n\nThe assistant replied:\n\"%s\"", request, answer)
+	if ev != "" {
+		fmt.Fprintf(&b, "\n\nTool results the assistant had:\n\"%s\"", ev)
+	}
 	return b.String()
 }

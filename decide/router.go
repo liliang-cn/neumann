@@ -2,19 +2,21 @@ package decide
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // RouteQuestion is the name Router asks its question under.
 const RouteQuestion = "route"
 
-// DefaultRouterTimeout bounds each engine request a Router makes.
-const DefaultRouterTimeout = 2 * time.Second
+// Router defaults.
+const (
+	DefaultRouterTimeout = 3 * time.Second
+	DefaultRouteFloor    = 0.2  // a pick less sure than this goes to the default class
+	DefaultMaxInput      = 4096 // bytes of the input shown to the engine
+)
 
 // DefaultRouteInstructions is the question Router asks unless
 // RouterConfig.Instructions replaces it.
@@ -27,7 +29,9 @@ type Route struct {
 	Description string
 }
 
-// RouterConfig configures a Router.
+// RouterConfig configures a Router. As in PolicyConfig and CheckerConfig, a
+// zero number takes the package default and a negative one turns the bound
+// off.
 type RouterConfig struct {
 	// Routes are the candidate classes, at least two, in order of
 	// preference: an engine breaks ties by it.
@@ -36,13 +40,21 @@ type RouterConfig struct {
 	// enough. It need not be one of Routes, but must be a class the machine
 	// runs.
 	Default string
-	// Floor is the confidence the engine's pick needs, in [0, 1); below it
-	// Route returns Default. Zero takes every pick.
+	// Floor is the confidence the engine's pick needs (zero:
+	// DefaultRouteFloor; negative: every pick is taken); below it Route
+	// returns Default. It must be below 1.
 	Floor float64
 	// Instructions replaces DefaultRouteInstructions.
 	Instructions string
-	// Timeout bounds each engine request (default DefaultRouterTimeout).
+	// Timeout bounds each engine request (zero: DefaultRouterTimeout; it
+	// cannot be turned off).
 	Timeout time.Duration
+	// MaxInput is how many bytes of an input the engine is shown: a longer
+	// one keeps its start and its end, with a marker where the middle was
+	// cut (zero: DefaultMaxInput, which fits tev1:4b's 2050-token context
+	// with room for the question, for English, and takes it a second or two
+	// to read; negative: all of it).
+	MaxInput int
 }
 
 // Router picks the class a submission runs in: the host asks it before
@@ -55,11 +67,12 @@ type RouterConfig struct {
 // not an instruction of any task and is recorded nowhere by the machine.
 // The class it picks is, in the task's accepted event.
 type Router struct {
-	engine  Engine
-	q       Question
-	def     string
-	floor   float64
-	timeout time.Duration
+	engine   Engine
+	q        Question
+	def      string
+	floor    float64
+	timeout  time.Duration
+	maxInput int
 }
 
 // NewRouter checks cfg and builds a Router on engine.
@@ -70,8 +83,9 @@ func NewRouter(engine Engine, cfg RouterConfig) (*Router, error) {
 	if strings.TrimSpace(cfg.Default) == "" {
 		return nil, fmt.Errorf("decide: a router needs a default class")
 	}
-	if cfg.Floor < 0 || cfg.Floor >= 1 {
-		return nil, fmt.Errorf("decide: router floor %v is not in [0, 1)", cfg.Floor)
+	floor, err := bound("router floor", cfg.Floor, DefaultRouteFloor)
+	if err != nil {
+		return nil, err
 	}
 	in := cfg.Instructions
 	if strings.TrimSpace(in) == "" {
@@ -90,7 +104,10 @@ func NewRouter(engine Engine, cfg RouterConfig) (*Router, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultRouterTimeout
 	}
-	return &Router{engine: engine, q: q, def: cfg.Default, floor: cfg.Floor, timeout: cfg.Timeout}, nil
+	if cfg.MaxInput == 0 {
+		cfg.MaxInput = DefaultMaxInput
+	}
+	return &Router{engine: engine, q: q, def: cfg.Default, floor: floor, timeout: cfg.Timeout, maxInput: cfg.MaxInput}, nil
 }
 
 // Question is the choice the router asks, one option per route.
@@ -100,31 +117,19 @@ func (r *Router) Question() Question { return r.q }
 // answers with at least the floor's confidence, and the default otherwise:
 // below the floor, err is nil and ans is the answer that was not trusted; on
 // an engine error, err says why and ans is zero. Either way class is usable.
-// An input longer than MaxState is routed on its first MaxState bytes.
+// An input longer than MaxInput is shown to the engine with its middle cut.
 func (r *Router) Route(ctx context.Context, input string) (class string, ans Answer, err error) {
 	if strings.TrimSpace(input) == "" {
 		return r.def, Answer{}, fmt.Errorf("decide: nothing to route")
 	}
-	if len(input) > MaxState {
-		cut := MaxState
-		for cut > 0 && !utf8.RuneStart(input[cut]) {
-			cut--
-		}
-		input = input[:cut]
+	if r.maxInput > 0 {
+		input = clipMiddle(input, r.maxInput)
 	}
-	actx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
-	answers, err := r.engine.Decide(actx, input, map[string]Question{RouteQuestion: r.q})
+	answers, err := ask(ctx, r.engine, r.timeout, input, []Ask{{Name: RouteQuestion, Question: r.q}})
 	if err != nil {
-		if ctx.Err() == nil && errors.Is(actx.Err(), context.DeadlineExceeded) {
-			err = fmt.Errorf("decide: %s gave no route within %s: %w", r.engine.Name(), r.timeout, err)
-		}
 		return r.def, Answer{}, err
 	}
-	ans, ok := answers[RouteQuestion]
-	if !ok {
-		return r.def, Answer{}, fmt.Errorf("decide: %s did not answer %q", r.engine.Name(), RouteQuestion)
-	}
+	ans = answers[RouteQuestion]
 	if !slices.Contains(r.q.Options, ans.Label) {
 		return r.def, Answer{}, fmt.Errorf("decide: %s routed to %q, which is not a route", r.engine.Name(), ans.Label)
 	}

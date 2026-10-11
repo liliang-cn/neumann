@@ -21,6 +21,14 @@ func verdicts(onTopic, planOnly, refuses float64) *decidetest.Engine {
 	}}
 }
 
+func names(asks []decide.Ask) string {
+	var out []string
+	for _, a := range asks {
+		out = append(out, a.Name)
+	}
+	return strings.Join(out, ",")
+}
+
 func TestCheckerPasses(t *testing.T) {
 	e := verdicts(0.95, 0.05, 0.02)
 	c, err := decide.NewChecker(e, decide.CheckerConfig{})
@@ -32,8 +40,8 @@ func TestCheckerPasses(t *testing.T) {
 		t.Fatalf("%+v %v", res, err)
 	}
 	a := e.Asked()[0]
-	if len(a.Questions) != 3 || a.Questions[decide.CheckPlanOnly].Type != decide.TypeNoul {
-		t.Fatalf("questions %+v", a.Questions)
+	if got := names(a.Asks); got != "on_topic,plan_only,refuses" {
+		t.Fatalf("asked %s", got)
 	}
 	if a.State != "A user asked an AI assistant:\n\"What is 6 x 7?\"\n\nThe assistant replied:\n\"42.\"\n\nTool results the assistant had:\n\"calc_multiply: 42\"" {
 		t.Fatalf("state %q", a.State)
@@ -41,7 +49,10 @@ func TestCheckerPasses(t *testing.T) {
 }
 
 func TestCheckerFailures(t *testing.T) {
-	checks := decide.DefaultChecks()
+	feedback := map[string]string{}
+	for _, c := range decide.DefaultChecks() {
+		feedback[c.Name] = c.Feedback
+	}
 	for _, c := range []struct {
 		name   string
 		engine *decidetest.Engine
@@ -63,7 +74,7 @@ func TestCheckerFailures(t *testing.T) {
 			}
 			var want []string
 			for _, name := range c.failed {
-				want = append(want, checks[name].Feedback)
+				want = append(want, feedback[name])
 			}
 			if res.Feedback != strings.Join(want, " ") {
 				t.Fatalf("feedback %q", res.Feedback)
@@ -90,23 +101,25 @@ func TestCheckerFloor(t *testing.T) {
 
 func TestCheckerFailsOpen(t *testing.T) {
 	boom := errors.New("boom")
-	failing := &decidetest.Engine{Fn: func(string, map[string]decide.Question) (map[string]decide.Answer, error) { return nil, boom }}
+	failing := &decidetest.Engine{Fn: func(string, []decide.Ask) (map[string]decide.Answer, error) { return nil, boom }}
 	c, _ := decide.NewChecker(failing, decide.CheckerConfig{})
 	res, err := c.Check(bg, "r", "a")
 	if !errors.Is(err, boom) || !res.Pass || res.Answers != nil || res.Failed != nil {
 		t.Fatalf("%+v %v", res, err)
 	}
 
-	slow := verdicts(0.1, 0.9, 0.9)
-	slow.Delay = time.Minute
-	c, _ = decide.NewChecker(slow, decide.CheckerConfig{Timeout: 50 * time.Millisecond})
-	start := time.Now()
-	res, err = c.Check(bg, "r", "a")
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "within 50ms") || !res.Pass {
-		t.Fatalf("%+v %v", res, err)
-	}
-	if took := time.Since(start); took > 2*time.Second {
-		t.Fatalf("took %s", took)
+	for _, ignore := range []bool{false, true} {
+		slow := verdicts(0.1, 0.9, 0.9)
+		slow.Delay, slow.IgnoreContext = 500*time.Millisecond, ignore
+		c, _ = decide.NewChecker(slow, decide.CheckerConfig{Timeout: 50 * time.Millisecond})
+		start := time.Now()
+		res, err = c.Check(bg, "r", "a")
+		if !errors.Is(err, context.DeadlineExceeded) || err.Error() != "decide: decidetest: no answer within 50ms" || !res.Pass {
+			t.Fatalf("ignore context %v: %+v %v", ignore, res, err)
+		}
+		if took := time.Since(start); took > 400*time.Millisecond {
+			t.Fatalf("ignore context %v: took %s", ignore, took)
+		}
 	}
 
 	partial := &decidetest.Engine{Answers: map[string]decide.Answer{decide.CheckOnTopic: decidetest.Yes(0.1)}}
@@ -117,12 +130,11 @@ func TestCheckerFailsOpen(t *testing.T) {
 }
 
 func TestCheckerCustomChecks(t *testing.T) {
-	checks := decide.DefaultChecks()
-	delete(checks, decide.CheckRefuses)
-	checks["cites"] = decide.Check{Question: decide.Noul("Does the answer cite its sources?"), FailOn: false, Feedback: "Cite your sources."}
+	checks := decide.DefaultChecks()[:2]
+	checks = append([]decide.Check{{Name: "cites", Question: decide.Noul("Does the answer cite its sources?"), FailOn: false, Feedback: "Cite your sources."}}, checks...)
 	e := &decidetest.Engine{Answers: map[string]decide.Answer{
 		decide.CheckOnTopic:  decidetest.Yes(0.9),
-		decide.CheckPlanOnly: decidetest.Yes(0.1),
+		decide.CheckPlanOnly: decidetest.Yes(0.9),
 		"cites":              decidetest.Yes(0.2),
 	}}
 	c, err := decide.NewChecker(e, decide.CheckerConfig{Checks: checks})
@@ -130,33 +142,47 @@ func TestCheckerCustomChecks(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, err := c.Check(bg, "r", "a")
-	if err != nil || res.Pass || strings.Join(res.Failed, ",") != "cites" || res.Feedback != "Cite your sources." {
+	if err != nil || res.Pass || strings.Join(res.Failed, ",") != "cites,plan_only" || !strings.HasPrefix(res.Feedback, "Cite your sources. Your answer described a plan") {
 		t.Fatalf("%+v %v", res, err)
 	}
-	if _, ok := e.Asked()[0].Questions[decide.CheckRefuses]; ok {
-		t.Fatal("a removed check was asked")
+	if got := names(e.Asked()[0].Asks); got != "cites,on_topic,plan_only" {
+		t.Fatalf("asked %s", got)
 	}
 }
 
 func TestCheckerClipsTheState(t *testing.T) {
 	e := verdicts(0.9, 0.1, 0.1)
 	c, _ := decide.NewChecker(e, decide.CheckerConfig{})
-	big := strings.Repeat("x", decide.MaxState)
-	if _, err := c.Check(bg, big, big, decide.WithEvidence(big, big)); err != nil {
+	answer := "START " + strings.Repeat("x", 20000) + " END"
+	if _, err := c.Check(bg, strings.Repeat("r", 20000), answer, decide.WithEvidence(strings.Repeat("e", 20000))); err != nil {
 		t.Fatal(err)
 	}
-	if s := e.Asked()[0].State; len(s) > decide.MaxState {
+	s := e.Asked()[0].State
+	if len(s) > decide.DefaultMaxCheckState+300 {
 		t.Fatalf("state of %d bytes", len(s))
+	}
+	if !strings.Contains(s, "\"START ") || !strings.Contains(s, " END\"") || strings.Count(s, "bytes cut …]") != 1 || strings.Count(s, "more bytes]") != 2 {
+		t.Fatalf("state %q", s)
+	}
+
+	c, _ = decide.NewChecker(e, decide.CheckerConfig{MaxState: -1})
+	if _, err := c.Check(bg, "r", answer); err != nil {
+		t.Fatal(err)
+	}
+	if s := e.Asked()[1].State; !strings.Contains(s, answer) {
+		t.Fatal("a negative MaxState cut the answer")
 	}
 }
 
 func TestNewCheckerChecks(t *testing.T) {
 	e := &decidetest.Engine{}
 	for name, cfg := range map[string]decide.CheckerConfig{
-		"not a noul":  {Checks: map[string]decide.Check{"x": {Question: decide.Choice("?", "a", "b"), Feedback: "f"}}},
-		"no feedback": {Checks: map[string]decide.Check{"x": {Question: decide.Noul("?")}}},
-		"no checks":   {Checks: map[string]decide.Check{}},
-		"bad noul":    {Checks: map[string]decide.Check{"x": {Question: decide.Noul(""), Feedback: "f"}}},
+		"not a noul":  {Checks: []decide.Check{{Name: "x", Question: decide.Choice("?", "a", "b"), Feedback: "f"}}},
+		"no feedback": {Checks: []decide.Check{{Name: "x", Question: decide.Noul("?")}}},
+		"no checks":   {Checks: []decide.Check{}},
+		"no name":     {Checks: []decide.Check{{Question: decide.Noul("?"), Feedback: "f"}}},
+		"same name":   {Checks: append(decide.DefaultChecks(), decide.DefaultChecks()[0])},
+		"bad noul":    {Checks: []decide.Check{{Name: "x", Question: decide.Noul(""), Feedback: "f"}}},
 		"floor":       {Floor: 1},
 	} {
 		if _, err := decide.NewChecker(e, cfg); err == nil {

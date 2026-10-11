@@ -45,10 +45,25 @@ func TestQuestionValidate(t *testing.T) {
 	if err := decide.Validate(nil); err == nil {
 		t.Error("no questions validated")
 	}
-	if err := decide.Validate(map[string]decide.Question{"": decide.Noul("?")}); err == nil {
+	if err := decide.Validate(one("", decide.Noul("?"))); err == nil {
 		t.Error("an unnamed question validated")
 	}
-	if err := decide.Validate(map[string]decide.Question{"x": decide.Choice("?", "a")}); err == nil || !strings.Contains(err.Error(), `"x"`) {
+	if err := decide.Validate(one("x", decide.Choice("?", "a"))); err == nil || !strings.Contains(err.Error(), `"x"`) {
+		t.Errorf("err = %v", err)
+	}
+	twice := append(one("x", decide.Noul("?")), one("x", decide.Noul("!"))...)
+	if err := decide.Validate(twice); err == nil || !strings.Contains(err.Error(), "two questions are named") {
+		t.Errorf("err = %v", err)
+	}
+	var asks []decide.Ask
+	for i := range decide.MaxQuestions {
+		asks = append(asks, decide.Ask{Name: fmt.Sprint("q", i), Question: decide.Noul("?")})
+	}
+	if err := decide.Validate(asks); err != nil {
+		t.Errorf("%d questions: %v", len(asks), err)
+	}
+	asks = append(asks, decide.Ask{Name: "one too many", Question: decide.Noul("?")})
+	if err := decide.Validate(asks); err == nil || !strings.Contains(err.Error(), "1 to 64 questions, not 65") {
 		t.Errorf("err = %v", err)
 	}
 }

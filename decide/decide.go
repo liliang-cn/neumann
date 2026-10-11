@@ -21,8 +21,9 @@ const (
 // both need at least two. System One refuses anything outside 2 to 26.
 const MaxOptions = 26
 
-// MaxState is the longest text, in bytes, System One answers about.
-const MaxState = 64 << 10
+// MaxQuestions is the most questions one request may ask; System One
+// refuses more.
+const MaxQuestions = 64
 
 // Question is one closed question about a text. Build one with Choice, Score
 // or Noul, and add descriptions with Describe.
@@ -110,18 +111,29 @@ func (q Question) Validate() error {
 	}
 }
 
-// Validate checks a set of questions before it is sent: at least one, each
-// with a name and valid.
-func Validate(qs map[string]Question) error {
-	if len(qs) == 0 {
-		return fmt.Errorf("decide: no questions")
+// Ask is one question and the name its answer comes back under.
+type Ask struct {
+	Name     string
+	Question Question
+}
+
+// Validate checks a request's questions before it is sent: 1 to
+// MaxQuestions of them, each named, no name twice, and each valid.
+func Validate(asks []Ask) error {
+	if len(asks) == 0 || len(asks) > MaxQuestions {
+		return fmt.Errorf("decide: a request asks 1 to %d questions, not %d", MaxQuestions, len(asks))
 	}
-	for _, name := range slices.Sorted(maps.Keys(qs)) {
-		if strings.TrimSpace(name) == "" {
+	seen := make(map[string]bool, len(asks))
+	for _, a := range asks {
+		if strings.TrimSpace(a.Name) == "" {
 			return fmt.Errorf("decide: a question has no name")
 		}
-		if err := qs[name].Validate(); err != nil {
-			return fmt.Errorf("%w (question %q)", err, name)
+		if seen[a.Name] {
+			return fmt.Errorf("decide: two questions are named %q", a.Name)
+		}
+		seen[a.Name] = true
+		if err := a.Question.Validate(); err != nil {
+			return fmt.Errorf("%w (question %q)", err, a.Name)
 		}
 	}
 	return nil
@@ -130,8 +142,9 @@ func Validate(qs map[string]Question) error {
 // Answer is an engine's answer to one question.
 type Answer struct {
 	Type Type
-	// Label is the answer whatever the type: the option chosen, the most
-	// likely level of a score, or "yes" or "no".
+	// Label is the answer whatever the type: the option chosen, "yes" or
+	// "no", or for a score the level with the highest probability (the
+	// lower one on a tie), which need not be the level nearest Score.
 	Label string
 	// Yes is a noul's verdict: its probability of yes is at least 0.5.
 	// False for other types.
@@ -142,8 +155,10 @@ type Answer struct {
 	// of yes, so its confidence is |2p - 1|: 0 for a coin toss, 1 for a
 	// certain answer either way.
 	Confidence float64
-	// Score is a score's position on its scale, from 0 (the first level) to
-	// len(Options)-1, not rounded to a level. 0 for other types.
+	// Score is a score's position on its scale: the expected level index
+	// under Probabilities, from 0 (the first level) to len(Options)-1, not
+	// rounded. A spread distribution puts it between levels, away from
+	// Label. 0 for other types.
 	Score float64
 	// Probabilities is the whole distribution: by option for a choice, by
 	// level for a score, "yes" and "no" for a noul.
@@ -156,13 +171,21 @@ func (a Answer) P(label string) float64 { return a.Probabilities[label] }
 
 // Engine answers closed questions about a text.
 //
-// Decide answers every question in one request, keyed as qs is: an engine
+// Decide answers every question in one request, keyed by Ask.Name: an engine
 // reads the text once whatever the number of questions, so asking them
-// together costs about what one does. An error means no answer at all;
-// callers degrade, they never guess. Implementations must be safe for
-// concurrent use.
+// together costs about what one does. The questions are asked in the order
+// given, and the order can change the answers: System One answers them one
+// after another, each in sight of the answers before it. A question asked
+// after a related one is often answered better than the same question
+// alone, so put the question the others depend on first.
+//
+// An error means no answer at all; callers degrade, they never guess.
+// Decide must return promptly, with an error, once ctx is done: Policy,
+// Router and Checker stop waiting for it then whatever it does, but a
+// Decide that ignores ctx keeps its goroutine. Implementations must be safe
+// for concurrent use.
 type Engine interface {
 	// Name says which engine and model answered, for reasons and logs.
 	Name() string
-	Decide(ctx context.Context, state string, qs map[string]Question) (map[string]Answer, error)
+	Decide(ctx context.Context, state string, asks []Ask) (map[string]Answer, error)
 }

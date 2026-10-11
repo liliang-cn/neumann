@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -26,15 +27,18 @@ const realReply = `{"model":"tev1:4b","answers":{
  "usage":{"input_tokens":749,"output_tokens":4}}`
 
 // questions are the three questions realReply answers.
-func questions() map[string]decide.Question {
-	return map[string]decide.Question{
-		"risky":  decide.Noul("Is this risky?"),
-		"route":  decide.Choice("Which model?", "fast", "strong"),
-		"effort": decide.Score("How much work is it?", "一步", "几步", "很多步"),
+func questions() []decide.Ask {
+	return []decide.Ask{
+		{Name: "risky", Question: decide.Noul("Is this risky?")},
+		{Name: "route", Question: decide.Choice("Which model?", "fast", "strong")},
+		{Name: "effort", Question: decide.Score("How much work is it?", "一步", "几步", "很多步")},
 	}
 }
 
-// server records each request and answers with reply and status.
+func one(name string, q decide.Question) []decide.Ask { return []decide.Ask{{Name: name, Question: q}} }
+
+// server records each request and answers with reply and status, or with
+// the next of script while it lasts.
 type server struct {
 	mu     sync.Mutex
 	reqs   []*http.Request
@@ -42,6 +46,12 @@ type server struct {
 	status int
 	reply  string
 	delay  time.Duration
+	script []scripted
+}
+
+type scripted struct {
+	status int
+	reply  string
 }
 
 func (s *server) start(t *testing.T) *httptest.Server {
@@ -52,6 +62,9 @@ func (s *server) start(t *testing.T) *httptest.Server {
 		s.reqs = append(s.reqs, r)
 		s.bodies = append(s.bodies, string(b))
 		status, reply, delay := s.status, s.reply, s.delay
+		if len(s.script) > 0 {
+			status, reply, s.script = s.script[0].status, s.script[0].reply, s.script[1:]
+		}
 		s.mu.Unlock()
 		if delay > 0 {
 			select {
@@ -86,11 +99,14 @@ func TestSystemOneEncodesQuestions(t *testing.T) {
 	s := &server{reply: realReply}
 	srv := s.start(t)
 	e := decide.NewSystemOne(decide.SystemOneConfig{URL: srv.URL + "/v1/", APIKey: "k-secret", KeepAlive: 5 * time.Minute})
-	qs := questions()
-	// Options out of alphabetical order, one described and one not: the
-	// order must survive and the undescribed one must be null.
-	qs["route"] = decide.Choice("Which model?", "strong", "fast").Describe("strong", "hard requests")
-	qs["risky"] = qs["risky"].Describe("yes", "it destroys data").Describe("no", "it reads")
+	// Questions and options out of alphabetical order, one option described
+	// and one not: both orders must survive and the undescribed option must
+	// be null.
+	qs := []decide.Ask{
+		{Name: "route", Question: decide.Choice("Which model?", "strong", "fast").Describe("strong", "hard requests")},
+		{Name: "risky", Question: decide.Noul("Is this risky?").Describe("yes", "it destroys data").Describe("no", "it reads")},
+		{Name: "effort", Question: decide.Score("How much work is it?", "一步", "几步", "很多步")},
+	}
 	if _, err := e.Decide(bg, "delete everything", qs); err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +133,11 @@ func TestSystemOneEncodesQuestions(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("the body lacks %s:\n%s", want, body)
 		}
+	}
+	// The questions are sent in the caller's order.
+	route, risky, effort := strings.Index(body, `"route":{`), strings.Index(body, `"risky":{`), strings.Index(body, `"effort":{`)
+	if route < 0 || !(route < risky && risky < effort) {
+		t.Errorf("questions out of order (route %d, risky %d, effort %d):\n%s", route, risky, effort, body)
 	}
 
 	// No descriptions, no keep-alive, no key: none of them is sent.
@@ -171,7 +192,7 @@ func TestSystemOneDecodesARealReply(t *testing.T) {
 func TestSystemOneNoulYesAtOneHalf(t *testing.T) {
 	s := &server{reply: `{"answers":{"q":{"type":"noul","noul":0.5}}}`}
 	e := decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
-	got, err := e.Decide(bg, "x", map[string]decide.Question{"q": decide.Noul("?")})
+	got, err := e.Decide(bg, "x", one("q", decide.Noul("?")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +211,7 @@ func TestSystemOneRejectsAnswersThatDoNotFit(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := &server{reply: reply}
 			e := decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
-			_, err := e.Decide(bg, "x", map[string]decide.Question{"q": decide.Choice("?", "fast", "strong")})
+			_, err := e.Decide(bg, "x", one("q", decide.Choice("?", "fast", "strong")))
 			if err == nil || !strings.HasPrefix(err.Error(), "decide: ") {
 				t.Fatalf("err = %v", err)
 			}
@@ -201,7 +222,7 @@ func TestSystemOneRejectsAnswersThatDoNotFit(t *testing.T) {
 func TestSystemOneScoreLevelOutOfRange(t *testing.T) {
 	s := &server{reply: `{"answers":{"q":{"type":"score","score":1,"probabilities":{"0":0.2,"5":0.8}}}}`}
 	e := decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
-	if _, err := e.Decide(bg, "x", map[string]decide.Question{"q": decide.Score("?", "low", "high")}); err == nil {
+	if _, err := e.Decide(bg, "x", one("q", decide.Score("?", "low", "high"))); err == nil {
 		t.Fatal("a probability for a level that does not exist was accepted")
 	}
 }
@@ -232,14 +253,19 @@ func TestSystemOneErrorBodies(t *testing.T) {
 func TestSystemOneRefusesBeforeSending(t *testing.T) {
 	s := &server{reply: realReply}
 	e := decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
+	var many []decide.Ask
+	for i := range decide.MaxQuestions + 1 {
+		many = append(many, decide.Ask{Name: fmt.Sprint("q", i), Question: decide.Noul("?")})
+	}
 	cases := map[string]struct {
 		state string
-		qs    map[string]decide.Question
+		qs    []decide.Ask
 	}{
-		"empty state":  {" ", questions()},
-		"long state":   {strings.Repeat("x", decide.MaxState+1), questions()},
-		"no questions": {"x", nil},
-		"bad question": {"x", map[string]decide.Question{"q": decide.Choice("?", "only")}},
+		"empty state":    {" ", questions()},
+		"body too large": {strings.Repeat("x", decide.MaxBody-100), questions()},
+		"no questions":   {"x", nil},
+		"65 questions":   {"x", many},
+		"bad question":   {"x", one("q", decide.Choice("?", "only"))},
 	}
 	for name, c := range cases {
 		if _, err := e.Decide(bg, c.state, c.qs); err == nil {
@@ -310,5 +336,69 @@ func TestSystemOneReady(t *testing.T) {
 	srv.Close()
 	if err := decide.NewSystemOne(decide.SystemOneConfig{URL: srv.URL}).Ready(bg); err == nil {
 		t.Fatal("a closed server is ready")
+	}
+}
+
+// overContext is how Ollama refuses a state longer than the model's context.
+const overContext = `{"error":"prompt 0 has 4000 tokens; expected 1–2050 (input is never truncated)"}`
+
+func TestSystemOneRetriesAStateTooLong(t *testing.T) {
+	s := &server{reply: realReply, script: []scripted{{400, overContext}}}
+	e := decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
+	state := "HEAD " + strings.Repeat("é", 10000) + " TAIL"
+	if _, err := e.Decide(bg, state, questions()); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.bodies) != 2 {
+		t.Fatalf("%d requests", len(s.bodies))
+	}
+	var second struct{ State string }
+	if err := json.Unmarshal([]byte(s.bodies[1]), &second); err != nil {
+		t.Fatal(err)
+	}
+	want := int(float64(len(state)) * 2050 / 4000 * 0.9)
+	if len(second.State) > want+64 || len(second.State) < want-64 {
+		t.Errorf("the second state is %d bytes, want about %d", len(second.State), want)
+	}
+	if !strings.HasPrefix(second.State, "HEAD ") || !strings.HasSuffix(second.State, " TAIL") || !strings.Contains(second.State, "bytes cut …]") {
+		t.Errorf("the second state keeps neither end, or has no marker: %.40q … %.40q", second.State, second.State[len(second.State)-40:])
+	}
+
+	// Refused twice: the second refusal is the error, and there is no third
+	// request.
+	s = &server{status: 400, reply: overContext}
+	e = decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
+	_, err := e.Decide(bg, state, questions())
+	if err == nil || err.Error() != "decide: systemone:tev1:4b: 400 Bad Request: prompt 0 has 4000 tokens; expected 1–2050 (input is never truncated)" {
+		t.Fatalf("err = %v", err)
+	}
+	if len(s.bodies) != 2 {
+		t.Fatalf("%d requests", len(s.bodies))
+	}
+
+	// Any other 400 is not retried.
+	s = &server{status: 400, reply: `{"error":"questions must contain 1–64 fields"}`}
+	e = decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
+	if _, err := e.Decide(bg, state, questions()); err == nil || len(s.bodies) != 1 {
+		t.Fatalf("err = %v after %d requests", err, len(s.bodies))
+	}
+}
+
+func TestSystemOneWarm(t *testing.T) {
+	s := &server{reply: `{"answers":{"ready":{"type":"noul","noul":0.9}}}`, delay: 200 * time.Millisecond}
+	e := decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL, Timeout: 50 * time.Millisecond})
+	if err := e.Warm(bg); err != nil {
+		t.Fatalf("Warm is cut off by the request timeout: %v", err)
+	}
+	if _, body := s.last(t); !strings.Contains(body, `"questions":{"ready":{"type":"noul"`) {
+		t.Fatalf("body %s", body)
+	}
+	if _, err := e.Decide(bg, "x", one("ready", decide.Noul("?"))); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Decide keeps its timeout: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(bg, 50*time.Millisecond)
+	defer cancel()
+	if err := e.Warm(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Warm keeps ctx: %v", err)
 	}
 }

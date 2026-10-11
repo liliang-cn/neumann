@@ -24,7 +24,7 @@ import (
 )
 
 // risky answers needs_approval by tool: yes for notes_delete, no otherwise.
-func risky(state string, _ map[string]decide.Question) (map[string]decide.Answer, error) {
+func risky(state string, _ []decide.Ask) (map[string]decide.Answer, error) {
 	p := 0.02
 	if strings.Contains(state, "tool: notes_delete\n") {
 		p = 0.97
@@ -85,9 +85,9 @@ func TestPolicyHoldsAYes(t *testing.T) {
 	if len(asked) != 3 {
 		t.Fatalf("asked %d times", len(asked))
 	}
-	q, ok := asked[0].Questions[decide.NeedsApproval]
-	if !ok || len(asked[0].Questions) != 1 || q.Instructions != decide.DefaultApprovalQuestion().Instructions {
-		t.Fatalf("questions %+v", asked[0].Questions)
+	q, ok := asked[0].Question(decide.NeedsApproval)
+	if !ok || len(asked[0].Asks) != 1 || q.Instructions != decide.DefaultApprovalQuestion().Instructions {
+		t.Fatalf("questions %+v", asked[0].Asks)
 	}
 	want := "tool: notes_delete\ndevice: notes\ndeclared effect: side_effect\ntask class: default\narguments: {\"id\":\"n-42\"}"
 	if asked[0].State != want {
@@ -98,7 +98,10 @@ func TestPolicyHoldsAYes(t *testing.T) {
 func TestPolicyThreshold(t *testing.T) {
 	e := &decidetest.Engine{Answers: map[string]decide.Answer{decide.NeedsApproval: decidetest.Yes(0.6)}} // confidence 0.2
 	if d := decide.Policy(e, decide.PolicyConfig{})(bg, call("x", bus.SideEffect)); d.Verdict != neumann.VerdictRequireApproval {
-		t.Fatalf("threshold 0 holds any yes: %+v", d)
+		t.Fatalf("the default threshold holds any yes: %+v", d)
+	}
+	if d := decide.Policy(e, decide.PolicyConfig{Threshold: -1})(bg, call("x", bus.SideEffect)); d.Verdict != neumann.VerdictRequireApproval {
+		t.Fatalf("a negative threshold holds any yes: %+v", d)
 	}
 	if d := decide.Policy(e, decide.PolicyConfig{Threshold: 0.5})(bg, call("x", bus.SideEffect)); d.Verdict != neumann.VerdictAllow {
 		t.Fatalf("a yes under the threshold: %+v", d)
@@ -110,28 +113,38 @@ func TestPolicyThreshold(t *testing.T) {
 
 func TestPolicyFallsBackOnError(t *testing.T) {
 	var l logs
-	e := &decidetest.Engine{Fn: func(string, map[string]decide.Question) (map[string]decide.Answer, error) {
+	e := &decidetest.Engine{Fn: func(string, []decide.Ask) (map[string]decide.Answer, error) {
 		return nil, errors.New("decide: decidetest: 500 Internal Server Error: boom")
 	}}
 	p := decide.Policy(e, decide.PolicyConfig{Logf: l.logf})
-	d := p(bg, call("notes_delete", bus.SideEffect))
-	if d.Verdict != neumann.VerdictRequireApproval || !strings.HasPrefix(d.Reason, "decidetest: no answer (") ||
-		!strings.Contains(d.Reason, "boom") || !strings.HasSuffix(d.Reason, "held because the call has side effects") {
-		t.Fatalf("side effect: %+v", d)
+	for _, effect := range []bus.Effect{bus.SideEffect, bus.Idempotent} {
+		// Idempotent is not harmless: a delete by id is idempotent.
+		d := p(bg, call("notes_delete", effect))
+		if d.Verdict != neumann.VerdictRequireApproval || d.Reason != "decidetest: no answer (500 Internal Server Error: boom); held" {
+			t.Fatalf("%s: %+v", effect, d)
+		}
 	}
-	if d := p(bg, call("notes_touch", bus.Idempotent)); d.Verdict != neumann.VerdictAllow {
-		t.Fatalf("idempotent: %+v", d)
-	}
-	if got := l.all(); len(got) != 2 || !strings.Contains(got[1], "notes_touch call t1/c-1") || !strings.Contains(got[1], "boom") {
+	got := l.all()
+	if len(got) != 2 || got[1] != "decide: policy for notes_delete call t1/c-1: decide: decidetest: 500 Internal Server Error: boom" {
 		t.Fatalf("logged %q", got)
 	}
 
-	// A missing answer is no answer.
-	e = &decidetest.Engine{Fn: func(string, map[string]decide.Question) (map[string]decide.Answer, error) {
-		return map[string]decide.Answer{}, nil
-	}}
-	if d := decide.Policy(e, decide.PolicyConfig{Logf: l.logf})(bg, call("x", bus.SideEffect)); d.Verdict != neumann.VerdictRequireApproval {
-		t.Fatalf("missing answer: %+v", d)
+	// A missing answer, or one of the wrong type, is no answer.
+	for name, c := range map[string]struct {
+		answers map[string]decide.Answer
+		reason  string
+	}{
+		"missing":    {map[string]decide.Answer{}, `decidetest: no answer ("needs_approval" unanswered); held`},
+		"wrong type": {map[string]decide.Answer{decide.NeedsApproval: decidetest.Pick("yes", 0.9)}, `decidetest: no answer ("needs_approval" answered as a choice, asked as a noul); held`},
+	} {
+		e = &decidetest.Engine{Fn: func(string, []decide.Ask) (map[string]decide.Answer, error) { return c.answers, nil }}
+		d := decide.Policy(e, decide.PolicyConfig{Logf: l.logf})(bg, call("x", bus.SideEffect))
+		if d.Verdict != neumann.VerdictRequireApproval || d.Reason != c.reason {
+			t.Fatalf("%s: %+v", name, d)
+		}
+	}
+	if got := l.all(); len(got) != 4 {
+		t.Fatalf("logged %q", got)
 	}
 
 	// A fallback of the caller's own.
@@ -146,25 +159,37 @@ func TestPolicyFallsBackOnError(t *testing.T) {
 }
 
 // TestPolicyTimeoutBoundsTheHook: the machine gives a policy no timeout, so
-// the policy's own must cut a slow engine short.
+// the policy's own must cut a slow engine short, and a stuck one too.
 func TestPolicyTimeoutBoundsTheHook(t *testing.T) {
+	for _, ignore := range []bool{false, true} {
+		var l logs
+		e := &decidetest.Engine{Fn: risky, Delay: 500 * time.Millisecond, IgnoreContext: ignore}
+		p := decide.Policy(e, decide.PolicyConfig{Timeout: 50 * time.Millisecond, Logf: l.logf})
+		start := time.Now()
+		d := p(bg, call("notes_save", bus.SideEffect))
+		if took := time.Since(start); took > 400*time.Millisecond {
+			t.Fatalf("ignore context %v: the policy took %s", ignore, took)
+		}
+		if d.Verdict != neumann.VerdictRequireApproval || d.Reason != "decidetest: no answer within 50ms; held" {
+			t.Fatalf("ignore context %v: %+v", ignore, d)
+		}
+		if got := l.all(); len(got) != 1 || got[0] != "decide: policy for notes_save call t1/c-1: decide: decidetest: no answer within 50ms" {
+			t.Fatalf("logged %q", got)
+		}
+	}
+
+	// The task's own end (a cancel, its deadline) is not the engine's
+	// failure: the call falls back, and nothing is logged.
 	var l logs
-	e := &decidetest.Engine{Fn: risky, Delay: time.Minute}
-	p := decide.Policy(e, decide.PolicyConfig{Timeout: 50 * time.Millisecond, Logf: l.logf})
-	start := time.Now()
-	d := p(bg, call("notes_save", bus.SideEffect))
-	if took := time.Since(start); took > 2*time.Second {
-		t.Fatalf("the policy took %s", took)
-	}
-	if d.Verdict != neumann.VerdictRequireApproval || d.Reason != "decidetest: no answer (no answer within 50ms); held because the call has side effects" {
-		t.Fatalf("%+v", d)
-	}
-	// The caller's own cancel is not reported as the policy's timeout.
+	p := decide.Policy(&decidetest.Engine{Fn: risky, Delay: time.Minute}, decide.PolicyConfig{Logf: l.logf})
 	ctx, cancel := context.WithCancel(bg)
-	cancel()
-	d = p(ctx, call("notes_save", bus.SideEffect))
+	time.AfterFunc(20*time.Millisecond, cancel)
+	d := p(ctx, call("notes_save", bus.SideEffect))
 	if d.Verdict != neumann.VerdictRequireApproval || !strings.Contains(d.Reason, "context canceled") {
 		t.Fatalf("%+v", d)
+	}
+	if got := l.all(); len(got) != 0 {
+		t.Fatalf("logged %q", got)
 	}
 }
 
@@ -172,11 +197,12 @@ func TestPolicyExtraQuestionsAndDecide(t *testing.T) {
 	e := &decidetest.Engine{Answers: map[string]decide.Answer{
 		decide.NeedsApproval: decidetest.Yes(0.1),
 		"pii":                decidetest.Yes(0.9),
+		"bulk":               decidetest.Yes(0.1),
 	}}
 	var seen neumann.Decision
 	p := decide.Policy(e, decide.PolicyConfig{
 		Question: decide.Noul("Does this call touch production?"),
-		Extra:    map[string]decide.Question{"pii": decide.Noul("Do the arguments hold personal data?")},
+		Extra:    []decide.Ask{{Name: "pii", Question: decide.Noul("Do the arguments hold personal data?")}, {Name: "bulk", Question: decide.Noul("Many records?")}},
 		Decide: func(info neumann.ToolCallInfo, answers map[string]decide.Answer, d neumann.Decision) neumann.Decision {
 			seen = d
 			if answers["pii"].Yes {
@@ -193,8 +219,8 @@ func TestPolicyExtraQuestionsAndDecide(t *testing.T) {
 		t.Fatalf("%+v (policy alone: %+v)", d, seen)
 	}
 	a := e.Asked()[0]
-	if a.Questions[decide.NeedsApproval].Instructions != "Does this call touch production?" || a.Questions["pii"].Type != decide.TypeNoul {
-		t.Fatalf("questions %+v", a.Questions)
+	if names(a.Asks) != "needs_approval,pii,bulk" || a.Asks[0].Question.Instructions != "Does this call touch production?" {
+		t.Fatalf("questions %+v", a.Asks)
 	}
 	if !strings.Contains(a.State, "about the tool: Send an email to anyone.\n") || !strings.HasSuffix(a.State, `arguments: {"to":"bob@example.com"`) {
 		t.Fatalf("state %q", a.State)
@@ -203,15 +229,29 @@ func TestPolicyExtraQuestionsAndDecide(t *testing.T) {
 
 func TestCallStateClipsArguments(t *testing.T) {
 	info := neumann.ToolCallInfo{Tool: "fs_write", Effect: bus.SideEffect, Args: json.RawMessage(`{"text":"` + strings.Repeat("é", 5000) + `"}`)}
-	s := decide.CallState(info, "")
+	s := decide.CallState(info, "", decide.DefaultMaxArgs)
 	if strings.Contains(s, "device:") || strings.Contains(s, "task class:") || strings.Contains(s, "about the tool:") {
 		t.Fatalf("empty fields shown: %q", s[:100])
 	}
-	if !strings.HasSuffix(s, "more bytes)") || len(s) > 4096+200 || !strings.Contains(s, "é…") {
+	if !strings.HasSuffix(s, "more bytes]") || len(s) > decide.DefaultMaxArgs+100 || !strings.Contains(s, "é…") {
 		t.Fatalf("clipped to %d bytes, ending %q", len(s), s[len(s)-40:])
 	}
-	if s := decide.CallState(neumann.ToolCallInfo{Tool: "x"}, ""); !strings.HasSuffix(s, "arguments: (none)") {
+	if s := decide.CallState(info, "", -1); !strings.HasSuffix(s, `é"}`) {
+		t.Fatal("a negative maxArgs cut the arguments")
+	}
+	if s := decide.CallState(info, "", 0); len(s) > decide.DefaultMaxArgs+100 {
+		t.Fatalf("zero maxArgs is not DefaultMaxArgs: %d bytes", len(s))
+	}
+	if s := decide.CallState(neumann.ToolCallInfo{Tool: "x"}, "", 0); !strings.HasSuffix(s, "arguments: (none)") {
 		t.Fatalf("%q", s)
+	}
+
+	// Policy cuts at DefaultMaxArgs unless told otherwise.
+	e := &decidetest.Engine{Fn: risky}
+	decide.Policy(e, decide.PolicyConfig{})(bg, info)
+	decide.Policy(e, decide.PolicyConfig{MaxArgs: 100})(bg, info)
+	if a := e.Asked(); len(a[0].State) > decide.DefaultMaxArgs+100 || len(a[1].State) > 250 {
+		t.Fatalf("states of %d and %d bytes", len(a[0].State), len(a[1].State))
 	}
 }
 
@@ -222,12 +262,19 @@ func TestPolicyPanicsOnBadConfig(t *testing.T) {
 		"not a noul":   func() { decide.Policy(e, decide.PolicyConfig{Question: decide.Choice("?", "a", "b")}) },
 		"bad question": func() { decide.Policy(e, decide.PolicyConfig{Question: decide.Noul(" ")}) },
 		"name clash": func() {
-			decide.Policy(e, decide.PolicyConfig{Extra: map[string]decide.Question{decide.NeedsApproval: decide.Noul("?")}})
+			decide.Policy(e, decide.PolicyConfig{Extra: []decide.Ask{{Name: decide.NeedsApproval, Question: decide.Noul("?")}}})
 		},
 		"bad extra": func() {
-			decide.Policy(e, decide.PolicyConfig{Extra: map[string]decide.Question{"x": decide.Choice("?", "a")}})
+			decide.Policy(e, decide.PolicyConfig{Extra: []decide.Ask{{Name: "x", Question: decide.Choice("?", "a")}}})
 		},
 		"threshold": func() { decide.Policy(e, decide.PolicyConfig{Threshold: 1}) },
+		"64 extras": func() {
+			var extra []decide.Ask
+			for i := range decide.MaxQuestions {
+				extra = append(extra, decide.Ask{Name: fmt.Sprint("x", i), Question: decide.Noul("?")})
+			}
+			decide.Policy(e, decide.PolicyConfig{Extra: extra})
+		},
 	} {
 		func() {
 			defer func() {

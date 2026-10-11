@@ -9,7 +9,6 @@ import (
 	"log"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/liliang-cn/neumann"
 	"github.com/liliang-cn/neumann/bus"
@@ -18,11 +17,12 @@ import (
 // NeedsApproval is the name Policy asks its own question under.
 const NeedsApproval = "needs_approval"
 
-// DefaultPolicyTimeout bounds each engine request a Policy makes.
-const DefaultPolicyTimeout = 2 * time.Second
-
-// maxArgs is how much of a call's arguments Policy shows the engine.
-const maxArgs = 4096
+// Policy defaults.
+const (
+	DefaultPolicyTimeout   = 2 * time.Second
+	DefaultPolicyThreshold = 0   // every yes holds the call
+	DefaultMaxArgs         = 512 // bytes of a call's arguments shown to the engine; see MaxArgs
+)
 
 // DefaultApprovalQuestion is the question Policy asks unless
 // PolicyConfig.Question replaces it: is this call irreversible or harmful
@@ -37,46 +37,62 @@ func DefaultApprovalQuestion() Question {
 
 // PolicyConfig configures Policy. The zero value asks
 // DefaultApprovalQuestion, holds every call the engine answers yes for, and
-// waits DefaultPolicyTimeout for an answer.
+// waits DefaultPolicyTimeout for an answer. As in RouterConfig and
+// CheckerConfig, a zero number takes the package default and a negative one
+// turns the bound off.
 type PolicyConfig struct {
 	// Question replaces DefaultApprovalQuestion; it must be a noul whose
-	// yes means "hold the call". It is asked under the name NeedsApproval.
+	// yes means "hold the call". It is asked first, under the name
+	// NeedsApproval.
 	Question Question
-	// Threshold is the confidence a yes needs to hold the call, in [0, 1).
-	// Zero holds every yes (a probability of yes of at least 0.5); 0.5, for
-	// one, needs a probability of at least 0.75 (see Answer.Confidence).
+	// Threshold is the confidence a yes needs to hold the call (see
+	// Answer.Confidence; 0.5, say, needs a probability of yes of at least
+	// 0.75). Zero takes DefaultPolicyThreshold; negative: every yes holds.
+	// It must be below 1.
 	Threshold float64
-	// Timeout bounds each engine request (default DefaultPolicyTimeout). The
-	// policy runs on a vCore and the machine gives it no timeout of its own;
-	// this is the one that keeps a slow engine from stalling the group.
+	// Timeout bounds each engine request (zero: DefaultPolicyTimeout; it
+	// cannot be turned off). The policy runs on a vCore and the machine
+	// gives it no timeout of its own; this is the one that keeps a slow
+	// engine from stalling the group.
 	Timeout time.Duration
+	// MaxArgs is how many bytes of a call's arguments the engine is shown;
+	// the rest is cut, and the cut is marked (zero: DefaultMaxArgs;
+	// negative: all of them, which a long argument can push past the
+	// model's context). What the engine reads costs time: tev1:4b, its
+	// cache missed, reads some 700 tokens a second on an Apple-silicon Mac,
+	// and dense text such as base64 is close to a token a byte, so 512
+	// bytes of it take about a second of the 2 the policy waits.
+	MaxArgs int
 	// Tools adds a line about a tool to what the engine is shown, keyed by
 	// the tool's full name (<device>_<tool>): its description, say. A
 	// name says little; a sentence about what the tool does helps the
 	// engine more than anything else here.
 	Tools map[string]string
-	// Extra questions are asked in the same request; their answers reach
-	// Decide. Names must not be NeedsApproval.
-	Extra map[string]Question
+	// Extra questions are asked in the same request, in order, after
+	// NeedsApproval; their answers reach Decide. None may be named
+	// NeedsApproval.
+	Extra []Ask
 	// Decide, if set, makes the final decision once the engine has
 	// answered: answers holds every answer (NeedsApproval's and Extra's), d
 	// is what the policy would decide on its own. It runs on the vCore like
 	// the policy: keep it fast and free of side effects.
 	Decide func(info neumann.ToolCallInfo, answers map[string]Answer, d neumann.Decision) neumann.Decision
-	// Fallback decides a call the engine did not answer (an error, or no
-	// answer within Timeout). The default holds SideEffect calls for
-	// approval, with a reason that says the engine failed, and allows the
-	// others.
+	// Fallback decides a call the engine did not answer (an error, no
+	// answer within Timeout, an answer of the wrong type). The default
+	// holds the call for approval, with a reason that says the engine gave
+	// no answer: every call that gets this far is not ReadOnly, and an
+	// Idempotent call (a delete by id) can do as much harm as any.
 	Fallback func(info neumann.ToolCallInfo, err error) neumann.Decision
 	// Logf reports engine failures (default log.Printf). An allowed call's
-	// record keeps no reason, so this is where a failure that let a call
-	// through shows.
+	// record keeps no reason, so this is where a failure shows when a
+	// Fallback lets the call through.
 	Logf func(format string, args ...any)
 }
 
 // Policy is a tool policy that asks engine whether each call needs a person
 // (design §9.7). A ReadOnly call is allowed without asking. For any other,
-// it asks the engine in one request, bounded by cfg.Timeout:
+// it asks the engine in one request, bounded by cfg.Timeout whether or not
+// the engine honours its context:
 //
 //   - yes with Confidence at least cfg.Threshold: RequireApproval, with a
 //     reason naming the engine, the question and the probability of yes,
@@ -92,9 +108,15 @@ type PolicyConfig struct {
 //
 // The policy is called once per call, in call order, so a round of n calls
 // that are not ReadOnly waits for up to n engine requests while it holds its
-// vCore. Policy panics on a nil engine or an invalid cfg: both are
-// programming errors, found when the machine is configured rather than on
-// its first tool call.
+// vCore. Start does the same while it recovers, for every planned call
+// that was never decided: with the engine down, Start takes up to n ×
+// Timeout for n such calls. A server that answers one request at a time
+// queues concurrent calls from several vCores behind each other, each
+// within its own Timeout.
+//
+// Policy panics on a nil engine or an invalid cfg: both are programming
+// errors, found when the machine is configured rather than on its first
+// tool call.
 func Policy(engine Engine, cfg PolicyConfig) neumann.ToolPolicy {
 	if engine == nil {
 		panic("decide: Policy needs an engine")
@@ -106,57 +128,44 @@ func Policy(engine Engine, cfg PolicyConfig) neumann.ToolPolicy {
 	if q.Type != TypeNoul {
 		panic(fmt.Sprintf("decide: Policy asks a noul, not a %q", q.Type))
 	}
-	qs := map[string]Question{NeedsApproval: q}
-	for name, x := range cfg.Extra {
-		if name == NeedsApproval {
-			panic("decide: Policy: an extra question is named " + NeedsApproval)
-		}
-		qs[name] = x
-	}
-	if err := Validate(qs); err != nil {
+	asks := append([]Ask{{Name: NeedsApproval, Question: q}}, cfg.Extra...)
+	if err := Validate(asks); err != nil {
 		panic(fmt.Sprintf("decide: Policy: %v", err))
 	}
-	if cfg.Threshold < 0 || cfg.Threshold >= 1 {
-		panic(fmt.Sprintf("decide: Policy: threshold %v is not in [0, 1)", cfg.Threshold))
+	threshold, err := bound("Policy threshold", cfg.Threshold, DefaultPolicyThreshold)
+	if err != nil {
+		panic(err.Error())
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultPolicyTimeout
 	}
+	if cfg.MaxArgs == 0 {
+		cfg.MaxArgs = DefaultMaxArgs
+	}
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
+	name := engine.Name()
 	fallback := cfg.Fallback
 	if fallback == nil {
-		fallback = func(info neumann.ToolCallInfo, err error) neumann.Decision {
-			if info.Effect == bus.SideEffect {
-				return neumann.RequireApproval(fmt.Sprintf("%s: no answer (%v); held because the call has side effects", engine.Name(), err))
-			}
-			return neumann.Allow()
+		fallback = func(_ neumann.ToolCallInfo, err error) neumann.Decision {
+			return neumann.RequireApproval(failReason(name, err) + "; held")
 		}
 	}
-	name := engine.Name()
 	return func(ctx context.Context, info neumann.ToolCallInfo) neumann.Decision {
 		if info.Effect == bus.ReadOnly {
 			return neumann.Allow()
 		}
-		actx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-		answers, err := engine.Decide(actx, CallState(info, cfg.Tools[info.Tool]), qs)
-		if err == nil {
-			if _, ok := answers[NeedsApproval]; !ok {
-				err = fmt.Errorf("decide: %s did not answer %q", name, NeedsApproval)
-			}
-		}
-		if err != nil && ctx.Err() == nil && errors.Is(actx.Err(), context.DeadlineExceeded) {
-			err = fmt.Errorf("no answer within %s", cfg.Timeout)
-		}
-		cancel()
+		answers, err := ask(ctx, engine, cfg.Timeout, CallState(info, cfg.Tools[info.Tool], cfg.MaxArgs), asks)
 		if err != nil {
-			cfg.Logf("decide: policy for %s call %s/%s: %s: %v", info.Tool, info.TaskID, info.CallID, name, err)
+			if ctx.Err() == nil || !errors.Is(err, ctx.Err()) {
+				cfg.Logf("decide: policy for %s call %s/%s: %v", info.Tool, info.TaskID, info.CallID, err)
+			} // else the task itself ended (cancelled, past its deadline): not the engine's failure
 			return fallback(info, err)
 		}
 		a := answers[NeedsApproval]
 		d := neumann.Allow()
-		if a.Yes && a.Confidence >= cfg.Threshold {
+		if a.Yes && a.Confidence >= threshold {
 			d = neumann.RequireApproval(fmt.Sprintf("%s: %s yes, p=%.2f", name, NeedsApproval, a.P("yes")))
 		}
 		if cfg.Decide != nil {
@@ -166,10 +175,36 @@ func Policy(engine Engine, cfg PolicyConfig) neumann.ToolPolicy {
 	}
 }
 
+// failReason says, in a committed reason's few words, that the engine gave
+// no answer and why: "systemone:tev1:4b: no answer within 2s", or
+// "systemone:tev1:4b: no answer (400 Bad Request: ...)".
+func failReason(engine string, err error) string {
+	var te *timeoutError
+	if errors.As(err, &te) {
+		return fmt.Sprintf("%s: no answer within %s", engine, te.after)
+	}
+	return fmt.Sprintf("%s: no answer (%s)", engine, short(err, engine, 160))
+}
+
+// bound applies the package's convention for a confidence bound: zero is
+// def, negative is 0 (anything passes), and 1 or more is an error.
+func bound(what string, v, def float64) (float64, error) {
+	switch {
+	case v >= 1:
+		return 0, fmt.Errorf("decide: %s %v is not below 1", what, v)
+	case v == 0:
+		return def, nil
+	case v < 0:
+		return 0, nil
+	}
+	return v, nil
+}
+
 // CallState is what Policy shows the engine about a call: one line each for
 // the tool, its device, its declared effect, the task's class, note (if
-// any) and the arguments, compacted and cut to 4 KiB.
-func CallState(info neumann.ToolCallInfo, note string) string {
+// any) and the arguments, compacted and cut to maxArgs bytes (zero:
+// DefaultMaxArgs; negative: no cut).
+func CallState(info neumann.ToolCallInfo, note string, maxArgs int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "tool: %s\n", info.Tool)
 	if info.Device != "" {
@@ -182,7 +217,14 @@ func CallState(info neumann.ToolCallInfo, note string) string {
 	if note = strings.TrimSpace(note); note != "" {
 		fmt.Fprintf(&b, "about the tool: %s\n", note)
 	}
-	fmt.Fprintf(&b, "arguments: %s", clip(compact(info.Args), maxArgs))
+	args := compact(info.Args)
+	if maxArgs == 0 {
+		maxArgs = DefaultMaxArgs
+	}
+	if maxArgs > 0 {
+		args = clipHead(args, maxArgs)
+	}
+	fmt.Fprintf(&b, "arguments: %s", args)
 	return b.String()
 }
 
@@ -197,16 +239,4 @@ func compact(args []byte) string {
 		return b.String()
 	}
 	return string(args)
-}
-
-// clip cuts s to at most n bytes on a rune boundary, saying how much went.
-func clip(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	cut := n
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return fmt.Sprintf("%s… (%d more bytes)", s[:cut], len(s)-cut)
 }
