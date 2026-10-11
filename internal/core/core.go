@@ -125,6 +125,10 @@ func (e *Env) frameSteer(text string) string {
 type stepData struct {
 	PC   string `json:"pc"`
 	Core int    `json:"core"`
+	// CheckMS is how long the answer check held the step after its model
+	// call answered (design §9.8): the step's commit is that much later
+	// than the provider's answer. Omitted when no check ran.
+	CheckMS int64 `json:"check_ms,omitempty"`
 }
 
 // taskContext is what work for a task runs under: it ends when the task is

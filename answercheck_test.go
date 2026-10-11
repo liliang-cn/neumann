@@ -3,8 +3,10 @@ package neumann_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -162,6 +164,10 @@ func TestNoAnswerCheckRecordsNothing(t *testing.T) {
 			if string(ev.Data) != `{"stop_reason":"end_turn"}` {
 				t.Fatalf("done %s", ev.Data)
 			}
+		case proto.EvStep:
+			if strings.Contains(string(ev.Data), "check_ms") {
+				t.Fatalf("step %s", ev.Data)
+			}
 		case proto.EvAnswerRejected:
 			t.Fatal("answer_rejected without a check")
 		}
@@ -232,22 +238,49 @@ func TestAnswerCheckRetriesRunOut(t *testing.T) {
 	}
 }
 
-// Each answer is a model call: the step budget ends a loop of rejections,
-// with the last answer, which no check is asked about.
+// Each answer is a model call, so the step budget bounds a loop of
+// rejections too: a rejection with no step left for another answer is
+// final, in the same commit, as one past the retries is: the task ends
+// end_turn with that answer marked check_failed, and no feedback is left
+// that nobody answers.
 func TestAnswerCheckLoopIsBoundedByTheBudget(t *testing.T) {
-	c := &checker{fn: func(context.Context, neumann.AnswerInfo) neumann.AnswerVerdict {
-		return neumann.AnswerVerdict{Reject: true, Reason: "no"}
-	}}
-	m, sm := start(t, neumann.Config{AnswerCheck: c.check, MaxAnswerRetries: 5}, func(model.Request) (model.Response, error) {
-		return sim.Reply("draft"), nil
-	})
-	id := submit(t, m, proto.Instruction{Input: "q", Budget: &task.Budget{MaxSteps: 2}})
-	got := waitDone(t, m, id)
-	if got.State != task.Done || got.StopReason != "budget" || got.LastAnswer() != "draft" || sm.Calls() != 2 || len(c.attempts()) != 2 {
-		t.Fatalf("ended %s %q with %q after %d calls, %d checks", got.State, got.StopReason, got.LastAnswer(), sm.Calls(), len(c.attempts()))
-	}
-	if done := one(t, eventData(t, m, id, proto.EvDone), proto.EvDone); done["checked"] != nil {
-		t.Fatalf("a budget answer was marked checked: %v", done)
+	for _, steps := range []int{1, 2} {
+		t.Run(fmt.Sprint(steps), func(t *testing.T) {
+			c := &checker{fn: func(context.Context, neumann.AnswerInfo) neumann.AnswerVerdict {
+				return neumann.AnswerVerdict{Reject: true, Reason: "no"}
+			}}
+			m, sm := start(t, neumann.Config{AnswerCheck: c.check, MaxAnswerRetries: 5}, func(model.Request) (model.Response, error) {
+				return sim.Reply("draft"), nil
+			})
+			id := submit(t, m, proto.Instruction{Input: "q", Budget: &task.Budget{MaxSteps: steps}})
+			got := waitDone(t, m, id)
+			if got.State != task.Done || got.StopReason != "end_turn" || got.LastAnswer() != "draft" || sm.Calls() != steps || len(c.attempts()) != steps {
+				t.Fatalf("ended %s %q with %q after %d calls, %d checks", got.State, got.StopReason, got.LastAnswer(), sm.Calls(), len(c.attempts()))
+			}
+			if last := got.Regs[len(got.Regs)-1]; last.Role != task.RoleAssistant || got.Rejections != steps {
+				t.Fatalf("last register %+v, rejections %d", last, got.Rejections)
+			}
+			rej := eventData(t, m, id, proto.EvAnswerRejected)
+			if len(rej) != steps || rej[steps-1]["final"] != true || rej[steps-1]["budget"] != true || rej[steps-1]["feedback"] != nil {
+				t.Fatalf("answer_rejected %v", rej)
+			}
+			for _, d := range rej[:steps-1] {
+				if d["final"] != nil || d["budget"] != nil {
+					t.Fatalf("answer_rejected %v", rej)
+				}
+			}
+			ans := one(t, eventData(t, m, id, proto.EvAnswer), proto.EvAnswer)
+			done := one(t, eventData(t, m, id, proto.EvDone), proto.EvDone)
+			if ans["text"] != "draft" || ans["check_failed"] != true || done["check_failed"] != true || done["check_reason"] != "no" {
+				t.Fatalf("answer %v, done %v", ans, done)
+			}
+			// One commit: the final rejection and the end of the task.
+			evs := eventsOf(t, m, id)
+			k := slices.IndexFunc(evs, func(ev proto.Event) bool { return ev.Kind == proto.EvDone })
+			if evs[k-2].Kind != proto.EvAnswerRejected || evs[k-2].Seq != evs[k].Seq-2 {
+				t.Fatalf("events %v", kindsOf(t, m, id))
+			}
+		})
 	}
 }
 
@@ -291,6 +324,10 @@ func TestAnswerCheckTimeoutPasses(t *testing.T) {
 				done := one(t, eventData(t, m, id, proto.EvDone), proto.EvDone)
 				if done["checked"] != true || done["check_error"] != "check timed out" || done["check_failed"] != nil {
 					t.Fatalf("done %v", done)
+				}
+				// The step records the time the check took after the call.
+				if step := one(t, eventData(t, m, id, proto.EvStep), proto.EvStep); step["check_ms"].(float64) < float64(timeout.Milliseconds()) {
+					t.Fatalf("step %v", step)
 				}
 			}
 			// One vCore, three checks one after the other: each held it for

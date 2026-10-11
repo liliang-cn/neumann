@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/liliang-cn/neumann/internal/group"
 	"github.com/liliang-cn/neumann/limit"
@@ -133,11 +134,23 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	// arrived while it ran counts as if it had arrived during the call: a
 	// cancel ends the task and a steer makes the answer a turn, and the
 	// verdict is dropped either way.
+	began := e.Clock.Now()
 	v := e.checkAnswer(t, msg.TextContent())
+	checkTook(&c, core, e.Clock.Now().Sub(began))
 	if out := e.arrived(ctx, t, c, base, resp); out != nil {
 		return out.c, out.batch, out.err
 	}
 	return e.answerChecked(t, c, v), nil, nil
+}
+
+// checkTook notes on the step event in c how long the answer check held the
+// step, so that an observer can tell the provider's latency from it.
+func checkTook(c *mem.CommitSet, core int, d time.Duration) {
+	for i, ev := range c.Events {
+		if ev.Kind == proto.EvStep {
+			c.Events[i] = proto.NewEvent(proto.EvStep, ev.TaskID, stepData{PC: task.StepModel.String(), Core: core, CheckMS: max(d.Milliseconds(), 0)})
+		}
+	}
 }
 
 // arrived ends a model step whose final answer is in hand (the last of t's

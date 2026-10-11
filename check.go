@@ -4,28 +4,31 @@ import "github.com/liliang-cn/neumann/internal/core"
 
 // AnswerCheck is asked about a final answer before its task is finished
 // (design §9.8): Config.AnswerCheck. It is called once per final answer the
-// model gives (a reply with no tool calls, not cut off, with no steer
-// arriving during the call), on the goroutine that owns the task, after the
-// model call and before the commit that would finish the task. It is not
-// asked about an answer a task's budget ended with, nor about compactions,
-// failures or cancellations.
+// model gives (a reply with no tool calls, not cut off before it produced
+// any text, with no steer arriving during the call), by the vCore that owns
+// the task, after the model call and before the commit that would finish
+// the task. It is not asked about an answer a task's budget ended with, nor
+// about compactions, failures or cancellations. A reply cut off by its
+// output cap after some text is a final answer like any other, and is
+// checked: a check is the one place that may notice it is incomplete.
 //
 // Its verdict exists only through that commit: a crash or a cancel before
 // it lands discards it, and a restart redoes the model step and asks again
 // about the new answer. Keep it fast and free of side effects. It runs
 // under the task's context with Config.AnswerCheckTimeout (default 3s) on
-// top, on a goroutine of its own, so the vCore never waits for it longer
-// than that, whether it honours its context or not. A check that times out,
-// panics or whose task is cancelled meanwhile passes the answer: the done
-// event records why (check_error).
+// top, on a goroutine of its own while the vCore waits, so the vCore never
+// waits for it longer than that, whether it honours its context or not. A
+// check that times out or panics passes the answer: the done event records
+// why (check_error). The step event records how long it took (check_ms).
 //
 // A rejection with a retry left (Config.MaxAnswerRetries, default 1) puts
 // the answer and its feedback, as a user message, into the registers, emits
 // answer_rejected, and the model answers again; each answer is a model call
 // like any other, so Budget.MaxSteps bounds the loop too. A rejection past
-// the retries finishes the task with that answer anyway: an answer is never
-// dropped, and answer_rejected (final: true) and the done event's
-// check_failed say so.
+// the retries, or with no model step left in Budget.MaxSteps for another
+// answer, finishes the task (end_turn) with that answer anyway: an answer
+// is never dropped, and answer_rejected (final: true; budget: true when it
+// was the budget) and the done event's check_failed say so.
 type AnswerCheck = core.AnswerCheck
 
 // AnswerInfo is what an AnswerCheck is shown: the task's id and class, its

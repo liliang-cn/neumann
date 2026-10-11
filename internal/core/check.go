@@ -40,9 +40,10 @@ type AnswerVerdict struct {
 }
 
 // AnswerCheck is asked about each final answer before its task is finished
-// (design §9.8). It runs on the goroutine that owns the task, inside the
-// model instruction whose commit finishes it, bounded by a timeout; a check
-// that times out or panics passes the answer.
+// (design §9.8), inside the model instruction whose commit finishes it: it
+// runs on a goroutine of its own while the vCore that owns the task waits
+// for it, at most the check timeout; a check that times out or panics
+// passes the answer.
 type AnswerCheck func(ctx context.Context, info AnswerInfo) AnswerVerdict
 
 // verdict is what came of asking the check about one answer: its verdict,
@@ -75,7 +76,11 @@ func (e *Env) checkRetries() int {
 // honours its context or not, and a check given up on is not waited for
 // (what it says then is never used). A check that panics, times out, or
 // whose task is cancelled meanwhile passes the answer (err says why): a
-// check must never hold a task or lose its answer.
+// check must never hold a task or lose its answer. ("check cancelled" never
+// reaches a commit: a cancel or deadline is committed before the task's
+// context ends, and the step then finalises the cancel; a halt commits
+// nothing. It is set only so that a verdict is never taken from a check cut
+// off that way.)
 func (e *Env) checkAnswer(t *task.TCB, answer string) verdict {
 	tctx, release := e.taskContext(t.ID)
 	defer release()
@@ -137,9 +142,13 @@ func feedbackText(v AnswerVerdict) string {
 //   - rejected with a retry left: the feedback follows the answer as a user
 //     message, Rejections counts it, an answer_rejected event records it,
 //     and the task is ready for another model step;
-//   - rejected with none left: the task is done with that answer all the
-//     same (an answer is never dropped), an answer_rejected event marked
-//     final records it, and its answer and done events say check_failed.
+//   - rejected with no retry left, or with no model step left in the
+//     task's budget for another answer: the task is done with that answer
+//     all the same (an answer is never dropped), end_turn, an
+//     answer_rejected event marked final records it (budget: true when it
+//     was the budget), and its answer and done events say check_failed.
+//     Sending it back with no step left would only have the next step end
+//     the task on its budget with the rejected answer, unmarked.
 func (e *Env) answerChecked(t *task.TCB, c mem.CommitSet, v verdict) mem.CommitSet {
 	check := map[string]any{"checked": true}
 	if !v.Reject {
@@ -152,7 +161,9 @@ func (e *Env) answerChecked(t *task.TCB, c mem.CommitSet, v verdict) mem.CommitS
 	}
 	attempt := t.Rejections
 	t.Rejections++
-	if attempt < e.checkRetries() {
+	// The same bound execModel applies before a call (design §5.1).
+	spent := t.Budget.MaxSteps > 0 && t.Used.Steps+t.Unconfirmed >= t.Budget.MaxSteps
+	if attempt < e.checkRetries() && !spent {
 		feedback := feedbackText(v.AnswerVerdict)
 		t.Regs = append(t.Regs, task.FeedbackMessage(feedback))
 		e.ready(t, task.StepModel)
@@ -162,9 +173,11 @@ func (e *Env) answerChecked(t *task.TCB, c mem.CommitSet, v verdict) mem.CommitS
 		}))
 		return c
 	}
-	c.Events = append(c.Events, proto.NewEvent(proto.EvAnswerRejected, t.ID, map[string]any{
-		"reason": v.Reason, "attempt": attempt, "final": true,
-	}))
+	final := map[string]any{"reason": v.Reason, "attempt": attempt, "final": true}
+	if attempt < e.checkRetries() {
+		final["budget"] = true
+	}
+	c.Events = append(c.Events, proto.NewEvent(proto.EvAnswerRejected, t.ID, final))
 	check["check_failed"] = true
 	if v.Reason != "" {
 		check["check_reason"] = v.Reason

@@ -99,6 +99,9 @@ const (
 	// a check is configured, the answer and done events of an answer it saw
 	// carry checked: true; done adds check_reason (the check's reason, if
 	// any) or check_error (it timed out or panicked, and the answer passed).
+	// A final rejection for want of a model step in the task's budget adds
+	// budget: true. The step event of a checked answer carries check_ms,
+	// how long the check took after the call answered.
 	EvAnswerRejected = "answer_rejected"
 
 	// A compaction swapped the oldest rounds of a task's registers out into
