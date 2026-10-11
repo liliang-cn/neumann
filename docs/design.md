@@ -26,7 +26,7 @@ neumann 是一个 Go 写的常驻 agent 运行时，按冯·诺依曼计算机�
 - 插件系统。
 - RAG 实现（只定义"磁盘"接口）。
 - 子 agent / 协处理器设备。
-- 输出 lint。确定性检查以后作为可选协处理器提供，默认关闭。
+- 输出 lint。确定性检查以后作为可选协处理器提供，默认关闭。第一个这样的钩子是答案检查（9.8）：宿主给一个函数，neumann 只负责在什么时候问、问的结论怎么提交。
 - 缓存感知调度。
 - 多模态输入（第一版只有文本和工具调用）。
 
@@ -58,9 +58,10 @@ neumann 是一个 Go 写的常驻 agent 运行时，按冯·诺依曼计算机�
 type Role string // system / user / assistant / tool
 
 type Message struct {
-    Role    Role
-    Parts   []Part
-    Summary bool // 压缩放进来的摘要消息（5.3）；适配器照普通消息发
+    Role     Role
+    Parts    []Part
+    Summary  bool // 压缩放进来的摘要消息（5.3）；适配器照普通消息发
+    Feedback bool // 答案检查驳回答案时放进来的反馈（9.8）；适配器、压缩都照普通 user 消息处理
 }
 
 type Part struct {
@@ -118,6 +119,7 @@ type TCB struct {
     CompactRaise int           // 进行中的压缩被截断后放大输出上限的次数，最多 2
     CompactLimit int           // 最大上限仍被截断后，下一块最多带几个单元，0 = 不限
     Archived   int             // 压缩移进归档的消息数（5.3）
+    Rejections int             // 被答案检查驳回的最终答案数（9.8）；检查看到的 Attempt
     StopReason string
     Version    int64           // 每次提交 +1
 }
@@ -285,7 +287,7 @@ vCore 只在两条指令之间退役，从不在指令中途被杀。
 3. 本组熔断中（不闭合、也没到放探测请求的时候）：不预占、不调用，任务提交 `Waiting(Group)`。否则向本组的限流器预占额度（7.2），等额度时 vCore 持着任务、什么都不提交；拿到额度后 `Admit`，不放行则退还额度、任务转 `Waiting(Group)`；放行则提交 `Running`，通过适配器调一次模型。等额度和调用都以任务的 context 进行，取消和 Deadline 会立刻打断。调用结束先与限流器结算（7.2），再把结果报给执行组（第 6 节），然后才组装任务自己的提交。
 4. 结果：
    - **有工具调用**：assistant 消息原样追加，调用记录写为 `planned`，`PC = StepTools`。
-   - **最终文本**：调用期间到达了插话，则文本作为 assistant 轮次，`PC = StepModel`，**插话留在中断表里不合并**：下一条模型指令开头再送达，若下一步因预算或模型出错而结束，它由终态提交报告为 `steer_dropped`。没有插话则 `Done`。
+   - **最终文本**：调用期间到达了插话，则文本作为 assistant 轮次，`PC = StepModel`，**插话留在中断表里不合并**：下一条模型指令开头再送达，若下一步因预算或模型出错而结束，它由终态提交报告为 `steer_dropped`。没有插话则 `Done`；配置了答案检查时先问它（9.8），驳回则带着反馈再来一步。
    - 模型调用 panic 等同于永久错误：任务 `Failed`，`StopReason = "model_error"`，事件里的错误是 `model panicked: …`；不报给执行组（说明不了服务商的状况）。适配器的钩子（`Classify`、`RateInfo`、`Metered.Reserve`、`Metered.Settle`）在同样的保护下运行，panic 一律按调用 panic 处理（`model panicked in <钩子>: …`），预占全额退回，调用即使有回答也不采用。
    - **截断且没有内容**（`finish_reason = "length"`，没有文本也没有工具调用）：按任务自己的上限乘 4 重做（`MaxOut` 为 0 时从适配器的 `model.OutputCap` 起算，没有则 4096），连续最多两次（`Truncations`），第三次 `Failed`，`StopReason = "truncated"`。放大后的上限不超过本组限流器 `output_tokens` / `tokens` 维度的最小 `Limit`（再大就永远预占不下）；放大后不比刚发的大时，不再重做，直接 `truncated`。重做的那次调用有回答，计入 `Used.Steps`，发 `model_retry`（`class = "truncated"`，带新的 `max_out`），这一步合并的插话退回未送达，重做时再送达。放大只管这一串截断：下一次有回答且没被截断的调用把 `Truncations` 清零，之后的调用回到任务自己的 `MaxOut`，不会每次都按 4–16 倍预占输出。
 5. 提交里带 `usage` 事件（已确认用量）。成功（包括截断）清零 `Retries`。出错见第 11、13 节。
@@ -584,6 +586,40 @@ err = m.Approve(ctx, taskID, callID, ApprovalDecision{Verdict: ApproveAllow}) //
 - 插话：留在中断表，这一轮结束后下一条模型指令开头送达，排在 tool 消息之后。
 - `Status.Approval`、`GroupStatus.Approval`、`ClassQueue.Approval`（JSON `approval`）：等批准的任务数。
 
+### 9.8 答案检查
+
+```go
+type AnswerCheck func(ctx context.Context, info AnswerInfo) AnswerVerdict // Config.AnswerCheck
+
+type AnswerInfo struct {
+    TaskID, Class string
+    Request string // 任务的请求：第一条 user 消息（Instruction.Input），压缩永远保留它
+    Answer  string // 模型刚给出的最终文本
+    Attempt int    // 0 = 第一个被检查的答案；被驳回 n 次之后为 n（TCB.Rejections）
+}
+
+type AnswerVerdict struct { // 零值 = 通过
+    Reject   bool
+    Reason   string // 写进事件，要短
+    Feedback string // 驳回时作为 user 消息交给模型；空 = 一句带原因的"请修改后重答"
+}
+// Config.AnswerCheckTimeout（默认 3s），Config.MaxAnswerRetries（默认 1，负数 = 不重答）
+```
+
+可选，默认关闭（`nil`）：没有配置时行为与之前逐字节相同，事件里不多任何字段。
+
+- **在哪问**：只在 `execModel` 里模型给出最终答案、本来要以 `end_turn` 提交 `Done` 的那条路上：没有工具调用、没被截断、调用期间没有插话（有插话时照旧把答案当作一轮、再走一步，不问）。预算结束的答案（5.1 第 1 步）、压缩、取消、失败都不问。
+- **谁、何时问**：持有任务的 vCore，在模型调用结算之后、组装最终提交之前。和工具策略（9.7）一样，它运行时 vCore 持着任务，所以有界：钩子拿到的 ctx 由任务的 context 派生（取消、Deadline、强制停机照样打断它），再加 `AnswerCheckTimeout` 的期限（墙上时间，不走机器时钟）。钩子在单独的 goroutine 里跑，vCore 最多等这么久，不管钩子理不理 ctx；放弃之后它的结论不再采用。**超时、ctx 结束、panic 一律按通过处理**（fail open），原因记进 `done` 的 `check_error`（`check timed out`、`check cancelled`、`check panicked: …`）：轻量的检查不能卡住任务，也不能默认丢掉答案。
+- **钩子运行期间到达的输入**：当作调用期间到达的处理：检查之后再读一次中断表，有取消则按取消最终提交、答案丢弃；有插话则答案作为一轮、`PC = StepModel`。两种情况结论都作废，什么都不记。
+- **通过**：与没有检查时同样提交 `Done`；`answer`、`done` 带 `checked: true`，`done` 另带 `check_reason`（钩子给了原因时）或 `check_error`。
+- **驳回且还能重答**（`Rejections < MaxAnswerRetries`）：一次提交：答案作为 assistant 消息留在寄存器里，后面追加一条 `Feedback = true` 的 user 消息（反馈），`Rejections + 1`，`answer_rejected`（`{reason, feedback, attempt}`），任务 `Ready`、`PC = StepModel`，交还调度器。这一步的模型调用照常计入 `Used.Steps`，下一次回答也计，所以 `MaxSteps` 同样约束这个循环：预算用完时任务以 `budget` 结束，答案是最后一条 assistant 文本（被驳回的那条），不再问检查。
+- **驳回且不能再重答**：任务照样以这个答案 `Done`（`end_turn`），**答案从不丢**；`Rejections + 1`，`answer_rejected` 带 `final: true`（`{reason, attempt, final}`，没有 `feedback`），`answer`、`done` 带 `check_failed: true`，`done` 带 `check_reason`。要更严格的宿主可以据此重新提交。
+- **提交失败、被取消抢先**：与原来的最终提交完全一样。提交被 `ErrCancelPending` 拒绝时按取消最终提交（`cancelInstead`：从库里的任务出发，只保留已确认用量和 `step` / `usage` 事件），结论丢弃：没有 `answer_rejected`、没有反馈消息、`Rejections` 不变。
+- **崩溃**：结论只通过它的提交存在。提交前崩溃，任务停在 `Running`，重启按 4.5 重做这次模型调用（`Unconfirmed + 1`），新答案再问一次检查（`Attempt` 不变）；驳回提交落盘之后崩溃，重启从反馈之后接着答，检查拿到的 `Attempt` 是持久化的 `Rejections`。钩子没有副作用的要求与 9.7 相同。
+- **反馈消息**：role 为 user、`Feedback = true`。两个适配器都照普通 user 消息发（Anthropic 与相邻的 user 消息合并成一个回合）；压缩把它当作普通 user 消息，自成一个单元，可以换出到归档，文字稿里是 `### user`；`m.History` 里保留它；估算照常计入。
+- 观测（第 14 节）：`neumann.answers.checked`（按类、`outcome`：`passed` / `failed_open` / `rejected` / `failed`）；`answer_rejected` 是任务根 span 上的事件（`neumann.attempt`、`neumann.final`），活动日志 info 一行（`attempt`、`final`），`done` 行带 `checked`、`check_failed`、`check_error`；原因、反馈、答案都不进指标、trace 和日志。
+- 答案检查只能在 Go 里配置（`Config.AnswerCheck`），stdio 前端不提供。
+
 ## 10. 总线与设备
 
 ```go
@@ -723,7 +759,7 @@ type Event struct {
 
 `Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
-任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`done`、`failed`、`cancelled`、`steer_dropped`。
+任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_dropped`。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
 
 `compacted`：`{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（5.3）。`step` 的 `pc` 为 `model`、`tools` 或 `compact`。`model_retry` 的 `class` 可以是 `context_length`（`wait = "compact"`）。
 
@@ -758,7 +794,7 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 
 `observe` 包只用公开 API（`Events`、`EventLog`、`Status`、`Queue`、`Load`、`Calls`），任何宿主都能挂；不挂就没有任何开销。事件从主存按序号读，消费方慢只会落后，不会挡住机器；`Follow` 返回最后读到的 `Seq`，宿主存下来重启后接着读；`Head` 用 O(log n) 次单条读找到日志末尾，只想统计"从现在起"的就从那里开始。
 
-- `Metrics`：OpenTelemetry 指标，名字都在 `neumann.` 下，带单位，完整的表在包文档里。事件来的计数和直方图：任务接受 / 结束（按类、`stop_reason`）、模型调用与失败（按类、错误类别）、模型指令耗时、工具调用（按工具、结果：ok / error / cached / denied / unknown / late / cancelled）与耗时（`tool_call` → 结果）、token（prompt / completion / reasoning / cached）、重试、限流等待、`core_up` / `core_down`、熔断、迁移、`reconcile_needed`；工具策略与批准（9.7）：`tool_denied`（按工具、`by`，同时是该调用的 `denied` 结果）、`tool_rewritten`、待批准的调用数（重启再宣布不重复计）、决定数与等待时长（首次 `approval_needed` → 决定，按 `verdict`：allow / edit / deny，任务先结束为 cancelled）。采集时读 `Status` / `Queue` 的仪表：各组 vCore、`W`、`Target`、`epoch`、熔断状态，各类队列与最长等待，各限流器各维度用量与可用量，L2，未结束任务数、等批准的任务数（总数与各类），丢掉的增量，进程的 goroutine、堆（Linux 上还有 RSS）。基数有界：不按任务 id 打标签；工具名、类名和其他标签各有上限，超出的记为 `_other`（模型会编造工具名）。
+- `Metrics`：OpenTelemetry 指标，名字都在 `neumann.` 下，带单位，完整的表在包文档里。事件来的计数和直方图：任务接受 / 结束（按类、`stop_reason`）、模型调用与失败（按类、错误类别）、模型指令耗时、工具调用（按工具、结果：ok / error / cached / denied / unknown / late / cancelled）与耗时（`tool_call` → 结果）、token（prompt / completion / reasoning / cached）、重试、限流等待、`core_up` / `core_down`、熔断、迁移、`reconcile_needed`；工具策略与批准（9.7）：`tool_denied`（按工具、`by`，同时是该调用的 `denied` 结果）、`tool_rewritten`、待批准的调用数（重启再宣布不重复计）、决定数与等待时长（首次 `approval_needed` → 决定，按 `verdict`：allow / edit / deny，任务先结束为 cancelled）；答案检查（9.8）：`neumann.answers.checked`（按类、`outcome`：passed / failed_open / rejected / failed）。采集时读 `Status` / `Queue` 的仪表：各组 vCore、`W`、`Target`、`epoch`、熔断状态，各类队列与最长等待，各限流器各维度用量与可用量，L2，未结束任务数、等批准的任务数（总数与各类），丢掉的增量，进程的 goroutine、堆（Linux 上还有 RSS）。基数有界：不按任务 id 打标签；工具名、类名和其他标签各有上限，超出的记为 `_other`（模型会编造工具名）。
 - 模型指令耗时的起点：`step` 事件和它的结果在同一个提交里，调用前的 `Running` 提交不带事件，所以日志里没有"请求发出"的时刻。起点取任务能运行的时刻：上一次提交、退避结束、或放行这次调用的 `throttled`；终点是结果的提交。包括就绪队列和限流器上的等待，空闲时就是调用本身。
 - `Tracer`：从事件重建 OpenTelemetry trace，一个任务一个 trace。根 span `task`（accepted → 终态，`failed` 为错误状态），子 span：每条模型 / 压缩指令一个（失败带错误类别），每轮工具一个 `tools`，其下每个调用一个 `tool <名字>`；每个待批准的调用一个 `approval <工具>`（首次宣布 → 决定，带 `verdict`）；被拒的调用 span 在 `tool_denied` 结束、错误状态；重试、限流、迁移、恢复、核对、策略与批准事件（不带参数和原因）是根 span 上的事件；终态之后提交的（`steer_dropped`、`tool_late`）是根下零长度的 span，这样 trace 不取决于何时 flush。时间全用 `Event.Time`，id 由任务 id 和打开该 span 的事件的 `Seq` 经 SHA-256 得到（trace id = `SHA-256("neumann/trace/"+任务)` 前 16 字节），所以从 0 补读重建的 trace 与在线导出的逐字段相同；从中途接着读时，根 span 从第一个看到的事件开始并标 `neumann.partial`，id 不变。直接把 span 交给 `SpanExporter`（OTLP、内存），不经过 TracerProvider：后者自己生成 id 和时间。
 - `Log`：slog，每个值得一提的事件一行，消息是事件种类，`seq`、`task`、`class` 等是可以 grep 的键值，`at` 是提交时刻。生命周期 info；重试、限流、熔断、迁移被拒、插话丢弃、晚到结果、`tool_denied`、`approval_needed`（操作员要处理）warn；`approved` 带 `verdict` 与等待时长；`failed`、`reconcile_needed` error；`step`、`usage`、工具调用和结果 debug。`LogResources` 定期写一行资源。
@@ -783,6 +819,7 @@ m, err := neumann.New(neumann.Config{
     Store:     store,
     Devices:   []bus.Device{builtin, mcpGitHub, skillsDir},
     ToolPolicy: policy,                    // 可选：每个调用第一次派发前的决定（9.7）
+    AnswerCheck: check,                    // 可选：最终答案提交前的检查（9.8）
     System:    "You are ...",
     MaxQueued: 1000,
 })
@@ -851,6 +888,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
 
 5. **工具策略与人工批准**（9.7）：`Config.ToolPolicy` 在每个调用第一次派发之前决定（放行、拒绝、改参数、要批准），决定与调用同一次提交、写在调用记录上，恢复不再问；`Waiting(Approval)` 整轮等待，`m.Approve` 允许、拒绝或编辑，最后一个决定的提交派发这一轮；取消、Deadline、`Stop`、恢复、插话、`Status` / `Queue`；stdio 的 `approve`、`not_awaiting_approval`；`examples/approval`。
    验证：`TestToolPolicyDecidesEachCall`（放行、拒绝、改参数、改成非法 JSON：调用记录、事件、设备只见放行的、tool 消息顺序）、`TestToolPolicyPanicDenies`、`TestApprovalAllowDenyEdit`、`TestMixedRoundKeepsOrderAndPairing`（放行、待批准、拒绝混在一轮：批准前什么都不跑，之后顺序与配对不变）、`TestApproveErrors`、`TestApproveRightAfterTheAnnouncement`（收到事件立刻批准、两个操作员同时批准同一轮）、`TestCheckoutWaitGivesUpOnceTheTaskIsHandedBackElsewhere`、`TestConcurrentApprovalsAllGetTheTask`、`TestFiveApprovalsThenReadyAllReturn`、`TestEntryAfterAReadyHandBackGivesUp`、`TestCancelInsteadKeepsADenialWithItsEvent`、`TestRewriteArgsMustBeAnObject`、`TestCancelInsteadSettlesALoggedPlannedCall`（`execTools` 的提交被取消拒绝时，库里已有的待批准 `planned` 调用由 `cancelSet` 记 `cancelled`）、`TestCancelWhileAwaitingApproval`、`TestDeadlineWhileAwaitingApproval`、`TestSteerWaitsForTheApprovedRound`、`TestApprovalSurvivesARestart`（`Stop` 立即返回，重启后再宣布、不再问钩子）、`TestCrashAtEveryCommitPointWithAnApproval`（支付要批准，每个提交点前后各崩一次，批准在重启前或重启后给出，钩子不重问已决定的调用，支付至多一次）、`TestApproveOverTheWire`。
+
+6. **答案检查**（9.8）：`Config.AnswerCheck` / `AnswerCheckTimeout` / `MaxAnswerRetries`；在 `execModel` 的最终答案路径上、最终提交之前问，超时、panic、取消按通过；驳回一次提交（答案、`Feedback` 消息、`Rejections`、`answer_rejected`、`Ready`），用完重答次数照样 `Done` 并记 `check_failed`；取消抢先、插话抢先时结论作废；观测接上。
+   验证：`TestAnswerCheckRejectsThenPasses`、`TestNoAnswerCheckRecordsNothing`、`TestAnswerCheckRetriesRunOut`、`TestAnswerCheckLoopIsBoundedByTheBudget`、`TestAnswerCheckTimeoutPasses`（理不理 ctx 都一样，单 vCore 上三个超时的检查各占它一个超时）、`TestAnswerCheckPanicPasses`、`TestSteerDuringTheCallSkipsTheCheck`、`TestSteerDuringTheCheckWins`、`TestCancelBeatsTheVerdict`（驳回、最后一次驳回、通过三种提交被取消抢先）、`TestCancelDuringTheCheck`、`TestRejectionsSurviveARestart`（SQLite）、`TestCrashAtEveryCommitPointWithAnAnswerCheck`（付款后先驳回再通过、两次都驳回，每个提交点前后各崩一次）、`TestOldTaskBlobsDecode`（加字段之前写下的 TCB gob 照常读出）、两个适配器的反馈渲染测试、`observe` 的指标 / trace / 日志测试。
 
 ## 18. 测试
 

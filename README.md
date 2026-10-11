@@ -225,7 +225,7 @@ pieces. The committed `answer` event is the record.
   global `Seq` and a per-task `TaskSeq`. Task events include `accepted`,
   `step`, `tool_call`, `tool_result`, `usage`, `answer`, `done`, `failed`,
   `cancelled`, `model_retry`, `compacted`, `reconcile_needed`, `tool_denied`,
-  `approval_needed`, `approved`; machine events (no task)
+  `approval_needed`, `approved`, `answer_rejected`; machine events (no task)
   include `core_up`, `core_down`, `group_down`, `group_up`, `throttled`.
 
 [docs/overview.md](docs/overview.md) walks through these mechanisms in more
@@ -451,6 +451,25 @@ err = m.Approve(ctx, taskID, callID, neumann.ApprovalDecision{Verdict: neumann.A
 A cancel, a deadline or `Stop` while the round waits sends nothing; a restart
 keeps it waiting and announces the held calls again. `examples/approval` runs
 it offline.
+
+**Answer check.** `Config.AnswerCheck` (off by default) is asked about every
+final answer before the commit that would finish its task. A rejection with a
+retry left (`MaxAnswerRetries`, default 1) commits the answer, the check's
+feedback as a user message and an `answer_rejected` event, and the model
+answers again; past the retries the task finishes with that answer anyway,
+marked `check_failed`. The check runs on the vCore, bounded by
+`AnswerCheckTimeout` (default 3s); one that times out or panics passes the
+answer. The verdict exists only through its commit: a cancel that lands
+first wins, and a crash before it redoes the model step and asks again.
+
+```go
+cfg.AnswerCheck = func(_ context.Context, a neumann.AnswerInfo) neumann.AnswerVerdict {
+	if !strings.Contains(a.Answer, "EUR") {
+		return neumann.AnswerVerdict{Reject: true, Reason: "no currency", Feedback: "Give the amount in EUR."}
+	}
+	return neumann.AnswerVerdict{} // the zero value passes
+}
+```
 
 **Groups.** `m.SetCores(class, n)` pins a group's window at `n` vCores;
 `m.AutoScale(class, true)` lets it adapt again. `m.SetClass(ctx, id, class)`

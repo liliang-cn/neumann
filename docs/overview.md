@@ -108,7 +108,14 @@ which instruction comes next.
      `dispatched`, set the task `Waiting(IO)`. After the commit and the
      hand-back, the same vCore gives the calls to the bus;
    - **final text**: `Done` with `answer` and `done` events (or one more
-     model step if a steer arrived during the call);
+     model step if a steer arrived during the call). With
+     `Config.AnswerCheck` set, the vCore first asks the check about the
+     answer (design §9.8), bounded by a timeout and failing open; a
+     rejection with a retry left commits the answer, the feedback as a
+     user message and `answer_rejected`, and the task is ready for another
+     model step; past the retries it is `Done` anyway, marked
+     `check_failed`. The verdict exists only through that commit, so a
+     cancel that lands first wins and a crash before it asks again;
    - **failure**: by error class (design §11): back off in
      `Waiting(Backoff)`, park on the group, or fail.
 
