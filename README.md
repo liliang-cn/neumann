@@ -472,6 +472,17 @@ cfg.AnswerCheck = func(_ context.Context, a neumann.AnswerInfo) neumann.AnswerVe
 }
 ```
 
+`decide`'s checker (below) fits it; give it the time it needs (its own
+timeout is 5s):
+
+```go
+cfg.AnswerCheckTimeout = 6 * time.Second
+cfg.AnswerCheck = func(ctx context.Context, a neumann.AnswerInfo) neumann.AnswerVerdict {
+	res, _ := checker.Check(ctx, a.Request, a.Answer) // fails open: an error passes
+	return neumann.AnswerVerdict{Reject: !res.Pass, Reason: strings.Join(res.Failed, ","), Feedback: res.Feedback}
+}
+```
+
 **Groups.** `m.SetCores(class, n)` pins a group's window at `n` vCores;
 `m.AutoScale(class, true)` lets it adapt again. `m.SetClass(ctx, id, class)`
 moves a task to another group between instructions (`ErrTaskBusy` means try
@@ -583,8 +594,9 @@ router, _ := decide.NewRouter(engine, decide.RouterConfig{
 class, _, _ := router.Route(ctx, input)
 id, err := m.Submit(ctx, proto.Instruction{Input: input, Class: class})
 
-// An answer checker, run by the host after done: is the answer on topic,
-// only a plan, a refusal? It fails open: no answer from the engine passes.
+// An answer checker, run by the host after done (or as Config.AnswerCheck,
+// above, before it): is the answer on topic, only a plan, a refusal? It
+// fails open: no answer from the engine passes.
 checker, _ := decide.NewChecker(engine, decide.CheckerConfig{})
 res, err := checker.Check(ctx, input, answer) // answer: the done task's LastAnswer()
 if !res.Pass {
