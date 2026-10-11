@@ -8,11 +8,10 @@ Each example is a `main` package; run it from the repository root.
 | [approval](approval/main.go) | A tool policy that allows reads, denies transfers to unknown accounts and holds the rest for a person; an operator approves one transfer and edits another through `Machine.Approve`, offline. | `go run ./examples/approval` |
 | [skills](skills/main.go) | A skills device serving skill directories by progressive disclosure, driven by a scripted model, offline. | `go run ./examples/skills` |
 | [mcp](mcp/main.go) | An MCP server (this same binary, over stdio) attached as a bus device. Offline with a scripted model; uses a real OpenAI-compatible model when `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `OPENAI_MODEL` are set. | `go run ./examples/mcp` |
+| [observe](observe/main.go) | The `observe` package on an offline machine: the HTTP view (status, queue, tasks, SSE events, Prometheus metrics, pprof), the activity log, and traces printed as a span tree. `-serve` keeps it up; it listens on a free port unless `-addr` is given. | `go run ./examples/observe` |
 | [live](live/main.go) | Six concurrent tasks against a real OpenAI-compatible endpoint: parallel tool calls, a slow tool, a steer while it runs, streamed output; checks the invariants at the end. `NEUMANN_DB=path` keeps state in SQLite. | `OPENAI_BASE_URL=https://host/v1 OPENAI_API_KEY=... OPENAI_MODEL=... go run ./examples/live` |
 | [netbench](netbench/main.go) | What the wire protocol costs against a real endpoint (cold connection, warm round trips, a burst, tiny completions), separate from inference. | `OPENAI_BASE_URL=https://host/v1 OPENAI_API_KEY=... OPENAI_MODEL=... go run ./examples/netbench` |
 
 `live` and `netbench` also read `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`
 when the `OPENAI_` variables are unset. Keep keys in the environment, never in
 source.
-
-<!-- PENDING: add examples/observe once the observe branch has merged. -->

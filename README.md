@@ -488,33 +488,53 @@ and nothing is durable.
 
 ## Observability
 
-<!-- PENDING: written before the observe branch merged. Verify every name below
-     (package observe, observe.Handler, its routes, the cmd/neumann flags,
-     examples/observe, proto.Event.Time) against the merged code. -->
+Package `observe` turns a machine's committed event log into the signals an
+operator expects. It uses only the public `Machine` API, never blocks the
+machine (events are read from the durable log at the consumer's pace), and a
+consumer that restarts resumes from the last sequence number it read.
 
-> This section describes the `observe` package, which lands together with
-> v0.1. Check `go doc github.com/liliang-cn/neumann/observe` for the exact API.
+```go
+reader, prom, _ := observe.PrometheusReader()            // or any sdkmetric.Reader (OTLP...)
+metrics, _ := observe.NewMetrics(m, sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)), observe.MetricsOptions{})
+tracer := observe.NewTracer(spanExporter, observe.TracerOptions{}) // any sdktrace.SpanExporter
+activity := observe.NewLog(slog.Default())
+go observe.Follow(ctx, m, 0, metrics, tracer, activity)  // replay from seq 0, then live
 
-Package `observe` turns a machine's committed events into the signals an
-operator expects, without changing what the machine commits:
-
-- **An HTTP handler.** Mount `observe.Handler` (an `http.Handler`) on your own
-  server to get `/status` and `/queue` (the `Status` and `Queue` snapshots),
-  `/tasks/{id}` (one task), `/events` (the event log as server-sent events),
-  `/metrics` and `/debug/pprof`.
-- **OpenTelemetry.** Metrics, and traces reconstructed from the event log;
-  set `OTEL_EXPORTER_OTLP_ENDPOINT` to export them over OTLP.
-- **An activity log** through `log/slog`.
-- **Event times.** `proto.Event` carries a `Time`.
-
-With the stdio frontend, `-observe-addr` serves the handler on a port of your
-choice, and `-metrics` / `-pprof` control those endpoints (see `-help`):
-
-```
-NEUMANN_API_KEY=... go run ./cmd/neumann -model m -store state.db -observe-addr 127.0.0.1:43517
+http.Handle("/", observe.NewHandler(m, observe.HandlerOptions{Metrics: prom, Token: os.Getenv("TOKEN")}))
 ```
 
-`examples/observe` is a runnable program.
+- **Metrics** (OpenTelemetry, `neumann.` prefix): tasks by outcome, model call
+  latency and failures by error class, tokens, retries, throttling, tool calls
+  by outcome (incl. denied, cached, late), approvals, compactions, migrations,
+  vCore changes; gauges for live/busy vCores, the window and breaker per
+  group, queues, limiter headroom, the cache and the process. Labels are
+  bounded; nothing is labelled by task id. The full table is in
+  `go doc github.com/liliang-cn/neumann/observe`.
+- **Traces**: one trace per task, rebuilt from the event log (`proto.Event`
+  carries the commit `Time`): a task span, a span per instruction and per
+  tool call, span events for retries, migrations and approvals. Span ids are
+  derived from the task id and sequence numbers, so replaying the log after a
+  crash rebuilds the same trace. Model spans start at the `model_call` event,
+  committed as the request goes out, so they measure the provider's latency.
+- **Activity log**: one `key=value` line per notable event through
+  `log/slog` (no prompts or arguments).
+- **HTTP** (`observe.NewHandler`, read-only): `/status`, `/queue`,
+  `/tasks/{id}`, `/events?from_seq=N` (server-sent events, replay then live,
+  `Last-Event-ID` resumes), `/metrics` when given, `/debug/pprof/` only when
+  `Pprof` is set. `/tasks` and `/events` expose prompts and tool arguments:
+  set `Token` or keep the handler private.
+
+The stdio frontend serves the same view with `-observe-addr` (plus
+`-metrics`, `-pprof`; `NEUMANN_OBSERVE_TOKEN` sets the bearer token) and
+exports traces and metrics over OTLP/HTTP when `OTEL_EXPORTER_OTLP_ENDPOINT`
+is set:
+
+```
+NEUMANN_API_KEY=... go run ./cmd/neumann -model m -store state.db -observe-addr 127.0.0.1:43517 -metrics
+```
+
+`go run ./examples/observe` runs all of it offline and prints the URLs and a
+span tree.
 
 ## Guarantees, precisely
 
