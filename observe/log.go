@@ -14,8 +14,8 @@ import (
 // the kind carries), and "at" is the commit time. Levels:
 //
 //   - info: lifecycle — accepted, done, cancelled, compacted, migrated,
-//     recovered, resolved, approved, tool_rewritten, group_up, core_up,
-//     core_down, and kinds this package does not know;
+//     recovered, resolved, approved, tool_rewritten, answer_rejected,
+//     group_up, core_up, core_down, and kinds this package does not know;
 //   - warn: model_retry, throttled, group_down, migrate_refused,
 //     steer_dropped, tool_late, tool_denied, and approval_needed (an
 //     operator must answer it: Machine.Approve);
@@ -23,8 +23,8 @@ import (
 //   - debug: step, usage, tool_call, tool_result, answer.
 //
 // Lines carry no task content: no prompts, answers, tool arguments or
-// results, nor the reasons a tool policy or an operator gave (they may quote
-// the arguments). A failed task's error text is logged; it is the provider's or
+// results, nor the reasons a tool policy, an operator or an answer check
+// gave (they may quote the arguments or the answer). A failed task's error text is logged; it is the provider's or
 // the machine's, not the user's.
 type Log struct {
 	l  *slog.Logger
@@ -126,9 +126,21 @@ func (g *Log) Observe(ev proto.Event) {
 		a = append(a, slog.Int("rounds", d.Rounds), slog.Int("messages_before", d.MessagesBefore), slog.Int("messages_after", d.MessagesAfter),
 			slog.Int64("tokens_before_est", d.TokensBefore), slog.Int64("tokens_after_est", d.TokensAfter),
 			slog.Int("chunk", d.Chunk), slog.Int("chunks", d.Chunks))
+	case proto.EvAnswerRejected:
+		a = append(a, slog.Int("attempt", d.Attempt))
+		if d.Final {
+			a = append(a, slog.Bool("final", true))
+		}
 	case proto.EvDone, proto.EvFailed, proto.EvCancelled:
 		str("stop_reason", d.StopReason)
 		str("error", d.Error)
+		if d.Checked {
+			a = append(a, slog.Bool("checked", true))
+		}
+		if d.CheckFailed {
+			a = append(a, slog.Bool("check_failed", true))
+		}
+		str("check_error", d.CheckError)
 	}
 	if !ev.Time.IsZero() {
 		a = append(a, slog.String("at", ev.Time.Format(time.RFC3339Nano)))

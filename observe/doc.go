@@ -66,6 +66,7 @@
 //	neumann.compactions          counter    {chunk}      class                           compacted (one per chunk swapped out)
 //	neumann.compaction.rounds    counter    {round}      class                           compacted: rounds swapped out
 //	neumann.compaction.tokens    counter    {token}      class                           compacted: tokens_before_est - tokens_after_est
+//	neumann.answers.checked      counter    {answer}     class, outcome                  answer_rejected, done of a checked answer
 //
 // outcome of a model step: ok, error, cancelled; error_class is the
 // model_retry class (rate_limited, quota_exhausted, overload, transient,
@@ -77,7 +78,10 @@
 // among them). A task's: done, failed, cancelled. A held call's verdict
 // (design §9.7): allow, edit, deny, or cancelled when its task ended first;
 // a restart that announces a held call again neither counts it again nor
-// restarts its wait.
+// restarts its wait. A final answer the answer check saw (design §9.8):
+// passed, failed_open (the check timed out or panicked, and the answer
+// passed), rejected (sent back to the model with feedback), or failed
+// (rejected past the retries, and kept).
 //
 // neumann.model.duration: from the model_call event, committed with the
 // task's Running state as the request goes out, to the commit of the result:

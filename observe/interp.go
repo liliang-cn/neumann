@@ -46,6 +46,11 @@ type data struct {
 	Effect     string `json:"effect"`    // approval_needed
 	Recovered  bool   `json:"recovered"` // approval_needed announced again by a restart
 	Edited     bool   `json:"edited"`    // approved with new arguments
+	// the answer check (design §9.8): answer_rejected, and done
+	Final       bool   `json:"final"`        // answer_rejected: no retry was left
+	Checked     bool   `json:"checked"`      // done: the answer check saw the answer
+	CheckFailed bool   `json:"check_failed"` // done: and rejected it, past the retries
+	CheckError  string `json:"check_error"`  // done: and gave no verdict (timed out, panicked)
 	// compacted
 	Rounds         int   `json:"rounds"`
 	MessagesBefore int   `json:"messages_before"`

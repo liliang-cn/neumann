@@ -45,7 +45,8 @@ type TracerOptions struct {
 //     reconcile and operator resolutions are events on it, and so are the
 //     tool policy's and the operators' decisions: tool_denied,
 //     tool_rewritten, approval_needed (again after a restart, marked
-//     neumann.recovered) and approved.
+//     neumann.recovered) and approved, and the answer check's rejections
+//     (answer_rejected, with neumann.attempt and neumann.final).
 //   - "model" / "compact": one per model instruction, child of the task.
 //     It spans from when the task could run (its previous commit, after any
 //     backoff, or when the limiters let its call go) to the commit of the
@@ -324,6 +325,12 @@ func markAttrs(f fact) []attribute.KeyValue {
 		}
 	case proto.EvRecovered:
 		add("neumann.from", d.From)
+	case proto.EvAnswerRejected:
+		// Never the reason or the feedback: they may quote the answer.
+		a = append(a, attribute.Int("neumann.attempt", d.Attempt))
+		if d.Final {
+			a = append(a, attribute.Bool("neumann.final", true))
+		}
 	case proto.EvToolDenied, proto.EvToolRewritten, proto.EvApprovalNeeded, proto.EvApproved:
 		// Never the arguments, nor a reason: a policy may quote them.
 		add("neumann.call.id", d.CallID)
