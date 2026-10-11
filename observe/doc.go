@@ -79,13 +79,12 @@
 // a restart that announces a held call again neither counts it again nor
 // restarts its wait.
 //
-// neumann.model.duration: the core commits a step's event together with its
-// result, and the commit that starts a call (Running) carries no event, so
-// the log does not hold the moment a request went out. The histogram spans
-// from when the task could run — its previous commit, the end of its
-// backoff, or the throttled event that let its call go — to the commit of
-// the result: ready-queue wait, limiter wait and the call. On an idle
-// machine that is the call's latency.
+// neumann.model.duration: from the model_call event, committed with the
+// task's Running state as the request goes out, to the commit of the result:
+// the provider's latency, without the ready-queue or limiter wait before it.
+// A log written before model_call existed falls back to the moment the task
+// could run (its previous commit, the end of its backoff, or the throttled
+// event that let its call go), which includes those waits.
 //
 // Read at collection (gauges, and counters the machine keeps):
 //

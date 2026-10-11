@@ -232,7 +232,8 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	prevPC := t.PC
 	t.State, t.PC = task.Running, pc
 	t.Version++
-	if err := e.Commit(context.WithoutCancel(ctx), mem.CommitSet{Task: t, Events: pre}); err != nil {
+	call := proto.NewEvent(proto.EvModelCall, t.ID, stepData{PC: pc.String(), Core: core})
+	if err := e.Commit(context.WithoutCancel(ctx), mem.CommitSet{Task: t, Events: append(pre, call)}); err != nil {
 		t.State, t.PC = task.Ready, prevPC
 		t.Version--
 		unsent()

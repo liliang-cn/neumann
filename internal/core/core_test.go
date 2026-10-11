@@ -102,7 +102,7 @@ func TestModelStepAnswers(t *testing.T) {
 	if got.State != task.Done || got.StopReason != "end_turn" || got.LastAnswer() != "hello" || got.Version != 3 {
 		t.Fatalf("task %+v", got)
 	}
-	if k := kinds(store); k != "step,usage,answer,done" {
+	if k := kinds(store); k != "model_call,step,usage,answer,done" {
 		t.Fatalf("events %s", k)
 	}
 }
@@ -131,7 +131,7 @@ func TestModelStepDispatchesToolCalls(t *testing.T) {
 		t.Fatalf("records %+v", recs)
 	}
 	// One instruction: the model step itself hands the calls to the bus.
-	if k := kinds(store); k != "step,usage,tool_call,tool_call" {
+	if k := kinds(store); k != "model_call,step,usage,tool_call,tool_call" {
 		t.Fatalf("events %s", k)
 	}
 	close(gate)
@@ -392,7 +392,7 @@ func TestModelErrorFailsTheTask(t *testing.T) {
 	if got.State != task.Failed || got.StopReason != "model_error" || !strings.Contains(failedError(store), "scripted permanent") {
 		t.Fatalf("task %+v, error %q", got, failedError(store))
 	}
-	if k := kinds(store); k != "step,failed" {
+	if k := kinds(store); k != "model_call,step,failed" {
 		t.Fatalf("events %s", k)
 	}
 }

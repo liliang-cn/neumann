@@ -51,6 +51,11 @@ const (
 	// {class, attempt, delay_ms, wait, error} (design §11, §13).
 	EvModelRetry = "model_retry"
 
+	// A model request is about to go out: committed with the task's Running
+	// state, so its time is when the call began and a provider's latency is
+	// the time from it to the step that carries the result ({pc, core}).
+	EvModelCall = "model_call"
+
 	// Machine events, with no task: a model call waited for room in its
 	// limiters ({task, class, waited_ms}); an execution group's breaker opened
 	// ({class, cause}) or closed ({class}) (design §6.2, §7.2).

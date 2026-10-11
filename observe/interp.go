@@ -309,6 +309,11 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 		in.endApproval(ev, d, t, d.CallID, verdict, emit)
 	case proto.EvModelRetry:
 		emit(f(factMark))
+	case proto.EvModelCall:
+		// Committed as the request goes out: the step that follows spans
+		// the provider's latency only, not the queue or the limiters.
+		t.call = ev.Time
+		return t.class, d
 	case proto.EvMigrated:
 		emit(f(factMark))
 		t.class = d.To

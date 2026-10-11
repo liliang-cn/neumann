@@ -394,6 +394,12 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 	return m
 }
 
+// sweepPatience is how long a sweep's process may take to go quiet or to
+// finish. It detects a hang, not slowness: an idle machine takes about a
+// second, but a shared CI runner's disk can stretch a few dozen fsyncs past
+// any tight bound, and a timeout dumps every goroutine to tell the two apart.
+const sweepPatience = 30 * time.Second
+
 // quiesceOr waits, up to patience, until the dead machine has nothing left
 // in flight, or until dead says the process died while nothing was ready or
 // held: a task left waiting for an approval
@@ -497,7 +503,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		t.Fatalf("submit: %v", submitErr)
 	}
 	if submitErr == nil {
-		patience := 5 * time.Second
+		patience := sweepPatience
 		if sc.patience > 0 {
 			patience = sc.patience
 		}
@@ -538,7 +544,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		sc.mid.Add(1)
 	}
 	m2 := newMachine(t, s2, w, sc.model(w))
-	finish := 10 * time.Second
+	finish := sweepPatience
 	if sc.patience > 0 {
 		finish = sc.patience
 	}

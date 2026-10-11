@@ -137,7 +137,7 @@ func TestSubmitAnswers(t *testing.T) {
 	for _, ev := range eventsOf(t, m, id) {
 		kinds = append(kinds, ev.Kind)
 	}
-	if k := strings.Join(kinds, ","); k != "accepted,step,usage,answer,done" {
+	if k := strings.Join(kinds, ","); k != "accepted,model_call,step,usage,answer,done" {
 		t.Fatalf("events %s", k)
 	}
 }

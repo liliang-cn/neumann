@@ -129,7 +129,7 @@ func TestCancelStopsAModelCall(t *testing.T) {
 	if got.State != task.Cancelled || got.Unconfirmed != 1 || got.Used.Steps != 0 {
 		t.Fatalf("task %s unconfirmed=%d steps=%d", got.State, got.Unconfirmed, got.Used.Steps)
 	}
-	if k := kinds(store); k != "step,cancelled" {
+	if k := kinds(store); k != "model_call,step,cancelled" {
 		t.Fatalf("events %s", k)
 	}
 	if r, w, h := e.Sched.Counts(); r+w+h != 0 {

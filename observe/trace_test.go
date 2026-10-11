@@ -290,3 +290,22 @@ func TestThrottleWithoutACall(t *testing.T) {
 		t.Fatalf("model span starts at %v, want when the task parked", m.Start.Sub(t0))
 	}
 }
+
+// A model_call event marks when the request went out, so the model span
+// covers the provider's latency only, not the queue or the limiters before it.
+func TestModelSpanStartsAtTheCall(t *testing.T) {
+	var s script
+	s.add(0, proto.EvAccepted, "a", nil)
+	s.add(4*time.Second, proto.EvModelCall, "a", map[string]any{"pc": "model", "core": 1})
+	s.add(6*time.Second, proto.EvStep, "a", map[string]any{"pc": "model", "core": 1})
+	s.add(6*time.Second, proto.EvUsage, "a", usage(1, 1, 0, 0))
+	s.add(6*time.Second, proto.EvDone, "a", map[string]any{"stop_reason": "end_turn"})
+	exp := tracetest.NewInMemoryExporter()
+	tr := NewTracer(exp, TracerOptions{})
+	feed(tr, s.evs)
+	tr.Flush(context.Background())
+	m := one(t, spans(exp), "a", "model")
+	if !m.Start.Equal(t0.Add(4*time.Second)) || !m.End.Equal(t0.Add(6*time.Second)) {
+		t.Fatalf("model span %v → %v, want 4s → 6s", m.Start.Sub(t0), m.End.Sub(t0))
+	}
+}

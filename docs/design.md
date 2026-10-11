@@ -723,7 +723,7 @@ type Event struct {
 
 `Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
-任务事件：`accepted`、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`done`、`failed`、`cancelled`、`steer_dropped`。
+任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`done`、`failed`、`cancelled`、`steer_dropped`。
 
 `compacted`：`{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（5.3）。`step` 的 `pc` 为 `model`、`tools` 或 `compact`。`model_retry` 的 `class` 可以是 `context_length`（`wait = "compact"`）。
 
