@@ -57,9 +57,14 @@ func main() {
 	var engine decide.Engine = scripted()
 	if *live {
 		so := decide.NewSystemOne(decide.SystemOneConfig{URL: *url, Model: *modelName, APIKey: *key, KeepAlive: 10 * time.Minute})
-		if err := so.Ready(ctx); err != nil {
+		if err := so.Ready(ctx); err != nil { // the server lists the model
 			log.Fatal(err)
 		}
+		start := time.Now()
+		if err := so.Warm(ctx); err != nil { // and has it loaded: a cold load takes seconds
+			log.Fatal(err)
+		}
+		fmt.Printf("warmed %s in %s\n", so.Name(), time.Since(start).Round(time.Millisecond))
 		engine = so
 	}
 	if _, err := run(ctx, os.Stdout, engine); err != nil {
@@ -126,7 +131,6 @@ func run(ctx context.Context, w io.Writer, engine decide.Engine) (result, error)
 			{Class: "strong", Description: "a large, careful model: multi-step work with tools, reasoning, writing"},
 		},
 		Default: "strong",
-		Floor:   0.2, // a coin toss goes to the strong model
 	})
 	if err != nil {
 		return res, err
@@ -257,9 +261,10 @@ func script(req model.Request) (model.Response, error) {
 // scripted is the offline engine: it answers the questions the router, the
 // policy and the checker ask, the way tev1:4b answered them.
 func scripted() *decidetest.Engine {
-	return &decidetest.Engine{EngineName: "scripted", Fn: func(state string, qs map[string]decide.Question) (map[string]decide.Answer, error) {
+	return &decidetest.Engine{EngineName: "scripted", Fn: func(state string, asks []decide.Ask) (map[string]decide.Answer, error) {
 		out := map[string]decide.Answer{}
-		for name := range qs {
+		for _, a := range asks {
+			name := a.Name
 			switch name {
 			case decide.RouteQuestion:
 				out[name] = decidetest.Pick("fast", 0.76)
