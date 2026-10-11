@@ -50,7 +50,7 @@ type TracerOptions struct {
 //   - "model" / "compact": one per model instruction, child of the task.
 //     It spans from when the task could run (its previous commit, after any
 //     backoff, or when the limiters let its call go) to the commit of the
-//     step's result. Status error with the error class for a failed call.
+//     step's result, less the answer check's time (check_ms on the step). Status error with the error class for a failed call.
 //     A compaction that was applied carries its compacted event's figures
 //     (neumann.compact.rounds, .messages_before, .messages_after,
 //     .tokens_before_est, .tokens_after_est, .chunk, .chunks), which are

@@ -114,3 +114,32 @@ func TestLogOfAnswerChecks(t *testing.T) {
 		t.Errorf("task content in the log:\n%s", out)
 	}
 }
+
+// The check's time is not the provider's: a step whose answer the check held
+// for 400ms after an instant call ends 400ms before its commit, in the
+// duration histogram and in its span.
+func TestModelLatencyLeavesTheCheckOut(t *testing.T) {
+	var s script
+	s.add(0, proto.EvAccepted, "a", map[string]any{"class": "big"})
+	s.add(time.Second, proto.EvModelCall, "a", map[string]any{"pc": "model", "core": 1})
+	s.add(time.Second+401*time.Millisecond, proto.EvStep, "a", map[string]any{"pc": "model", "core": 1, "check_ms": 400})
+	s.add(time.Second+401*time.Millisecond, proto.EvUsage, "a", usage(10, 5, 0, 0))
+	s.add(time.Second+401*time.Millisecond, proto.EvAnswer, "a", map[string]any{"text": "x", "checked": true})
+	s.add(time.Second+401*time.Millisecond, proto.EvDone, "a", map[string]any{"stop_reason": "end_turn", "checked": true})
+
+	reader, mp := newReader(t)
+	m, err := NewMetrics(nil, mp, MetricsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	feed(m, s.evs)
+	collect(t, reader).mustHist("neumann.model.duration", map[string]string{"class": "big", "pc": "model", "outcome": "ok"}, 1, 0.001)
+
+	exp := tracetest.NewInMemoryExporter()
+	tr := NewTracer(exp, TracerOptions{})
+	feed(tr, s.evs)
+	tr.Flush(context.Background())
+	if sp := one(t, spans(exp), "a", "model"); !sp.Start.Equal(t0.Add(time.Second)) || !sp.End.Equal(t0.Add(time.Second+time.Millisecond)) {
+		t.Fatalf("model span %v → %v", sp.Start.Sub(t0), sp.End.Sub(t0))
+	}
+}

@@ -86,6 +86,9 @@
 // neumann.model.duration: from the model_call event, committed with the
 // task's Running state as the request goes out, to the commit of the result:
 // the provider's latency, without the ready-queue or limiter wait before it.
+// A step whose answer the answer check saw (design §9.8) ends check_ms (on
+// its step event) before its commit: the check's time is not the
+// provider's.
 // A log written before model_call existed falls back to the moment the task
 // could run (its previous commit, the end of its backoff, or the throttled
 // event that let its call go), which includes those waits.

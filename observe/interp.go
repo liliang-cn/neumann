@@ -47,6 +47,7 @@ type data struct {
 	Recovered  bool   `json:"recovered"` // approval_needed announced again by a restart
 	Edited     bool   `json:"edited"`    // approved with new arguments
 	// the answer check (design §9.8): answer_rejected, and done
+	CheckMS     int64  `json:"check_ms"`     // step: how long the answer check held it after the call answered
 	Final       bool   `json:"final"`        // answer_rejected: no retry was left
 	Checked     bool   `json:"checked"`      // done: the answer check saw the answer
 	CheckFailed bool   `json:"check_failed"` // done: and rejected it, past the retries
@@ -136,6 +137,7 @@ type openStep struct {
 	core      int
 	at, start time.Time
 	usage     *task.Usage
+	check     time.Duration // the answer check's share of the step, after the call answered
 }
 
 type openCall struct {
@@ -245,7 +247,7 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 		if !t.call.IsZero() {
 			start = t.call
 		}
-		t.step = &openStep{seq: ev.Seq, pc: d.PC, core: d.Core, at: ev.Time, start: start}
+		t.step = &openStep{seq: ev.Seq, pc: d.PC, core: d.Core, at: ev.Time, start: start, check: time.Duration(d.CheckMS) * time.Millisecond}
 		t.call = time.Time{}
 		if d.PC == task.StepTools.String() {
 			// Dispatching planned calls: the instruction is the commit.
@@ -375,6 +377,14 @@ func (in *interp) endStep(ev proto.Event, d data, t *taskState, emit func(fact))
 	if s.at.Before(ev.Time) {
 		// The step was committed before its result: the call ran in between.
 		f.start = s.at
+	}
+	if s.check > 0 {
+		// The answer check ran between the answer and the commit: the call
+		// ended that much earlier.
+		f.end = f.end.Add(-s.check)
+		if f.end.Before(f.start) {
+			f.end = f.start
+		}
 	}
 	if s.usage == nil && s.pc != task.StepTools.String() {
 		switch ev.Kind {
