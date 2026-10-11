@@ -542,23 +542,23 @@ Package `decide` adds a coprocessor: a decision engine is a small model that
 answers closed questions about a text (which of these, how much, yes or no)
 in one forward pass, without generating anything. `decide.SystemOne` is the
 client for Ollama's System One API (`POST /v1/systemone`, Ollama 0.35 and
-later; tev1:4b answers in about 0.1 to 1 second locally). Its calls are not
-instructions: no task step, no window or limiter, no event. Three uses come
-ready-made:
+later). Its calls are not instructions: no task step, no window or limiter,
+no event. Three uses come ready-made:
 
 ```go
 engine := decide.NewSystemOne(decide.SystemOneConfig{}) // tev1:4b on 127.0.0.1:11434; URL, Model, APIKey for a relay
+if err := engine.Warm(ctx); err != nil { ... }          // load the model before the first real question
 
 // A tool policy: ReadOnly calls pass unasked; a call the engine thinks needs
 // a person is held, its reason ("systemone:tev1:4b: needs_approval yes,
 // p=0.98") committed with the call record. Each request is cut off after 2s;
-// with no answer a SideEffect call is held, anything else allowed.
+// with no answer the call is held.
 cfg.ToolPolicy = decide.Policy(engine, decide.PolicyConfig{})
 
 // A router: which group should run this request?
 router, _ := decide.NewRouter(engine, decide.RouterConfig{
 	Routes:  []decide.Route{{Class: "fast", Description: "short factual answers"}, {Class: "strong", Description: "multi-step work"}},
-	Default: "strong", // on an error, or below Floor
+	Default: "strong", // on an error, or a pick less sure than Floor
 })
 class, _, _ := router.Route(ctx, input)
 id, err := m.Submit(ctx, proto.Instruction{Input: input, Class: class})
@@ -571,6 +571,26 @@ if !res.Pass {
 	m.Submit(ctx, proto.Instruction{Input: input + "\n\n" + res.Feedback, Class: class})
 }
 ```
+
+What to expect from tev1:4b on a local Ollama (measured on an Apple-silicon
+Mac):
+
+- **Latency.** A short question takes 50 to 400 ms; the engine reads about
+  700 tokens a second when its prompt cache misses, so a few KB take a
+  second or two. Loading the model cold takes 2 to 4 seconds, longer than
+  any of the timeouts above: call `Warm` at start-up, and set `KeepAlive`
+  to keep the model loaded.
+- **One request at a time.** The server answers one request at a time, so
+  policy calls from several vCores queue behind each other (each within its
+  own timeout, after which the call is held).
+- **A small context.** The model reads at most 2050 tokens, questions
+  included, and the server never truncates: some 6 to 7 KB of English, far
+  less of base64 or code. Policy, Router and Checker cut what they show it
+  (512 bytes of arguments, 4 KB of input or of request, answer and tool
+  results), marking the cut, and `SystemOne` retries once with a shorter
+  state when the server still says it is too long.
+- **Order matters.** The questions of a request are answered in the order
+  given, each in sight of the answers before it.
 
 An engine that fails gives no answer, and each of these falls back to a
 fixed choice rather than a guess. A small engine is right most of the time,
