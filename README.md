@@ -456,10 +456,11 @@ it offline.
 final answer before the commit that would finish its task. A rejection with a
 retry left (`MaxAnswerRetries`, default 1) commits the answer, the check's
 feedback as a user message and an `answer_rejected` event, and the model
-answers again; past the retries the task finishes with that answer anyway,
-marked `check_failed`. The check runs on the vCore, bounded by
-`AnswerCheckTimeout` (default 3s); one that times out or panics passes the
-answer. The verdict exists only through its commit: a cancel that lands
+answers again; past the retries, or with no step left in `MaxSteps` for
+another answer, the task finishes with that answer anyway, marked
+`check_failed`. The check runs on a goroutine of its own while the vCore
+waits, at most `AnswerCheckTimeout` (default 3s); one that times out or
+panics passes the answer. The verdict exists only through its commit: a cancel that lands
 first wins, and a crash before it redoes the model step and asks again.
 
 ```go

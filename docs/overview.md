@@ -113,8 +113,8 @@ which instruction comes next.
      answer (design §9.8), bounded by a timeout and failing open; a
      rejection with a retry left commits the answer, the feedback as a
      user message and `answer_rejected`, and the task is ready for another
-     model step; past the retries it is `Done` anyway, marked
-     `check_failed`. The verdict exists only through that commit, so a
+     model step; past the retries, or with no step left in its budget, it
+     is `Done` anyway, marked `check_failed`. The verdict exists only through that commit, so a
      cancel that lands first wins and a crash before it asks again;
    - **failure**: by error class (design §11): back off in
      `Waiting(Backoff)`, park on the group, or fail.

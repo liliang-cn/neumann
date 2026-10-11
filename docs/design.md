@@ -608,15 +608,16 @@ type AnswerVerdict struct { // 零值 = 通过
 
 可选，默认关闭（`nil`）：没有配置时行为与之前逐字节相同，事件里不多任何字段。
 
-- **在哪问**：只在 `execModel` 里模型给出最终答案、本来要以 `end_turn` 提交 `Done` 的那条路上：没有工具调用、没被截断、调用期间没有插话（有插话时照旧把答案当作一轮、再走一步，不问）。预算结束的答案（5.1 第 1 步）、压缩、取消、失败都不问。
-- **谁、何时问**：持有任务的 vCore，在模型调用结算之后、组装最终提交之前。和工具策略（9.7）一样，它运行时 vCore 持着任务，所以有界：钩子拿到的 ctx 由任务的 context 派生（取消、Deadline、强制停机照样打断它），再加 `AnswerCheckTimeout` 的期限（墙上时间，不走机器时钟）。钩子在单独的 goroutine 里跑，vCore 最多等这么久，不管钩子理不理 ctx；放弃之后它的结论不再采用。**超时、ctx 结束、panic 一律按通过处理**（fail open），原因记进 `done` 的 `check_error`（`check timed out`、`check cancelled`、`check panicked: …`）：轻量的检查不能卡住任务，也不能默认丢掉答案。
+- **在哪问**：只在 `execModel` 里模型给出最终答案、本来要以 `end_turn` 提交 `Done` 的那条路上：没有工具调用、不是"截断且没有内容"（5.1 第 4 步；截断前已经给出文字的回答本来就当作最终答案，同样要问，检查正好是能发现它不完整的地方）、调用期间没有插话（有插话时照旧把答案当作一轮、再走一步，不问）。预算结束的答案（5.1 第 1 步）、压缩、取消、失败都不问。
+- **谁、何时问**：持有任务的 vCore，在模型调用结算之后、组装最终提交之前。和工具策略（9.7）一样，它运行时 vCore 持着任务（钩子本身在单独的 goroutine 里，vCore 等它），所以有界：钩子拿到的 ctx 由任务的 context 派生（取消、Deadline、强制停机照样打断它），再加 `AnswerCheckTimeout` 的期限（墙上时间，不走机器时钟）。钩子在单独的 goroutine 里跑，vCore 最多等这么久，不管钩子理不理 ctx；放弃之后它的结论不再采用。**超时、ctx 结束、panic 一律按通过处理**（fail open），原因记进 `done` 的 `check_error`（`check timed out`、`check panicked: …`；任务被取消、Deadline 到了或强制停机时钩子的 ctx 也会结束，但那时取消已先提交、这一步按取消最终提交，强制停机什么都不提交，所以提交的 `done` 里不会出现这种原因）：轻量的检查不能卡住任务，也不能默认丢掉答案。
 - **钩子运行期间到达的输入**：当作调用期间到达的处理：检查之后再读一次中断表，有取消则按取消最终提交、答案丢弃；有插话则答案作为一轮、`PC = StepModel`。两种情况结论都作废，什么都不记。
 - **通过**：与没有检查时同样提交 `Done`；`answer`、`done` 带 `checked: true`，`done` 另带 `check_reason`（钩子给了原因时）或 `check_error`。
-- **驳回且还能重答**（`Rejections < MaxAnswerRetries`）：一次提交：答案作为 assistant 消息留在寄存器里，后面追加一条 `Feedback = true` 的 user 消息（反馈），`Rejections + 1`，`answer_rejected`（`{reason, feedback, attempt}`），任务 `Ready`、`PC = StepModel`，交还调度器。这一步的模型调用照常计入 `Used.Steps`，下一次回答也计，所以 `MaxSteps` 同样约束这个循环：预算用完时任务以 `budget` 结束，答案是最后一条 assistant 文本（被驳回的那条），不再问检查。
-- **驳回且不能再重答**：任务照样以这个答案 `Done`（`end_turn`），**答案从不丢**；`Rejections + 1`，`answer_rejected` 带 `final: true`（`{reason, attempt, final}`，没有 `feedback`），`answer`、`done` 带 `check_failed: true`，`done` 带 `check_reason`。要更严格的宿主可以据此重新提交。
+- **驳回且还能重答**（`Rejections < MaxAnswerRetries`）：一次提交：答案作为 assistant 消息留在寄存器里，后面追加一条 `Feedback = true` 的 user 消息（反馈），`Rejections + 1`，`answer_rejected`（`{reason, feedback, attempt}`），任务 `Ready`、`PC = StepModel`，交还调度器。这一步的模型调用照常计入 `Used.Steps`，下一次回答也计，所以 `MaxSteps` 同样约束这个循环。
+- **驳回且不能再重答**：重答次数用完，或预算里已没有下一次模型调用的余地（`MaxSteps > 0` 且这一步之后 `Used.Steps + Unconfirmed >= MaxSteps`，与 5.1 第 1 步同一个判断）：任务照样以这个答案 `Done`，**答案从不丢**；`Rejections + 1`，`answer_rejected` 带 `final: true`（`{reason, attempt, final}`，没有 `feedback`；因为预算时另带 `budget: true`），`answer`、`done` 带 `check_failed: true`，`done` 带 `check_reason`。要更严格的宿主可以据此重新提交。停止原因是 `end_turn` 而不是 `budget`：这一步是模型自己的回答，与重答用完同一个形状；如果把它退回去，下一步一开头就会以 `budget` 结束，带着被驳回、却没有任何标记的答案和一条没人回答的反馈。
 - **提交失败、被取消抢先**：与原来的最终提交完全一样。提交被 `ErrCancelPending` 拒绝时按取消最终提交（`cancelInstead`：从库里的任务出发，只保留已确认用量和 `step` / `usage` 事件），结论丢弃：没有 `answer_rejected`、没有反馈消息、`Rejections` 不变。
 - **崩溃**：结论只通过它的提交存在。提交前崩溃，任务停在 `Running`，重启按 4.5 重做这次模型调用（`Unconfirmed + 1`），新答案再问一次检查（`Attempt` 不变）；驳回提交落盘之后崩溃，重启从反馈之后接着答，检查拿到的 `Attempt` 是持久化的 `Rejections`。钩子没有副作用的要求与 9.7 相同。
 - **反馈消息**：role 为 user、`Feedback = true`。两个适配器都照普通 user 消息发（Anthropic 与相邻的 user 消息合并成一个回合）；压缩把它当作普通 user 消息，自成一个单元，可以换出到归档，文字稿里是 `### user`；`m.History` 里保留它；估算照常计入。
+- **耗时**：检查占用的时间（机器时钟）记在这一步的 `step` 事件上（`check_ms`，没有检查时不出现）：`step` 和结果同一次提交，检查让这次提交晚了这么久；`observe` 用它把模型指令的时延和 span 提前结束，`neumann.model.duration` 仍是服务商的时延。
 - 观测（第 14 节）：`neumann.answers.checked`（按类、`outcome`：`passed` / `failed_open` / `rejected` / `failed`）；`answer_rejected` 是任务根 span 上的事件（`neumann.attempt`、`neumann.final`），活动日志 info 一行（`attempt`、`final`），`done` 行带 `checked`、`check_failed`、`check_error`；原因、反馈、答案都不进指标、trace 和日志。
 - 答案检查只能在 Go 里配置（`Config.AnswerCheck`），stdio 前端不提供。
 
