@@ -52,6 +52,12 @@ func (e *Env) execModel(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 	// a task that keeps crashing mid-call must not re-send past its budget.
 	if t.Budget.MaxSteps > 0 && t.Used.Steps+t.Unconfirmed >= t.Budget.MaxSteps {
 		// Not an instruction: no model call happens, so no step event.
+		if e.Check != nil && len(t.Regs) > 0 && t.Regs[len(t.Regs)-1].Feedback {
+			// The answer it ends with is one the answer check rejected and
+			// sent back (design §9.8): a request for another answer was lost
+			// and spent the last step. Say so, as a final rejection would.
+			return e.finishWith(t, c, "budget", map[string]any{"checked": true, "check_failed": true}), nil, nil
+		}
 		return e.finish(t, c, "budget"), nil, nil
 	}
 	g := e.groupOf(t.Class)

@@ -605,3 +605,48 @@ func TestRejectionsSurviveARestart(t *testing.T) {
 		t.Fatalf("ended %s with %q, rejections %d, attempts %v", got.State, got.LastAnswer(), got.Rejections, c2.attempts())
 	}
 }
+
+// A rejection is committed, then the request for another answer is lost (a
+// hard Stop mid-call): the restart counts it unconfirmed, finds no step
+// left, and ends the task on its budget with the rejected answer, marked
+// check_failed.
+func TestBudgetEndAfterALostRetryIsMarked(t *testing.T) {
+	store := mem.NewMemory()
+	block := make(chan struct{})
+	var n atomic.Int32
+	fn := func(req model.Request) (model.Response, error) {
+		if n.Add(1) == 1 {
+			return sim.Reply("draft"), nil
+		}
+		<-block
+		return sim.Reply("final"), nil
+	}
+	c := &checker{fn: rejectDrafts}
+	m1, err := neumann.New(neumann.Config{Model: &sim.Model{Fn: fn}, Store: store, AnswerCheck: c.check, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m1.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	id := submit(t, m1, proto.Instruction{Input: "q", Budget: &task.Budget{MaxSteps: 2}})
+	waitFor(t, func() bool { return n.Load() == 2 })
+	ctx, cancel := context.WithTimeout(bg, 100*time.Millisecond)
+	m1.Stop(ctx) // runs out: the call is halted, nothing committed for it
+	cancel()
+	close(block)
+
+	m2 := startWith(t, neumann.Config{Model: &sim.Model{Fn: fn}, Store: store, AnswerCheck: c.check})
+	got := waitDone(t, m2, id)
+	if got.State != task.Done || got.StopReason != "budget" || got.LastAnswer() != "draft" || got.Unconfirmed != 1 || got.Rejections != 1 {
+		t.Fatalf("ended %s %q with %q, unconfirmed %d, rejections %d", got.State, got.StopReason, got.LastAnswer(), got.Unconfirmed, got.Rejections)
+	}
+	ans := one(t, eventData(t, m2, id, proto.EvAnswer), proto.EvAnswer)
+	done := one(t, eventData(t, m2, id, proto.EvDone), proto.EvDone)
+	if ans["text"] != "draft" || ans["checked"] != true || ans["check_failed"] != true || done["checked"] != true || done["check_failed"] != true {
+		t.Fatalf("answer %v, done %v", ans, done)
+	}
+	if !slices.Equal(c.attempts(), []int{0}) {
+		t.Fatalf("attempts %v", c.attempts())
+	}
+}
