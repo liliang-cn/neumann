@@ -577,18 +577,22 @@ Mac):
 
 - **Latency.** A short question takes 50 to 400 ms; the engine reads about
   700 tokens a second when its prompt cache misses, so a few KB take a
-  second or two. Loading the model cold takes 2 to 4 seconds, longer than
-  any of the timeouts above: call `Warm` at start-up, and set `KeepAlive`
-  to keep the model loaded.
+  second or more: a router question on 3 KB about 1.4 s, the checker's
+  three questions on 3 KB about 2 s and up to 4 s on a busy machine (its
+  timeout is 5 s). Loading the model takes 2 to 4 seconds, and over 20
+  when its files have left the OS cache, far longer than the policy's
+  timeout: call `Warm` at start-up (with a deadline of its own), and set
+  `KeepAlive` to keep the model loaded.
 - **One request at a time.** The server answers one request at a time, so
   policy calls from several vCores queue behind each other (each within its
   own timeout, after which the call is held).
 - **A small context.** The model reads at most 2050 tokens, questions
   included, and the server never truncates: some 6 to 7 KB of English, far
   less of base64 or code. Policy, Router and Checker cut what they show it
-  (512 bytes of arguments, 4 KB of input or of request, answer and tool
-  results), marking the cut, and `SystemOne` retries once with a shorter
-  state when the server still says it is too long.
+  (about 512 bytes of arguments, every key kept; 3 KB of input, or of
+  request, answer and tool results), marking each cut, and `SystemOne`
+  retries once with a shorter state when the server still says it is too
+  long (`Usage.StateCut` says by how much).
 - **Order matters.** The questions of a request are answered in the order
   given, each in sight of the answers before it.
 
