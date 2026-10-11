@@ -225,7 +225,8 @@ pieces. The committed `answer` event is the record.
   global `Seq` and a per-task `TaskSeq`. Task events include `accepted`,
   `step`, `tool_call`, `tool_result`, `usage`, `answer`, `done`, `failed`,
   `cancelled`, `model_retry`, `compacted`, `reconcile_needed`, `tool_denied`,
-  `approval_needed`, `approved`, `answer_rejected`; machine events (no task)
+  `approval_needed`, `approved`, `answer_rejected`, `steer_delivered` (a steer
+  with a sender reached the model), `steer_dropped`; machine events (no task)
   include `core_up`, `core_down`, `group_down`, `group_up`, `throttled`.
 
 [docs/overview.md](docs/overview.md) walks through these mechanisms in more

@@ -687,9 +687,10 @@ dev.Bind(m) // New 之后、Start 之前
 
 - `From` 随中断一起提交（`mem.Interrupt.From`，SQLite 中断表的 `sender` 列；`Open` 给旧库补列，旧中断读出为空）。至多 256 字节（`MaxSteerFrom`）、不含控制字符，否则 `SteerWith` 报错、什么都不提交。
 - 送达时模型看到 `SteerFormat("[message from <From>] " + text)`。前缀在格式化之内：消息仍经用户这一路进来，默认格式"这是你工作期间用户发来的"照样成立，前缀说明它出自谁；自定义 `SteerFormat` 拿到的是带前缀的文字。
-- 事件：带 `From` 的插话被送达时，送达它的那次模型指令的提交里有一个 `steer_delivered`（`{seq, from}`），排在这次提交的其他事件之前（插话在指令开头放进请求）。它由 Store 在把中断标为 `applied` 时写出，和终态提交写 `steer_dropped` 是同一处：无论哪条路径提交了 `Applied`（工具调用、最终答案、插话把答案变成一轮），都不漏、不重；调用失败被收回的插话没有提交 `Applied`，也就没有事件。`steer_dropped` 对带 `From` 的插话多一个 `from`。
+- 事件：带 `From` 的插话被送达时，送达它的那次模型指令的提交里有一个 `steer_delivered`（`{seq, from}`），排在这次提交的其他事件之前（插话在指令开头放进请求）。它由 Store 在把中断标为 `applied` 时写出，和终态提交写 `steer_dropped` 是同一处：无论哪条路径提交了 `Applied`（工具调用、最终答案、答案检查的通过或驳回、调用期间或检查期间到达的插话把答案变成一轮），都不漏、不重；调用失败被收回的插话没有提交 `Applied`，也就没有事件。`steer_dropped` 对带 `From` 的插话多一个 `from`。
 - 不带 `From` 的插话：没有前缀、没有 `steer_delivered`，`steer_dropped` 的内容逐字节不变。不用发送方的机器，寄存器和事件流与以前完全相同。
 - 不变量不变：每条插话要么送达、要么报 `steer_dropped`（4.3）；带 `From` 的，两种结局都有事件。
+- 与答案检查（9.8）：检查期间到达的带 `From` 的插话和别的插话一样让答案变成一轮，结论作废；它留在中断表，下一条模型指令开头带前缀送达，那次提交里有 `steer_delivered`。驳回留下的反馈是另一条用户消息：标 `Feedback`、不带前缀；插话的消息带前缀、不标 `Feedback`，两者不会混。
 - `Key`：任务已有同 `Key` 的插话（待送达、已送达或已丢弃）时不再提交，`SteerWith` 照样返回 nil，任务结束后也是；新键对已结束的任务照常 `ErrFinished`。查重读中断表，与提交在同一把锁里（带键的插话只来自工具调用，量小），键随中断持久化（`idem_key` 列），所以跨重启有效。
 
 **tasks 设备**（`bus/tasks`）。
@@ -797,7 +798,7 @@ type Event struct {
 
 `Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
-任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_dropped`。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
+任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_delivered`（带发送方的插话送达，10.1）、`steer_dropped`（带发送方的多一个 `from`）。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
 
 `compacted`：`{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（5.3）。`step` 的 `pc` 为 `model`、`tools` 或 `compact`。`model_retry` 的 `class` 可以是 `context_length`（`wait = "compact"`）。
 
@@ -932,6 +933,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
 
 6. **答案检查**（9.8）：`Config.AnswerCheck` / `AnswerCheckTimeout` / `MaxAnswerRetries`；在 `execModel` 的最终答案路径上、最终提交之前问，超时、panic、取消按通过；驳回一次提交（答案、`Feedback` 消息、`Rejections`、`answer_rejected`、`Ready`），用完重答次数照样 `Done` 并记 `check_failed`；取消抢先、插话抢先时结论作废；观测接上。
    验证：`TestAnswerCheckRejectsThenPasses`、`TestNoAnswerCheckRecordsNothing`、`TestAnswerCheckRetriesRunOut`、`TestAnswerCheckLoopIsBoundedByTheBudget`、`TestAnswerCheckTimeoutPasses`（理不理 ctx 都一样，单 vCore 上三个超时的检查各占它一个超时）、`TestAnswerCheckPanicPasses`、`TestSteerDuringTheCallSkipsTheCheck`、`TestSteerDuringTheCheckWins`、`TestCancelBeatsTheVerdict`（驳回、最后一次驳回、通过三种提交被取消抢先）、`TestCancelDuringTheCheck`、`TestRejectionsSurviveARestart`（SQLite）、`TestCrashAtEveryCommitPointWithAnAnswerCheck`（付款后先驳回再通过、两次都驳回，每个提交点前后各崩一次）、`TestOldTaskBlobsDecode`（加字段之前写下的 TCB gob 照常读出）、两个适配器的反馈渲染测试、`observe` 的指标 / trace / 日志测试。
+
+7. **插话的发送方与 tasks 设备**（10.1）：`m.SteerWith` 与 `SteerOptions{From, Key}`，`From` 随中断提交（两个 Store、一致性套件、SQLite 旧库补列），送达带前缀、`steer_delivered`，`steer_dropped` 带 `from`，不带 `From` 的逐字节不变；`Key` 去重；stdio `steer` 的 `from`；`DeviceCall.Task`；`bus/tasks` 的 `tasks_send`（`Idempotent`，按调用的幂等键去重）、`tasks_list`、`WithVisible`、`Bind`；`examples/messaging`。
+   验证：`SteerSenderAndKeyRoundTrip`、`SteerWithASenderIsReportedDeliveredOrDropped`（一致性套件）、`TestOpenAddsTheSenderColumns`（旧库的中断照常读出、丢弃）、`TestSteerWithASenderIsPrefixedAndReported`（恒等格式与默认格式、`steer_delivered` 紧挨在它的 `step` 之前）、`TestSteerWithASenderIsReportedDropped`、`TestSteerWithoutASenderIsDeliveredSilently`（事件序列与以前相同）、`TestSteerWithChecksItsSenderAndKeepsItsKey`、`TestSteerWithASenderDuringTheCheck`、`TestFeedbackAndASteerWithASender`、`TestTwoTasksExchangeMessages`、`TestSendAcrossACrashIsSentOnce`（插话落盘后立刻崩溃，重启后恢复用同一个键重发，设备在两个进程里各跑一次、对方只收到一条，重启后带前缀送达）、`bus/tasks` 的发送、列表、错误结果、可见性、页表与策略测试、`TestSteerWithASender`（stdio）、`examples/messaging` 的测试。
 
 ## 18. 测试
 
