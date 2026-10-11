@@ -1,9 +1,11 @@
 package neumann_test
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -209,5 +211,83 @@ func TestSteerWithChecksItsSenderAndKeepsItsKey(t *testing.T) {
 	}
 	if err := m.SteerWith(bg, "nope", "x", o); !errors.Is(err, neumann.ErrNotFound) {
 		t.Fatalf("unknown task: %v", err)
+	}
+}
+
+// A steer with a sender that arrives while the answer check runs makes the
+// answer a turn, as any steer does (design §9.8), and the next model step
+// sends it with its sender in front and reports it delivered, once.
+func TestSteerWithASenderDuringTheCheck(t *testing.T) {
+	var m *neumann.Machine
+	var steered atomic.Bool
+	check := func(_ context.Context, info neumann.AnswerInfo) neumann.AnswerVerdict {
+		if !steered.Swap(true) {
+			if err := m.SteerWith(bg, info.TaskID, "and in euros", neumann.SteerOptions{From: "task:t-9"}); err != nil {
+				t.Errorf("steer: %v", err)
+			}
+			return neumann.AnswerVerdict{Reject: true, Reason: "dropped"}
+		}
+		return neumann.AnswerVerdict{}
+	}
+	var calls atomic.Int32
+	m, _ = start(t, neumann.Config{AnswerCheck: check}, func(req model.Request) (model.Response, error) {
+		if calls.Add(1) == 1 {
+			return sim.Reply("10 dollars"), nil
+		}
+		return sim.Reply("9 euros"), nil
+	})
+	id := submit(t, m, proto.Instruction{Input: "price?"})
+	got := waitDone(t, m, id)
+	if got.LastAnswer() != "9 euros" || got.Rejections != 0 || len(got.Regs) != 4 ||
+		got.Regs[2].TextContent() != "[message from task:t-9] and in euros" || got.Regs[2].Feedback {
+		t.Fatalf("regs %+v, rejections %d", got.Regs, got.Rejections)
+	}
+	if evs := kindsData(t, m, id, proto.EvSteerDelivered, proto.EvSteerDropped, proto.EvAnswerRejected); len(evs) != 1 ||
+		evs[0] != proto.EvSteerDelivered+` {"from":"task:t-9","seq":1}` {
+		t.Fatalf("events %q", evs)
+	}
+}
+
+// A rejected answer's feedback and a later steer with a sender are separate
+// user messages: the feedback marked Feedback and unprefixed, the steer
+// prefixed and not marked.
+func TestFeedbackAndASteerWithASender(t *testing.T) {
+	var m *neumann.Machine
+	check := func(_ context.Context, info neumann.AnswerInfo) neumann.AnswerVerdict {
+		if info.Attempt == 0 {
+			return neumann.AnswerVerdict{Reject: true, Reason: "vague", Feedback: "give the figure"}
+		}
+		return neumann.AnswerVerdict{}
+	}
+	var calls atomic.Int32
+	m, _ = start(t, neumann.Config{AnswerCheck: check}, func(req model.Request) (model.Response, error) {
+		switch calls.Add(1) {
+		case 1:
+			return sim.Reply("about ten"), nil
+		case 2:
+			// Committed while this call runs: the answer becomes a turn.
+			if err := m.SteerWith(bg, "p", "in euros, please", neumann.SteerOptions{From: "operator"}); err != nil {
+				t.Errorf("steer: %v", err)
+			}
+			return sim.Reply("10 dollars"), nil
+		}
+		return sim.Reply("9 euros"), nil
+	})
+	submit(t, m, proto.Instruction{TaskID: "p", Input: "price?"})
+	got := waitDone(t, m, "p")
+	want := []struct {
+		text     string
+		feedback bool
+	}{{"price?", false}, {"about ten", false}, {"give the figure", true}, {"10 dollars", false}, {"[message from operator] in euros, please", false}, {"9 euros", false}}
+	if len(got.Regs) != len(want) {
+		t.Fatalf("regs %+v", got.Regs)
+	}
+	for i, w := range want {
+		if got.Regs[i].TextContent() != w.text || got.Regs[i].Feedback != w.feedback {
+			t.Fatalf("reg %d = %q (feedback %v), want %q (feedback %v)", i, got.Regs[i].TextContent(), got.Regs[i].Feedback, w.text, w.feedback)
+		}
+	}
+	if evs := kindsData(t, m, "p", proto.EvSteerDelivered); len(evs) != 1 || evs[0] != proto.EvSteerDelivered+` {"from":"operator","seq":1}` {
+		t.Fatalf("steer_delivered %q", evs)
 	}
 }
