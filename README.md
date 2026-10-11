@@ -589,10 +589,12 @@ Mac):
 - **A small context.** The model reads at most 2050 tokens, questions
   included, and the server never truncates: some 6 to 7 KB of English, far
   less of base64 or code. Policy, Router and Checker cut what they show it
-  (about 512 bytes of arguments, every key kept; 3 KB of input, or of
-  request, answer and tool results), marking each cut, and `SystemOne`
-  retries once with a shorter state when the server still says it is too
-  long (`Usage.StateCut` says by how much).
+  (about 512 bytes of arguments; 3 KB of input, or of request, answer and
+  tool results), marking each cut. Arguments keep every key, their longest
+  values cut first; a call whose arguments do not fit with every key and
+  every value of up to 64 bytes whole is held without asking the engine.
+  `SystemOne` retries once with a shorter state when the server still says
+  it is too long (`Usage.StateCut` says by how much).
 - **Order matters.** The questions of a request are answered in the order
   given, each in sight of the answers before it.
 
