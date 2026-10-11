@@ -499,10 +499,20 @@ func steerMessages(pending []mem.Interrupt, frame func(string) string) []task.Me
 	var out []task.Message
 	for _, in := range pending {
 		if in.Kind == mem.InterruptSteer {
-			out = append(out, task.Text(task.RoleUser, frame(in.Text)))
+			out = append(out, task.Text(task.RoleUser, frame(steerText(in))))
 		}
 	}
 	return out
+}
+
+// steerText is what a steer says before SteerFormat frames it: its text,
+// prefixed by its sender when it has one ("[message from task:t-42] ...").
+// A steer without a sender is its text alone, as before senders existed.
+func steerText(in mem.Interrupt) string {
+	if in.From == "" {
+		return in.Text
+	}
+	return "[message from " + in.From + "] " + in.Text
 }
 
 // applySteers appends each pending steer as a user message, rendered by
@@ -514,7 +524,7 @@ func applySteers(t *task.TCB, pending []mem.Interrupt, frame func(string) string
 		if in.Kind != mem.InterruptSteer {
 			continue
 		}
-		t.Regs = append(t.Regs, task.Text(task.RoleUser, frame(in.Text)))
+		t.Regs = append(t.Regs, task.Text(task.RoleUser, frame(steerText(in))))
 		seqs = append(seqs, in.Seq)
 	}
 	return seqs

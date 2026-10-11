@@ -18,7 +18,7 @@ import (
 // Machine is what the server drives; *neumann.Machine implements it.
 type Machine interface {
 	Submit(ctx context.Context, in proto.Instruction) (string, error)
-	Steer(ctx context.Context, taskID, text string) error
+	SteerWith(ctx context.Context, taskID, text string, o neumann.SteerOptions) error
 	Cancel(ctx context.Context, taskID string) error
 	Resolve(ctx context.Context, taskID, callID string, o neumann.Outcome) error
 	Approve(ctx context.Context, taskID, callID string, d neumann.ApprovalDecision) error
@@ -159,7 +159,7 @@ func (s *Server) handle(ctx context.Context, l line) (*Reply, *subscription) {
 		r.TaskID, err = s.Machine.Submit(ctx, req.Instruction)
 	case proto.KindSteer:
 		r.TaskID = req.TaskID
-		err = s.Machine.Steer(ctx, req.TaskID, req.Input)
+		err = s.Machine.SteerWith(ctx, req.TaskID, req.Input, neumann.SteerOptions{From: req.From})
 	case proto.KindCancel:
 		r.TaskID = req.TaskID
 		err = s.Machine.Cancel(ctx, req.TaskID)

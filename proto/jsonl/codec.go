@@ -170,7 +170,7 @@ func Marshal(v any) ([]byte, error) {
 // not a field that is silently ignored.
 var fields = map[string][]string{
 	proto.KindSubmit: {"task_id", "input", "class", "pin_class", "priority", "budget", "allow", "deny"},
-	proto.KindSteer:  {"task_id", "input"},
+	proto.KindSteer:  {"task_id", "input", "from"},
 	proto.KindCancel: {"task_id"},
 	KindResolve:      {"task_id", "call_id", "outcome"},
 	KindApprove:      {"task_id", "call_id", "decision"},
@@ -252,6 +252,8 @@ func (r *Request) field(name string) any {
 		return &r.TaskID
 	case "input":
 		return &r.Input
+	case "from":
+		return &r.From
 	case "class":
 		return &r.Class
 	case "pin_class":

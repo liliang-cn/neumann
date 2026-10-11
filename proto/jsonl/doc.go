@@ -31,7 +31,7 @@
 //
 //	submit       input (required), task_id, class, pin_class, priority, budget {max_steps, deadline (RFC 3339)}, allow, deny
 //	             → task_id
-//	steer        task_id, input (both required)
+//	steer        task_id, input (both required), from (the sender, Machine.SteerWith)
 //	cancel       task_id (required)
 //	resolve      task_id, call_id, outcome (all required); outcome is {"result":"…"},
 //	             {"result":"…","is_error":true} or {"retry":true}

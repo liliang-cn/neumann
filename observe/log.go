@@ -107,6 +107,8 @@ func (g *Log) Observe(ev proto.Event) {
 		str("error", d.Error)
 	case proto.EvThrottled:
 		a = append(a, slog.Int64("waited_ms", d.WaitedMS))
+	case proto.EvSteerDelivered, proto.EvSteerDropped:
+		str("from", d.From) // the steer's sender, a name; never its text
 	case proto.EvCoreUp, proto.EvCoreDown:
 		a = append(a, slog.Int("core", d.Core), slog.String("reason", d.Reason), slog.Int("live", d.Live))
 	case proto.EvGroupDown:

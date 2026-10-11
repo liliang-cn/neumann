@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -78,7 +79,8 @@ type Config struct {
 
 	// SteerFormat renders a steer as the user message the model sees. nil
 	// uses DefaultSteerFormat; pass an identity function to send the text as
-	// it is.
+	// it is. A steer with a sender (SteerOptions.From) is rendered with its
+	// sender in front: SteerFormat("[message from <From>] " + text).
 	SteerFormat func(text string) string
 
 	// ToolPolicy, when set, decides every tool call before its first
@@ -196,7 +198,7 @@ func DefaultSteerFormat(text string) string {
 // gets real timers set for the time it says is left.
 type Clock interface{ Now() time.Time }
 
-// ErrNotStarted is returned by Submit, Steer, Cancel and Resolve before Start.
+// ErrNotStarted is returned by Submit, Steer, SteerWith, Cancel and Resolve before Start.
 var ErrNotStarted = errors.New("neumann: machine not started")
 
 var (
@@ -249,6 +251,8 @@ type Machine struct {
 	stopped   bool
 	accepting bool           // set by Start once recovery is done
 	inflight  sync.WaitGroup // Submit and Steer calls admitted and still committing
+
+	keyed sync.Mutex // a keyed steer's look for its Key and its commit, together
 
 	haltCtx    context.Context
 	haltCancel context.CancelFunc
@@ -842,15 +846,63 @@ func (m *Machine) enterTask(id, class string) error {
 // failure). A steer that arrives while the final answer is being produced stays
 // pending, and the task takes one more model step to answer it.
 func (m *Machine) Steer(ctx context.Context, taskID, text string) error {
+	return m.SteerWith(ctx, taskID, text, SteerOptions{})
+}
+
+// MaxSteerFrom bounds SteerOptions.From, in bytes.
+const MaxSteerFrom = 256
+
+// SteerOptions are a steer's optional parts (SteerWith). The zero value is
+// a plain Steer.
+type SteerOptions struct {
+	// From names the sender: "operator", "user", "task:<id>" (what the
+	// bus/tasks device sends), or any other name of at most MaxSteerFrom
+	// bytes with no control characters. It is committed with the steer; the
+	// model sees the message after "[message from <From>] ", and the
+	// steer_delivered event (sent to the model) or steer_dropped event (the
+	// task ended first) carries it as from. Empty: no sender, and nothing
+	// differs from a steer before senders existed — no prefix, no
+	// steer_delivered event, no from.
+	From string
+	// Key makes the steer idempotent: a steer whose Key the task already has
+	// (pending, delivered or dropped) is not committed again, and SteerWith
+	// returns nil as it did for the first, even once the task has ended. A
+	// device passes its call's idempotency key, so a call sent again after a
+	// restart does not steer twice. Empty: every call is a new steer.
+	Key string
+}
+
+// SteerWith is Steer with a sender and an idempotency key (SteerOptions).
+func (m *Machine) SteerWith(ctx context.Context, taskID, text string, o SteerOptions) error {
 	if strings.TrimSpace(text) == "" {
 		return errors.New("neumann: steer needs text")
+	}
+	if len(o.From) > MaxSteerFrom {
+		return fmt.Errorf("neumann: steer sender longer than %d bytes", MaxSteerFrom)
+	}
+	if strings.ContainsFunc(o.From, unicode.IsControl) {
+		return fmt.Errorf("neumann: steer sender %q has a control character", o.From)
 	}
 	if err := m.enter(); err != nil {
 		return err
 	}
 	defer m.inflight.Done()
+	if o.Key != "" {
+		// Steers with a key are few (one per tool call that sends one), so
+		// one lock keeps a repeat from slipping in between the look and the
+		// commit.
+		m.keyed.Lock()
+		defer m.keyed.Unlock()
+		had, err := m.store.Interrupts(ctx, taskID, false)
+		if err != nil {
+			return err
+		}
+		if slices.ContainsFunc(had, func(in mem.Interrupt) bool { return in.Kind == mem.InterruptSteer && in.Key == o.Key }) {
+			return nil
+		}
+	}
 	_, err := m.store.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{
-		{TaskID: taskID, Kind: mem.InterruptSteer, Text: text},
+		{TaskID: taskID, Kind: mem.InterruptSteer, Text: text, From: o.From, Key: o.Key},
 	}})
 	if err == nil {
 		m.hub.notify()
@@ -937,6 +989,12 @@ func (m *Machine) History(ctx context.Context, id string) ([]task.Message, error
 // Load returns the committed state of a task.
 func (m *Machine) Load(ctx context.Context, id string) (*task.TCB, error) {
 	return m.store.Load(ctx, id)
+}
+
+// Unfinished returns the committed state of every task that has not ended,
+// ordered by id.
+func (m *Machine) Unfinished(ctx context.Context) ([]*task.TCB, error) {
+	return m.store.Unfinished(ctx)
 }
 
 // Calls returns a task's tool call records.
