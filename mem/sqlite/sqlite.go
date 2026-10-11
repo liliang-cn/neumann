@@ -160,6 +160,10 @@ func Open(path string, opts ...Option) (*Store, error) {
 		db.Close()
 		return fail(fmt.Errorf("sqlite: event times: %w", err))
 	}
+	if err := interruptSenders(db); err != nil {
+		db.Close()
+		return fail(fmt.Errorf("sqlite: interrupt senders: %w", err))
+	}
 	go s.writer()
 	return s, nil
 }
@@ -185,6 +189,24 @@ func eventTimes(db *sql.DB) (time.Time, error) {
 		return time.Time{}, nil
 	}
 	return time.Unix(0, last.Int64).UTC(), nil
+}
+
+// interruptSenders adds the interrupts' sender and idem_key columns
+// (mem.Interrupt's From and Key) to a database created before they existed;
+// its old interrupts read back with both empty.
+func interruptSenders(db *sql.DB) error {
+	for _, col := range []string{"sender", "idem_key"} {
+		var has int
+		if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('interrupts') WHERE name = ?", col).Scan(&has); err != nil {
+			return err
+		}
+		if has == 0 {
+			if _, err := db.Exec("ALTER TABLE interrupts ADD COLUMN " + col + " TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // dsn builds the connection string. The path goes into a file: URI, so every
@@ -419,8 +441,8 @@ func (s *Store) apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto
 		}
 	}
 	for _, in := range c.NewInterrupts {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO interrupts (task_id, kind, text, applied) VALUES (?, ?, ?, 0)",
-			in.TaskID, in.Kind, in.Text); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO interrupts (task_id, kind, text, sender, idem_key, applied) VALUES (?, ?, ?, ?, ?, 0)",
+			in.TaskID, in.Kind, in.Text, in.From, in.Key); err != nil {
 			return nil, err
 		}
 	}
@@ -430,8 +452,19 @@ func (s *Store) apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto
 			for i, seq := range c.Applied {
 				args[i] = seq
 			}
-			q := "UPDATE interrupts SET applied = 1 WHERE seq IN (?" + strings.Repeat(",?", len(args)-1) + ")"
-			if _, err := tx.ExecContext(ctx, q, args...); err != nil {
+			seqs := "(?" + strings.Repeat(",?", len(args)-1) + ")"
+			// Steers with a sender are reported delivered (mem.CommitSet).
+			delivered, err := interrupts(ctx, tx, "SELECT seq, task_id, kind, text, sender, idem_key, applied FROM interrupts WHERE seq IN "+seqs+
+				" AND kind = ? AND sender != '' ORDER BY seq", append(args, mem.InterruptSteer)...)
+			if err != nil {
+				return nil, err
+			}
+			var first []proto.Event
+			for _, in := range delivered {
+				first = append(first, proto.NewEvent(proto.EvSteerDelivered, t.ID, map[string]any{"seq": in.Seq, "from": in.From}))
+			}
+			events = append(first, events...)
+			if _, err := tx.ExecContext(ctx, "UPDATE interrupts SET applied = 1 WHERE seq IN "+seqs, args...); err != nil {
 				return nil, err
 			}
 		}
@@ -445,8 +478,7 @@ func (s *Store) apply(ctx context.Context, tx *sql.Tx, c mem.CommitSet) ([]proto
 			}
 			for _, in := range left {
 				if in.Kind == mem.InterruptSteer {
-					events = append(events, proto.NewEvent(proto.EvSteerDropped, t.ID,
-						map[string]any{"seq": in.Seq, "text": in.Text}))
+					events = append(events, proto.NewEvent(proto.EvSteerDropped, t.ID, mem.SteerEventData(in)))
 				}
 			}
 		}
@@ -501,7 +533,7 @@ type querier interface {
 }
 
 func pending(ctx context.Context, q querier, taskID string) ([]mem.Interrupt, error) {
-	return interrupts(ctx, q, "SELECT seq, task_id, kind, text, applied FROM interrupts WHERE task_id = ? AND applied = 0 ORDER BY seq", taskID)
+	return interrupts(ctx, q, "SELECT seq, task_id, kind, text, sender, idem_key, applied FROM interrupts WHERE task_id = ? AND applied = 0 ORDER BY seq", taskID)
 }
 
 func interrupts(ctx context.Context, q querier, query string, args ...any) ([]mem.Interrupt, error) {
@@ -513,7 +545,7 @@ func interrupts(ctx context.Context, q querier, query string, args ...any) ([]me
 	var out []mem.Interrupt
 	for rows.Next() {
 		var in mem.Interrupt
-		if err := rows.Scan(&in.Seq, &in.TaskID, &in.Kind, &in.Text, &in.Applied); err != nil {
+		if err := rows.Scan(&in.Seq, &in.TaskID, &in.Kind, &in.Text, &in.From, &in.Key, &in.Applied); err != nil {
 			return nil, err
 		}
 		out = append(out, in)
@@ -595,7 +627,7 @@ func (s *Store) Interrupts(ctx context.Context, taskID string, unappliedOnly boo
 	if unappliedOnly {
 		return pending(ctx, s.db, taskID)
 	}
-	return interrupts(ctx, s.db, "SELECT seq, task_id, kind, text, applied FROM interrupts WHERE task_id = ? ORDER BY seq", taskID)
+	return interrupts(ctx, s.db, "SELECT seq, task_id, kind, text, sender, idem_key, applied FROM interrupts WHERE task_id = ? ORDER BY seq", taskID)
 }
 
 func (s *Store) Events(ctx context.Context, afterSeq int64, limit int) ([]proto.Event, error) {

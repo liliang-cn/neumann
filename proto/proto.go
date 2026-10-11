@@ -25,6 +25,7 @@ type Instruction struct {
 	Budget   *task.Budget `json:"budget,omitempty"`
 	Allow    []string     `json:"allow,omitempty"`
 	Deny     []string     `json:"deny,omitempty"`
+	From     string       `json:"from,omitempty"` // steer: its sender ("operator", "task:<id>", ...); empty: unspecified
 }
 
 // Event kinds.
@@ -40,6 +41,11 @@ const (
 	EvFailed       = "failed"
 	EvCancelled    = "cancelled"
 	EvSteerDropped = "steer_dropped"
+	// A steer that has a sender reached the model: {seq, from}, committed
+	// with the model step that sent it, ahead of that step's events. A steer
+	// without one is delivered silently; steer_dropped carries from too when
+	// the steer has one.
+	EvSteerDelivered = "steer_delivered"
 
 	// Recovery after a restart, and an operator's answer for a call whose
 	// outcome became unknown.

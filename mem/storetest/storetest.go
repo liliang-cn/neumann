@@ -55,6 +55,8 @@ func Run(t *testing.T, newStore Factory) {
 		{"SameVersionIsAConflict", testSameVersionIsAConflict},
 		{"AppliedMustBePending", testAppliedMustBePending},
 		{"NonSteerInterruptDroppedSilently", testNonSteerInterruptDroppedSilently},
+		{"SteerSenderAndKeyRoundTrip", testSteerSenderAndKeyRoundTrip},
+		{"SteerWithASenderIsReportedDeliveredOrDropped", testSteerWithASenderIsReportedDeliveredOrDropped},
 		{"FullTaskRoundTrip", testFullTaskRoundTrip},
 		{"FullCallRecordRoundTrip", testFullCallRecordRoundTrip},
 		{"UnfinishedCoversEveryNonTerminalState", testUnfinishedCoversEveryNonTerminalState},
@@ -737,5 +739,66 @@ func testArchiveIsAllOrNothing(t *testing.T, newStore Factory) {
 	}
 	if got, _ := s.Archive(ctx, "a"); len(got) != 0 {
 		t.Fatalf("refused commits archived %d messages", len(got))
+	}
+}
+
+// A steer's sender and key are kept as committed, pending and applied.
+func testSteerSenderAndKeyRoundTrip(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{
+		{TaskID: "a", Kind: mem.InterruptSteer, Text: "hi", From: "task:b", Key: "b/c-1/1"},
+		{TaskID: "a", Kind: mem.InterruptSteer, Text: "plain"},
+	}})
+	want := []mem.Interrupt{
+		{TaskID: "a", Seq: 1, Kind: mem.InterruptSteer, Text: "hi", From: "task:b", Key: "b/c-1/1"},
+		{TaskID: "a", Seq: 2, Kind: mem.InterruptSteer, Text: "plain"},
+	}
+	if pending, _ := s.Interrupts(ctx, "a", true); !reflect.DeepEqual(pending, want) {
+		t.Fatalf("pending:\n got %+v\nwant %+v", pending, want)
+	}
+	tc.Version = 2
+	mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{1, 2}})
+	want[0].Applied, want[1].Applied = true, true
+	if all, _ := s.Interrupts(ctx, "a", false); !reflect.DeepEqual(all, want) {
+		t.Fatalf("applied:\n got %+v\nwant %+v", all, want)
+	}
+}
+
+// Applying a steer that has a sender adds a steer_delivered event before
+// the commit's own; one without a sender is applied silently. A terminal commit
+// reports what is left as steer_dropped, with from only for a steer that has
+// one: a steer without a sender is reported byte for byte as before senders
+// existed.
+func testSteerWithASenderIsReportedDeliveredOrDropped(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, steer("a", "plain"))
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptSteer, Text: "from b", From: "task:b"}}})
+	tc.Version = 2
+	evs := mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{2, 1}, Events: []proto.Event{proto.NewEvent(proto.EvStep, "a", nil)}})
+	if len(evs) != 2 || evs[0].Kind != proto.EvSteerDelivered || string(evs[0].Data) != `{"from":"task:b","seq":2}` || evs[1].Kind != proto.EvStep {
+		t.Fatalf("events %+v", evs)
+	}
+
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptSteer, Text: "late", From: "operator"}}})
+	mustCommit(t, s, steer("a", "later"))
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: "a", Kind: mem.InterruptSteer, Text: "now", From: "user"}}})
+	tc.State, tc.Version = task.Done, 3
+	evs = mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{5}, Events: []proto.Event{proto.NewEvent(proto.EvDone, "a", nil)}})
+	var got []string
+	for _, ev := range evs {
+		got = append(got, ev.Kind+" "+string(ev.Data))
+	}
+	want := []string{
+		proto.EvSteerDelivered + ` {"from":"user","seq":5}`,
+		proto.EvDone + " ",
+		proto.EvSteerDropped + ` {"from":"operator","seq":3,"text":"late"}`,
+		proto.EvSteerDropped + ` {"seq":4,"text":"later"}`,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("events:\n got %q\nwant %q", got, want)
 	}
 }

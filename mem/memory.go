@@ -78,19 +78,24 @@ func (m *Memory) Commit(ctx context.Context, c CommitSet) ([]proto.Event, error)
 			applied[s] = true
 		}
 		list := m.interrupts[c.Task.ID]
+		var delivered, dropped []proto.Event
 		for i := range list {
 			switch {
 			case list[i].Applied:
 			case applied[list[i].Seq]:
 				list[i].Applied = true
+				if list[i].Kind == InterruptSteer && list[i].From != "" {
+					delivered = append(delivered, proto.NewEvent(proto.EvSteerDelivered, c.Task.ID,
+						map[string]any{"seq": list[i].Seq, "from": list[i].From}))
+				}
 			case c.Task.State.Terminal():
 				list[i].Applied = true
 				if list[i].Kind == InterruptSteer {
-					events = append(events, proto.NewEvent(proto.EvSteerDropped, c.Task.ID,
-						map[string]any{"seq": list[i].Seq, "text": list[i].Text}))
+					dropped = append(dropped, proto.NewEvent(proto.EvSteerDropped, c.Task.ID, SteerEventData(list[i])))
 				}
 			}
 		}
+		events = append(append(delivered, events...), dropped...)
 	}
 	if len(events) > 0 {
 		now := time.Now
