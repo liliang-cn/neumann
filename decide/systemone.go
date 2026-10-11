@@ -135,7 +135,10 @@ type Usage struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
-// Decide asks every question about state in one request.
+// Decide asks every question about state in one request. The questions go
+// in name order: System One answers them in the order sent, and an answer
+// can lean on those before it, so a caller that wants one question settled
+// first names it to sort first.
 func (s *SystemOne) Decide(ctx context.Context, state string, qs map[string]Question) (map[string]Answer, error) {
 	a, _, err := s.DecideUsage(ctx, state, qs)
 	return a, err

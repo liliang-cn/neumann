@@ -12,13 +12,19 @@ import (
 
 // The names of the default checks.
 const (
-	CheckResponds = "responds"  // fails when the answer does not respond to the request
+	CheckOnTopic  = "on_topic"  // fails when the answer is not about the request
 	CheckPlanOnly = "plan_only" // fails when the answer only plans or promises the work
 	CheckRefuses  = "refuses"   // fails when the answer refuses or evades
 )
 
 // DefaultCheckTimeout bounds each engine request a Checker makes.
 const DefaultCheckTimeout = 3 * time.Second
+
+// DefaultCheckFloor is the confidence a failing answer needs, by default, to
+// fail its check: a probability of at least 0.65 for the failing side. A
+// small engine is often unsure about a good answer, and its doubt should not
+// fail it.
+const DefaultCheckFloor = 0.3
 
 // Check is one thing a Checker asks about an answer: a noul, the answer to
 // it that fails the check, and the sentence that says so in
@@ -30,29 +36,31 @@ type Check struct {
 }
 
 // DefaultChecks are the checks a Checker runs unless CheckerConfig.Checks
-// replaces them: does the answer respond to the request, is it only a plan
-// or a promise, does it refuse or evade. The map is new on every call; add
-// to it or change it freely.
+// replaces them: is the answer about the request, is it only a plan or a
+// promise, does it refuse or evade. The map is new on every call; add to it
+// or change it freely.
+//
+// The wording was tuned against tev1:4b, and so were the names: System One
+// answers questions in the order they are sent, which is name order (see
+// SystemOne.Decide), and these are answered best in this one.
 func DefaultChecks() map[string]Check {
 	return map[string]Check{
-		CheckResponds: {
-			Question: Noul("Does the answer actually respond to the request: does it address what was asked, rather than something else?").
-				Describe("yes", "it addresses what the request asked for").
-				Describe("no", "it answers a different question, or talks around the request"),
+		CheckOnTopic: {
+			Question: Noul("Is the assistant's reply about what the user asked for (the same task or question), whether or not it finishes it?").
+				Describe("yes", "it deals with the user's request").
+				Describe("no", "it talks about something unrelated to the request"),
 			FailOn:   false,
 			Feedback: "Your answer did not respond to the request: answer what was asked.",
 		},
 		CheckPlanOnly: {
-			Question: Noul("Is the answer only a plan, an outline or a promise to do the work (\"I will...\", \"here is how I would...\") instead of the finished work or its result?").
-				Describe("yes", "it describes or promises the work, but does not deliver it").
-				Describe("no", "it delivers the work or its result"),
+			Question: Noul("Does the reply talk about work in the future tense (I will, I'll, first I'm going to) instead of reporting a result?"),
 			FailOn:   true,
 			Feedback: "Your answer described a plan or promised the work without doing it: do the work now and give the result.",
 		},
 		CheckRefuses: {
-			Question: Noul("Does the answer refuse, deflect or evade the request instead of fulfilling it?").
-				Describe("yes", "it declines, changes the subject, or answers with excuses").
-				Describe("no", "it takes the request on"),
+			Question: Noul("Does the assistant decline or refuse to help with the request?").
+				Describe("yes", "it says it cannot or will not help").
+				Describe("no", "it tries to help"),
 			FailOn:   true,
 			Feedback: "Your answer refused or evaded the request: if it can be done, do it; if not, say exactly what stands in the way.",
 		},
@@ -63,8 +71,9 @@ func DefaultChecks() map[string]Check {
 type CheckerConfig struct {
 	// Checks are asked by name in one request (default DefaultChecks()).
 	Checks map[string]Check
-	// Floor is the confidence a failing answer needs to fail its check, in
-	// [0, 1). Zero fails a check on any failing answer.
+	// Floor is the confidence a failing answer needs to fail its check,
+	// below 1 (default DefaultCheckFloor; negative: any failing answer
+	// fails it).
 	Floor float64
 	// Timeout bounds each engine request (default DefaultCheckTimeout).
 	Timeout time.Duration
@@ -106,8 +115,13 @@ func NewChecker(engine Engine, cfg CheckerConfig) (*Checker, error) {
 	if err := Validate(qs); err != nil {
 		return nil, err
 	}
-	if cfg.Floor < 0 || cfg.Floor >= 1 {
-		return nil, fmt.Errorf("decide: checker floor %v is not in [0, 1)", cfg.Floor)
+	switch {
+	case cfg.Floor >= 1:
+		return nil, fmt.Errorf("decide: checker floor %v is not below 1", cfg.Floor)
+	case cfg.Floor == 0:
+		cfg.Floor = DefaultCheckFloor
+	case cfg.Floor < 0:
+		cfg.Floor = 0
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultCheckTimeout
@@ -196,12 +210,13 @@ func (c *Checker) Check(ctx context.Context, request, answer string, opts ...Che
 func checkState(request, answer string, evidence []string) string {
 	const part = 8 << 10
 	var b strings.Builder
-	fmt.Fprintf(&b, "REQUEST:\n%s\n\n", clip(strings.TrimSpace(request), part))
+	fmt.Fprintf(&b, "A user asked an AI assistant:\n\"%s\"\n\n", clip(strings.TrimSpace(request), part))
 	ev := ""
 	if len(evidence) > 0 {
-		ev = "\n\nEVIDENCE (tool results the answer rests on):\n" + clip(strings.TrimSpace(strings.Join(evidence, "\n---\n")), part)
+		ev = fmt.Sprintf("\n\nTool results the assistant had:\n\"%s\"", clip(strings.TrimSpace(strings.Join(evidence, "\n---\n")), part))
 	}
-	room := MaxState - b.Len() - len("ANSWER:\n") - len(ev) - 64 // 64: clip's note
-	fmt.Fprintf(&b, "ANSWER:\n%s%s", clip(strings.TrimSpace(answer), room), ev)
+	const head = "The assistant replied:\n\""
+	room := MaxState - b.Len() - len(head) - len(ev) - 64 // 64: the quote and clip's note
+	fmt.Fprintf(&b, "%s%s\"%s", head, clip(strings.TrimSpace(answer), room), ev)
 	return b.String()
 }

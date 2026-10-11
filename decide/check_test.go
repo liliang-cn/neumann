@@ -11,11 +11,11 @@ import (
 	"github.com/liliang-cn/neumann/decide/decidetest"
 )
 
-// verdicts answers the default checks: responds, plan_only, refuses, each as
+// verdicts answers the default checks: on_topic, plan_only, refuses, each as
 // the probability of yes.
-func verdicts(responds, planOnly, refuses float64) *decidetest.Engine {
+func verdicts(onTopic, planOnly, refuses float64) *decidetest.Engine {
 	return &decidetest.Engine{Answers: map[string]decide.Answer{
-		decide.CheckResponds: decidetest.Yes(responds),
+		decide.CheckOnTopic:  decidetest.Yes(onTopic),
 		decide.CheckPlanOnly: decidetest.Yes(planOnly),
 		decide.CheckRefuses:  decidetest.Yes(refuses),
 	}}
@@ -35,7 +35,7 @@ func TestCheckerPasses(t *testing.T) {
 	if len(a.Questions) != 3 || a.Questions[decide.CheckPlanOnly].Type != decide.TypeNoul {
 		t.Fatalf("questions %+v", a.Questions)
 	}
-	if a.State != "REQUEST:\nWhat is 6 x 7?\n\nANSWER:\n42.\n\nEVIDENCE (tool results the answer rests on):\ncalc_multiply: 42" {
+	if a.State != "A user asked an AI assistant:\n\"What is 6 x 7?\"\n\nThe assistant replied:\n\"42.\"\n\nTool results the assistant had:\n\"calc_multiply: 42\"" {
 		t.Fatalf("state %q", a.State)
 	}
 }
@@ -47,10 +47,10 @@ func TestCheckerFailures(t *testing.T) {
 		engine *decidetest.Engine
 		failed []string
 	}{
-		{"off topic", verdicts(0.1, 0.05, 0.02), []string{decide.CheckResponds}},
+		{"off topic", verdicts(0.1, 0.05, 0.02), []string{decide.CheckOnTopic}},
 		{"plan only", verdicts(0.9, 0.9, 0.02), []string{decide.CheckPlanOnly}},
 		{"refuses", verdicts(0.9, 0.05, 0.8), []string{decide.CheckRefuses}},
-		{"all", verdicts(0.2, 0.7, 0.6), []string{decide.CheckPlanOnly, decide.CheckRefuses, decide.CheckResponds}},
+		{"all", verdicts(0.1, 0.9, 0.9), []string{decide.CheckOnTopic, decide.CheckPlanOnly, decide.CheckRefuses}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			ch, err := decide.NewChecker(c.engine, decide.CheckerConfig{})
@@ -74,13 +74,17 @@ func TestCheckerFailures(t *testing.T) {
 
 func TestCheckerFloor(t *testing.T) {
 	e := verdicts(0.9, 0.6, 0.02) // plan_only yes with confidence 0.2
-	c, _ := decide.NewChecker(e, decide.CheckerConfig{Floor: 0.5})
+	c, _ := decide.NewChecker(e, decide.CheckerConfig{})
 	if res, err := c.Check(bg, "r", "a"); err != nil || !res.Pass {
-		t.Fatalf("a doubtful failure under the floor: %+v %v", res, err)
+		t.Fatalf("a doubtful failure under the default floor: %+v %v", res, err)
 	}
-	c, _ = decide.NewChecker(e, decide.CheckerConfig{})
+	c, _ = decide.NewChecker(e, decide.CheckerConfig{Floor: 0.1})
 	if res, _ := c.Check(bg, "r", "a"); res.Pass {
-		t.Fatalf("floor 0 fails on any failing answer: %+v", res)
+		t.Fatalf("a failure over the floor: %+v", res)
+	}
+	c, _ = decide.NewChecker(verdicts(0.9, 0.5, 0.02), decide.CheckerConfig{Floor: -1})
+	if res, _ := c.Check(bg, "r", "a"); res.Pass || res.Failed[0] != decide.CheckPlanOnly {
+		t.Fatalf("a negative floor fails on any failing answer: %+v", res)
 	}
 }
 
@@ -105,7 +109,7 @@ func TestCheckerFailsOpen(t *testing.T) {
 		t.Fatalf("took %s", took)
 	}
 
-	partial := &decidetest.Engine{Answers: map[string]decide.Answer{decide.CheckResponds: decidetest.Yes(0.1)}}
+	partial := &decidetest.Engine{Answers: map[string]decide.Answer{decide.CheckOnTopic: decidetest.Yes(0.1)}}
 	c, _ = decide.NewChecker(partial, decide.CheckerConfig{})
 	if res, err := c.Check(bg, "r", "a"); err == nil || !res.Pass {
 		t.Fatalf("a missing answer: %+v %v", res, err)
@@ -117,7 +121,7 @@ func TestCheckerCustomChecks(t *testing.T) {
 	delete(checks, decide.CheckRefuses)
 	checks["cites"] = decide.Check{Question: decide.Noul("Does the answer cite its sources?"), FailOn: false, Feedback: "Cite your sources."}
 	e := &decidetest.Engine{Answers: map[string]decide.Answer{
-		decide.CheckResponds: decidetest.Yes(0.9),
+		decide.CheckOnTopic:  decidetest.Yes(0.9),
 		decide.CheckPlanOnly: decidetest.Yes(0.1),
 		"cites":              decidetest.Yes(0.2),
 	}}
@@ -153,7 +157,7 @@ func TestNewCheckerChecks(t *testing.T) {
 		"no feedback": {Checks: map[string]decide.Check{"x": {Question: decide.Noul("?")}}},
 		"no checks":   {Checks: map[string]decide.Check{}},
 		"bad noul":    {Checks: map[string]decide.Check{"x": {Question: decide.Noul(""), Feedback: "f"}}},
-		"floor":       {Floor: -0.1},
+		"floor":       {Floor: 1},
 	} {
 		if _, err := decide.NewChecker(e, cfg); err == nil {
 			t.Errorf("%s: no error", name)
