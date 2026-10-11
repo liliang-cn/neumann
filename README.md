@@ -382,8 +382,10 @@ func TestMyStore(t *testing.T) {
 The rules a store must keep are in the `mem.CommitSet` documentation and
 [design §4.1](docs/design.md): one commit is one transaction; versions advance
 by exactly one; events get dense sequence numbers; a pending cancel refuses
-everything but the task's final commit. The machine never closes the store;
-its owner does, after `Stop`.
+everything but the task's final commit; an interrupt's `From` and `Key` are
+kept as committed (without `Key`, a keyed steer, and so a `bus/tasks` send
+sent again after a restart, would arrive twice). The machine never closes the
+store; its owner does, after `Stop`.
 
 ## Operating it
 
@@ -411,12 +413,16 @@ A deadline is `Budget.Deadline` on submit; `Budget.MaxSteps` bounds the model
 calls that got an answer plus those whose response was lost.
 
 `m.SteerWith(ctx, id, text, neumann.SteerOptions{From: "operator"})` names
-the sender. The model sees the message after `[message from operator] `
-(inside `SteerFormat`), its delivery is a `steer_delivered` event
-`{seq, from}`, and `steer_dropped` carries `from` too. A steer without a
-sender is exactly what it always was: no prefix, no `steer_delivered`.
-`SteerOptions.Key` makes a steer idempotent: a repeat with the same key is
-acknowledged and not committed again. Over stdio, `steer` takes `"from"`.
+the sender (1 to 256 bytes of `[A-Za-z0-9:._@/-]`). The model gets such a
+message through `Config.MessageFormat`, not `SteerFormat`: by default a line
+saying who sent it, that it is not the user, and that it is information to
+weigh rather than the user's instructions, then its text with every line
+quoted (`> `), so that no line of it can pass for the frame. Its delivery is
+a `steer_delivered` event `{seq, from}`, and `steer_dropped` carries `from`
+too. A steer without a sender is exactly what it always was. `SteerOptions.Key`
+makes a steer idempotent: a repeat with the same key is acknowledged and not
+committed again (`m.HasSteer` looks a key up). Over stdio, `steer` takes
+`"from"`; the stdio peer is the operator, so its `from` is taken as given.
 
 **Messages between tasks.** The `bus/tasks` device gives the model
 `tasks_list` (the other unfinished tasks: id, class, state, the start of
@@ -425,22 +431,29 @@ their request) and `tasks_send {task_id, text}`, a steer with
 to the machine after `New` and before `Start`:
 
 ```go
-dev := tasks.New("tasks") // or tasks.New("tasks", tasks.WithVisible(sameTenant))
+dev := tasks.New("tasks") // or tasks.New("tasks", tasks.WithVisible(tasks.All))
 m, err := neumann.New(neumann.Config{Model: adapter, Devices: []bus.Device{dev}})
 dev.Bind(m)
 err = m.Start(ctx)
 ```
 
 Sending to an unknown or finished task, to itself, an empty or oversized
-text is an error result for the model. `tasks_send` is `Idempotent`: it
-passes its call's idempotency key as the steer's key, so recovery may send
-it again after a crash without the message arriving twice. By default every
-task sees every other unfinished task of the machine; `WithVisible` narrows
-that (a task it hides is reported as unknown), and the page table
-(`Deny: []string{"tasks_"}`) or a `ToolPolicy` gate the tools per task. A
-message only reaches a task that has not finished, so a task that waits for
-an answer must still be working when it comes. `examples/messaging` runs two
-tasks talking, offline.
+text, or past the sender's quota (`WithMaxSends`, default 32 messages per
+task, counted from its call log) is an error result for the model.
+`tasks_send` is `Idempotent`: it passes its call's idempotency key as the
+steer's key and looks the key up before anything else, so recovery may send
+it again after a crash without the message arriving twice, and the repeat is
+answered "sent" even if the receiver has finished since. By default a task
+sees the unfinished tasks of its own class (`tasks.SameClass`);
+`WithVisible` widens (`tasks.All`) or narrows that (a task it hides is
+reported as unknown), and the page table (`Deny: []string{"tasks_"}`) or a
+`ToolPolicy` gate the tools per task. `tasks_list` reads `m.Tasks()`, a
+snapshot the machine keeps in memory, not the store. A message is another
+task's words, and that task may have read untrusted content: keep the
+default `MessageFormat` (or one that says as much) for tasks whose tools act.
+A message only reaches a task that has not finished, so a task that waits
+for an answer must still be working when it comes. `examples/messaging` runs
+two tasks talking, offline.
 
 **Resolving after a crash.** When a restart finds a `SideEffect` call that was
 dispatched but has no result, the task waits in `Waiting(Reconcile)` and a

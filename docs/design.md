@@ -223,7 +223,7 @@ type CallRecord struct {
 
 插话送达时以一条用户消息出现，内容经 `Config.SteerFormat` 渲染。默认格式会注明"这是你工作期间用户发来的，请和原请求一并考虑"：实测裸发"Also tell me the weather there."时，模型只答了天气，丢掉了刚查到的人口。
 
-插话可以带发送方和幂等键（`m.SteerWith`，见 10.1）：带发送方的，模型看到的文字前面有 `[message from <发送方>] `，送达有 `steer_delivered` 事件；不带的与以前逐字节相同。
+插话可以带发送方和幂等键（`m.SteerWith`，见 10.1）：带发送方的经 `Config.MessageFormat` 送达，默认说明它来自谁、不是用户、是信息而不是指令，送达有 `steer_delivered` 事件；不带的与以前逐字节相同。
 
 中断表与 TCB 分开，正是为了让外部输入可以在任务被某个 vCore 持有时立刻持久化，而不违反单一所有者（第 8 节）。持有任务的一方在下一次提交里把它取用的中断标记为 `applied`，与它造成的状态变化在同一事务里。
 
@@ -677,29 +677,33 @@ type SteerOptions struct {
     Key  string // 幂等键：同一任务已有同键的插话就不再提交
 }
 err = m.SteerWith(ctx, id, text, neumann.SteerOptions{From: "operator"}) // Steer(ctx, id, text) 即 SteerOptions{}
+had, err := m.HasSteer(ctx, id, key)                                     // 这个键的插话提交过没有
+infos := m.Tasks()                                                       // 未结束任务的轻量快照：id、类、状态、等待原因、标题
 
-dev := tasks.New("tasks", tasks.WithVisible(sameTenant)) // 模型看到 tasks_send、tasks_list
+dev := tasks.New("tasks", tasks.WithVisible(tasks.All)) // 模型看到 tasks_send、tasks_list
 m, err := neumann.New(neumann.Config{Devices: []bus.Device{dev /* , ... */}})
 dev.Bind(m) // New 之后、Start 之前
 ```
 
 **发送方。**
 
-- `From` 随中断一起提交（`mem.Interrupt.From`，SQLite 中断表的 `sender` 列；`Open` 给旧库补列，旧中断读出为空）。至多 256 字节（`MaxSteerFrom`）、不含控制字符，否则 `SteerWith` 报错、什么都不提交。
-- 送达时模型看到 `SteerFormat("[message from <From>] " + text)`。前缀在格式化之内：消息仍经用户这一路进来，默认格式"这是你工作期间用户发来的"照样成立，前缀说明它出自谁；自定义 `SteerFormat` 拿到的是带前缀的文字。
-- 事件：带 `From` 的插话被送达时，送达它的那次模型指令的提交里有一个 `steer_delivered`（`{seq, from}`），排在这次提交的其他事件之前（插话在指令开头放进请求）。它由 Store 在把中断标为 `applied` 时写出，和终态提交写 `steer_dropped` 是同一处：无论哪条路径提交了 `Applied`（工具调用、最终答案、答案检查的通过或驳回、调用期间或检查期间到达的插话把答案变成一轮），都不漏、不重；调用失败被收回的插话没有提交 `Applied`，也就没有事件。`steer_dropped` 对带 `From` 的插话多一个 `from`。
-- 不带 `From` 的插话：没有前缀、没有 `steer_delivered`，`steer_dropped` 的内容逐字节不变。不用发送方的机器，寄存器和事件流与以前完全相同。
+- `From` 随中断一起提交（`mem.Interrupt.From`，SQLite 中断表的 `sender` 列；`Open` 给旧库补列，旧中断读出为空）。只能是 1–256 字节（`MaxSteerFrom`）的 `[A-Za-z0-9:._@/-]`（`ValidFrom`）：没有括号、空格、换行，也没有显示成换行或改变文字方向的字符，框架里写不出别的东西。否则 `SteerWith` 报错、什么都不提交。`Submit` 带 `From` 也报错（stdio 本来就只给 `steer` 这个字段）。
+- 送达时模型看到的不是 `SteerFormat`，而是 `Config.MessageFormat(from, text)`；默认 `DefaultMessageFormat`：先一行说明这条消息来自谁、**不是用户**、在你工作期间到达，要当作需要权衡的信息，而不是用户的指令，不改变用户要的东西；然后是正文，每一行前面加 `> `（`QuoteMessage`；`\r\n`、`\r`、`\v`、`\f`、U+0085、U+2028、U+2029 都先当作换行，非法 UTF-8 替换掉），所以正文里任何一行都冒充不了框架或别的发送方的消息。理由：别的任务的消息带着那个任务读到的东西，读不可信内容的任务不能以"用户"的身份对另一个有写工具的任务说话。默认格式把"这是你工作期间用户发来的"那句换成了"这不是用户"；自定义 `MessageFormat` 要做到同样两点。
+- 事件：带 `From` 的插话被送达时，送达它的那次模型指令的提交里有一个 `steer_delivered`（`{seq, from}`），排在这次提交的其他事件之前（插话在指令开头放进请求）。它由 vCore 写出，不是 Store：`execModel` 知道读到的待送达中断和这次提交的 `Applied`，无论哪条路径提交了 `Applied`（工具调用、最终答案、答案检查的通过或驳回、调用期间或检查期间到达的插话把答案变成一轮），都不漏、不重；调用失败被收回的插话没有提交 `Applied`，也就没有事件。`steer_dropped` 仍由 Store 在终态提交里写，带 `From` 的多一个 `from`。Store 只需原样保存 `From` 和 `Key`。
+- 不带 `From` 的插话：仍走 `SteerFormat`，没有 `steer_delivered`，`steer_dropped` 的内容逐字节不变。不用发送方的机器，寄存器和事件流与以前完全相同。
 - 不变量不变：每条插话要么送达、要么报 `steer_dropped`（4.3）；带 `From` 的，两种结局都有事件。
-- 与答案检查（9.8）：检查期间到达的带 `From` 的插话和别的插话一样让答案变成一轮，结论作废；它留在中断表，下一条模型指令开头带前缀送达，那次提交里有 `steer_delivered`。驳回留下的反馈是另一条用户消息：标 `Feedback`、不带前缀；插话的消息带前缀、不标 `Feedback`，两者不会混。
-- `Key`：任务已有同 `Key` 的插话（待送达、已送达或已丢弃）时不再提交，`SteerWith` 照样返回 nil，任务结束后也是；新键对已结束的任务照常 `ErrFinished`。查重读中断表，与提交在同一把锁里（带键的插话只来自工具调用，量小），键随中断持久化（`idem_key` 列），所以跨重启有效。
+- 与答案检查（9.8）：检查期间到达的带 `From` 的插话和别的插话一样让答案变成一轮，结论作废；它留在中断表，下一条模型指令开头按 `MessageFormat` 送达，那次提交里有 `steer_delivered`。驳回留下的反馈是另一条用户消息：标 `Feedback`、不经任何格式；插话的消息经 `MessageFormat`、不标 `Feedback`，两者不会混。
+- `Key`：任务已有同 `Key` 的插话（待送达、已送达或已丢弃）时不再提交，`SteerWith` 照样返回 nil，任务结束后也是；新键对已结束的任务照常 `ErrFinished`。查重读这个任务的中断表，与提交在**这个任务的**锁里（不同任务的带键插话互不等待；等锁随 ctx 结束）。键随中断持久化（`idem_key` 列），所以跨重启有效——前提是 Store 保存了 `Key`：两个自带 Store 都过一致性套件的 `SteerSenderAndKeyRoundTrip`；自己写的 Store 丢了 `Key`，带键插话（以及 `tasks_send`）重启后会送两次。没有在 `Start` 时做往返检查：要往一个存在的任务写中断才能查，代价和副作用都不值得，一致性套件已经覆盖。没给 `(task_id, idem_key)` 建索引：查重走 `Store.Interrupts(task)`，用的是已有的 `(task_id, applied)` 索引，按键查的接口不存在，多一个索引只增加写入。
+- 停机：带键的插话在 `Stop` 等工具批次排空期间仍然放行（不带键的照旧在 `Stop` 开始时就拒绝），批次排空后才拒绝并等放行的提交完。理由：设备的调用在批次里跑，`Stop` 本来就等它；它发的插话若被拒，调用会以"什么都没发"的结果提交为 `done`，消息就丢了。Go 错误不是出路：总线把 Go 错误也变成错误结果、照样提交。
 
 **tasks 设备**（`bus/tasks`）。
 
-- `tasks_send {task_id, text}`：以 `From = "task:<调用者>"`、`Key = 这次调用的幂等键` 调 `SteerWith`，成功返回 `sent to task <id>`。调用者取自幂等键 `task/call/attempt`（`DeviceCall.Task`），由机器填写，模型改不了。未知任务、已结束的任务、发给自己、空文本、超长（`WithMaxText`，默认 8 KiB）都是给模型的错误结果，不是设备故障。
-- `tasks_send` 声明 `Idempotent`，不是 `SideEffect`：派发后、结果提交前崩溃，恢复用同一个键重发（4.2），设备按键找到已提交的插话，不再发一次，模型照常拿到 `sent`；不必让操作员核对。操作员 `Resolve` 的重试是新尝试、新键，会再发。
-- `tasks_list {}`：调用者看得见的其他未结束任务，JSON 数组 `{id, class, state, wait, title}`；`wait` 只给等待中的任务，`title` 是任务请求（第一条用户消息）开头至多 80 个字符、压成一行。读主存里提交的状态（`m.Unfinished`）。`ReadOnly`，不缓存：任务状态随时在变。
-- 可见性：默认同一台机器的所有未结束任务互相可见、可发，`tasks_list` 会露出别的任务请求的开头。这适合为同一个用户工作的任务，不适合多用户共用一台机器。`WithVisible(func(caller, other *task.TCB) bool)` 按任务对限定（同类、同租户前缀……）；看不见的任务一律报"不存在"，不泄露它存在与否。谁能用这两个工具由页表决定（`Deny: ["tasks_"]`），`ToolPolicy` 可以像对任何工具一样拒绝或扣住 `tasks_send`（9.7）。
-- 接线：设备要用机器，机器又由设备构造，所以 `New` 之后、`Start` 之前 `Bind`：恢复时重发的调用在 `Start` 里就会跑，没绑定的设备给错误结果。设备只通过一个小接口用机器（`SteerWith`、`Load`、`Unfinished`），`*neumann.Machine` 满足它；`bus/tasks` 引用 `neumann`，`neumann` 不引用它，没有环。
+- `tasks_send {task_id, text}`：先按这次调用的幂等键查（`HasSteer`），提交过就直接回 `sent to task <id>`，不看此后变化了的任何东西（对方已结束、可见性、长度上限、配额）；否则校验，再以 `From = "task:<调用者>"`、`Key = 调用的幂等键` 调 `SteerWith`。调用者取自幂等键 `task/call/attempt`（`DeviceCall.Task`），由机器填写，模型改不了；id 里有 `ValidFrom` 不允许的字符的任务不能发。未知任务、看不见的任务、已结束的任务、发给自己、空文本、超长（`WithMaxText`，默认 8 KiB）、超出配额都是给模型的错误结果，不是设备故障。
+- `tasks_send` 声明 `Idempotent`：派发后、结果提交前崩溃，恢复用同一个键重发（4.2），设备按键查到已提交的插话，回 `sent`，不再发。`Idempotent` 的调用重启后不会变成 unknown、不会等操作员核对，也就不经过 `Resolve`。
+- 配额：每个任务一生最多发 `WithMaxSends` 条（默认 32，负数不限），超出回错误结果。两个有礼貌、有问必答的任务否则会一直聊到预算耗尽。计数取自调用者自己的调用记录：这次调用之前（按调用序号）的 `tasks_send` 中结果不是错误的、已派发的、未知的，所以重启不清零，重发的调用算得和第一次一样。
+- `tasks_list {}`：调用者看得见的其他未结束任务，JSON 数组 `{id, class, state, wait, title}`；`wait` 只给等待中的任务，`title` 是任务请求开头至多 80 个字符、压成一行。读 `m.Tasks()`：机器在内存里维护的快照，每次带任务的提交和恢复时更新，不读主存、不解码寄存器；没为它扩 `Store` 接口。`ReadOnly`，不缓存。
+- 可见性：默认只看见同一类（执行组）的未结束任务（`tasks.SameClass`），`tasks_list` 会露出它们请求的开头。`WithVisible(func(caller, other neumann.TaskInfo) bool)` 放宽（`tasks.All`）或收紧（同租户前缀……）；看不见的任务一律报"不存在"，不泄露它存在与否。谁能用这两个工具由页表决定（`Deny: ["tasks_"]`），`ToolPolicy` 可以像对任何工具一样拒绝或扣住 `tasks_send`（9.7）。
+- 接线：设备要用机器，机器又由设备构造，所以 `New` 之后、`Start` 之前 `Bind`：恢复时重发的调用在 `Start` 里就会跑，没绑定的设备给错误结果。设备只通过一个小接口用机器（`SteerWith`、`HasSteer`、`Tasks`、`Load`、`Calls`），`*neumann.Machine` 满足它；`bus/tasks` 引用 `neumann`，`neumann` 不引用它，没有环。
 - 限制：消息只能送给还没结束的任务。等回复的任务在回复到达时必须还在工作（比如还有工具在跑）；最终答案正在生成时到达的消息让它多走一步（4.3），但已经结束的任务收不到。没有"等消息"的原语，`examples/messaging` 用一个占位工具代替。
 
 ## 11. 模型适配器
@@ -808,7 +812,7 @@ type Event struct {
 
 机器事件（`task_id` 为空）：`core_up` / `core_down`（`{class, core, reason, live}`）、`throttled`（`{task, class, waited_ms}`）、`group_down`（`{class, cause}`）、`group_up`（`{class}`，操作员复位时带 `reset`）。
 
-stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。`steer` 可带 `from`（发送方，10.1）。
+stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。`steer` 可带 `from`（发送方，10.1）；stdio 的对端就是操作员，它给的 `from` 不做核实。
 
 操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`suspend`、`resume`、`priority` 仍回 `unsupported`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`，`args` 必须是对象）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
 
@@ -934,8 +938,8 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
 6. **答案检查**（9.8）：`Config.AnswerCheck` / `AnswerCheckTimeout` / `MaxAnswerRetries`；在 `execModel` 的最终答案路径上、最终提交之前问，超时、panic、取消按通过；驳回一次提交（答案、`Feedback` 消息、`Rejections`、`answer_rejected`、`Ready`），用完重答次数照样 `Done` 并记 `check_failed`；取消抢先、插话抢先时结论作废；观测接上。
    验证：`TestAnswerCheckRejectsThenPasses`、`TestNoAnswerCheckRecordsNothing`、`TestAnswerCheckRetriesRunOut`、`TestAnswerCheckLoopIsBoundedByTheBudget`、`TestAnswerCheckTimeoutPasses`（理不理 ctx 都一样，单 vCore 上三个超时的检查各占它一个超时）、`TestAnswerCheckPanicPasses`、`TestSteerDuringTheCallSkipsTheCheck`、`TestSteerDuringTheCheckWins`、`TestCancelBeatsTheVerdict`（驳回、最后一次驳回、通过三种提交被取消抢先）、`TestCancelDuringTheCheck`、`TestRejectionsSurviveARestart`（SQLite）、`TestCrashAtEveryCommitPointWithAnAnswerCheck`（付款后先驳回再通过、两次都驳回，每个提交点前后各崩一次）、`TestOldTaskBlobsDecode`（加字段之前写下的 TCB gob 照常读出）、两个适配器的反馈渲染测试、`observe` 的指标 / trace / 日志测试。
 
-7. **插话的发送方与 tasks 设备**（10.1）：`m.SteerWith` 与 `SteerOptions{From, Key}`，`From` 随中断提交（两个 Store、一致性套件、SQLite 旧库补列），送达带前缀、`steer_delivered`，`steer_dropped` 带 `from`，不带 `From` 的逐字节不变；`Key` 去重；stdio `steer` 的 `from`；`DeviceCall.Task`；`bus/tasks` 的 `tasks_send`（`Idempotent`，按调用的幂等键去重）、`tasks_list`、`WithVisible`、`Bind`；`examples/messaging`。
-   验证：`SteerSenderAndKeyRoundTrip`、`SteerWithASenderIsReportedDeliveredOrDropped`（一致性套件）、`TestOpenAddsTheSenderColumns`（旧库的中断照常读出、丢弃）、`TestSteerWithASenderIsPrefixedAndReported`（恒等格式与默认格式、`steer_delivered` 紧挨在它的 `step` 之前）、`TestSteerWithASenderIsReportedDropped`、`TestSteerWithoutASenderIsDeliveredSilently`（事件序列与以前相同）、`TestSteerWithChecksItsSenderAndKeepsItsKey`、`TestSteerWithASenderDuringTheCheck`、`TestFeedbackAndASteerWithASender`、`TestTwoTasksExchangeMessages`、`TestSendAcrossACrashIsSentOnce`（插话落盘后立刻崩溃，重启后恢复用同一个键重发，设备在两个进程里各跑一次、对方只收到一条，重启后带前缀送达）、`bus/tasks` 的发送、列表、错误结果、可见性、页表与策略测试、`TestSteerWithASender`（stdio）、`examples/messaging` 的测试。
+7. **插话的发送方与 tasks 设备**（10.1）：`m.SteerWith` 与 `SteerOptions{From, Key}`、`ValidFrom`、`Config.MessageFormat` / `DefaultMessageFormat` / `QuoteMessage`、`HasSteer`、`Tasks`；`From`、`Key` 随中断提交（两个 Store、一致性套件、SQLite 旧库补列），`steer_delivered` 由 vCore 写，`steer_dropped` 带 `from`，不带 `From` 的逐字节不变；`Key` 去重（按任务加锁）、停机排空期间放行带键插话；`Submit` 拒绝 `from`；stdio `steer` 的 `from`；`DeviceCall.Task`；`bus/tasks` 的 `tasks_send`（`Idempotent`，先按键查、再校验，配额）、`tasks_list`、`WithVisible`（默认同类）、`Bind`；`examples/messaging`。
+   验证：`SteerSenderAndKeyRoundTrip`、`SteerWithASenderIsReportedDropped`（一致性套件）、`TestOpenAddsTheSenderColumns`（旧库的中断照常读出、丢弃）、`TestSteerWithASenderIsFramedAndReported`（默认与自定义格式、`steer_delivered` 紧挨在它的 `step` 之前）、`TestAMessageCannotForgeItsFrame`、`TestSendersAreRestricted`、`TestSteerWithASenderIsReportedDropped`、`TestSteerWithoutASenderIsDeliveredSilently`（事件序列与以前相同）、`TestSteerWithChecksItsSenderAndKeepsItsKey`、`TestSteerWithASenderDuringTheCheck`、`TestFeedbackAndASteerWithASender`、`TestTwoTasksExchangeMessages`、`TestSendAcrossACrashIsSentOnce`（插话落盘后立刻崩溃，恢复用同一个键重发，设备两个进程各跑一次、对方只收到一条，重启后送达）、`TestRepeatAfterTheReceiverFinished`（重发时对方已结束、可见性隐藏已结束的任务，仍回 `sent`）、`TestSendDuringStopIsCommitted`、`bus/tasks` 的发送、列表、错误结果、默认同类可见、可见性、配额（互相回复的两个任务停在配额上）、先查键再校验、页表与策略测试、`TestSteerWithASender`（stdio）、`examples/messaging` 的测试。
 
 ## 18. 测试
 
