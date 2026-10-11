@@ -1,0 +1,129 @@
+package decide_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/liliang-cn/neumann/decide"
+	"github.com/liliang-cn/neumann/decide/decidetest"
+)
+
+var routes = []decide.Route{
+	{Class: "strong", Description: "multi-step reasoning, analysis, writing"},
+	{Class: "fast", Description: "short factual answers"},
+}
+
+// byLength routes short inputs to fast, long ones to strong.
+func byLength(state string, _ map[string]decide.Question) (map[string]decide.Answer, error) {
+	if len(state) < 40 {
+		return map[string]decide.Answer{decide.RouteQuestion: decidetest.Pick("fast", 0.8)}, nil
+	}
+	return map[string]decide.Answer{decide.RouteQuestion: decidetest.Pick("strong", 0.3)}, nil
+}
+
+func TestRouterRoutes(t *testing.T) {
+	e := &decidetest.Engine{Fn: byLength}
+	r, err := decide.NewRouter(e, decide.RouterConfig{Routes: routes, Default: "strong"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	class, ans, err := r.Route(bg, "What is 17 + 25?")
+	if err != nil || class != "fast" || ans.Label != "fast" || ans.Confidence != 0.8 {
+		t.Fatalf("%q %+v %v", class, ans, err)
+	}
+	class, _, err = r.Route(bg, "Reconcile the revenue figures of three quarterly reports and write a memo.")
+	if err != nil || class != "strong" {
+		t.Fatalf("%q %v", class, err)
+	}
+	q := e.Asked()[0].Questions[decide.RouteQuestion]
+	if q.Type != decide.TypeChoice || q.Instructions != decide.DefaultRouteInstructions ||
+		strings.Join(q.Options, ",") != "strong,fast" || q.Descriptions["fast"] != "short factual answers" {
+		t.Fatalf("question %+v", q)
+	}
+	if e.Asked()[0].State != "What is 17 + 25?" {
+		t.Fatalf("state %q", e.Asked()[0].State)
+	}
+}
+
+func TestRouterFloor(t *testing.T) {
+	e := &decidetest.Engine{Fn: byLength}
+	r, err := decide.NewRouter(e, decide.RouterConfig{Routes: routes, Default: "default", Floor: 0.5, Instructions: "Who?"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if class, _, err := r.Route(bg, "short"); err != nil || class != "fast" {
+		t.Fatalf("%q %v", class, err)
+	}
+	class, ans, err := r.Route(bg, strings.Repeat("long ", 20))
+	if err != nil || class != "default" || ans.Label != "strong" {
+		t.Fatalf("under the floor: %q %+v %v", class, ans, err)
+	}
+	if q := r.Question(); q.Instructions != "Who?" {
+		t.Fatalf("%+v", q)
+	}
+}
+
+func TestRouterDefaultsOnFailure(t *testing.T) {
+	boom := errors.New("boom")
+	cases := map[string]*decidetest.Engine{
+		"error": {Fn: func(string, map[string]decide.Question) (map[string]decide.Answer, error) { return nil, boom }},
+		"missing": {Fn: func(string, map[string]decide.Question) (map[string]decide.Answer, error) {
+			return map[string]decide.Answer{}, nil
+		}},
+		"not a route": {Answers: map[string]decide.Answer{decide.RouteQuestion: decidetest.Pick("medium", 0.9)}},
+		"slow":        {Fn: byLength, Delay: time.Minute},
+	}
+	for name, e := range cases {
+		r, err := decide.NewRouter(e, decide.RouterConfig{Routes: routes, Default: "strong", Timeout: 50 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		class, ans, err := r.Route(bg, "short")
+		if class != "strong" || err == nil || ans.Label != "" {
+			t.Errorf("%s: %q %+v %v", name, class, ans, err)
+		}
+		if took := time.Since(start); took > 2*time.Second {
+			t.Errorf("%s: took %s", name, took)
+		}
+		if name == "slow" && (!errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "no route within 50ms")) {
+			t.Errorf("slow: %v", err)
+		}
+	}
+	r, _ := decide.NewRouter(&decidetest.Engine{Fn: byLength}, decide.RouterConfig{Routes: routes, Default: "strong"})
+	if class, _, err := r.Route(bg, "  "); class != "strong" || err == nil {
+		t.Errorf("empty input: %q %v", class, err)
+	}
+}
+
+func TestRouterClipsLongInput(t *testing.T) {
+	e := &decidetest.Engine{Fn: byLength}
+	r, _ := decide.NewRouter(e, decide.RouterConfig{Routes: routes, Default: "strong"})
+	if _, _, err := r.Route(bg, strings.Repeat("é", decide.MaxState)); err != nil {
+		t.Fatal(err)
+	}
+	if s := e.Asked()[0].State; len(s) > decide.MaxState || !strings.HasSuffix(s, "é") {
+		t.Fatalf("routed on %d bytes", len(s))
+	}
+}
+
+func TestNewRouterChecks(t *testing.T) {
+	e := &decidetest.Engine{}
+	for name, cfg := range map[string]decide.RouterConfig{
+		"one route":   {Routes: routes[:1], Default: "strong"},
+		"no default":  {Routes: routes},
+		"same class":  {Routes: []decide.Route{{Class: "a"}, {Class: "a"}}, Default: "a"},
+		"floor":       {Routes: routes, Default: "strong", Floor: 1},
+		"empty class": {Routes: []decide.Route{{Class: "a"}, {Class: ""}}, Default: "a"},
+	} {
+		if _, err := decide.NewRouter(e, cfg); err == nil || !strings.HasPrefix(err.Error(), "decide: ") {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+	if _, err := decide.NewRouter(nil, decide.RouterConfig{Routes: routes, Default: "strong"}); err == nil {
+		t.Error("a router without an engine")
+	}
+}
