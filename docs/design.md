@@ -223,6 +223,8 @@ type CallRecord struct {
 
 插话送达时以一条用户消息出现，内容经 `Config.SteerFormat` 渲染。默认格式会注明"这是你工作期间用户发来的，请和原请求一并考虑"：实测裸发"Also tell me the weather there."时，模型只答了天气，丢掉了刚查到的人口。
 
+插话可以带发送方和幂等键（`m.SteerWith`，见 10.1）：带发送方的，模型看到的文字前面有 `[message from <发送方>] `，送达有 `steer_delivered` 事件；不带的与以前逐字节相同。
+
 中断表与 TCB 分开，正是为了让外部输入可以在任务被某个 vCore 持有时立刻持久化，而不违反单一所有者（第 8 节）。持有任务的一方在下一次提交里把它取用的中断标记为 `applied`，与它造成的状态变化在同一事务里。
 
 任务进入终态的那次提交，把所有未送达的插话标记为 `applied` 并为每条写一个 `steer_dropped` 事件。
@@ -636,6 +638,7 @@ type DeviceCall struct {
     Tool string
     Args json.RawMessage
     Key  string // 幂等键，设备可以用它去重
+    Task string // 发起调用的任务 id：Key 的任务部分，由总线填写
 }
 
 type Effect int // ReadOnly, Idempotent, SideEffect
@@ -664,7 +667,39 @@ type ToolDef struct {
   - `CacheTTL` 到期后不再命中（0 = 直到被清空），查到时惰性删除；时钟可注入（`cache.Config.Now`）。
   - 内存有界：每任务最多 256 条（`DefaultMaxEntriesPerTask`），全局 64 MiB（`DefaultMaxBytes`，按键 + 内容 + 每条 160 字节估算），各按 LRU 淘汰；单条超过全局上限的不存。
   - 任务结束时由机器调用 `bus.ForgetTask(id)`（即 `L2.Forget`）丢掉它的缓存，在途的未命中也不会再填回：机器在每个带终态事件的提交成功后调用。工具批次用 `RunCached` 派发，命中的那次 `tool_result` 事件带 `cached: true`。总线默认带一个默认上限的 L2，`SetCache(nil)` 关闭；`CacheStats()` 给出命中、未命中、填入、淘汰、过期、清空次数和当前条目、字节、任务数，供 `m.Status()` 使用。
-- 第一版设备：`builtin`、`mcp`（`github.com/modelcontextprotocol/go-sdk`）、`skills`。
+- 第一版设备：`builtin`、`mcp`（`github.com/modelcontextprotocol/go-sdk`）、`skills`、`tasks`（10.1）。
+
+### 10.1 插话的发送方与 tasks 设备
+
+```go
+type SteerOptions struct {
+    From string // 发送方："operator"、"user"、"task:<id>"……；空 = 未指明
+    Key  string // 幂等键：同一任务已有同键的插话就不再提交
+}
+err = m.SteerWith(ctx, id, text, neumann.SteerOptions{From: "operator"}) // Steer(ctx, id, text) 即 SteerOptions{}
+
+dev := tasks.New("tasks", tasks.WithVisible(sameTenant)) // 模型看到 tasks_send、tasks_list
+m, err := neumann.New(neumann.Config{Devices: []bus.Device{dev /* , ... */}})
+dev.Bind(m) // New 之后、Start 之前
+```
+
+**发送方。**
+
+- `From` 随中断一起提交（`mem.Interrupt.From`，SQLite 中断表的 `sender` 列；`Open` 给旧库补列，旧中断读出为空）。至多 256 字节（`MaxSteerFrom`）、不含控制字符，否则 `SteerWith` 报错、什么都不提交。
+- 送达时模型看到 `SteerFormat("[message from <From>] " + text)`。前缀在格式化之内：消息仍经用户这一路进来，默认格式"这是你工作期间用户发来的"照样成立，前缀说明它出自谁；自定义 `SteerFormat` 拿到的是带前缀的文字。
+- 事件：带 `From` 的插话被送达时，送达它的那次模型指令的提交里有一个 `steer_delivered`（`{seq, from}`），排在这次提交的其他事件之前（插话在指令开头放进请求）。它由 Store 在把中断标为 `applied` 时写出，和终态提交写 `steer_dropped` 是同一处：无论哪条路径提交了 `Applied`（工具调用、最终答案、插话把答案变成一轮），都不漏、不重；调用失败被收回的插话没有提交 `Applied`，也就没有事件。`steer_dropped` 对带 `From` 的插话多一个 `from`。
+- 不带 `From` 的插话：没有前缀、没有 `steer_delivered`，`steer_dropped` 的内容逐字节不变。不用发送方的机器，寄存器和事件流与以前完全相同。
+- 不变量不变：每条插话要么送达、要么报 `steer_dropped`（4.3）；带 `From` 的，两种结局都有事件。
+- `Key`：任务已有同 `Key` 的插话（待送达、已送达或已丢弃）时不再提交，`SteerWith` 照样返回 nil，任务结束后也是；新键对已结束的任务照常 `ErrFinished`。查重读中断表，与提交在同一把锁里（带键的插话只来自工具调用，量小），键随中断持久化（`idem_key` 列），所以跨重启有效。
+
+**tasks 设备**（`bus/tasks`）。
+
+- `tasks_send {task_id, text}`：以 `From = "task:<调用者>"`、`Key = 这次调用的幂等键` 调 `SteerWith`，成功返回 `sent to task <id>`。调用者取自幂等键 `task/call/attempt`（`DeviceCall.Task`），由机器填写，模型改不了。未知任务、已结束的任务、发给自己、空文本、超长（`WithMaxText`，默认 8 KiB）都是给模型的错误结果，不是设备故障。
+- `tasks_send` 声明 `Idempotent`，不是 `SideEffect`：派发后、结果提交前崩溃，恢复用同一个键重发（4.2），设备按键找到已提交的插话，不再发一次，模型照常拿到 `sent`；不必让操作员核对。操作员 `Resolve` 的重试是新尝试、新键，会再发。
+- `tasks_list {}`：调用者看得见的其他未结束任务，JSON 数组 `{id, class, state, wait, title}`；`wait` 只给等待中的任务，`title` 是任务请求（第一条用户消息）开头至多 80 个字符、压成一行。读主存里提交的状态（`m.Unfinished`）。`ReadOnly`，不缓存：任务状态随时在变。
+- 可见性：默认同一台机器的所有未结束任务互相可见、可发，`tasks_list` 会露出别的任务请求的开头。这适合为同一个用户工作的任务，不适合多用户共用一台机器。`WithVisible(func(caller, other *task.TCB) bool)` 按任务对限定（同类、同租户前缀……）；看不见的任务一律报"不存在"，不泄露它存在与否。谁能用这两个工具由页表决定（`Deny: ["tasks_"]`），`ToolPolicy` 可以像对任何工具一样拒绝或扣住 `tasks_send`（9.7）。
+- 接线：设备要用机器，机器又由设备构造，所以 `New` 之后、`Start` 之前 `Bind`：恢复时重发的调用在 `Start` 里就会跑，没绑定的设备给错误结果。设备只通过一个小接口用机器（`SteerWith`、`Load`、`Unfinished`），`*neumann.Machine` 满足它；`bus/tasks` 引用 `neumann`，`neumann` 不引用它，没有环。
+- 限制：消息只能送给还没结束的任务。等回复的任务在回复到达时必须还在工作（比如还有工具在跑）；最终答案正在生成时到达的消息让它多走一步（4.3），但已经结束的任务收不到。没有"等消息"的原语，`examples/messaging` 用一个占位工具代替。
 
 ## 11. 模型适配器
 
@@ -744,6 +779,7 @@ type Instruction struct {
     Budget   *Budget         `json:"budget,omitempty"`
     Allow    []string        `json:"allow,omitempty"`
     Deny     []string        `json:"deny,omitempty"`
+    From     string          `json:"from,omitempty"`    // steer：发送方（10.1）
     CallID   string          `json:"call_id,omitempty"` // resolve
     Outcome  *ResolveOutcome `json:"outcome,omitempty"` // resolve：done(result) / failed / retry
     Decision *Decision       `json:"decision,omitempty"` // approve：{verdict: allow / deny / edit, reason, args}
@@ -765,11 +801,13 @@ type Event struct {
 
 `compacted`：`{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（5.3）。`step` 的 `pc` 为 `model`、`tools` 或 `compact`。`model_retry` 的 `class` 可以是 `context_length`（`wait = "compact"`）。
 
+`steer_delivered`：`{seq, from}`，带发送方的插话送达（10.1）；`steer_dropped`：`{seq, text}`，带发送方的多一个 `from`。
+
 `migrated`：`{from, to, reason}`，`reason` 为 `group_down` 或 `manual`。`migrate_refused`：`{from, to, check, detail}`，本组熔断、`Fallback` 校验不过、任务留下等本组。`tool_result` 来自 L2 时带 `cached: true`。
 
 机器事件（`task_id` 为空）：`core_up` / `core_down`（`{class, core, reason, live}`）、`throttled`（`{task, class, waited_ms}`）、`group_down`（`{class, cause}`）、`group_up`（`{class}`，操作员复位时带 `reset`）。
 
-stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。
+stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。`steer` 可带 `from`（发送方，10.1）。
 
 操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`suspend`、`resume`、`priority` 仍回 `unsupported`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`，`args` 必须是对象）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
 
@@ -836,6 +874,7 @@ err = m.AutoScale("little", true)          // 恢复自适应
 err = m.SetClass(ctx, id, "little")        // 手动迁移：*MigrateError / ErrTaskBusy / ErrFinished / ErrNotFound
 err = m.GroupReset(ctx, "big")             // 额度耗尽熔断后复位
 err = m.Approve(ctx, id, "c-3", neumann.ApprovalDecision{Verdict: neumann.ApproveAllow}) // 回答待批准的调用：ErrNotAwaitingApproval / ErrNotFound
+err = m.SteerWith(ctx, id, "…", neumann.SteerOptions{From: "operator"}) // 带发送方、幂等键的插话（10.1）
 q := m.Queue()                             // 各类队列
 ```
 
@@ -851,7 +890,7 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
   limit/            限流器
   task/             TCB、中立消息、寄存器组装、token 估算
   bus/              Bus、仲裁、设备队列、页表
-    builtin/  mcp/  skills/
+    builtin/  mcp/  skills/  tasks/
   cache/            L2
   mem/              Store 接口、memory 实现、Disk 接口
     sqlite/         SQLite 实现（组提交）

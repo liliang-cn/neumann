@@ -236,7 +236,8 @@ depth for contributors.
 ### A custom device
 
 Implement `bus.Device`. For plain Go functions, `bus/builtin` does it for
-you; for an MCP server use `bus/mcp`; for skill directories, `bus/skills`.
+you; for an MCP server use `bus/mcp`; for skill directories, `bus/skills`;
+for messages between tasks, `bus/tasks` (below).
 
 ```go
 // outbox sends messages. Sending twice would be visible, so it is a
@@ -407,6 +408,38 @@ running task (delivered at its next model call, or reported as
 `steer_dropped`); `m.Cancel(ctx, id)` ends it. Both return once committed.
 A deadline is `Budget.Deadline` on submit; `Budget.MaxSteps` bounds the model
 calls that got an answer plus those whose response was lost.
+
+`m.SteerWith(ctx, id, text, neumann.SteerOptions{From: "operator"})` names
+the sender. The model sees the message after `[message from operator] `
+(inside `SteerFormat`), its delivery is a `steer_delivered` event
+`{seq, from}`, and `steer_dropped` carries `from` too. A steer without a
+sender is exactly what it always was: no prefix, no `steer_delivered`.
+`SteerOptions.Key` makes a steer idempotent: a repeat with the same key is
+acknowledged and not committed again. Over stdio, `steer` takes `"from"`.
+
+**Messages between tasks.** The `bus/tasks` device gives the model
+`tasks_list` (the other unfinished tasks: id, class, state, the start of
+their request) and `tasks_send {task_id, text}`, a steer with
+`From: "task:<sender>"` that the other task can answer the same way. Bind it
+to the machine after `New` and before `Start`:
+
+```go
+dev := tasks.New("tasks") // or tasks.New("tasks", tasks.WithVisible(sameTenant))
+m, err := neumann.New(neumann.Config{Model: adapter, Devices: []bus.Device{dev}})
+dev.Bind(m)
+err = m.Start(ctx)
+```
+
+Sending to an unknown or finished task, to itself, an empty or oversized
+text is an error result for the model. `tasks_send` is `Idempotent`: it
+passes its call's idempotency key as the steer's key, so recovery may send
+it again after a crash without the message arriving twice. By default every
+task sees every other unfinished task of the machine; `WithVisible` narrows
+that (a task it hides is reported as unknown), and the page table
+(`Deny: []string{"tasks_"}`) or a `ToolPolicy` gate the tools per task. A
+message only reaches a task that has not finished, so a task that waits for
+an answer must still be working when it comes. `examples/messaging` runs two
+tasks talking, offline.
 
 **Resolving after a crash.** When a restart finds a `SideEffect` call that was
 dispatched but has no result, the task waits in `Waiting(Reconcile)` and a

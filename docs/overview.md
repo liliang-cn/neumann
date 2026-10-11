@@ -16,7 +16,7 @@ this page and design.md disagree, design.md and the tests win.
 | `limit` | rate limiters (sliding-window logs, all-or-nothing reservations) |
 | `task` | the TCB, provider-neutral messages, the token estimate |
 | `mem`, `mem/sqlite`, `mem/storetest` | the `Store` interface, the in-memory and SQLite stores, the conformance suite |
-| `bus`, `bus/builtin`, `bus/mcp`, `bus/skills`, `cache` | tools as devices, the page table, per-device queues, the L2 result cache |
+| `bus`, `bus/builtin`, `bus/mcp`, `bus/skills`, `bus/tasks`, `cache` | tools as devices, the page table, per-device queues, the L2 result cache; `bus/tasks` lets tasks message each other through steers with a sender |
 | `model`, `model/openai`, `model/anthropic` | the adapter interface, error classes, two adapters |
 | `proto`, `proto/jsonl`, `cmd/neumann` | instructions and events, the JSON Lines frontend |
 | `decide`, `decide/decidetest` | decision engines as a coprocessor (System One client, tool policy, router, answer checker), outside the machine: host code and the tool policy ask them, no instruction does |
@@ -73,7 +73,9 @@ Two things reach a task without owning it:
 
 - **Outside input** (`Submit` aside): `Steer`, `Cancel` and the like are
   written to the interrupt table and committed; the owner consumes them in its
-  next commit, marking them applied in the same transaction (design §4.3).
+  next commit, marking them applied in the same transaction (design §4.3). A
+  message from another task (`bus/tasks`) is a steer like any other, with its
+  sender recorded on the interrupt (design §10.1).
 - **The cancel signal**: the scheduler holds a context per task. `Cancel`
   commits the cancel interrupt, then cancels that context, so an in-flight
   model call or tool call stops at once; the owner still makes the final
