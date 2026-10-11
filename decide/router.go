@@ -15,7 +15,7 @@ const RouteQuestion = "route"
 const (
 	DefaultRouterTimeout = 3 * time.Second
 	DefaultRouteFloor    = 0.2  // a pick less sure than this goes to the default class
-	DefaultMaxInput      = 4096 // bytes of the input shown to the engine
+	DefaultMaxInput      = 3072 // bytes of the input shown to the engine
 )
 
 // DefaultRouteInstructions is the question Router asks unless
@@ -52,8 +52,10 @@ type RouterConfig struct {
 	// MaxInput is how many bytes of an input the engine is shown: a longer
 	// one keeps its start and its end, with a marker where the middle was
 	// cut (zero: DefaultMaxInput, which fits tev1:4b's 2050-token context
-	// with room for the question, for English, and takes it a second or two
-	// to read; negative: all of it).
+	// with room for the question, for English, and takes it about 1.4s to
+	// read when its cache misses, so that two requests queued on a server
+	// that answers one at a time still fit DefaultRouterTimeout; negative:
+	// all of it).
 	MaxInput int
 }
 

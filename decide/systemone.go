@@ -134,6 +134,9 @@ func (s *SystemOne) Ready(ctx context.Context) error {
 type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+	// StateCut is how many bytes shorter the state was when a request
+	// refused as too long was sent again (see Decide); 0 if it went whole.
+	StateCut int `json:"-"`
 }
 
 // MaxBody is the largest request body System One takes, in bytes: the
@@ -159,7 +162,11 @@ func (s *SystemOne) Warm(ctx context.Context) error {
 // (tev1:4b takes 2050 tokens, state and questions together: some 6 to 7 KB
 // of English). A request it refuses as too long is sent once more with the
 // state cut, keeping its start and its end, to about the share of it the
-// server's limit allows; a second refusal is the error.
+// server's limit leaves after an estimate of what the questions take; a
+// second refusal is the error, and so is a first one when the questions
+// alone take most of the limit, since no cut of the state would help.
+// DecideUsage reports the cut in Usage.StateCut. Timeout applies to each
+// request, so a refused and retried Decide can take up to twice Timeout.
 func (s *SystemOne) Decide(ctx context.Context, state string, asks []Ask) (map[string]Answer, error) {
 	a, _, err := s.DecideUsage(ctx, state, asks)
 	return a, err
@@ -175,12 +182,40 @@ func (s *SystemOne) DecideUsage(ctx context.Context, state string, asks []Ask) (
 	}
 	out, usage, err := s.send(ctx, state, asks)
 	if over, ok := err.(*overContext); ok {
-		// Cut by what the server says, with a tenth to spare: the questions
-		// count against the limit too, and they are not cut.
-		n := int(float64(len(state)) * float64(over.limit) / float64(over.tokens) * 0.9)
-		out, usage, err = s.send(ctx, clipMiddle(state, n), asks)
+		if n, ok := retryLen(len(state), over, asks); ok {
+			cut := clipMiddle(state, min(n, len(state)*9/10))
+			out, usage, err = s.send(ctx, cut, asks)
+			usage.StateCut = len(state) - len(cut)
+		}
 	}
 	return out, usage, err
+}
+
+// retryLen is how long a state of n bytes refused as over may be when it is
+// sent again, and whether a retry is worth it. The server counts state and
+// questions together; the questions are estimated at a token per 3 bytes of
+// their JSON plus 100 for the prompt around them (an overestimate for
+// tev1:4b, so the cut errs long), and the state gets nine tenths of what is
+// left. When the questions take more than nine tenths of the limit, there is
+// nothing to cut to.
+func retryLen(n int, over *overContext, asks []Ask) (int, bool) {
+	qbytes := 0
+	for _, a := range asks {
+		qbytes += len(a.Name) + len(a.Question.Instructions) + 32
+		for _, o := range a.Question.Options {
+			qbytes += len(o) + 8
+		}
+		for _, d := range a.Question.Descriptions {
+			qbytes += len(d) + 8
+		}
+	}
+	q := 100 + qbytes/3
+	room := over.limit - q
+	stateTokens := over.tokens - q
+	if room < over.limit/10 || stateTokens <= 0 {
+		return 0, false
+	}
+	return int(float64(n) * 0.9 * float64(room) / float64(stateTokens)), true
 }
 
 // overContext is System One refusing a request longer than the model's

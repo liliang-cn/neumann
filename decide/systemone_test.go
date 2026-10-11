@@ -346,7 +346,8 @@ func TestSystemOneRetriesAStateTooLong(t *testing.T) {
 	s := &server{reply: realReply, script: []scripted{{400, overContext}}}
 	e := decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
 	state := "HEAD " + strings.Repeat("é", 10000) + " TAIL"
-	if _, err := e.Decide(bg, state, questions()); err != nil {
+	_, usage, err := e.DecideUsage(bg, state, questions())
+	if err != nil {
 		t.Fatal(err)
 	}
 	if len(s.bodies) != 2 {
@@ -356,9 +357,14 @@ func TestSystemOneRetriesAStateTooLong(t *testing.T) {
 	if err := json.Unmarshal([]byte(s.bodies[1]), &second); err != nil {
 		t.Fatal(err)
 	}
-	want := int(float64(len(state)) * 2050 / 4000 * 0.9)
-	if len(second.State) > want+64 || len(second.State) < want-64 {
-		t.Errorf("the second state is %d bytes, want about %d", len(second.State), want)
+	// The questions' share comes off the limit first, so the state is cut
+	// further than by the bare ratio of the limit to the count.
+	naive := int(float64(len(state)) * 2050 / 4000 * 0.9)
+	if len(second.State) > naive || len(second.State) < naive*3/4 {
+		t.Errorf("the second state is %d bytes; the bare ratio gives %d", len(second.State), naive)
+	}
+	if usage.StateCut != len(state)-len(second.State) {
+		t.Errorf("StateCut %d, the state went from %d to %d bytes", usage.StateCut, len(state), len(second.State))
 	}
 	if !strings.HasPrefix(second.State, "HEAD ") || !strings.HasSuffix(second.State, " TAIL") || !strings.Contains(second.State, "bytes cut …]") {
 		t.Errorf("the second state keeps neither end, or has no marker: %.40q … %.40q", second.State, second.State[len(second.State)-40:])
@@ -368,12 +374,24 @@ func TestSystemOneRetriesAStateTooLong(t *testing.T) {
 	// request.
 	s = &server{status: 400, reply: overContext}
 	e = decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
-	_, err := e.Decide(bg, state, questions())
+	_, err = e.Decide(bg, state, questions())
 	if err == nil || err.Error() != "decide: systemone:tev1:4b: 400 Bad Request: prompt 0 has 4000 tokens; expected 1–2050 (input is never truncated)" {
 		t.Fatalf("err = %v", err)
 	}
 	if len(s.bodies) != 2 {
 		t.Fatalf("%d requests", len(s.bodies))
+	}
+
+	// Questions that alone take most of the limit: no cut of the state
+	// would help, and there is no retry.
+	var big []decide.Ask
+	for i := range 20 {
+		big = append(big, decide.Ask{Name: fmt.Sprint("q", i), Question: decide.Noul(strings.Repeat("Is it so? ", 50))})
+	}
+	s = &server{status: 400, reply: overContext}
+	e = decide.NewSystemOne(decide.SystemOneConfig{URL: s.start(t).URL})
+	if _, err := e.Decide(bg, state, big); err == nil || len(s.bodies) != 1 {
+		t.Fatalf("err = %v after %d requests", err, len(s.bodies))
 	}
 
 	// Any other 400 is not retried.

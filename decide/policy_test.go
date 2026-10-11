@@ -125,7 +125,7 @@ func TestPolicyFallsBackOnError(t *testing.T) {
 		}
 	}
 	got := l.all()
-	if len(got) != 2 || got[1] != "decide: policy for notes_delete call t1/c-1: decide: decidetest: 500 Internal Server Error: boom" {
+	if len(got) != 2 || got[1] != "decide: policy for notes_delete call t1/c-1: decidetest: 500 Internal Server Error: boom" {
 		t.Fatalf("logged %q", got)
 	}
 
@@ -173,7 +173,7 @@ func TestPolicyTimeoutBoundsTheHook(t *testing.T) {
 		if d.Verdict != neumann.VerdictRequireApproval || d.Reason != "decidetest: no answer within 50ms; held" {
 			t.Fatalf("ignore context %v: %+v", ignore, d)
 		}
-		if got := l.all(); len(got) != 1 || got[0] != "decide: policy for notes_save call t1/c-1: decide: decidetest: no answer within 50ms" {
+		if got := l.all(); len(got) != 1 || got[0] != "decide: policy for notes_save call t1/c-1: decidetest: no answer within 50ms" {
 			t.Fatalf("logged %q", got)
 		}
 	}
@@ -233,8 +233,8 @@ func TestCallStateClipsArguments(t *testing.T) {
 	if strings.Contains(s, "device:") || strings.Contains(s, "task class:") || strings.Contains(s, "about the tool:") {
 		t.Fatalf("empty fields shown: %q", s[:100])
 	}
-	if !strings.HasSuffix(s, "more bytes]") || len(s) > decide.DefaultMaxArgs+100 || !strings.Contains(s, "é…") {
-		t.Fatalf("clipped to %d bytes, ending %q", len(s), s[len(s)-40:])
+	if !strings.HasSuffix(s, `é"}`) || !strings.Contains(s, `arguments: {"text":"éé`) || !strings.Contains(s, "bytes cut]…") || len(s) > decide.DefaultMaxArgs+100 {
+		t.Fatalf("clipped to %d bytes: %q", len(s), s)
 	}
 	if s := decide.CallState(info, "", -1); !strings.HasSuffix(s, `é"}`) {
 		t.Fatal("a negative maxArgs cut the arguments")
@@ -252,6 +252,89 @@ func TestCallStateClipsArguments(t *testing.T) {
 	decide.Policy(e, decide.PolicyConfig{MaxArgs: 100})(bg, info)
 	if a := e.Asked(); len(a[0].State) > decide.DefaultMaxArgs+100 || len(a[1].State) > 250 {
 		t.Fatalf("states of %d and %d bytes", len(a[0].State), len(a[1].State))
+	}
+}
+
+// panicking is an engine that panics on every request.
+func panicking() *decidetest.Engine {
+	return &decidetest.Engine{Fn: func(string, []decide.Ask) (map[string]decide.Answer, error) {
+		var m map[string]decide.Answer
+		m["x"] = decide.Answer{} // a nil map: panics
+		return m, nil
+	}}
+}
+
+// TestPolicySurvivesAPanickingEngine: the engine runs on a goroutine of its
+// own, where the machine's recover cannot reach; the policy must, and hold
+// the call.
+func TestPolicySurvivesAPanickingEngine(t *testing.T) {
+	var l logs
+	d := decide.Policy(panicking(), decide.PolicyConfig{Logf: l.logf})(bg, call("notes_delete", bus.SideEffect))
+	if d.Verdict != neumann.VerdictRequireApproval || d.Reason != "decidetest: no answer (decidetest panicked: assignment to entry in nil map); held" {
+		t.Fatalf("%+v", d)
+	}
+	if got := l.all(); len(got) != 1 || !strings.Contains(got[0], "panicked") {
+		t.Fatalf("logged %q", got)
+	}
+}
+
+func TestCallStateKeepsEveryKey(t *testing.T) {
+	note := strings.Repeat("Routine housekeeping of the build machine, as agreed. ", 13)
+	cases := map[string]struct {
+		args       string
+		want       []string
+		maxLen     int
+		middleOnly bool
+	}{
+		"a late field": {
+			args:   `{"comment":"` + note + `","z_cmd":"rm -rf / --no-preserve-root"}`,
+			want:   []string{`"comment":"Routine housekeeping`, `bytes cut]…`, `"z_cmd":"rm -rf / --no-preserve-root"}`},
+			maxLen: decide.DefaultMaxArgs + 40,
+		},
+		"nested, the longest cut most": {
+			args:   `{"a":"` + strings.Repeat("x", 2000) + `","opts":{"force":true,"paths":["/etc","` + strings.Repeat("y", 300) + `"]},"n":3}`,
+			want:   []string{`"opts":{"force":true,"paths":["/etc","yyy`, `,"n":3}`, `"a":"xxx`},
+			maxLen: decide.DefaultMaxArgs + 40,
+		},
+		"short values whole": {
+			args: `{"to":"bob@example.com","subject":"<hi> & bye","body":"` + strings.Repeat("z", 3000) + `"}`,
+			want: []string{`"to":"bob@example.com"`, `"subject":"<hi> & bye"`, `"body":"zzz`},
+		},
+		"an array": {
+			args:       `["` + strings.Repeat("a", 2000) + `","rm -rf /"]`,
+			want:       []string{`["aaa`, `bytes cut …]`, `rm -rf /"]`},
+			middleOnly: true,
+		},
+		"invalid JSON": {
+			args:       `{"comment":"` + note + note + `", "cmd":"rm -rf /"`,
+			want:       []string{`{"comment":"Routine`, `bytes cut …]`, `"cmd":"rm -rf /"`},
+			middleOnly: true,
+		},
+	}
+	for name, c := range cases {
+		s := decide.CallState(neumann.ToolCallInfo{Tool: "shell_run", Args: json.RawMessage(c.args)}, "", 0)
+		args := s[strings.Index(s, "arguments: ")+len("arguments: "):]
+		for _, w := range c.want {
+			if !strings.Contains(args, w) {
+				t.Errorf("%s: lacks %s: %s", name, w, args)
+			}
+		}
+		if limit := max(c.maxLen, decide.DefaultMaxArgs+80); len(args) > limit {
+			t.Errorf("%s: %d bytes", name, len(args))
+		}
+		if !c.middleOnly && !json.Valid([]byte(args)) {
+			t.Errorf("%s: not JSON: %s", name, args)
+		}
+	}
+
+	// So many keys that they alone do not fit: the rendering is cut.
+	var many []string
+	for i := range 200 {
+		many = append(many, fmt.Sprintf(`"key_%03d":"value"`, i))
+	}
+	s := decide.CallState(neumann.ToolCallInfo{Tool: "x", Args: json.RawMessage("{" + strings.Join(many, ",") + "}")}, "", 0)
+	if !strings.Contains(s, `"key_000"`) || !strings.Contains(s, `"key_199":"value"}`) || !strings.Contains(s, "bytes cut …]") {
+		t.Fatalf("%s", s)
 	}
 }
 

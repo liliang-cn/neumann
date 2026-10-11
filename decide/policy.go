@@ -55,8 +55,9 @@ type PolicyConfig struct {
 	// gives it no timeout of its own; this is the one that keeps a slow
 	// engine from stalling the group.
 	Timeout time.Duration
-	// MaxArgs is how many bytes of a call's arguments the engine is shown;
-	// the rest is cut, and the cut is marked (zero: DefaultMaxArgs;
+	// MaxArgs is about how many bytes of a call's arguments the engine is
+	// shown: every key of an object, its long string values cut in the
+	// middle, each cut marked (zero: DefaultMaxArgs;
 	// negative: all of them, which a long argument can push past the
 	// model's context). What the engine reads costs time: tev1:4b, its
 	// cache missed, reads some 700 tokens a second on an Apple-silicon Mac,
@@ -159,7 +160,7 @@ func Policy(engine Engine, cfg PolicyConfig) neumann.ToolPolicy {
 		answers, err := ask(ctx, engine, cfg.Timeout, CallState(info, cfg.Tools[info.Tool], cfg.MaxArgs), asks)
 		if err != nil {
 			if ctx.Err() == nil || !errors.Is(err, ctx.Err()) {
-				cfg.Logf("decide: policy for %s call %s/%s: %v", info.Tool, info.TaskID, info.CallID, err)
+				cfg.Logf("decide: policy for %s call %s/%s: %s: %s", info.Tool, info.TaskID, info.CallID, name, short(err, name, 500))
 			} // else the task itself ended (cancelled, past its deadline): not the engine's failure
 			return fallback(info, err)
 		}
@@ -202,8 +203,10 @@ func bound(what string, v, def float64) (float64, error) {
 
 // CallState is what Policy shows the engine about a call: one line each for
 // the tool, its device, its declared effect, the task's class, note (if
-// any) and the arguments, compacted and cut to maxArgs bytes (zero:
-// DefaultMaxArgs; negative: no cut).
+// any) and the arguments, compacted and cut to about maxArgs bytes (zero:
+// DefaultMaxArgs; negative: no cut). An object keeps every key, its long
+// string values cut in the middle, so no field the model wrote is hidden
+// behind a long one.
 func CallState(info neumann.ToolCallInfo, note string, maxArgs int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "tool: %s\n", info.Tool)
@@ -217,12 +220,12 @@ func CallState(info neumann.ToolCallInfo, note string, maxArgs int) string {
 	if note = strings.TrimSpace(note); note != "" {
 		fmt.Fprintf(&b, "about the tool: %s\n", note)
 	}
-	args := compact(info.Args)
 	if maxArgs == 0 {
 		maxArgs = DefaultMaxArgs
 	}
+	args := compact(info.Args)
 	if maxArgs > 0 {
-		args = clipHead(args, maxArgs)
+		args = clipArgs(info.Args, maxArgs)
 	}
 	fmt.Fprintf(&b, "arguments: %s", args)
 	return b.String()

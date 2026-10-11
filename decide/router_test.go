@@ -111,6 +111,14 @@ func TestRouterDefaultsOnFailure(t *testing.T) {
 	}
 }
 
+func TestRouterSurvivesAPanickingEngine(t *testing.T) {
+	r, _ := decide.NewRouter(panicking(), decide.RouterConfig{Routes: routes, Default: "strong"})
+	class, _, err := r.Route(bg, "x")
+	if class != "strong" || err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("%q %v", class, err)
+	}
+}
+
 func TestRouterClipsLongInput(t *testing.T) {
 	e := &decidetest.Engine{Fn: byLength}
 	r, _ := decide.NewRouter(e, decide.RouterConfig{Routes: routes, Default: "strong"})

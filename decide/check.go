@@ -24,8 +24,10 @@ const (
 	DefaultCheckFloor = 0.3
 	// DefaultMaxCheckState is how many bytes of request, answer and
 	// evidence together the engine is shown, which fits tev1:4b's
-	// 2050-token context with room for the default checks, for English.
-	DefaultMaxCheckState = 4096
+	// 2050-token context with room for the default checks, for English,
+	// and takes it about 2s to read with the default checks when its cache
+	// misses (4 KB took 2.2 to 4.2s).
+	DefaultMaxCheckState = 3072
 )
 
 // Check is one thing a Checker asks about an answer: a noul, the answer to
@@ -89,9 +91,9 @@ type CheckerConfig struct {
 	Timeout time.Duration
 	// MaxState is how many bytes of request, answer and evidence the engine
 	// is shown (zero: DefaultMaxCheckState; negative: all of them). The
-	// request and the evidence get up to a quarter each, cut at the end;
-	// the answer gets the rest, and a longer one keeps its start and its
-	// end, with a marker where the middle was cut.
+	// request gets up to a quarter, and so does the evidence, cut at its
+	// end; the answer gets the rest. A long request or answer keeps its
+	// start and its end, with a marker where the middle was cut.
 	MaxState int
 }
 
@@ -206,7 +208,7 @@ func checkState(request, answer string, evidence []string, max int) string {
 	request, answer = strings.TrimSpace(request), strings.TrimSpace(answer)
 	ev := strings.TrimSpace(strings.Join(evidence, "\n---\n"))
 	if max >= 0 {
-		request = clipHead(request, max/4)
+		request = clipMiddle(request, max/4)
 		ev = clipHead(ev, max/4)
 		answer = clipMiddle(answer, max-len(request)-len(ev))
 	}

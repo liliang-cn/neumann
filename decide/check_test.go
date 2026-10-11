@@ -161,7 +161,7 @@ func TestCheckerClipsTheState(t *testing.T) {
 	if len(s) > decide.DefaultMaxCheckState+300 {
 		t.Fatalf("state of %d bytes", len(s))
 	}
-	if !strings.Contains(s, "\"START ") || !strings.Contains(s, " END\"") || strings.Count(s, "bytes cut …]") != 1 || strings.Count(s, "more bytes]") != 2 {
+	if !strings.Contains(s, "\"START ") || !strings.Contains(s, " END\"") || strings.Count(s, "bytes cut …]") != 2 || strings.Count(s, "more bytes]") != 1 {
 		t.Fatalf("state %q", s)
 	}
 
@@ -171,6 +171,14 @@ func TestCheckerClipsTheState(t *testing.T) {
 	}
 	if s := e.Asked()[1].State; !strings.Contains(s, answer) {
 		t.Fatal("a negative MaxState cut the answer")
+	}
+}
+
+func TestCheckerSurvivesAPanickingEngine(t *testing.T) {
+	c, _ := decide.NewChecker(panicking(), decide.CheckerConfig{})
+	res, err := c.Check(bg, "r", "a")
+	if !res.Pass || err == nil || err.Error() != "decide: decidetest panicked: assignment to entry in nil map" {
+		t.Fatalf("%+v %v", res, err)
 	}
 }
 

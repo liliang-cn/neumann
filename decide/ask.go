@@ -25,6 +25,13 @@ func ask(ctx context.Context, engine Engine, timeout time.Duration, state string
 	}
 	done := make(chan reply, 1) // buffered: a late Decide never blocks
 	go func() {
+		// A panic here would end the process: the machine recovers a
+		// panicking policy only on its own goroutine. It is no answer.
+		defer func() {
+			if v := recover(); v != nil {
+				done <- reply{err: fmt.Errorf("decide: %s panicked: %v", engine.Name(), v)}
+			}
+		}()
 		a, err := engine.Decide(actx, state, asks)
 		done <- reply{a, err}
 	}()
