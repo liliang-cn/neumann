@@ -143,15 +143,17 @@ func DefaultMessageFormat(from, text string) string {
 }
 
 // QuoteMessage puts "> " before every line of text. Every line break a
-// reader could see is one: \n, \r\n, \r, vertical tab, form feed, U+0085,
-// U+2028 and U+2029 all become \n first. Invalid UTF-8 is replaced.
+// reader could see is one: \n, \r\n, \r, vertical tab, form feed, the
+// file, group and record separators, U+0085, U+2028 and U+2029 all become \n
+// first. NUL becomes U+FFFD, as invalid UTF-8 does.
 func QuoteMessage(text string) string {
 	text = strings.ToValidUTF8(text, "\uFFFD")
 	text = lineBreaks.Replace(text)
+	text = strings.ReplaceAll(text, "\x00", "\uFFFD")
 	return "> " + strings.ReplaceAll(text, "\n", "\n> ")
 }
 
-var lineBreaks = strings.NewReplacer("\r\n", "\n", "\r", "\n", "\v", "\n", "\f", "\n", "\u0085", "\n", "\u2028", "\n", "\u2029", "\n")
+var lineBreaks = strings.NewReplacer("\r\n", "\n", "\r", "\n", "\v", "\n", "\f", "\n", "\x1c", "\n", "\x1d", "\n", "\x1e", "\n", "\u0085", "\n", "\u2028", "\n", "\u2029", "\n")
 
 type stepData struct {
 	PC   string `json:"pc"`

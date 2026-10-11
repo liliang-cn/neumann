@@ -120,7 +120,7 @@ func (d *Device) Tools(context.Context) ([]bus.ToolDef, error) {
 		{
 			Name: "send",
 			Description: "Send a message to another unfinished task of this system (find ids with " + bus.FullName(d.name, "list") + "). " +
-				"It reaches that task as a message headed [message from task:<your task id>] at its next step, " +
+				"It reaches that task at its next step as a message from task:<your task id>, marked as not from its user, " +
 				"and it can answer the same way. Errors if the task is unknown or has finished.",
 			Schema: json.RawMessage(`{"type":"object","properties":{` +
 				`"task_id":{"type":"string","description":"The id of the task to send to."},` +

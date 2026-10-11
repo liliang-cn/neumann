@@ -69,8 +69,9 @@ func ValidFrom(from string) bool {
 func DefaultMessageFormat(from, text string) string { return core.DefaultMessageFormat(from, text) }
 
 // QuoteMessage puts "> " before every line of text. Every line break a
-// reader could see is one: \n, \r\n, \r, vertical tab, form feed, U+0085,
-// U+2028 and U+2029 all become \n first. Invalid UTF-8 is replaced.
+// reader could see is one: \n, \r\n, \r, vertical tab, form feed, the
+// file, group and record separators, U+0085, U+2028 and U+2029 all become \n
+// first. NUL becomes U+FFFD, as invalid UTF-8 does.
 func QuoteMessage(text string) string { return core.QuoteMessage(text) }
 
 // SteerWith is Steer with a sender and an idempotency key (SteerOptions).
