@@ -299,10 +299,6 @@ func TestCallStateKeepsEveryKey(t *testing.T) {
 			args: `{"comment":"` + note + `","z_cmd":"rm -rf / --no-preserve-root"}`,
 			want: []string{`"comment":"Routine housekeeping`, `bytes cut]…`, `"z_cmd":"rm -rf / --no-preserve-root"}`},
 		},
-		"a field padded on both sides": {
-			args: "{" + strings.Join(padded, ",") + "}",
-			want: []string{`"note00":"`, `"command":"rm -rf / --no-preserve-root"`, `"note23":"`},
-		},
 		"nested": {
 			args: `{"a":"` + strings.Repeat("x", 2000) + `","opts":{"force":true,"paths":["/etc","` + strings.Repeat("y", 300) + `"]},"n":3}`,
 			want: []string{`"opts":{"force":true,"paths":["/etc","yyy`, `,"n":3}`, `"a":"xxx`},
@@ -335,16 +331,16 @@ func TestCallStateKeepsEveryKey(t *testing.T) {
 		}
 	}
 
-	// At every budget, a short value is shown whole or the call is not
-	// whole: never silently dropped.
+	// At every budget, whole means every short value as written and no
+	// value reduced to a bare placeholder: nothing silently dropped.
 	four := `{"a":"` + strings.Repeat("a", 300) + `","b":"` + strings.Repeat("b", 200) + `","c":"rm -rf /","d":"` + strings.Repeat("d", 250) + `"}`
 	for n := 1; n <= len(four); n++ {
 		s, whole := decide.CallState(neumann.ToolCallInfo{Tool: "x", Args: json.RawMessage(four)}, "", n)
-		if whole && !strings.Contains(s, `"c":"rm -rf /"`) {
-			t.Fatalf("budget %d: whole, without c: %s", n, s)
+		if whole && (!strings.Contains(s, `"c":"rm -rf /"`) || strings.Contains(s, `":"…"`)) {
+			t.Fatalf("budget %d: whole, yet c is cut or a value is a placeholder: %s", n, s)
 		}
-		if n >= 60 && !whole {
-			t.Fatalf("budget %d: keys and placeholders fit, yet not whole: %s", n, s)
+		if n >= 200 && !whole {
+			t.Fatalf("budget %d: each long value fits with its start and end, yet not whole: %s", n, s)
 		}
 	}
 
@@ -357,10 +353,21 @@ func TestCallStateKeepsEveryKey(t *testing.T) {
 	for i := range 30 {
 		shorts = append(shorts, fmt.Sprintf(`"k%02d":"%s"`, i, strings.Repeat("s", 50)))
 	}
+	// A long command among padding: shown as "command":"…" it says nothing
+	// (live, such a call was held at p=0.51; alone, at p=0.99).
+	var padding []string
+	for i := range 14 {
+		if i == 7 {
+			padding = append(padding, `"command":"cd /srv && tar czf /tmp/srv.tgz . && rm -rf /srv/data /var/lib/postgresql/16/main"`)
+		}
+		padding = append(padding, fmt.Sprintf(`"pad%02d":"%s"`, i, strings.Repeat("Routine maintenance notes. ", 4)))
+	}
 	for name, args := range map[string]string{
-		"keys":         "{" + strings.Join(many, ",") + "}",
-		"short values": "{" + strings.Join(shorts, ",") + "}",
-		"invalid JSON": `{"comment":"` + note + note + `", "cmd":"rm -rf /"`,
+		"a short value padded on both sides": "{" + strings.Join(padded, ",") + "}",
+		"a long value padded on both sides":  "{" + strings.Join(padding, ",") + "}",
+		"keys":                               "{" + strings.Join(many, ",") + "}",
+		"short values":                       "{" + strings.Join(shorts, ",") + "}",
+		"invalid JSON":                       `{"comment":"` + note + note + `", "cmd":"rm -rf /"`,
 	} {
 		if s, whole := decide.CallState(neumann.ToolCallInfo{Tool: "x", Args: json.RawMessage(args)}, "", 0); whole {
 			t.Errorf("%s: whole: %s", name, s)
@@ -372,19 +379,38 @@ func TestCallStateKeepsEveryKey(t *testing.T) {
 // every key and short value whole is held without asking the engine, which
 // would be asked about something other than the call.
 func TestPolicyHoldsWhatItCannotShow(t *testing.T) {
-	var keys []string
+	var keys, padding []string
 	for i := range 200 {
 		keys = append(keys, fmt.Sprintf(`"key_%03d":"value"`, i))
 	}
-	e := &decidetest.Engine{Fn: risky}
-	info := call("shell_run", bus.SideEffect)
-	info.Args = json.RawMessage("{" + strings.Join(keys, ",") + "}")
-	d := decide.Policy(e, decide.PolicyConfig{})(bg, info)
-	if d.Verdict != neumann.VerdictRequireApproval || d.Reason != decide.TooLarge || len(e.Asked()) != 0 {
-		t.Fatalf("%+v, asked %d times", d, len(e.Asked()))
+	for i := range 14 {
+		if i == 7 {
+			padding = append(padding, `"command":"cd /srv && tar czf /tmp/srv.tgz . && rm -rf /srv/data /var/lib/postgresql/16/main"`)
+		}
+		padding = append(padding, fmt.Sprintf(`"pad%02d":"%s"`, i, strings.Repeat("Routine maintenance notes. ", 4)))
 	}
-	// Given room, it asks.
-	if d := decide.Policy(e, decide.PolicyConfig{MaxArgs: -1})(bg, info); d.Verdict != neumann.VerdictAllow || len(e.Asked()) != 1 {
+	for name, args := range map[string]string{
+		"keys that do not fit":    "{" + strings.Join(keys, ",") + "}",
+		"a command among padding": "{" + strings.Join(padding, ",") + "}",
+	} {
+		e := &decidetest.Engine{Fn: risky}
+		info := call("shell_run", bus.SideEffect)
+		info.Args = json.RawMessage(args)
+		d := decide.Policy(e, decide.PolicyConfig{})(bg, info)
+		if d.Verdict != neumann.VerdictRequireApproval || d.Reason != decide.TooLarge || len(e.Asked()) != 0 {
+			t.Fatalf("%s: %+v, asked %d times", name, d, len(e.Asked()))
+		}
+		// Given room, it asks.
+		if d := decide.Policy(e, decide.PolicyConfig{MaxArgs: -1})(bg, info); d.Verdict != neumann.VerdictAllow || len(e.Asked()) != 1 {
+			t.Fatalf("%s: %+v, asked %d times", name, d, len(e.Asked()))
+		}
+	}
+
+	// One long value cut in the middle is whole: the engine is asked.
+	e := &decidetest.Engine{Fn: risky}
+	info := call("notes_save", bus.SideEffect)
+	info.Args = json.RawMessage(`{"title":"groceries","text":"` + strings.Repeat("milk, eggs, bread, ", 60) + `"}`)
+	if d := decide.Policy(e, decide.PolicyConfig{})(bg, info); d.Verdict != neumann.VerdictAllow || len(e.Asked()) != 1 {
 		t.Fatalf("%+v, asked %d times", d, len(e.Asked()))
 	}
 }

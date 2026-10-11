@@ -18,7 +18,7 @@ import (
 const NeedsApproval = "needs_approval"
 
 // TooLarge is the reason Policy holds a call whose arguments it cannot show
-// the engine with every key and every short value whole.
+// the engine whole (see CallState).
 const TooLarge = "arguments too large to show the engine; held"
 
 // Policy defaults.
@@ -61,11 +61,12 @@ type PolicyConfig struct {
 	Timeout time.Duration
 	// MaxArgs is about how many bytes of a call's arguments the engine is
 	// shown (zero: DefaultMaxArgs; negative: all of them, which a long
-	// argument can push past the model's context). Every key is kept and
-	// string values are cut, the longest first, each cut marked; a call
-	// whose arguments do not fit with every key and every short value
-	// (ShortValue bytes or less) whole is held, reason TooLarge, without
-	// asking the engine (see CallState). What the engine reads costs time: tev1:4b, its
+	// argument can push past the model's context). Every key is kept, and
+	// values longer than ShortValue bytes are cut in the middle, the
+	// longest first, each cut marked. A call whose arguments do not fit
+	// that way, with every key, every value of ShortValue bytes or less as
+	// written, and a start and an end of every longer one, is held, reason
+	// TooLarge, without asking the engine (see CallState). What the engine reads costs time: tev1:4b, its
 	// cache missed, reads some 700 tokens a second on an Apple-silicon Mac,
 	// and dense text such as base64 is close to a token a byte, so 512
 	// bytes of it take about a second of the 2 the policy waits.
@@ -98,8 +99,8 @@ type PolicyConfig struct {
 
 // Policy is a tool policy that asks engine whether each call needs a person
 // (design §9.7). A ReadOnly call is allowed without asking. A call whose
-// arguments cannot be shown within cfg.MaxArgs with every key and short
-// value whole is held without asking (TooLarge). For any other, it asks the
+// arguments cannot be shown whole within cfg.MaxArgs (see CallState) is
+// held without asking (TooLarge). For any other, it asks the
 // engine in one request, bounded by cfg.Timeout whether or not the engine
 // honours its context:
 //
@@ -218,11 +219,13 @@ func bound(what string, v, def float64) (float64, error) {
 // any) and the arguments, compacted and cut to about maxArgs bytes (zero:
 // DefaultMaxArgs; negative: no cut). Arguments that are valid JSON keep
 // every key; string values are cut, the longest first, in the middle and
-// then down to "…". whole reports whether every key and every short value
-// (ShortValue bytes or less) is shown as written; it is false when even the
-// keys did not fit, when invalid JSON had to be cut, or when the cut
-// reached a short value. Policy holds a call that is not whole without
-// asking the engine, since what it would be asked about is not the call.
+// then down to "…". whole is true when the arguments fit with every key,
+// every value of ShortValue bytes or less as written, and every longer
+// value cut no further than to its start, a marker and its end. It is false
+// when any value had to become a bare "…", when a short value was cut, when
+// even the keys did not fit, or when invalid JSON had to be cut. Policy
+// holds a call that is not whole without asking the engine, since what it
+// would be asked about is not the call.
 func CallState(info neumann.ToolCallInfo, note string, maxArgs int) (state string, whole bool) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "tool: %s\n", info.Tool)

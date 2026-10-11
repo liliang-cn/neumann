@@ -10,17 +10,19 @@ import (
 )
 
 // clipArgs renders a call's arguments in about n bytes, and reports whether
-// the engine still sees every key and every short value (ShortValue bytes
-// or less) whole. A field the model wrote anywhere is as likely to be the
-// dangerous one as the first ("comment": a page of prose, then "cmd":
-// "rm -rf /"), so arguments that are valid JSON keep every key at every
-// depth, and are cut in this order until they fit:
+// they are whole: every key shown, every short value (ShortValue bytes or
+// less) as written, and every long value with its start and its end. A
+// field the model wrote anywhere is as likely to be the dangerous one as
+// the first ("comment": a page of prose, then "cmd": "rm -rf /"), so
+// arguments that are valid JSON keep every key at every depth, and are cut
+// in this order until they fit:
 //
 //  1. long values, to a common cap, in the middle (a start, a marker, an
-//     end), the longest losing the most;
-//  2. long values, to a bare "…";
-//  3. short values, to a common cap, then to "…" (no longer whole);
-//  4. the rendering itself, in the middle (no longer whole).
+//     end), the longest losing the most: still whole;
+//  2. long values, to a bare "…": no longer whole, since a long command
+//     reduced to "…" says nothing about what it would do;
+//  3. short values, to a common cap, then to "…": not whole;
+//  4. the rendering itself, in the middle: not whole.
 //
 // Invalid JSON is cut in the middle, and is not whole once cut.
 func clipArgs(args []byte, n int) (string, bool) {
@@ -37,7 +39,7 @@ func clipArgs(args []byte, n int) (string, bool) {
 		return r, true
 	}
 	if r := render(v, 0, whole); len(r) <= n {
-		return r, true
+		return r, false
 	}
 	if r, ok := largestFit(n, 0, ShortValue-1, func(c int) string { return render(v, 0, c) }); ok {
 		return r, false
