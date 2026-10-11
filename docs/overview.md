@@ -19,6 +19,7 @@ this page and design.md disagree, design.md and the tests win.
 | `bus`, `bus/builtin`, `bus/mcp`, `bus/skills`, `cache` | tools as devices, the page table, per-device queues, the L2 result cache |
 | `model`, `model/openai`, `model/anthropic` | the adapter interface, error classes, two adapters |
 | `proto`, `proto/jsonl`, `cmd/neumann` | instructions and events, the JSON Lines frontend |
+| `decide`, `decide/decidetest` | decision engines as a coprocessor (System One client, tool policy, router, answer checker), outside the machine: host code and the tool policy ask them, no instruction does |
 | `sim` | scripted model, fake clock: the test harness |
 
 `internal/` is deliberate: nothing outside the module can bypass the ownership

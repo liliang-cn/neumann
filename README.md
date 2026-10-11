@@ -536,6 +536,49 @@ NEUMANN_API_KEY=... go run ./cmd/neumann -model m -store state.db -observe-addr 
 `go run ./examples/observe` runs all of it offline and prints the URLs and a
 span tree.
 
+## Decision engines
+
+Package `decide` adds a coprocessor: a decision engine is a small model that
+answers closed questions about a text (which of these, how much, yes or no)
+in one forward pass, without generating anything. `decide.SystemOne` is the
+client for Ollama's System One API (`POST /v1/systemone`, Ollama 0.35 and
+later; tev1:4b answers in about 0.1 to 1 second locally). Its calls are not
+instructions: no task step, no window or limiter, no event. Three uses come
+ready-made:
+
+```go
+engine := decide.NewSystemOne(decide.SystemOneConfig{}) // tev1:4b on 127.0.0.1:11434; URL, Model, APIKey for a relay
+
+// A tool policy: ReadOnly calls pass unasked; a call the engine thinks needs
+// a person is held, its reason ("systemone:tev1:4b: needs_approval yes,
+// p=0.98") committed with the call record. Each request is cut off after 2s;
+// with no answer a SideEffect call is held, anything else allowed.
+cfg.ToolPolicy = decide.Policy(engine, decide.PolicyConfig{})
+
+// A router: which group should run this request?
+router, _ := decide.NewRouter(engine, decide.RouterConfig{
+	Routes:  []decide.Route{{Class: "fast", Description: "short factual answers"}, {Class: "strong", Description: "multi-step work"}},
+	Default: "strong", // on an error, or below Floor
+})
+class, _, _ := router.Route(ctx, input)
+id, err := m.Submit(ctx, proto.Instruction{Input: input, Class: class})
+
+// An answer checker, run by the host after done: is the answer on topic,
+// only a plan, a refusal? It fails open: no answer from the engine passes.
+checker, _ := decide.NewChecker(engine, decide.CheckerConfig{})
+res, err := checker.Check(ctx, input, answer) // answer: the done task's LastAnswer()
+if !res.Pass {
+	m.Submit(ctx, proto.Instruction{Input: input + "\n\n" + res.Feedback, Class: class})
+}
+```
+
+An engine that fails gives no answer, and each of these falls back to a
+fixed choice rather than a guess. A small engine is right most of the time,
+not every time: use it to choose between safe options, not as the only guard
+on a dangerous one. `go run ./examples/decide` runs all three offline;
+`-live` asks a local Ollama. `decide/decidetest` has a scripted engine for
+tests.
+
 ## Guarantees, precisely
 
 What neumann promises:
@@ -589,8 +632,9 @@ machine, SQLite store with group commit, crash recovery and reconciliation,
 cancellation and deadlines, elastic vCores, execution groups with breakers and
 fallback migration, context compaction (including a migration that compacts
 on a smaller target window), shared rate limiters, the OpenAI-compatible and Anthropic
-adapters, MCP and skills devices, the tool result cache and the stdio
-frontend. The API may change before v1.
+adapters, MCP and skills devices, the tool result cache, the stdio
+frontend, and decision engines (`decide`) for tool policy, routing and
+answer checks. The API may change before v1.
 
 Designed but not built yet:
 
@@ -621,6 +665,14 @@ NEUMANN_ACCEPT_LIVE=1 OPENAI_BASE_URL=... OPENAI_API_KEY=... OPENAI_MODEL=... \
   go test -v -count=1 -timeout 30m ./acceptance/killnine   # SIGKILL mid side effect, then resolve
 NEUMANN_ACCEPT_LIVE=1 OPENAI_BASE_URL=... OPENAI_API_KEY=... OPENAI_MODEL=... \
   go test -v -count=1 -timeout 40m ./acceptance/load       # 200 tasks on one autoscaling group
+```
+
+`decide`'s live test asks a real System One server and is skipped unless
+`NEUMANN_DECIDE_LIVE=1` (`NEUMANN_DECIDE_URL`, `NEUMANN_DECIDE_MODEL` and
+`NEUMANN_DECIDE_KEY` point it elsewhere than tev1:4b on the local Ollama):
+
+```
+NEUMANN_DECIDE_LIVE=1 go test -v -count=1 -run TestLive ./decide
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are reviewed.
