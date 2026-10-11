@@ -229,20 +229,23 @@ func TestPolicyExtraQuestionsAndDecide(t *testing.T) {
 
 func TestCallStateClipsArguments(t *testing.T) {
 	info := neumann.ToolCallInfo{Tool: "fs_write", Effect: bus.SideEffect, Args: json.RawMessage(`{"text":"` + strings.Repeat("é", 5000) + `"}`)}
-	s := decide.CallState(info, "", decide.DefaultMaxArgs)
+	s, whole := decide.CallState(info, "", decide.DefaultMaxArgs)
+	if !whole {
+		t.Fatal("a long value cut is still whole")
+	}
 	if strings.Contains(s, "device:") || strings.Contains(s, "task class:") || strings.Contains(s, "about the tool:") {
 		t.Fatalf("empty fields shown: %q", s[:100])
 	}
 	if !strings.HasSuffix(s, `é"}`) || !strings.Contains(s, `arguments: {"text":"éé`) || !strings.Contains(s, "bytes cut]…") || len(s) > decide.DefaultMaxArgs+100 {
 		t.Fatalf("clipped to %d bytes: %q", len(s), s)
 	}
-	if s := decide.CallState(info, "", -1); !strings.HasSuffix(s, `é"}`) {
+	if s, _ := decide.CallState(info, "", -1); !strings.HasSuffix(s, `é"}`) {
 		t.Fatal("a negative maxArgs cut the arguments")
 	}
-	if s := decide.CallState(info, "", 0); len(s) > decide.DefaultMaxArgs+100 {
+	if s, _ := decide.CallState(info, "", 0); len(s) > decide.DefaultMaxArgs+100 {
 		t.Fatalf("zero maxArgs is not DefaultMaxArgs: %d bytes", len(s))
 	}
-	if s := decide.CallState(neumann.ToolCallInfo{Tool: "x"}, "", 0); !strings.HasSuffix(s, "arguments: (none)") {
+	if s, _ := decide.CallState(neumann.ToolCallInfo{Tool: "x"}, "", 0); !strings.HasSuffix(s, "arguments: (none)") {
 		t.Fatalf("%q", s)
 	}
 
@@ -270,71 +273,119 @@ func panicking() *decidetest.Engine {
 func TestPolicySurvivesAPanickingEngine(t *testing.T) {
 	var l logs
 	d := decide.Policy(panicking(), decide.PolicyConfig{Logf: l.logf})(bg, call("notes_delete", bus.SideEffect))
-	if d.Verdict != neumann.VerdictRequireApproval || d.Reason != "decidetest: no answer (decidetest panicked: assignment to entry in nil map); held" {
+	if d.Verdict != neumann.VerdictRequireApproval || d.Reason != "decidetest: no answer (panicked: assignment to entry in nil map); held" {
 		t.Fatalf("%+v", d)
 	}
-	if got := l.all(); len(got) != 1 || !strings.Contains(got[0], "panicked") {
+	if got := l.all(); len(got) != 1 || got[0] != "decide: policy for notes_delete call t1/c-1: decidetest: panicked: assignment to entry in nil map" {
 		t.Fatalf("logged %q", got)
 	}
 }
 
 func TestCallStateKeepsEveryKey(t *testing.T) {
 	note := strings.Repeat("Routine housekeeping of the build machine, as agreed. ", 13)
+	pad := strings.Repeat("Nothing to see here, just notes. ", 5)
+	var padded []string
+	for i := range 24 {
+		if i == 12 {
+			padded = append(padded, `"command":"rm -rf / --no-preserve-root"`)
+		}
+		padded = append(padded, fmt.Sprintf(`"note%02d":"%s"`, i, pad))
+	}
 	cases := map[string]struct {
-		args       string
-		want       []string
-		maxLen     int
-		middleOnly bool
+		args string
+		want []string
 	}{
 		"a late field": {
-			args:   `{"comment":"` + note + `","z_cmd":"rm -rf / --no-preserve-root"}`,
-			want:   []string{`"comment":"Routine housekeeping`, `bytes cut]…`, `"z_cmd":"rm -rf / --no-preserve-root"}`},
-			maxLen: decide.DefaultMaxArgs + 40,
+			args: `{"comment":"` + note + `","z_cmd":"rm -rf / --no-preserve-root"}`,
+			want: []string{`"comment":"Routine housekeeping`, `bytes cut]…`, `"z_cmd":"rm -rf / --no-preserve-root"}`},
 		},
-		"nested, the longest cut most": {
-			args:   `{"a":"` + strings.Repeat("x", 2000) + `","opts":{"force":true,"paths":["/etc","` + strings.Repeat("y", 300) + `"]},"n":3}`,
-			want:   []string{`"opts":{"force":true,"paths":["/etc","yyy`, `,"n":3}`, `"a":"xxx`},
-			maxLen: decide.DefaultMaxArgs + 40,
+		"a field padded on both sides": {
+			args: "{" + strings.Join(padded, ",") + "}",
+			want: []string{`"note00":"`, `"command":"rm -rf / --no-preserve-root"`, `"note23":"`},
+		},
+		"nested": {
+			args: `{"a":"` + strings.Repeat("x", 2000) + `","opts":{"force":true,"paths":["/etc","` + strings.Repeat("y", 300) + `"]},"n":3}`,
+			want: []string{`"opts":{"force":true,"paths":["/etc","yyy`, `,"n":3}`, `"a":"xxx`},
 		},
 		"short values whole": {
 			args: `{"to":"bob@example.com","subject":"<hi> & bye","body":"` + strings.Repeat("z", 3000) + `"}`,
 			want: []string{`"to":"bob@example.com"`, `"subject":"<hi> & bye"`, `"body":"zzz`},
 		},
 		"an array": {
-			args:       `["` + strings.Repeat("a", 2000) + `","rm -rf /"]`,
-			want:       []string{`["aaa`, `bytes cut …]`, `rm -rf /"]`},
-			middleOnly: true,
-		},
-		"invalid JSON": {
-			args:       `{"comment":"` + note + note + `", "cmd":"rm -rf /"`,
-			want:       []string{`{"comment":"Routine`, `bytes cut …]`, `"cmd":"rm -rf /"`},
-			middleOnly: true,
+			args: `["` + strings.Repeat("a", 2000) + `","rm -rf /"]`,
+			want: []string{`["aaa`, `bytes cut]…`, `,"rm -rf /"]`},
 		},
 	}
 	for name, c := range cases {
-		s := decide.CallState(neumann.ToolCallInfo{Tool: "shell_run", Args: json.RawMessage(c.args)}, "", 0)
+		s, whole := decide.CallState(neumann.ToolCallInfo{Tool: "shell_run", Args: json.RawMessage(c.args)}, "", 0)
 		args := s[strings.Index(s, "arguments: ")+len("arguments: "):]
+		if !whole {
+			t.Errorf("%s: not whole: %s", name, args)
+		}
 		for _, w := range c.want {
 			if !strings.Contains(args, w) {
 				t.Errorf("%s: lacks %s: %s", name, w, args)
 			}
 		}
-		if limit := max(c.maxLen, decide.DefaultMaxArgs+80); len(args) > limit {
+		if len(args) > decide.DefaultMaxArgs {
 			t.Errorf("%s: %d bytes", name, len(args))
 		}
-		if !c.middleOnly && !json.Valid([]byte(args)) {
+		if !json.Valid([]byte(args)) {
 			t.Errorf("%s: not JSON: %s", name, args)
 		}
 	}
 
-	// So many keys that they alone do not fit: the rendering is cut.
-	var many []string
+	// At every budget, a short value is shown whole or the call is not
+	// whole: never silently dropped.
+	four := `{"a":"` + strings.Repeat("a", 300) + `","b":"` + strings.Repeat("b", 200) + `","c":"rm -rf /","d":"` + strings.Repeat("d", 250) + `"}`
+	for n := 1; n <= len(four); n++ {
+		s, whole := decide.CallState(neumann.ToolCallInfo{Tool: "x", Args: json.RawMessage(four)}, "", n)
+		if whole && !strings.Contains(s, `"c":"rm -rf /"`) {
+			t.Fatalf("budget %d: whole, without c: %s", n, s)
+		}
+		if n >= 60 && !whole {
+			t.Fatalf("budget %d: keys and placeholders fit, yet not whole: %s", n, s)
+		}
+	}
+
+	// Not whole: the keys alone do not fit, short values had to be cut,
+	// invalid JSON had to be cut.
+	var many, shorts []string
 	for i := range 200 {
 		many = append(many, fmt.Sprintf(`"key_%03d":"value"`, i))
 	}
-	s := decide.CallState(neumann.ToolCallInfo{Tool: "x", Args: json.RawMessage("{" + strings.Join(many, ",") + "}")}, "", 0)
-	if !strings.Contains(s, `"key_000"`) || !strings.Contains(s, `"key_199":"value"}`) || !strings.Contains(s, "bytes cut …]") {
-		t.Fatalf("%s", s)
+	for i := range 30 {
+		shorts = append(shorts, fmt.Sprintf(`"k%02d":"%s"`, i, strings.Repeat("s", 50)))
+	}
+	for name, args := range map[string]string{
+		"keys":         "{" + strings.Join(many, ",") + "}",
+		"short values": "{" + strings.Join(shorts, ",") + "}",
+		"invalid JSON": `{"comment":"` + note + note + `", "cmd":"rm -rf /"`,
+	} {
+		if s, whole := decide.CallState(neumann.ToolCallInfo{Tool: "x", Args: json.RawMessage(args)}, "", 0); whole {
+			t.Errorf("%s: whole: %s", name, s)
+		}
+	}
+}
+
+// TestPolicyHoldsWhatItCannotShow: a call whose arguments do not fit with
+// every key and short value whole is held without asking the engine, which
+// would be asked about something other than the call.
+func TestPolicyHoldsWhatItCannotShow(t *testing.T) {
+	var keys []string
+	for i := range 200 {
+		keys = append(keys, fmt.Sprintf(`"key_%03d":"value"`, i))
+	}
+	e := &decidetest.Engine{Fn: risky}
+	info := call("shell_run", bus.SideEffect)
+	info.Args = json.RawMessage("{" + strings.Join(keys, ",") + "}")
+	d := decide.Policy(e, decide.PolicyConfig{})(bg, info)
+	if d.Verdict != neumann.VerdictRequireApproval || d.Reason != decide.TooLarge || len(e.Asked()) != 0 {
+		t.Fatalf("%+v, asked %d times", d, len(e.Asked()))
+	}
+	// Given room, it asks.
+	if d := decide.Policy(e, decide.PolicyConfig{MaxArgs: -1})(bg, info); d.Verdict != neumann.VerdictAllow || len(e.Asked()) != 1 {
+		t.Fatalf("%+v, asked %d times", d, len(e.Asked()))
 	}
 }
 

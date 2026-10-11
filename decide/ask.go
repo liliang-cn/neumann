@@ -29,7 +29,7 @@ func ask(ctx context.Context, engine Engine, timeout time.Duration, state string
 		// panicking policy only on its own goroutine. It is no answer.
 		defer func() {
 			if v := recover(); v != nil {
-				done <- reply{err: fmt.Errorf("decide: %s panicked: %v", engine.Name(), v)}
+				done <- reply{err: fmt.Errorf("decide: %s: panicked: %v", engine.Name(), v)}
 			}
 		}()
 		a, err := engine.Decide(actx, state, asks)

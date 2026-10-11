@@ -177,7 +177,7 @@ func TestCheckerClipsTheState(t *testing.T) {
 func TestCheckerSurvivesAPanickingEngine(t *testing.T) {
 	c, _ := decide.NewChecker(panicking(), decide.CheckerConfig{})
 	res, err := c.Check(bg, "r", "a")
-	if !res.Pass || err == nil || err.Error() != "decide: decidetest panicked: assignment to entry in nil map" {
+	if !res.Pass || err == nil || err.Error() != "decide: decidetest: panicked: assignment to entry in nil map" {
 		t.Fatalf("%+v %v", res, err)
 	}
 }
