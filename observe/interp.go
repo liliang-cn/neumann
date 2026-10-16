@@ -60,6 +60,14 @@ type data struct {
 	TokensAfter    int64 `json:"tokens_after_est"`
 	Chunk          int   `json:"chunk"`
 	Chunks         int   `json:"chunks"`
+	// preemption and continuation (design §6.4)
+	FirstMS  *int64 `json:"first_ms"` // step: ms from the request to its first streamed chunk; nil when none came
+	Prefill  int    `json:"prefill"`  // step: chars of the continued prefix
+	Kept     int    `json:"kept"`     // preempted: chars kept for the continuation
+	RanMS    int64  `json:"ran_ms"`   // preempted: how long the call ran
+	N        int    `json:"n"`        // preempted: how many times this step was preempted
+	Was      int    `json:"was"`      // priority_set: the priority before
+	SteerSeq int64  `json:"seq"`      // steer_delivered, steer_dropped: the steer's seq
 	task.Usage
 }
 
@@ -83,6 +91,9 @@ const (
 	outUnknown   = "unknown"
 	outDenied    = "denied"
 	outResolved  = "resolved"
+	// A model call cut off for a more urgent task (design §6.4): not an
+	// error, the task runs it again and continues the kept text.
+	outPreempted = "preempted"
 )
 
 // Verdicts of a call held for approval (design §9.7), as metric labels and
@@ -124,11 +135,14 @@ type fact struct {
 	errClass   string // a failed step's error class (model_retry class or the task's stop reason)
 	usage      *task.Usage
 	core       int
-	partial    bool       // the task's start was not seen
-	timed      bool       // tool end: start is when the call was made
-	batch      int64      // tool end: the Seq of its round (the round's first tool_call)
-	total      task.Usage // task end: the task's confirmed usage
-	steps      int        // task end: answered model calls
+	partial    bool           // the task's start was not seen
+	timed      bool           // tool end: start is when the call was made
+	batch      int64          // tool end: the Seq of its round (the round's first tool_call)
+	total      task.Usage     // task end: the task's confirmed usage
+	steps      int            // task end: answered model calls
+	priority   *int           // task end: the task's last priority, nil when unknown (a partial task)
+	firstByte  *time.Duration // step: from the request to its first streamed chunk
+	prefill    int            // step: chars of the continued prefix
 }
 
 type openStep struct {
@@ -138,6 +152,8 @@ type openStep struct {
 	at, start time.Time
 	usage     *task.Usage
 	check     time.Duration // the answer check's share of the step, after the call answered
+	firstByte *time.Duration
+	prefill   int
 }
 
 type openCall struct {
@@ -163,7 +179,7 @@ type openBatch struct {
 
 type taskState struct {
 	class    string
-	priority int
+	priority *int // nil until accepted or priority_set says
 	partial  bool
 	start    time.Time
 	// ready is when the task could next run an instruction: its last
@@ -218,7 +234,7 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 		t = &taskState{start: ev.Time, ready: ev.Time, open: map[string]*openCall{}, calls: map[string]*openCall{}, held: map[string]*openApproval{}}
 		in.tasks[ev.TaskID] = t
 		if ev.Kind == proto.EvAccepted {
-			t.class, t.priority = d.Class, d.Priority
+			t.class, t.priority = d.Class, &d.Priority
 		} else {
 			t.partial = true
 			if in.lookup != nil {
@@ -247,7 +263,11 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 		if !t.call.IsZero() {
 			start = t.call
 		}
-		t.step = &openStep{seq: ev.Seq, pc: d.PC, core: d.Core, at: ev.Time, start: start, check: time.Duration(d.CheckMS) * time.Millisecond}
+		t.step = &openStep{seq: ev.Seq, pc: d.PC, core: d.Core, at: ev.Time, start: start, check: time.Duration(d.CheckMS) * time.Millisecond, prefill: d.Prefill}
+		if d.FirstMS != nil {
+			fb := time.Duration(*d.FirstMS) * time.Millisecond
+			t.step.firstByte = &fb
+		}
 		t.call = time.Time{}
 		if d.PC == task.StepTools.String() {
 			// Dispatching planned calls: the instruction is the commit.
@@ -314,8 +334,18 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 			verdict = verdictEdit
 		}
 		in.endApproval(ev, d, t, d.CallID, verdict, emit)
-	case proto.EvModelRetry:
+	case proto.EvModelRetry, proto.EvPreempted:
+		// A preempted call's step ended above, outcome preempted; the task
+		// is Ready again from this commit on.
 		emit(f(factMark))
+	case proto.EvPrioritySet:
+		emit(f(factMark))
+		t.priority = &d.Priority
+	case proto.EvSteerDelivered:
+		// At the head of the commit of the step that sent the steer: that
+		// step's call began at its model_call, not here.
+		emit(f(factMark))
+		return t.class, d
 	case proto.EvModelCall:
 		// Committed as the request goes out: the step that follows spans
 		// the provider's latency only, not the queue or the limiters.
@@ -372,7 +402,8 @@ func (in *interp) after(ev proto.Event, d data, t *taskState, emit func(fact)) {
 func (in *interp) endStep(ev proto.Event, d data, t *taskState, emit func(fact)) {
 	s := t.step
 	t.step = nil
-	f := fact{kind: factStep, ev: ev, d: d, task: ev.TaskID, class: t.class, seq: s.seq, name: s.pc, core: s.core, usage: s.usage, outcome: outOK}
+	f := fact{kind: factStep, ev: ev, d: d, task: ev.TaskID, class: t.class, seq: s.seq, name: s.pc, core: s.core, usage: s.usage, outcome: outOK,
+		firstByte: s.firstByte, prefill: s.prefill}
 	f.start, f.end = s.start, ev.Time
 	if s.at.Before(ev.Time) {
 		// The step was committed before its result: the call ran in between.
@@ -397,6 +428,8 @@ func (in *interp) endStep(ev proto.Event, d data, t *taskState, emit func(fact))
 			}
 		case proto.EvCancelled:
 			f.outcome = outCancelled
+		case proto.EvPreempted:
+			f.outcome = outPreempted
 		}
 	}
 	emit(f)
@@ -460,7 +493,7 @@ func (in *interp) endTask(ev proto.Event, d data, t *taskState, emit func(fact))
 		in.endBatch(ev, t, ev.Time, emit)
 	}
 	f := fact{kind: factTaskEnd, ev: ev, d: d, task: ev.TaskID, class: t.class, name: ev.Kind, start: t.start, end: ev.Time,
-		partial: t.partial, total: t.usage, steps: t.steps}
+		partial: t.partial, total: t.usage, steps: t.steps, priority: t.priority}
 	switch ev.Kind {
 	case proto.EvDone:
 		f.outcome = "done"

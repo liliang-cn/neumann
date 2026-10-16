@@ -50,12 +50,13 @@ type Metrics struct {
 	modelCalls, modelFailures, retries, tokens metric.Int64Counter
 	toolCalls                                  metric.Int64Counter
 	vcores, transitions, migrations, refused   metric.Int64Counter
-	reconcile, steers                          metric.Int64Counter
+	reconcile, steersDropped, steersDelivered  metric.Int64Counter
+	preemptions                                metric.Int64Counter
 	denied, rewritten, needed, decided         metric.Int64Counter
 	compactions, compactRounds, compactTokens  metric.Int64Counter
 	answers                                    metric.Int64Counter
 	taskDur, modelDur, toolDur, throttle       metric.Float64Histogram
-	approvalWait                               metric.Float64Histogram
+	approvalWait, firstByte                    metric.Float64Histogram
 }
 
 // NewMetrics creates the instruments on mp's meter. src gives the gauges
@@ -100,7 +101,7 @@ func NewMetrics(src Source, mp metric.MeterProvider, o MetricsOptions) (*Metrics
 	m.accepted = counter("neumann.tasks.accepted", "{task}", "Tasks accepted, by class.")
 	m.terminal = counter("neumann.tasks.terminal", "{task}", "Tasks ended, by class, outcome (done, failed, cancelled) and stop reason.")
 	m.recovered = counter("neumann.tasks.recovered", "{task}", "Tasks recovered at a restart, by class and the state they were found in.")
-	m.modelCalls = counter("neumann.model.calls", "{call}", "Model instructions, by class, pc (model, compact) and outcome (ok, error, cancelled).")
+	m.modelCalls = counter("neumann.model.calls", "{call}", "Model instructions, by class, pc (model, compact) and outcome (ok, error, cancelled, preempted).")
 	m.modelFailures = counter("neumann.model.failures", "{call}", "Model instructions that failed, by class and error class.")
 	m.retries = counter("neumann.model.retries", "{retry}", "Model retries decided, by class, error class and what the task waits for.")
 	m.tokens = counter("neumann.model.tokens", "{token}", "Confirmed tokens, by class and type (prompt, completion, reasoning, cached).")
@@ -110,7 +111,10 @@ func NewMetrics(src Source, mp metric.MeterProvider, o MetricsOptions) (*Metrics
 	m.migrations = counter("neumann.migrations", "{migration}", "Tasks moved to another group, by from, to and reason.")
 	m.refused = counter("neumann.migrations.refused", "{refusal}", "Migrations refused by the capability check, by from, to and check.")
 	m.reconcile = counter("neumann.reconcile.needed", "{call}", "Calls of unknown outcome held for an operator, by class and whether the task was cancelled.")
-	m.steers = counter("neumann.steers.dropped", "{steer}", "Steers never delivered because the task ended, by class.")
+	m.steersDropped = counter("neumann.steers.dropped", "{steer}", "Steers never delivered because the task ended, by class.")
+	m.steersDelivered = counter("neumann.steers.delivered", "{steer}", "Steers with a sender that reached the model, by class.")
+	m.preemptions = counter("neumann.model.preemptions", "{preemption}", "Model calls preempted for a more urgent task of their group, by class.")
+	m.firstByte = hist("neumann.model.first_byte", "Time from a streamed model request to its first chunk (the backend's queue, then prefill), by class and pc.")
 	m.denied = counter("neumann.tool.denied", "{call}", "Tool calls refused before they ran, by tool and by whom (policy, operator).")
 	m.rewritten = counter("neumann.tool.rewritten", "{call}", "Tool calls whose arguments the tool policy replaced, by tool.")
 	m.needed = counter("neumann.approvals.needed", "{call}", "Tool calls held for an operator's approval, by class and tool; a restart's announcement again is not counted.")
@@ -121,7 +125,7 @@ func NewMetrics(src Source, mp metric.MeterProvider, o MetricsOptions) (*Metrics
 	m.compactTokens = counter("neumann.compaction.tokens", "{token}", "Estimated tokens compaction took off the task's request (before minus after), by class.")
 	m.answers = counter("neumann.answers.checked", "{answer}", "Final answers the answer check saw, by class and outcome (passed, failed_open, rejected and sent back, failed: rejected past the retries and kept).")
 	m.taskDur = hist("neumann.task.duration", "Task lifetime, accepted to terminal, by class and outcome.")
-	m.modelDur = hist("neumann.model.duration", "Model instruction latency, from the moment the task could run (its previous commit, after any backoff, or when the limiters let its call go) to the commit of the step's result, by class, pc and outcome.")
+	m.modelDur = hist("neumann.model.duration", "Model instruction latency, from its model_call (the request going out) to the commit of the step's result, by class, pc and outcome; a preempted call's is the time it ran before it was cut off.")
 	m.toolDur = hist("neumann.tool.duration", "Tool call latency, tool_call to its result, by tool and outcome.")
 	m.throttle = hist("neumann.limiter.throttled", "Waits for room in the limiters longer than 50ms, by class.")
 	if err := errors.Join(errs...); err != nil {
@@ -224,7 +228,11 @@ func (m *Metrics) Observe(ev proto.Event) {
 	case proto.EvReconcileNeeded:
 		m.reconcile.Add(bg, 1, m.attrs("class", class, "cancelled", strconv.FormatBool(d.Cancelled)))
 	case proto.EvSteerDropped:
-		m.steers.Add(bg, 1, m.attrs("class", class))
+		m.steersDropped.Add(bg, 1, m.attrs("class", class))
+	case proto.EvSteerDelivered:
+		m.steersDelivered.Add(bg, 1, m.attrs("class", class))
+	case proto.EvPreempted:
+		m.preemptions.Add(bg, 1, m.attrs("class", class))
 	case proto.EvToolDenied:
 		m.denied.Add(bg, 1, m.attrs("tool", d.Tool, "by", d.By))
 	case proto.EvToolRewritten:
@@ -282,6 +290,11 @@ func (m *Metrics) fact(f fact) {
 		}
 		if s, ok := timed(f.start, f.end); ok {
 			m.modelDur.Record(bg, s, m.attrs("class", f.class, "pc", f.name, "outcome", f.outcome))
+		}
+		if fb := f.firstByte; fb != nil {
+			// A duration the core measured, not two commit times: it needs
+			// none.
+			m.firstByte.Record(bg, max(*fb, 0).Seconds(), m.attrs("class", f.class, "pc", f.name))
 		}
 	case factApprovalNeeded:
 		m.needed.Add(bg, 1, m.attrs("class", f.class, "tool", f.name))

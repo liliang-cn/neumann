@@ -582,9 +582,10 @@ http.Handle("/", observe.NewHandler(m, observe.HandlerOptions{Metrics: prom, Tok
 ```
 
 - **Metrics** (OpenTelemetry, `neumann.` prefix): tasks by outcome, model call
-  latency and failures by error class, tokens, retries, throttling, tool calls
-  by outcome (incl. denied, cached, late), approvals, compactions, migrations,
-  vCore changes; gauges for live/busy vCores, the window and breaker per
+  latency and failures by error class, time to the first streamed chunk,
+  preemptions, tokens, retries, throttling, tool calls by outcome (incl.
+  denied, cached, late), approvals, compactions, migrations, delivered and
+  dropped steers, vCore changes; gauges for live/busy vCores, the window and breaker per
   group, queues, limiter headroom, the cache and the process. Labels are
   bounded; nothing is labelled by task id. The full table is in
   `go doc github.com/liliang-cn/neumann/observe`.
@@ -593,7 +594,10 @@ http.Handle("/", observe.NewHandler(m, observe.HandlerOptions{Metrics: prom, Tok
   tool call, span events for retries, migrations and approvals. Span ids are
   derived from the task id and sequence numbers, so replaying the log after a
   crash rebuilds the same trace. Model spans start at the `model_call` event,
-  committed as the request goes out, so they measure the provider's latency.
+  committed as the request goes out, so they measure the provider's latency;
+  a `first_byte` event marks the first streamed chunk. A preempted call ends
+  with outcome `preempted` (not an error) and links to the task that took
+  the backend; its continuation carries `neumann.prefill`.
 - **Activity log**: one `key=value` line per notable event through
   `log/slog` (no prompts or arguments).
 - **HTTP** (`observe.NewHandler`, read-only): `/status`, `/queue`,

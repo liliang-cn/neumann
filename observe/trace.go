@@ -40,17 +40,32 @@ type TracerOptions struct {
 //
 //   - "task": the root span, accepted to done / failed / cancelled. Status
 //     error with the error text for a failed task. Attributes: task id,
-//     class, priority, outcome, stop reason, steps, confirmed tokens.
-//     Retries, throttling, compactions, migrations, refusals, recovery,
-//     reconcile and operator resolutions are events on it, and so are the
-//     tool policy's and the operators' decisions: tool_denied,
+//     class, priority (its last, after any priority_set; left out when the
+//     task's start was not seen), outcome, stop reason, steps, confirmed
+//     tokens. Retries, throttling, compactions, migrations, refusals,
+//     recovery, reconcile and operator resolutions are events on it, and so
+//     are the tool policy's and the operators' decisions: tool_denied,
 //     tool_rewritten, approval_needed (again after a restart, marked
 //     neumann.recovered) and approved, and the answer check's rejections
-//     (answer_rejected, with neumann.attempt and neumann.final).
+//     (answer_rejected, with neumann.attempt and neumann.final). So are
+//     preemptions (preempted: neumann.preempt.by, the preempting task's
+//     id, .kept, .ran_ms, .n), priority changes (priority_set:
+//     neumann.priority, neumann.priority_was) and steers with a sender
+//     reaching the model (steer_delivered: neumann.steer.seq, neumann.from).
 //   - "model" / "compact": one per model instruction, child of the task.
-//     It spans from when the task could run (its previous commit, after any
-//     backoff, or when the limiters let its call go) to the commit of the
-//     step's result, less the answer check's time (check_ms on the step). Status error with the error class for a failed call.
+//     It spans from its model_call, committed as the request goes out (in
+//     a log written before model_call existed: from when the task could
+//     run, its previous commit, after any backoff, or when the limiters let
+//     its call go), to the commit of the step's result, less the answer
+//     check's time (check_ms on the step).
+//     Status error with the error class for a failed call. A call
+//     preempted for a more urgent task (design §6.4) ends at its preempted
+//     event with neumann.outcome preempted, which is not an error, and
+//     carries neumann.preempt.kept and .n and a link to the preempting
+//     task's root span; a call that continues kept text carries
+//     neumann.prefill (its chars). A step with first_ms has a first_byte
+//     event that many milliseconds after the span's start (the request),
+//     telling the backend's queue from its generation.
 //     A compaction that was applied carries its compacted event's figures
 //     (neumann.compact.rounds, .messages_before, .messages_after,
 //     .tokens_before_est, .tokens_after_est, .chunk, .chunks), which are
@@ -168,7 +183,7 @@ func (t *Tracer) Shutdown(ctx context.Context) error {
 
 var scope = instrumentation.Scope{Name: ScopeName}
 
-func (t *Tracer) emit(taskID string, id, parent trace.SpanID, name string, start, end time.Time, st sdktrace.Status, attrs []attribute.KeyValue, events []sdktrace.Event) {
+func (t *Tracer) emit(taskID string, id, parent trace.SpanID, name string, start, end time.Time, st sdktrace.Status, attrs []attribute.KeyValue, events []sdktrace.Event, links ...sdktrace.Link) {
 	if start.IsZero() || end.IsZero() {
 		return
 	}
@@ -183,6 +198,7 @@ func (t *Tracer) emit(taskID string, id, parent trace.SpanID, name string, start
 		EndTime:              end,
 		Attributes:           attrs,
 		Events:               events,
+		Links:                links,
 		Status:               st,
 		Resource:             t.res,
 		InstrumentationScope: scope,
@@ -224,7 +240,33 @@ func (t *Tracer) fact(f fact) {
 		if f.ev.Kind == proto.EvCompacted {
 			attrs = append(attrs, compactAttrs(f.d)...)
 		}
-		t.emit(f.task, spanID(f.task, "step", f.seq), TaskSpanID(f.task), name, f.start, f.end, st, attrs, nil)
+		if f.prefill > 0 {
+			attrs = append(attrs, attribute.Int("neumann.prefill", f.prefill))
+		}
+		var links []sdktrace.Link
+		if f.outcome == outPreempted {
+			attrs = append(attrs, attribute.Int("neumann.preempt.kept", f.d.Kept), attribute.Int("neumann.preempt.n", f.d.N))
+			if f.d.By != "" {
+				// The task that took the backend: its root span, in its own trace.
+				links = append(links, sdktrace.Link{SpanContext: spanContext(f.d.By, TaskSpanID(f.d.By)),
+					Attributes: []attribute.KeyValue{attribute.String("neumann.link", "preempted_by")}})
+			}
+		}
+		var events []sdktrace.Event
+		if fb := f.firstByte; fb != nil && !f.start.IsZero() {
+			// From the request, which the span starts with (its model_call),
+			// and never past the span's end.
+			at := f.start.Add(max(*fb, 0))
+			if at.After(f.end) {
+				at = f.end
+			}
+			if at.Before(f.start) {
+				at = f.start
+			}
+			events = append(events, sdktrace.Event{Name: "first_byte", Time: at,
+				Attributes: []attribute.KeyValue{attribute.Int64("neumann.first_ms", fb.Milliseconds())}})
+		}
+		t.emit(f.task, spanID(f.task, "step", f.seq), TaskSpanID(f.task), name, f.start, f.end, st, attrs, events, links...)
 	case factApprovalEnd:
 		// The wait for an operator, from the call's first announcement.
 		t.emit(f.task, spanID(f.task, "approval", f.seq), TaskSpanID(f.task), "approval "+f.name, f.start, f.end, sdktrace.Status{},
@@ -272,6 +314,9 @@ func (t *Tracer) fact(f fact) {
 			attribute.Int("neumann.steps", f.steps),
 		}
 		attrs = append(attrs, tokenAttrs(f.total)...)
+		if f.priority != nil {
+			attrs = append(attrs, attribute.Int("neumann.priority", *f.priority))
+		}
 		if f.partial {
 			attrs = append(attrs, attribute.Bool("neumann.partial", true))
 		}
@@ -324,6 +369,17 @@ func markAttrs(f fact) []attribute.KeyValue {
 			a = append(a, attribute.Bool("neumann.cancelled", true))
 		}
 	case proto.EvRecovered:
+		add("neumann.from", d.From)
+	case proto.EvPreempted:
+		// by is the preempting task's id, as on the task span: not content.
+		add("neumann.preempt.by", d.By)
+		a = append(a, attribute.Int("neumann.preempt.kept", d.Kept), attribute.Int64("neumann.preempt.ran_ms", d.RanMS),
+			attribute.Int("neumann.preempt.n", d.N))
+	case proto.EvPrioritySet:
+		a = append(a, attribute.Int("neumann.priority", d.Priority), attribute.Int("neumann.priority_was", d.Was))
+	case proto.EvSteerDelivered:
+		// The sender, a name; never the steer's text.
+		a = append(a, attribute.Int64("neumann.steer.seq", d.SteerSeq))
 		add("neumann.from", d.From)
 	case proto.EvAnswerRejected:
 		// Never the reason or the feedback: they may quote the answer.

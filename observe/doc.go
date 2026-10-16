@@ -48,6 +48,8 @@
 //	neumann.model.failures       counter    {call}       class, error_class              a step ending in model_retry or failed
 //	neumann.model.duration       histogram  s            class, pc, outcome              see below
 //	neumann.model.retries        counter    {retry}      class, error_class, wait        model_retry
+//	neumann.model.preemptions    counter    {preemption} class                           preempted
+//	neumann.model.first_byte     histogram  s            class, pc                       step with first_ms: request → first streamed chunk
 //	neumann.model.tokens         counter    {token}      class, type                     usage: prompt, completion, reasoning, cached
 //	neumann.tool.calls           counter    {call}       tool, outcome                   tool_result, tool_denied, reconcile_needed, tool_late, task end
 //	neumann.tool.duration        histogram  s            tool, outcome                   tool_call → its result
@@ -58,6 +60,7 @@
 //	neumann.migrations.refused   counter    {refusal}    from, to, check                 migrate_refused
 //	neumann.reconcile.needed     counter    {call}       class, cancelled                reconcile_needed
 //	neumann.steers.dropped       counter    {steer}      class                           steer_dropped
+//	neumann.steers.delivered     counter    {steer}      class                           steer_delivered
 //	neumann.tool.denied          counter    {call}       tool, by                        tool_denied (by policy or operator)
 //	neumann.tool.rewritten       counter    {call}       tool                            tool_rewritten
 //	neumann.approvals.needed     counter    {call}       class, tool                     approval_needed (first announcement only)
@@ -68,7 +71,10 @@
 //	neumann.compaction.tokens    counter    {token}      class                           compacted: tokens_before_est - tokens_after_est
 //	neumann.answers.checked      counter    {answer}     class, outcome                  answer_rejected, done of a checked answer
 //
-// outcome of a model step: ok, error, cancelled; error_class is the
+// outcome of a model step: ok, error, cancelled, preempted (cut off for a
+// more urgent task of its group, design §6.4: not a failure, so not in
+// neumann.model.failures; the task runs the step again, continuing the
+// kept text); error_class is the
 // model_retry class (rate_limited, quota_exhausted, overload, transient,
 // truncated, ...) or, for a call that failed its task, the stop reason. A
 // tool call's outcome: ok, error, cached (served by L2), denied (tool_denied:
@@ -91,7 +97,15 @@
 // provider's.
 // A log written before model_call existed falls back to the moment the task
 // could run (its previous commit, the end of its backoff, or the throttled
-// event that let its call go), which includes those waits.
+// event that let its call go), which includes those waits. A preempted
+// call's duration (outcome preempted) is the time it held the backend before
+// it was cut off; its continuation is another call, timed from its own
+// model_call.
+//
+// neumann.model.first_byte: first_ms of a streamed step, from the request
+// to its first chunk, for every outcome. On a local backend it tells the
+// time spent queued in the backend and reading the prompt from the time
+// spent generating.
 //
 // Read at collection (gauges, and counters the machine keeps):
 //

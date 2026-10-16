@@ -15,12 +15,15 @@ import (
 //
 //   - info: lifecycle — accepted, done, cancelled, compacted, migrated,
 //     recovered, resolved, approved, tool_rewritten, answer_rejected,
-//     group_up, core_up, core_down, and kinds this package does not know;
+//     preempted (by, kept, ran_ms, n), priority_set (priority, was),
+//     steer_delivered (from), group_up, core_up, core_down, and kinds this
+//     package does not know;
 //   - warn: model_retry, throttled, group_down, migrate_refused,
 //     steer_dropped, tool_late, tool_denied, and approval_needed (an
 //     operator must answer it: Machine.Approve);
 //   - error: failed, reconcile_needed;
-//   - debug: step, usage, tool_call, tool_result, answer.
+//   - debug: step (with first_ms and prefill when the core measured them),
+//     usage, tool_call, tool_result, answer.
 //
 // Lines carry no task content: no prompts, answers, tool arguments or
 // results, nor the reasons a tool policy, an operator or an answer check
@@ -70,6 +73,12 @@ func (g *Log) Observe(ev proto.Event) {
 		a = append(a, slog.Int("priority", d.Priority))
 	case proto.EvStep:
 		a = append(a, slog.String("pc", d.PC), slog.Int("core", d.Core))
+		if d.FirstMS != nil {
+			a = append(a, slog.Int64("first_ms", *d.FirstMS))
+		}
+		if d.Prefill > 0 {
+			a = append(a, slog.Int("prefill", d.Prefill))
+		}
 	case proto.EvUsage:
 		a = append(a, slog.Int("prompt_tokens", d.PromptTokens), slog.Int("completion_tokens", d.CompletionTokens),
 			slog.Int("reasoning_tokens", d.ReasoningTokens), slog.Int("cached_tokens", d.CachedTokens))
@@ -109,6 +118,11 @@ func (g *Log) Observe(ev proto.Event) {
 		a = append(a, slog.Int64("waited_ms", d.WaitedMS))
 	case proto.EvSteerDelivered, proto.EvSteerDropped:
 		str("from", d.From) // the steer's sender, a name; never its text
+	case proto.EvPreempted:
+		str("by", d.By) // the preempting task
+		a = append(a, slog.Int("kept", d.Kept), slog.Int64("ran_ms", d.RanMS), slog.Int("n", d.N))
+	case proto.EvPrioritySet:
+		a = append(a, slog.Int("priority", d.Priority), slog.Int("was", d.Was))
 	case proto.EvCoreUp, proto.EvCoreDown:
 		a = append(a, slog.Int("core", d.Core), slog.String("reason", d.Reason), slog.Int("live", d.Live))
 	case proto.EvGroupDown:

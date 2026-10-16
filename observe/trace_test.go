@@ -27,7 +27,9 @@ type span struct {
 	Status        codes.Code
 	Desc          string
 	Attrs         map[string]string
-	Events        []string // name@offset-from-t0
+	Events        []string            // name@offset-from-t0
+	EventAttrs    []map[string]string // each event's attributes, in order
+	Links         []string            // trace/span of each link
 	TraceSampled  bool
 	ParentIsValid bool
 }
@@ -45,6 +47,14 @@ func spans(exp *tracetest.InMemoryExporter) []span {
 		}
 		for _, e := range s.Events {
 			sp.Events = append(sp.Events, fmt.Sprintf("%s@%v", e.Name, e.Time.Sub(t0)))
+			a := map[string]string{}
+			for _, kv := range e.Attributes {
+				a[string(kv.Key)] = kv.Value.Emit()
+			}
+			sp.EventAttrs = append(sp.EventAttrs, a)
+		}
+		for _, l := range s.Links {
+			sp.Links = append(sp.Links, l.SpanContext.TraceID().String()+"/"+l.SpanContext.SpanID().String())
 		}
 		out = append(out, sp)
 	}
