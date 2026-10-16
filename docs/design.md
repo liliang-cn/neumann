@@ -596,7 +596,7 @@ type RateReporter interface { // 可选
 ```go
 m.Pause() / m.Resume()          // 全部 vCore 执行完当前指令后停止取指
 m.Drain(ctx)                    // 拒绝新 Submit，等所有任务结束
-m.Suspend(id) / m.ResumeTask(id)
+m.Suspend(id) / m.ResumeTask(id) // 9.9
 m.SetPriority(id, p)
 m.SetClass(id, class)           // 手动迁移，同样做 6.3 的校验
 m.Cancel(id)
@@ -686,6 +686,35 @@ type AnswerVerdict struct { // 零值 = 通过
 - **耗时**：检查占用的时间（机器时钟）记在这一步的 `step` 事件上（`check_ms`，没有检查时不出现）：`step` 和结果同一次提交，检查让这次提交晚了这么久；`observe` 用它把模型指令的时延和 span 提前结束，`neumann.model.duration` 仍是服务商的时延。
 - 观测（第 14 节）：`neumann.answers.checked`（按类、`outcome`：`passed` / `failed_open` / `rejected` / `failed`）；`answer_rejected` 是任务根 span 上的事件（`neumann.attempt`、`neumann.final`），活动日志 info 一行（`attempt`、`final`），`done` 行带 `checked`、`check_failed`、`check_error`；原因、反馈、答案都不进指标、trace 和日志。
 - 答案检查只能在 Go 里配置（`Config.AnswerCheck`），stdio 前端不提供。
+
+### 9.9 挂起与恢复
+
+```go
+m.Suspend(ctx, id) error     // 提交后返回；ErrNotFound / ErrFinished
+m.ResumeTask(ctx, id) error  // 提交后返回；ErrNotFound / ErrFinished / ErrNotSuspended
+```
+
+挂起是操作员把一个任务"拿下 CPU、放在一边"：它不再被调度，直到恢复。和取消一样，两条指令都先作为中断提交（中断表的新种类 `suspend`、`resume`），提交之后才返回，崩溃后仍然有效。
+
+**落地**：挂起不一定立刻生效，它在任务的下一个指令边界落地，由当时持有任务的一方执行：
+
+- 任务在调度器手里、没人在干活（就绪、退避、熔断等待）：挂起方取出任务，直接提交 `Suspended`（退避定时器停掉，`WakeAt` 不保留，恢复后直接就绪）。
+- 在 vCore 上、模型调用在途：像抢占一样打断这次调用（6.4），用 `errSuspended` 作为原因取消这次调用的 context，按 `keepPartial` 保留已收到的正文或思考，提交 `Suspended`。不计 `Preempts`。还在限流器上等额度时同样打断，什么都没发出。压缩调用不打断，压缩结束后的那次提交落地。
+- 在 vCore 上、其他指令（派发工具、答案检查）：这条指令的提交落地。
+- 等工具（`Waiting(IO)`）：工具不打断（可能有副作用），整轮结果回来后的那次提交改为 `Suspended`。
+- 待批准、待核对：照常等操作员；决定到了，那次提交改为 `Suspended`，而不是 `Ready`。
+
+落地的提交把挂起中断标为已送达，带 `suspended` 事件（`{was, kept, kept_think}`：`was` 是落地前在做什么，`ready` / `backoff` / `group` / `model` / `tools` / `approval` / `reconcile` / `check`；后两项只在打断模型调用时非 0）。
+
+**恢复**：任务是 `Suspended` 时，恢复方从等待集合取出，提交 `Ready`（`ReadySince = now`）和 `resumed`，交还调度器，触发一次抢占检查（6.4）。挂起还没落地（任务在 vCore 上或等工具）时，恢复抵消它：落地方按序号依次看待送达的挂起、恢复中断，最后一条是恢复就不挂起，两条都标为已送达，事件是 `resumed`（`{pending: true}`），任务照常往下走。既没挂起、也没有待落地的挂起：`ErrNotSuspended`。重复挂起一个已挂起的任务：成功，什么都不提交。
+
+**挂起期间**：Deadline 照常触发（9.4），取消照常生效（9.5：由取消方从等待集合取出做最终提交）。插话照收，留在中断表里，恢复后的第一步送达。`SetPriority`、`SetClass` 可以改挂起中的任务。挂起的任务仍计入未结束任务数（9.2）。保留的 `Partial` / `PartialThink` 恢复后续写，规则同 6.4。
+
+**持久化**：`Suspended` 重启后仍是 `Suspended`（4.5）。有待落地的挂起中断的任务，恢复流程按上面的规则直接落地；`Running` 中崩溃的任务按 4.5 重做时，先看挂起中断。
+
+**观测**：`Status` / `Queue` 带挂起数；`observe` 在根 span 下开一个 `suspended` span（`suspended` → `resumed` 或终态，带 `was`），根 span 上记 `suspended`、`resumed` 事件；仪表 `neumann.tasks.suspended`；`Log` 两行 info。
+
+stdio：`suspend`、`resume`（`task_id`），错误码 `not_suspended`。
 
 ## 10. 总线与设备
 
@@ -871,7 +900,7 @@ type Event struct {
 
 `Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
-任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_delivered`（带发送方的插话送达，10.1）、`steer_dropped`（带发送方的多一个 `from`）、`preempted`（`{by, kept, kept_think, ran_ms, n}`，6.4）、`priority_set`（`{priority, was}`，6.4）。`step` 在流式调用收到第一块数据时带 `first_ms`（发出到第一块的毫秒数），用来区分后端排队和生成；续写的调用带 `prefill`（续写前缀的字符数），接着想的调用带 `prefill_think`（思考前缀的字符数）。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
+任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_delivered`（带发送方的插话送达，10.1）、`steer_dropped`（带发送方的多一个 `from`）、`preempted`（`{by, kept, kept_think, ran_ms, n}`，6.4）、`priority_set`（`{priority, was}`，6.4）、`suspended`（`{was, kept, kept_think}`，9.9）、`resumed`（`{pending}`，9.9）。`step` 在流式调用收到第一块数据时带 `first_ms`（发出到第一块的毫秒数），用来区分后端排队和生成；续写的调用带 `prefill`（续写前缀的字符数），接着想的调用带 `prefill_think`（思考前缀的字符数）。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
 
 `compacted`：`{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（5.3）。`step` 的 `pc` 为 `model`、`tools` 或 `compact`。`model_retry` 的 `class` 可以是 `context_length`（`wait = "compact"`）。
 
@@ -883,7 +912,7 @@ type Event struct {
 
 stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。`steer` 可带 `from`（发送方，10.1）；stdio 的对端就是操作员，它给的 `from` 不做核实。
 
-操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`priority`（`task_id`、`priority`）对应 `m.SetPriority`，任务正在执行时 `task_busy`。`suspend`、`resume` 仍回 `unsupported`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`，`args` 必须是对象）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
+操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`priority`（`task_id`、`priority`）对应 `m.SetPriority`，任务正在执行时 `task_busy`。`suspend`、`resume`（`task_id`）对应 `m.Suspend` / `m.ResumeTask`（9.9），不在挂起中的任务恢复时错误码 `not_suspended`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`，`args` 必须是对象）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
 
 实现在 `proto/jsonl`（线格式的完整说明在它的包文档里），`cmd/neumann` 把它接到 stdin/stdout。回复和事件共用 stdout，每行第一个字段 `"type"` 是 `"reply"` 或 `"event"`：宿主进程（Node、Python）天然只有 stdout，多开一个 fd 两边都别扭；共用一个流还给出了顺序，`subscribe` 的回复恰好落在旧流最后一个事件和新流第一个事件之间。指令可带 `"id"`，回复原样带回；指令按到达顺序逐条执行。读得慢的一方不阻塞机器：事件按输出写出的速度从主存读，回复优先于积压的事件写出。
 
@@ -1019,6 +1048,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
    评审后修正：登记之后立刻查一次（取到任务到发出之间就绪的更急任务）、熔断探测不被抢、空出的 vCore 先取为之让出的任务、截断只看续写这次自己的产出、被抢与流中断保留 `Partial` 的规则一致（`keepPartial`）。验证：`TestPreemptACallTakenAheadByAging`、`TestPreemptACallThatWaitedForRoom`、`TestFreedVCoreGoesToTheUrgentTask`、`TestProbeIsNeverPreempted`、`TestThinkingOnlyContinuationIsRedone`、`TestAgedTaskDoesNotPreempt` 断言空出的 vCore 先跑谁、`TestKeepPartial` / `TestContinuedJoins`（core）。
    接着想：TCB 的 `PartialThink`、`Caps.ThinkPrefill`，OpenAI 兼容适配器的 `ThinkTags`（渲染与切分，含流式跨块标签），`-local` 设 `ThinkTags` 并打开组的 `Preempt`；`preempted` 的 `kept_think`、`step` 的 `prefill_think`；`sim.Think` / `sim.PrefillThink` / `sim.ContinueThink`，`sim.Model` 先流思考后流正文。验证：`TestPreemptedThinkingIsContinued`（思考中被抢：留下思考，下次请求以只有思考的 assistant 消息结尾，答案的 reasoning 是两段接起来的；正文已开始：只留正文）、`TestThinkTagsContinueAThought`、`TestThinkTagsSplitTheStream`、`TestThinkSplitAtEveryOffset`、`TestThinkTagsLeaveOtherAnswersWhole`、`TestThinkTagsWithABackendThatParsesThinking`、`TestAThoughtThatStopsWithoutAnAnswer`（openai）、`TestAThoughtThatStopsIsRedoneWithoutThinking`、`TestLocal`（cmd）。
    真实验收（`acceptance/local`，`NEUMANN_ACCEPT_LIVE=1`，本机 Ollama `qwen3.5:9b-mlx`，单 vCore、`Preempt`、`-local` 的适配器配置）：后台任务（17 × 23）思考 40 块后提交交互任务，后台调用立即被抢（已跑过 2 秒的量子），只留思考，交互任务答完，后台任务下一次调用带 `prefill_think`，接着想完、答 391。两次运行：被抢于 5.5 秒 / 2.1 秒，`kept_think` 168 / 159、`kept` 0，续写调用首块 393 / 430ms，交互任务 39 / 24 秒答完，后台任务 2 分 29 秒 / 1 分 27 秒完成；第二次断言答案的 reasoning 只开头一次（"Thinking Process:" 只出现一次，没有从头重想）。`observe` 的 span / 指标 / 日志在 `obs` 分支里做；`kept_think`、`prefill_think` 待它同步。
+
+9. **挂起与恢复**（9.9）：中断表的 `suspend` / `resume`、各状态下的落地、打断在途模型调用（复用 6.4 的打断与 `keepPartial`）、恢复抵消未落地的挂起、`suspended` / `resumed` 事件、`ErrNotSuspended`、重启、stdio、观测。
+   计划的验证：`TestSuspendReadyTask`、`TestSuspendBackoffAndGroupWait`、`TestSuspendInterruptsTheModelCall`（保留正文、恢复后续写）、`TestSuspendWhileThinkingKeepsTheThought`、`TestSuspendWaitsForTools`、`TestSuspendDuringApproval`、`TestSuspendDuringCompaction`、`TestResumeBeforeSuspendLands`、`TestSuspendResumeSuspendInOrder`、`TestDeadlineWhileSuspended`、`TestCancelWhileSuspended`、`TestSteerWhileSuspended`、`TestSetPriorityAndClassWhileSuspended`、`TestResumeTriggersPreemption`、`TestSuspendedSurvivesARestart`、`TestCrashAtEveryCommitPointWithASuspend`（各落地路径与恢复，每个提交点前后各崩一次）、存储一致性套件的新中断种类、stdio `suspend` / `resume`、`observe` 的 span / 仪表 / 日志。
 
 ## 18. 测试
 

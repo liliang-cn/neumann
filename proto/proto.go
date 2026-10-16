@@ -53,6 +53,13 @@ const (
 	EvPreempted = "preempted"
 	// An operator changed a task's priority: {priority, was} (design §6.4).
 	EvPrioritySet = "priority_set"
+	// An operator's suspend landed: the task is Suspended and not scheduled
+	// until resumed. {was, kept, kept_think}: what the task was doing, and
+	// the text or thinking kept from a model call it interrupted (design §9.9).
+	EvSuspended = "suspended"
+	// The task is Ready again after a suspend, or a resume cancelled a
+	// suspend that had not landed yet ({pending: true}) (design §9.9).
+	EvResumed = "resumed"
 
 	// Recovery after a restart, and an operator's answer for a call whose
 	// outcome became unknown.
