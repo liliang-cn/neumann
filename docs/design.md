@@ -767,9 +767,11 @@ type Classifier interface{ Classify(err error) ErrClass }
 type RateReporter interface{ RateInfo(resp *Response, err error) *RateInfo }
 ```
 
-`Caps` 另有三项，给本地后端用（6.4）：`Parallel`（后端同时处理的请求数，0 = 未知，约束组的窗口上限）、`Prefill`（以 assistant 消息结尾的请求会被续写，只返回接下来的部分）、`ThinkOff`（`Request.NoThink` 能关掉思考）。`Request.NoThink` 为真时适配器关掉思考：OpenAI 兼容适配器发配置的 `ThinkOff` 值（Ollama 上是 `reasoning_effort: "none"`，实测只生成 3 个 token 就作答），没配置时 `Caps.ThinkOff` 为假、这个字段被忽略；Anthropic 适配器不发 `thinking`。
+`Caps` 另有三项，给本地后端用（6.4）：`Parallel`（后端同时处理的请求数，0 = 未知，约束组的窗口上限）、`Prefill`（以 assistant 消息结尾的请求会被续写，只返回接下来的部分）、`ThinkOff`（`Request.NoThink` 能关掉思考）。`Request.NoThink` 为真时适配器关掉思考：OpenAI 兼容适配器发配置的 `ThinkOff` 值（Ollama 上是 `reasoning_effort: "none"`，实测只生成 3 个 token 就作答），没配置时 `Caps.ThinkOff` 为假、这个字段被忽略；Anthropic 适配器不发 `thinking`（配了 `ThinkingBudget` 也不发），所以它的 `Caps.ThinkOff` 恒为真。Anthropic 适配器的 `Caps.Prefill` 为假：Anthropic 拒绝以空白结尾的 assistant 前缀、开着思考时不许前缀，有的模型根本不收前缀，被抢的调用在这个组上从头生成。
 
 OpenAI 兼容适配器的本地选项：`Parallel`、`Prefill`、`ThinkOff` 原样进 `Caps`；超时分三种，`Timeout`（整次调用，默认 5 分钟，0 = 不限）、`FirstByteTimeout`（发出到第一个字节，默认 0 = 只受 `Timeout` 约束）、`IdleTimeout`（流式时相邻两块之间，默认 0 = 不限）。本地后端处理长提示词时首字节可能很慢，生成时却一直有数据，所以本地配置是 `Timeout = 0`、首字节 10 分钟、空闲 2 分钟，失控的生成靠输出上限截住（13）。三种超时都按单次请求超时处理：调用方还有时间，就是 `Transient`；流中途超时包 `ErrResponseLost`，已收到的正文进 `Partial`（6.4）。
+
+实现：三种超时由适配器自己用请求的 context 实现（以 `*openai.TimeoutError` 为原因取消，`Which` 为 `call` / `first byte` / `idle`），不再用 `http.Client.Timeout`，所以共用的传输层（HTTP/2 连接、HTTP/3 回退）不受影响；`HTTP.Timeout` 若另外设了，叠加生效。错误链里是 `*TimeoutError`，没有 `context.Canceled`，所以不会被误判为取消；调用方的 ctx 已结束时仍按取消处理。"第一个字节"指响应体的第一个字节：本地后端排队时可能先回响应头、正文迟迟不来，只看响应头量不到排队。非流式调用的响应体要等整个回答生成完才来，所以对 `Call` 来说 `FirstByteTimeout` 约束的是整次生成。`IdleTimeout` 从第一个字节之后开始，每次读到数据重新计时。响应头之前超时不包 `ErrResponseLost`（和原来的 `http.Client.Timeout` 一样），收到响应头之后超时包。流式增量的思考除了 `reasoning_content`（DeepSeek）也认 Ollama 的 `reasoning`，作为 `Delta.Reasoning` 报出；回答本身不带思考。
 
 错误分类：
 
@@ -896,7 +898,7 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 - 抢占与续写（6.4）：`preempted` 结束它那条模型指令的 span，`outcome = preempted`、不是错误，带 `neumann.preempt.kept`、`.n`，并链接（span link）到抢它的任务的根 span；根 span 上记一个 `preempted` 事件（`by`、`kept`、`ran_ms`、`n`）；`neumann.model.preemptions`（按类）；`Log` 以 info 写一行（`by`、`kept`、`ran_ms`、`n`）。被抢的调用在 `neumann.model.calls` 和 `neumann.model.duration` 里记 `outcome = preempted`：不算失败（不进 `neumann.model.failures`），耗时是它占着后端、被切断之前跑的时间，和正常回答的时延分开统计；续写是另一次调用，从它自己的 `model_call` 计时。续写的模型 span 带 `neumann.prefill`。`priority_set` 是根 span 上的事件（`neumann.priority`、`neumann.priority_was`）和一行 info 日志；根 span 的 `neumann.priority` 是任务最后的优先级（从中途接着读、没看到 `accepted` 也没看到 `priority_set` 时不带）。`step` 的 `first_ms` 是模型 span 上的 `first_byte` 事件（span 起点即请求发出之后 `first_ms` 毫秒，不超出 span）和直方图 `neumann.model.first_byte`（秒，按类、`pc`，各种结果都记，包括被抢的）。`steer_delivered` 是根 span 上的事件（`neumann.steer.seq`、`neumann.from`）和 `neumann.steers.delivered`（按类）。这些都只来自事件的数据和提交时刻，从 0 补读与在线导出逐字段相同。
 - `NewHandler`：只读的 HTTP 视图，`GET /status`、`/queue`、`/tasks/{id}`（TCB + 调用记录）、`/events?from_seq=N`（Server-Sent Events，先补读再在线，`Last-Event-ID` 续读，`task=` 过滤），可选 `/metrics`（OTel 的 Prometheus 导出器）和 `/debug/pprof/`（默认关；自己实现，不引入 `net/http/pprof`，它会注册到 `DefaultServeMux`）。没有任何会改状态的端点，其他方法 405。`/tasks`、`/events` 带任务内容（提示词、工具参数和结果），只能给操作员看；可以要求 bearer token。指标、trace、活动日志都不带任务内容。
 
-`cmd/neumann`：`-observe-addr`（空 = 关）在那里挂 `NewHandler`，`-metrics` 加 `/metrics`，`-pprof` 加 pprof，`NEUMANN_OBSERVE_TOKEN` 设了就要求 token；设了标准的 `OTEL_EXPORTER_OTLP_ENDPOINT` 时 trace 和指标经 OTLP/HTTP 导出，`service.name` 为 `neumann`。`-local` 一次配好本地后端：`Parallel = 1`（`-parallel` 可改，`Cores` 取它）、`Prefill`、`Preempt`、`ThinkOff = "none"`、超时按 11 节的本地配置、默认输出上限 8192（`-max-tokens` 可改）。观测从启动时的日志末尾开始；退出时先等机器停、观测读到日志末尾，再 flush 导出器，每步有时限。
+`cmd/neumann`：`-observe-addr`（空 = 关）在那里挂 `NewHandler`，`-metrics` 加 `/metrics`，`-pprof` 加 pprof，`NEUMANN_OBSERVE_TOKEN` 设了就要求 token；设了标准的 `OTEL_EXPORTER_OTLP_ENDPOINT` 时 trace 和指标经 OTLP/HTTP 导出，`service.name` 为 `neumann`。`-local` 一次配好本地后端：`Parallel = 1`（`-parallel` 可改，`Cores` 取它）、`Prefill`、`Preempt`、`ThinkOff = "none"`、超时按 11 节的本地配置、默认输出上限 8192（`-max-tokens` 可改）。显式给了 `-cores`、`-max-tokens`（命令行或环境变量）就用给的；`-base-url` 默认 Ollama 的 `http://127.0.0.1:11434/v1`；只能配 `-provider openai`。环境变量 `NEUMANN_LOCAL=1`、`NEUMANN_PARALLEL`。不带 `-local` 的 `-parallel` 只设适配器的 `Parallel`。观测从启动时的日志末尾开始；退出时先等机器停、观测读到日志末尾，再 flush 导出器，每步有时限。
 
 ## 15. 公开 API
 

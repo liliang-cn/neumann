@@ -146,6 +146,16 @@ any model): set `ContextWindow` on the adapter so tasks are compacted before
 they outgrow it. Without it, a task is compacted only once the provider
 rejects a request as too long. `anthropic.New` assumes 200000 tokens.
 
+A local backend (Ollama, llama.cpp, LM Studio) needs a few more settings on
+the OpenAI-compatible adapter: `Parallel` (how many requests it serves at
+once; Ollama's MLX runner serves one), `Prefill` (it continues a trailing
+assistant message), `ThinkOff` (the `reasoning_effort` value that turns
+thinking off, `"none"` on Ollama), and timeouts that fit it: `Timeout` bounds
+the whole call (5 minutes by default, 0 for none), `FirstByteTimeout` the wait
+for the first byte of the answer, `IdleTimeout` the gap between stream chunks.
+The package documentation of `model/openai` shows a local configuration;
+`cmd/neumann -local` sets it in one switch.
+
 Model output streams by default when the adapter supports it. `m.Deltas(ctx)`
 is a live preview of it; it is not committed and a slow reader may miss
 pieces. The committed `answer` event is the record.
@@ -563,6 +573,18 @@ means the instruction is committed. The other kinds (`status`, `queue`,
 documented in package `proto/jsonl`. Run `go run ./cmd/neumann -help` for
 every flag and its environment variable. Without `-store` state is in memory
 and nothing is durable.
+
+For a local model, `-local` configures the backend in one switch: one request
+at a time (`-parallel N` for more) and as many vCores, continuation of a
+cut-off answer, thinking turned off with `reasoning_effort: "none"` when a
+turn is cut off while still thinking, 10 minutes to the first byte and 2
+minutes between stream chunks with no limit on the whole call, and an output
+cap of 8192 tokens unless `-max-tokens` is given. The base URL defaults to
+Ollama's:
+
+```
+NEUMANN_API_KEY=ollama go run ./cmd/neumann -local -model qwen3.5:9b-mlx -store state.db
+```
 
 ## Observability
 
