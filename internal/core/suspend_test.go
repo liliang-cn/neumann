@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -64,26 +65,57 @@ func TestLandSuspend(t *testing.T) {
 	}
 }
 
-// suspendedAfter: the last suspend or resume decides, the state when there
-// is none.
-func TestSuspendedAfter(t *testing.T) {
-	sus := mem.Interrupt{Kind: mem.InterruptSuspend}
-	res := mem.Interrupt{Kind: mem.InterruptResume}
-	steer := mem.Interrupt{Kind: mem.InterruptSteer}
+// suspendedNow: the last suspend or resume ever committed decides, landed
+// or not; the state only when there is none (design §9.9).
+func TestSuspendedNow(t *testing.T) {
+	sus := mem.Interrupt{TaskID: "t1", Kind: mem.InterruptSuspend}
+	res := mem.Interrupt{TaskID: "t1", Kind: mem.InterruptResume}
+	steer := mem.Interrupt{TaskID: "t1", Kind: mem.InterruptSteer, Text: "x"}
 	for _, c := range []struct {
+		name    string
 		state   task.State
-		pending []mem.Interrupt
+		ints    []mem.Interrupt
+		applied int // how many of ints a landing has applied
 		want    bool
 	}{
-		{task.Ready, nil, false},
-		{task.Suspended, []mem.Interrupt{steer}, true},
-		{task.Running, []mem.Interrupt{sus, steer}, true},
-		{task.Running, []mem.Interrupt{sus, res}, false},
-		{task.Suspended, []mem.Interrupt{res}, false},
-		{task.Suspended, []mem.Interrupt{res, sus}, true},
+		{"nothing", task.Ready, []mem.Interrupt{steer}, 0, false},
+		{"suspended, nothing committed", task.Suspended, nil, 0, true},
+		{"a suspend pending", task.Running, []mem.Interrupt{sus, steer}, 0, true},
+		{"a suspend landed", task.Suspended, []mem.Interrupt{sus}, 1, true},
+		{"suspend, resume pending", task.Running, []mem.Interrupt{sus, res}, 0, false},
+		// The landing of the resume applied both; a state read just before
+		// it still said Suspended.
+		{"suspend, resume landed", task.Suspended, []mem.Interrupt{sus, res}, 2, false},
+		{"suspend landed, resume pending", task.Suspended, []mem.Interrupt{sus, res}, 1, false},
+		{"resume landed, suspend pending", task.Ready, []mem.Interrupt{sus, res, sus}, 2, true},
 	} {
-		if got := suspendedAfter(c.state, c.pending); got != c.want {
-			t.Errorf("%s %v: %v", c.state, c.pending, got)
+		e, store, _ := newTestEnv(t, nil)
+		tc := newTask(t, e, store, "q")
+		for _, in := range c.ints {
+			if _, err := store.Commit(bg, mem.CommitSet{NewInterrupts: []mem.Interrupt{in}}); err != nil {
+				t.Fatal(err)
+			}
 		}
+		tc.State, tc.Version = c.state, 2
+		var applied []int64
+		for i := range c.applied {
+			applied = append(applied, int64(i+1))
+		}
+		if _, err := store.Commit(bg, mem.CommitSet{Task: tc, Applied: applied}); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := e.suspendedNow(bg, "t1"); err != nil || got != c.want {
+			t.Errorf("%s: %v, %v", c.name, got, err)
+		}
+	}
+	e, store, _ := newTestEnv(t, nil)
+	tc := newTask(t, e, store, "q")
+	tc.State, tc.Version = task.Done, 2
+	store.Commit(bg, mem.CommitSet{Task: tc})
+	if _, err := e.suspendedNow(bg, "t1"); !errors.Is(err, mem.ErrFinished) {
+		t.Errorf("finished: %v", err)
+	}
+	if _, err := e.suspendedNow(bg, "nope"); !errors.Is(err, mem.ErrNotFound) {
+		t.Errorf("unknown: %v", err)
 	}
 }

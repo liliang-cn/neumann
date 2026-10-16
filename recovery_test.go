@@ -95,7 +95,42 @@ type world struct {
 	suspend   bool
 	suspTools atomic.Bool
 	suspCall  atomic.Bool
+	// suspendOn: an operator suspends the task (once across processes) when
+	// it starts to wait: for approval ("approval", before approving it), a
+	// backoff ("backoff") or its group ("group"); it resumes it whenever it
+	// is suspended. deny: the operator denies the held calls.
+	suspendOn string
+	suspWait  atomic.Bool
+	deny      bool
 }
+
+// waitSuspends reports whether ev starts the wait the operator suspends the
+// task in (suspendOn), the first time it does across processes.
+func (w *world) waitSuspends(ev proto.Event) bool {
+	var d struct {
+		Wait string `json:"wait"`
+	}
+	json.Unmarshal(ev.Data, &d)
+	switch {
+	case w.suspendOn == "approval" && ev.Kind == proto.EvApprovalNeeded:
+	case w.suspendOn != "" && ev.Kind == proto.EvModelRetry && d.Wait == w.suspendOn:
+	default:
+		return false
+	}
+	return w.suspWait.CompareAndSwap(false, true)
+}
+
+// decision is the operator's answer to a held call.
+func (w *world) decision() neumann.ApprovalDecision {
+	if w.deny {
+		return neumann.ApprovalDecision{Verdict: neumann.ApproveDeny, Reason: "not today"}
+	}
+	return neumann.ApprovalDecision{}
+}
+
+// resumer reports whether an operator suspends the task in this world, and
+// so resumes it.
+func (w *world) resumer() bool { return w.suspend || w.suspendOn != "" }
 
 // suspendible is the suspend scenario's model: it continues a prefill, and
 // streams an answer in two halves; between them, in pay-1's first answer
@@ -121,6 +156,29 @@ func (p suspendible) Stream(ctx context.Context, req model.Request, emit func(mo
 	}
 	emit(model.Delta{Text: string(r[len(r)/2:])})
 	return resp, nil
+}
+
+// payOnlyModel pays, then answers: a round of one call, which a denial
+// answers outright.
+func payOnlyModel(req model.Request) (model.Response, error) {
+	if sim.ToolRounds(req) == 0 {
+		return sim.CallTools("dev_pay"), nil
+	}
+	return sim.Reply("done"), nil
+}
+
+// backoffModel pays, then fails transiently once with a retry-after of ten
+// minutes (time runs: about half a second), then answers.
+func backoffModel(w *world) modelFn {
+	return func(req model.Request) (model.Response, error) {
+		if sim.ToolRounds(req) == 0 {
+			return sim.CallTools("dev_pay", "dev_look"), nil
+		}
+		if w.fails.Add(1) == 1 {
+			return model.Response{}, sim.Fail(model.Transient, 10*time.Minute)
+		}
+		return sim.Reply("done"), nil
+	}
 }
 
 // suspendModel pays with dev_spay and reads, then answers "done"; a call
@@ -304,6 +362,11 @@ type crashScenario struct {
 	// left the task Suspended.
 	suspend bool
 	parked  *atomic.Int32
+	// suspendOn, deny: an operator suspends the task as it starts to wait
+	// (world.suspendOn) and resumes it; was is what the clean run's one
+	// suspended event must say the task was doing.
+	suspendOn, was string
+	deny           bool
 	// wide bounds how many of the sweep's runs share the disk at once; 0:
 	// as many as run in parallel. A scenario with many commits per run
 	// needs it: each commit is a full fsync, and a few dozen runs at once
@@ -403,6 +466,22 @@ var (
 	// the resume and its landing are commit points like any other.
 	suspendScenario = crashScenario{name: "suspend", model: fixed(suspendModel), suspend: true, maxPays: 1, parked: new(atomic.Int32),
 		ends: map[task.State]string{task.Done: "end_turn"}}
+	// The operator suspends the task while it waits: for the payment's
+	// approval (then approves it, and the suspend lands when the round's
+	// results are in; or denies it, the round's only call, and it lands in
+	// the denial's commit),
+	// for a backoff after the payment, and for its group, out of quota after
+	// the payment. Each time it resumes the task.
+	suspendWaitScenarios = []crashScenario{
+		{name: "approval_allowed", model: fixed(payModel), approved: new(atomic.Int32), suspendOn: "approval", was: "tools",
+			maxPays: 1, parked: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}},
+		{name: "approval_denied", model: fixed(payOnlyModel), approved: new(atomic.Int32), suspendOn: "approval", deny: true, was: "approval",
+			maxPays: 0, parked: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}},
+		{name: "backoff", model: backoffModel, flaky: true, retries: "transient", suspendOn: "backoff", was: "backoff",
+			maxPays: 1, parked: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}},
+		{name: "group", model: quotaModel, retries: "quota_exhausted", suspendOn: "group", was: "group",
+			maxPays: 1, parked: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}},
+	}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
 	}, maxPays: 1, retries: "quota_exhausted", class: "little", moved: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
@@ -620,6 +699,7 @@ type crashRun struct {
 	preempted int      // preempted events of the task, both processes
 	prefilled int      // its steps that continued a prefill
 	suspended int      // suspended events of the task, both processes
+	was       []string // what each says the task was doing
 }
 
 // runAndCrash runs sc on a machine that dies after n commits (after: right
@@ -638,6 +718,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	w.preempt = sc.preempt
 	w.suspend = sc.suspend
+	w.suspendOn, w.deny = sc.suspendOn, sc.deny
 
 	s1, err := sqlite.Open(path)
 	if err != nil {
@@ -668,17 +749,24 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 						CallID string `json:"call_id"`
 					}
 					json.Unmarshal(ev.Data, &d)
-					m1.Approve(bg, ev.TaskID, d.CallID, neumann.ApprovalDecision{})
+					if w.waitSuspends(ev) {
+						m1.Suspend(bg, ev.TaskID)
+					}
+					m1.Approve(bg, ev.TaskID, d.CallID, w.decision())
 				}
 			}
 		}()
 	}
-	if w.suspend {
-		// The operator resumes the task whenever it is suspended.
+	if w.resumer() {
+		// The operator resumes the task whenever it is suspended, and
+		// suspends it as it starts to wait for a backoff or its group.
 		go func() {
 			for ev := range m1.Events(opCtx, 0) {
-				if ev.Kind == proto.EvSuspended {
+				switch {
+				case ev.Kind == proto.EvSuspended:
 					m1.ResumeTask(bg, ev.TaskID)
+				case ev.Kind != proto.EvApprovalNeeded && w.waitSuspends(ev):
+					m1.Suspend(bg, ev.TaskID)
 				}
 			}
 		}()
@@ -692,7 +780,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		if sc.patience > 0 {
 			patience = sc.patience
 		}
-		quiesceOr(t, m1, s1, id, patience, func() bool { return (w.approve || w.suspend) && cs.crashed.Load() })
+		quiesceOr(t, m1, s1, id, patience, func() bool { return (w.approve || w.resumer()) && cs.crashed.Load() })
 	}
 	stop(t, m1)
 	opStop()
@@ -773,8 +861,14 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		if ev.Kind == proto.EvRecovered && d.From == "waiting_group" {
 			run.fromGroup = true
 		}
+		if w.waitSuspends(ev) {
+			// The first process died before its operator suspended the task.
+			if err := m2.Suspend(bg, id); err != nil && !errors.Is(err, neumann.ErrFinished) {
+				t.Fatalf("suspend: %v", err)
+			}
+		}
 		if ev.Kind == proto.EvApprovalNeeded {
-			err := m2.Approve(bg, id, d.CallID, neumann.ApprovalDecision{})
+			err := m2.Approve(bg, id, d.CallID, w.decision())
 			switch {
 			case err == nil:
 				sc.approved.Add(1)
@@ -875,6 +969,11 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		}
 		if ev.Kind == proto.EvSuspended && ev.TaskID == id {
 			run.suspended++
+			var d struct {
+				Was string `json:"was"`
+			}
+			json.Unmarshal(ev.Data, &d)
+			run.was = append(run.was, d.Was)
 		}
 		if ev.Kind == proto.EvStep && ev.TaskID == id && strings.Contains(string(ev.Data), `"prefill"`) {
 			run.prefilled++
@@ -1065,6 +1164,9 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 	}
 	if sc.suspend && (clean.suspended != 2 || clean.prefilled != 1) {
 		t.Fatalf("a clean run was suspended %d times and continued %d calls", clean.suspended, clean.prefilled)
+	}
+	if sc.was != "" && strings.Join(clean.was, ",") != sc.was {
+		t.Fatalf("a clean run was suspended from %v, want %s", clean.was, sc.was)
 	}
 	if strings.Join(clean.retries, ",") != sc.retries {
 		t.Fatalf("the clean run retried %v", clean.retries)
@@ -1330,4 +1432,22 @@ func TestCrashAtEveryCommitPointWithASuspend(t *testing.T) {
 		t.Fatal("no crash point left the task suspended for the restart")
 	}
 	t.Logf("%d crash points; the operator was needed at %d; the restart found the task suspended at %d", points, held, suspendScenario.parked.Load())
+}
+
+// The same sweep with the task suspended while it waits, at each commit
+// point before and after: for an approval (approved, the suspend lands with
+// the round's results; denied, with the denial), for a backoff and for its
+// group. The task still finishes once, paying at most once, and a restart
+// keeps a suspended task suspended until the operator resumes it.
+func TestCrashAtEveryCommitPointWithASuspendWhileWaiting(t *testing.T) {
+	for _, sc := range suspendWaitScenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			sc.parked.Store(0)
+			points, held, _ := sweep(t, sc)
+			if sc.parked.Load() == 0 {
+				t.Fatal("no crash point left the task suspended for the restart")
+			}
+			t.Logf("%d crash points; the operator was needed at %d; the restart found the task suspended at %d", points, held, sc.parked.Load())
+		})
+	}
 }

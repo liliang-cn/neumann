@@ -46,18 +46,11 @@ const (
 // refuses a suspend of an unknown task (mem.ErrNotFound) or a finished one
 // (mem.ErrFinished).
 func (e *Env) Suspend(ctx context.Context, id string) error {
-	t, err := e.Store.Load(ctx, id)
+	suspended, err := e.suspendedNow(ctx, id)
 	if err != nil {
 		return err
 	}
-	if t.State.Terminal() {
-		return fmt.Errorf("%w: %s", mem.ErrFinished, id)
-	}
-	pending, err := e.Store.Interrupts(ctx, id, true)
-	if err != nil {
-		return err
-	}
-	if suspendedAfter(t.State, pending) {
+	if suspended {
 		return nil
 	}
 	in := mem.Interrupt{TaskID: id, Kind: mem.InterruptSuspend}
@@ -75,18 +68,11 @@ func (e *Env) Suspend(ctx context.Context, id string) error {
 // it where it would land. A task that is not suspended and has no suspend
 // pending gives ErrNotSuspended and commits nothing.
 func (e *Env) ResumeTask(ctx context.Context, id string) error {
-	t, err := e.Store.Load(ctx, id)
+	suspended, err := e.suspendedNow(ctx, id)
 	if err != nil {
 		return err
 	}
-	if t.State.Terminal() {
-		return fmt.Errorf("%w: %s", mem.ErrFinished, id)
-	}
-	pending, err := e.Store.Interrupts(ctx, id, true)
-	if err != nil {
-		return err
-	}
-	if !suspendedAfter(t.State, pending) {
+	if !suspended {
 		return fmt.Errorf("task %s: %w", id, ErrNotSuspended)
 	}
 	in := mem.Interrupt{TaskID: id, Kind: mem.InterruptResume}
@@ -122,20 +108,32 @@ func (e *Env) signal(ctx context.Context, id string, cut bool) {
 	e.handBack(ctx, t, nil)
 }
 
-// suspendedAfter reports whether a task in state, with pending interrupts,
-// is suspended once they land: the last suspend or resume decides, and
-// with none the state does.
-func suspendedAfter(state task.State, pending []mem.Interrupt) bool {
-	s := state == task.Suspended
-	for _, in := range pending {
-		switch in.Kind {
-		case mem.InterruptSuspend:
-			s = true
-		case mem.InterruptResume:
-			s = false
-		}
+// suspendedNow reports whether task id is suspended once every suspend and
+// resume committed so far has landed: the last of them decides (design
+// §9.9), applied or not, since every landing applies all those pending by
+// that same rule; a task that has none is suspended when its state says so.
+// It decides from one read of the interrupts, the task's state only where
+// there are none, so a landing between two reads cannot fool it (a state
+// read after the landing, the interrupts it applied gone from a read of the
+// pending ones). A suspend or resume committed after that read comes after
+// the caller's in their order. A finished task is ErrFinished, an unknown one
+// ErrNotFound.
+func (e *Env) suspendedNow(ctx context.Context, id string) (bool, error) {
+	all, err := e.Store.Interrupts(ctx, id, false)
+	if err != nil {
+		return false, err
 	}
-	return s
+	t, err := e.Store.Load(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if t.State.Terminal() {
+		return false, fmt.Errorf("%w: %s", mem.ErrFinished, id)
+	}
+	if ss := suspensions(all, nil); len(ss) > 0 {
+		return ss[len(ss)-1].Kind == mem.InterruptSuspend, nil
+	}
+	return t.State == task.Suspended, nil
 }
 
 // suspensions are the pending suspends and resumes that applied does not
