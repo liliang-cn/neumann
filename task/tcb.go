@@ -226,12 +226,17 @@ type TCB struct {
 	// Partial is the answer text a model call had produced when it was
 	// preempted, or when its stream broke off (design §6.4): the task's next
 	// model call asks the model to continue it, when its adapter can
-	// (model.Caps.Prefill), and the answer is joined onto it. It is cleared
-	// when a call is answered. Preempts counts the preemptions of the
-	// current step, also cleared by an answer; a call is not preempted once
-	// it reaches its group's limit.
-	Partial  string `json:"partial,omitempty"`
-	Preempts int    `json:"preempts,omitempty"`
+	// (model.Caps.Prefill), and the answer is joined onto it. PartialThink
+	// is the same for a call cut off while it was still thinking, before any
+	// text: the next call continues the thinking, when the adapter can
+	// (model.Caps.ThinkPrefill), and the answer's reasoning is joined onto
+	// it. At most one of the two is set. Both are cleared when a call is
+	// answered. Preempts counts the preemptions of the current step, also
+	// cleared by an answer; a call is not preempted once it reaches its
+	// group's limit.
+	Partial      string `json:"partial,omitempty"`
+	PartialThink string `json:"partial_think,omitempty"`
+	Preempts     int    `json:"preempts,omitempty"`
 	// NoThink: the next model call is sent with the model's thinking off
 	// (model.Request.NoThink), after a turn was cut off with nothing in it
 	// but thinking (design §13). Cleared by an answer that is not cut off.

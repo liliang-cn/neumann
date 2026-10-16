@@ -217,7 +217,7 @@ func TestOldTaskBlobsDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "a" || got.Version != 3 || got.Used.Steps != 2 || got.Rejections != 0 || got.Partial != "" || got.Preempts != 0 || got.NoThink || len(got.Regs) != 1 || got.Regs[0].TextContent() != "q" || got.Regs[0].Feedback {
+	if got.ID != "a" || got.Version != 3 || got.Used.Steps != 2 || got.Rejections != 0 || got.Partial != "" || got.PartialThink != "" || got.Preempts != 0 || got.NoThink || len(got.Regs) != 1 || got.Regs[0].TextContent() != "q" || got.Regs[0].Feedback {
 		t.Fatalf("old blob decoded as %+v", got)
 	}
 	got.Rejections, got.Partial, got.Preempts, got.NoThink, got.Version = 1, "Once", 1, true, 4

@@ -79,6 +79,11 @@ type Caps struct {
 	Prefill bool
 	// ThinkOff: Request.NoThink turns the model's thinking off.
 	ThinkOff bool
+	// ThinkPrefill: a request that ends with an assistant message holding
+	// only reasoning (task.PartReasoning, no text) has that thinking
+	// continued, and the response carries only what comes after it: the
+	// rest of the reasoning as reasoning, then the answer (design §6.4).
+	ThinkPrefill bool
 }
 
 // CapsReporter is an adapter that says what its model can take.
