@@ -142,3 +142,53 @@ func TestOperatorControlsOverTheWire(t *testing.T) {
 		t.Fatalf("little after autoscale: %+v", st.Groups[2])
 	}
 }
+
+// priority over the wire (design §12): it needs a task_id and a priority of
+// 0 or more (0 itself given, not left out); a task on a vCore is task_busy,
+// an unknown one not_found, and a ready task's change is committed with a
+// priority_set event before the reply.
+func TestPriorityOverTheWire(t *testing.T) {
+	for _, line := range []string{
+		`{"kind":"priority","task_id":"t1"}`,
+		`{"kind":"priority","priority":0}`,
+		`{"kind":"priority","task_id":"t1","priority":-1}`,
+		`{"kind":"priority","task_id":"t1","priority":"high"}`,
+		`{"kind":"priority","task_id":"t1","priority":1,"class":"big"}`,
+	} {
+		decodeErr(t, line, CodeBadRequest)
+	}
+	if req := decodeOK(t, `{"kind":"priority","task_id":"t1","priority":0}`); req.TaskID != "t1" || req.Priority != 0 {
+		t.Fatalf("priority %+v", req)
+	}
+
+	gate := make(chan struct{})
+	h := start(t, neumann.Config{Cores: 1}, func(req model.Request) (model.Response, error) {
+		if sim.FirstUser(req) == "hold" {
+			<-gate
+		}
+		return sim.Reply("done"), nil
+	})
+	mustOK(t, h.do(`{"kind":"submit","input":"hold","task_id":"hold"}`, nil), proto.KindSubmit)
+	deadline := time.Now().Add(wait)
+	for {
+		if tc, err := h.m.Load(bg, "hold"); err == nil && tc.State == task.Running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hold never ran")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mustOK(t, h.do(`{"kind":"submit","input":"q","task_id":"q","priority":1}`, nil), proto.KindSubmit)
+	mustFail(t, h.do(`{"kind":"priority","task_id":"hold","priority":2}`, nil), CodeTaskBusy)
+	mustFail(t, h.do(`{"kind":"priority","task_id":"nope","priority":2}`, nil), CodeNotFound)
+	r := h.do(`{"id":7,"kind":"priority","task_id":"q","priority":0}`, nil)
+	mustOK(t, r, KindPriority)
+	if r.TaskID != "q" || string(r.ID) != "7" {
+		t.Fatalf("priority reply %+v", r)
+	}
+	if tc, err := h.m.Load(bg, "q"); err != nil || tc.Priority != 0 {
+		t.Fatalf("q after priority: %+v, %v", tc, err)
+	}
+	close(gate)
+}

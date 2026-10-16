@@ -25,7 +25,7 @@
 //	{"id":1,"kind":"submit","input":"What is 2+2?"}
 //	{"type":"reply","id":1,"kind":"submit","ok":true,"task_id":"8c0f…"}
 //
-// An ok reply to submit, steer, cancel, resolve, approve and class means the
+// An ok reply to submit, steer, cancel, resolve, approve, class and priority means the
 // instruction is committed: it survives a crash from that moment on. The
 // kinds and their fields (anything else is refused by name):
 //
@@ -43,6 +43,9 @@
 //	subscribe    from_seq (default 0) → from_seq; starts or restarts the event stream
 //	unsubscribe  stops the event stream
 //	class        task_id, class (both required): moves the task to that group (Machine.SetClass)
+//	priority     task_id, priority (both required, priority >= 0: 0 is interactive, larger is
+//	             less urgent): changes the task's priority, then a call of a less urgent task
+//	             may be preempted for it (Machine.SetPriority)
 //	cores        class, cores (both required, cores >= 1): pins the group's window (Machine.SetCores)
 //	autoscale    class, on (both required): the group's window adapts again, or freezes (Machine.AutoScale)
 //	group_reset  class (required): closes the group's breaker (Machine.GroupReset)
@@ -54,11 +57,11 @@
 //
 // Codes: bad_request (malformed JSON, an object missing, unknown or ill-typed
 // field; the message names it), unknown_kind, unsupported (a designed
-// operator control the machine does not have yet: suspend, resume,
-// priority), not_found, finished, not_reconciling, not_awaiting_approval
+// operator control the machine does not have yet: suspend, resume),
+// not_found, finished, not_reconciling, not_awaiting_approval
 // (approve: the task is not waiting for approval, or the call is not held),
-// busy (with "count" and "limit"), task_busy (class: the task is between no
-// two instructions yet; try again), incompatible (class: the group cannot take the task; "check"
+// busy (with "count" and "limit"), task_busy (class, priority: the task is
+// executing an instruction or waiting for its tools; try again), incompatible (class: the group cannot take the task; "check"
 // names the failed check: tools, tool_count, context or caps), stopped,
 // not_started, failed (anything else, an unknown class among them). A
 // bad line costs one error reply; the server carries on. Blank lines are

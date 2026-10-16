@@ -30,19 +30,20 @@ const (
 	KindAutoScale  = "autoscale"   // let a group's window adapt again, or freeze it: Machine.AutoScale
 	KindGroupReset = "group_reset" // close a group's breaker: Machine.GroupReset
 	KindQueue      = "queue"       // the queues by class: Machine.Queue
+	KindPriority   = "priority"    // change a task's priority: Machine.SetPriority
 )
 
 // KnownKinds are the instructions this frontend executes.
 var KnownKinds = []string{
 	proto.KindSubmit, proto.KindSteer, proto.KindCancel, KindResolve, KindApprove,
 	KindStatus, KindSubscribe, KindUnsubscribe,
-	KindClass, KindCores, KindAutoScale, KindGroupReset, KindQueue,
+	KindClass, KindCores, KindAutoScale, KindGroupReset, KindQueue, KindPriority,
 }
 
 // UnsupportedKinds are operator controls the design names (§9.6) that the
 // machine does not offer yet. They are answered with CodeUnsupported, not
 // CodeUnknownKind, so a client can tell "not yet" from "never heard of it".
-var UnsupportedKinds = []string{"suspend", "resume", "priority"}
+var UnsupportedKinds = []string{"suspend", "resume"}
 
 // Error codes of a failed reply.
 const (
@@ -52,7 +53,7 @@ const (
 	CodeNotFound       = "not_found"       // no such task
 	CodeFinished       = "finished"        // the task has already ended
 	CodeNotReconciling = "not_reconciling" // resolve: the task or call is not held for an operator
-	CodeTaskBusy       = "task_busy"       // class: the task is executing an instruction or waiting for its tools; try again
+	CodeTaskBusy       = "task_busy"       // class, priority: the task is executing an instruction or waiting for its tools; try again
 	CodeIncompatible   = "incompatible"    // class: the target group cannot take the task; check says which check failed
 	CodeBusy           = "busy"            // submit: the machine is at capacity; count and limit say how full
 	CodeStopped        = "stopped"         // the machine is stopping
@@ -95,6 +96,8 @@ type Request struct {
 	On      *bool    `json:"on,omitempty"`       // autoscale
 
 	Decision *Decision `json:"decision,omitempty"` // approve
+
+	hasPriority bool // the line gave "priority": the priority kind needs it, 0 included
 }
 
 // Error is why an instruction failed. Count and Limit are set for CodeBusy,
@@ -182,6 +185,7 @@ var fields = map[string][]string{
 	KindAutoScale:    {"class", "on"},
 	KindGroupReset:   {"class"},
 	KindQueue:        {},
+	KindPriority:     {"task_id", "priority"},
 }
 
 // Decode parses and validates one input line. On error the returned Request
@@ -240,6 +244,9 @@ func Decode(line []byte) (Request, *Error) {
 		}
 		if err := strict(obj[k], req.field(k)); err != nil {
 			return req, errorf(CodeBadRequest, "field %q: %v", k, err)
+		}
+		if k == "priority" {
+			req.hasPriority = true
 		}
 	}
 	return req, req.validate()
@@ -360,6 +367,13 @@ func (r *Request) validate() *Error {
 		return need("class", r.Class)
 	case KindGroupReset:
 		return need("class", r.Class)
+	case KindPriority:
+		if err := need("task_id", r.TaskID); err != nil {
+			return err
+		}
+		if !r.hasPriority || r.Priority < 0 {
+			return errorf(CodeBadRequest, `priority needs "priority", a number from 0 (interactive) up`)
+		}
 	case KindCores:
 		if err := need("class", r.Class); err != nil {
 			return err

@@ -28,6 +28,7 @@ type Machine interface {
 	Stop(ctx context.Context) error
 
 	SetClass(ctx context.Context, taskID, class string) error
+	SetPriority(ctx context.Context, taskID string, p int) error
 	SetCores(class string, n int) error
 	AutoScale(class string, on bool) error
 	GroupReset(ctx context.Context, class string) error
@@ -176,6 +177,9 @@ func (s *Server) handle(ctx context.Context, l line) (*Reply, *subscription) {
 	case KindClass:
 		r.TaskID = req.TaskID
 		err = s.Machine.SetClass(ctx, req.TaskID, req.Class)
+	case KindPriority:
+		r.TaskID = req.TaskID
+		err = s.Machine.SetPriority(ctx, req.TaskID, req.Priority)
 	case KindCores:
 		err = s.Machine.SetCores(req.Class, *req.Cores)
 	case KindAutoScale:
