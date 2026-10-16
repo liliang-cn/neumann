@@ -81,7 +81,7 @@ func (a *Adapter) body(req model.Request, stream bool) ([]byte, error) {
 	if req.MaxOut > 0 {
 		w.MaxTokens = req.MaxOut // the request's own cap wins over the default
 	}
-	if a.ThinkingBudget > 0 {
+	if a.ThinkingBudget > 0 && !req.NoThink {
 		w.Thinking = &wireThinking{Type: "enabled", BudgetTokens: a.ThinkingBudget}
 	}
 	raw, err := marshal(w)

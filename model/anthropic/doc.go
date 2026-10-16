@@ -12,5 +12,7 @@
 // The adapter streams (model.Streamer), replays thinking blocks and tool-use
 // ids byte for byte to the model that produced them, places cache_control
 // breakpoints, classifies Anthropic's errors and reads its rate-limit headers.
-// ThinkingBudget turns on extended thinking.
+// ThinkingBudget turns on extended thinking; a request with NoThink goes out
+// without it. The adapter does not offer to continue a cut-off answer
+// (Caps.Prefill is false).
 package anthropic

@@ -30,7 +30,8 @@ type Adapter struct {
 	Model     string
 	MaxTokens int // required by the API; 0 sends DefaultMaxTokens
 	// ThinkingBudget turns on extended thinking with this many tokens when
-	// positive. It must be below MaxTokens.
+	// positive. It must be below MaxTokens. A request with NoThink is sent
+	// without thinking whatever the budget (Caps.ThinkOff).
 	ThinkingBudget int
 	// What the model can take (model.Caps), read before a task is moved
 	// onto this adapter's group. ContextWindow 0 is DefaultContextWindow; a
@@ -79,7 +80,11 @@ func (a *Adapter) MaxOut() int {
 const DefaultContextWindow = 200000
 
 // Caps reports ContextWindow, the output cap, NoTools and MaxTools
-// (model.CapsReporter).
+// (model.CapsReporter). ThinkOff is always true: a request with NoThink
+// carries no thinking configuration. Prefill is false: Anthropic rejects an
+// assistant prefix that ends in whitespace and forbids one while thinking is
+// on, and some models take no prefix at all, so the machine never asks this
+// adapter to continue a cut-off answer. Parallel is 0, unknown.
 func (a *Adapter) Caps() model.Caps {
 	w := a.ContextWindow
 	switch {
@@ -88,7 +93,7 @@ func (a *Adapter) Caps() model.Caps {
 	case w < 0:
 		w = 0
 	}
-	return model.Caps{Window: w, MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: max(a.MaxTools, 0)}
+	return model.Caps{Window: w, MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: max(a.MaxTools, 0), ThinkOff: true}
 }
 
 // WithProtocol switches the adapter's wire protocol and returns it.
