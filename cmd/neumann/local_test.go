@@ -33,7 +33,7 @@ func TestLocal(t *testing.T) {
 	if !a.Prefill || a.ThinkOff != "none" || a.Timeout != 0 || a.FirstByteTimeout != 10*time.Minute || a.IdleTimeout != 2*time.Minute {
 		t.Fatalf("adapter: prefill %v, think off %q, timeouts %v %v %v", a.Prefill, a.ThinkOff, a.Timeout, a.FirstByteTimeout, a.IdleTimeout)
 	}
-	if got := model.CapsOf(a); got.Parallel != 1 || !got.Prefill || !got.ThinkOff || got.MaxOut != localMaxTokens {
+	if got := model.CapsOf(a); got.Parallel != 1 || !got.Prefill || !got.ThinkOff || !got.ThinkPrefill || got.MaxOut != localMaxTokens {
 		t.Fatalf("caps %+v", got)
 	}
 }

@@ -65,6 +65,8 @@ var defaultBaseURL = map[string]string{
 const (
 	localBaseURL   = "http://127.0.0.1:11434/v1" // Ollama
 	localThinkOff  = "none"
+	localThinkOpen = "<think>" // the tags a local model writes its thinking between
+	localThinkEnd  = "</think>"
 	localFirstByte = 10 * time.Minute
 	localIdle      = 2 * time.Minute
 	localMaxTokens = 8192
@@ -119,7 +121,7 @@ func parse(args []string, getenv func(string) string, stderr io.Writer) (config,
 	fs.IntVar(&c.cores, "cores", envInt("NEUMANN_CORES", neumann.DefaultCores), "vCores [NEUMANN_CORES]")
 	fs.IntVar(&c.maxQueued, "max-queued", envInt("NEUMANN_MAX_QUEUED", neumann.DefaultMaxQueued), "unfinished tasks admitted at once [NEUMANN_MAX_QUEUED]")
 	fs.IntVar(&c.maxTokens, "max-tokens", envInt("NEUMANN_MAX_TOKENS", 0), "output token limit per model call; 0: the adapter's default [NEUMANN_MAX_TOKENS]")
-	fs.BoolVar(&c.local, "local", getenv("NEUMANN_LOCAL") == "1", fmt.Sprintf("a local OpenAI-compatible backend (Ollama, llama.cpp, LM Studio): -parallel 1 and -cores equal to it unless given, answers cut off are continued, reasoning_effort %q turns thinking off, %s to the first byte and %s between stream chunks with no limit on the whole call, -max-tokens %d unless given, -base-url %s unless given [NEUMANN_LOCAL=1]", localThinkOff, localFirstByte, localIdle, localMaxTokens, localBaseURL))
+	fs.BoolVar(&c.local, "local", getenv("NEUMANN_LOCAL") == "1", fmt.Sprintf("a local OpenAI-compatible backend (Ollama, llama.cpp, LM Studio): -parallel 1 and -cores equal to it unless given, a less urgent task's call is preempted for a more urgent one and its answer or thinking continued, reasoning_effort %q turns thinking off, %s to the first byte and %s between stream chunks with no limit on the whole call, -max-tokens %d unless given, -base-url %s unless given [NEUMANN_LOCAL=1]", localThinkOff, localFirstByte, localIdle, localMaxTokens, localBaseURL))
 	fs.IntVar(&c.parallel, "parallel", envInt("NEUMANN_PARALLEL", 0), "requests the backend serves at once; it caps the vCores working on it. 0: unknown, or 1 with -local. OpenAI-compatible provider only [NEUMANN_PARALLEL]")
 	fs.BoolVar(&c.echo, "echo", getenv("NEUMANN_ECHO") == "1", "attach a builtin device with one tool, util_echo, for testing [NEUMANN_ECHO=1]")
 	fs.DurationVar(&c.stopTimeout, "stop-timeout", envDur("NEUMANN_STOP_TIMEOUT", jsonl.DefaultStopTimeout), "how long a graceful stop may take [NEUMANN_STOP_TIMEOUT]")
@@ -197,6 +199,7 @@ func (c *config) adapter() model.Adapter {
 	a.Parallel = c.parallel
 	if c.local {
 		a.Prefill, a.ThinkOff = true, localThinkOff
+		a.ThinkTags = [2]string{localThinkOpen, localThinkEnd}
 		a.Timeout, a.FirstByteTimeout, a.IdleTimeout = 0, localFirstByte, localIdle
 	}
 	return a
@@ -259,9 +262,10 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdin i
 	if c.echo {
 		devices = append(devices, echoDevice())
 	}
-	// TODO(preempt): -local turns on preemption for the group (GroupConfig
-	// Preempt, design §6.4, §14) once the core has it.
+	// -local preempts (design §6.4): a backend that serves one request at a
+	// time would otherwise make an urgent task wait for a long one.
 	m, err := neumann.New(neumann.Config{
+		Preempt:   c.local,
 		Model:     c.adapter(),
 		Devices:   devices,
 		Store:     store,
