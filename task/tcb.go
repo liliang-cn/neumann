@@ -163,7 +163,7 @@ type TCB struct {
 	Wait       WaitReason `json:"wait"`
 	Class      string     `json:"class"`
 	PinClass   bool       `json:"pin_class,omitempty"` // never moved to a fallback group when its own is down (design §6.3)
-	Priority   int        `json:"priority"`
+	Priority   int        `json:"priority"`            // 0 interactive; larger is less urgent (design §6.4, §9.3)
 	ReadySince time.Time  `json:"ready_since"`
 	System     string     `json:"system,omitempty"`
 	Tools      []ToolSpec `json:"tools,omitempty"`

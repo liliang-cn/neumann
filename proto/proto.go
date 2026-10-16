@@ -21,7 +21,7 @@ type Instruction struct {
 	Input    string       `json:"input,omitempty"`
 	Class    string       `json:"class,omitempty"`
 	PinClass bool         `json:"pin_class,omitempty"` // never moved to a fallback group
-	Priority int          `json:"priority,omitempty"`
+	Priority int          `json:"priority,omitempty"`  // 0 interactive; larger is less urgent (submit, priority)
 	Budget   *task.Budget `json:"budget,omitempty"`
 	Allow    []string     `json:"allow,omitempty"`
 	Deny     []string     `json:"deny,omitempty"`
