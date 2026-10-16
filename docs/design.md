@@ -120,6 +120,9 @@ type TCB struct {
     CompactLimit int           // 最大上限仍被截断后，下一块最多带几个单元，0 = 不限
     Archived   int             // 压缩移进归档的消息数（5.3）
     Rejections int             // 被答案检查驳回的最终答案数（9.8）；检查看到的 Attempt
+    Partial    string          // 被抢占或流中断的模型调用已收到的正文，下一次调用续写（6.4）；有回答时清空
+    Preempts   int             // 本步被抢占的次数，有回答时清零（6.4）
+    NoThink    bool            // 下一次调用关掉思考：只想不答的截断之后（13）；有回答时清除
     StopReason string
     Version    int64           // 每次提交 +1
 }
@@ -339,8 +342,13 @@ type GroupConfig struct {
     MaxQueued  int           // 本组未结束任务上限，0 = 只受全局限制；迁入的任务不受它限制
     CompactAt   float64      // 压缩阈值，占窗口的比例，默认 0.8（5.3）
     CompactKeep float64      // 原样保留的最新轮次占窗口的比例，默认 0.3；必须小于 CompactAt
+    Preempt     bool          // 允许抢占本组在途的模型调用（6.4），默认关
+    PreemptAfter time.Duration // 调用至少跑这么久才能被抢，默认 2s
+    MaxPreempts int          // 一步最多被抢几次，默认 2；之后不再被抢
 }
 ```
+
+窗口上限还受适配器的 `Caps.Parallel`（后端同时处理的请求数，0 = 未知）约束：有效上限是 `Max` 和 `Parallel` 中不为 0 的较小者，单组简写的 `Cores` 同样取较小者，`SetCores` 超过它时按它截断。
 
 `New` 时校验：类名非空、不重复、不含 `/`；每组有 `Model`；`0 ≤ CompactKeep < CompactAt ≤ 1`（0 取默认）；`Limits` 里的名字都在 `Config.Limiters` 里；`Fallback` 指向存在的组，沿 `Fallback` 链走不会回到起点（无环）；`OnMigrateFail` 只能是 `wait` / `fail`；`Max > 0` 时不小于 `Min`。`Config.Default` 是不带 `Class` 提交的任务的类，空则取第一个组。
 
@@ -398,6 +406,42 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 - reasoning 由 vCore 在组请求时过滤（`forProvider`）：`Provider` 非空且不等于目标适配器 `Provider()` 的 reasoning 块不发，块全被去掉的消息不发，它两边同角色的消息并成一条（角色仍然交替，严格的服务商不会收到非法序列）；寄存器原样保留，迁回原服务商时还在。两个适配器本来也按 `Provider` 丢弃外来 reasoning（Anthropic 丢 thinking，OpenAI 兼容不渲染 reasoning），过滤在 vCore 做是为了对任何适配器成立。
 - 迁移提交：`State = Ready`、`PC = StepModel`、`ReadySince` 不变、`Retries` 不变、`migrated`（`{from, to, reason: "group_down"}`）；交还后进新组的就绪队列，触发新组扩容。准入计数随之从旧类移到新类。
 - 手动迁移 `m.SetClass(ctx, id, class)`：同样的校验，不通过返回 `*MigrateError`（`Check`、`Detail`），什么都不提交；`PinClass` 只禁止自动迁移，不拦操作员。只能在指令之间移动：任务在就绪队列、`Waiting(Group / Backoff / Reconcile)`、`Suspended` 时取出、提交、交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试。等旧组的 `Waiting(Group)` 改为 `Ready`，其他状态不变（退避保留 `WakeAt`）；`migrated` 的 `reason` 为 `manual`。
+
+### 6.4 抢占与续写
+
+本地后端（Ollama、llama.cpp、LM Studio）一次只处理很少几个请求：实测 Ollama 的 MLX runner 严格串行，多发的请求在后端内部排队。那个队列机器看不见、不能重排，排队时间还算进请求超时（2026-10-16 实测：第二个请求在 Ollama 里排了 4 分 48 秒）。原则是**队列留在机器里**：并发对齐到后端能力（`Caps.Parallel`，6 节），其余任务在就绪队列里等，重排和抢占才有意义。
+
+一颗被占满的"CPU"上来了更急的任务，就该像操作系统一样抢占。和 CPU 不同的是，模型调用的"寄存器现场"是已经生成的文字：丢掉就要重新生成。所以被抢的调用**保留已收到的正文，下次让模型接着写**（续写，prefill）。实测 Ollama 收到以 assistant 消息结尾的请求时只返回接下来的部分，而且跳过思考；把半截思考作为 assistant 的 reasoning 回传则不行，模型会从头重想，还把正文混进思考里。所以只保留正文，思考和半截的工具调用参数都丢弃。
+
+**抢占条件**（组的 `Preempt` 开着才会发生）：本组有就绪任务 `h`；存活 vCore 已经达到窗口、没有空闲的；在途的模型调用（`StepModel`，压缩不抢）里有任务 `v` 满足：
+
+- `h.Priority < v.Priority`，比较 TCB 上的原始优先级，不看老化：老化只决定出队顺序，被老化提上来的后台任务不能抢别的后台任务；
+- `v` 这次调用已经跑了至少 `PreemptAfter`，不满时挂一个定时器，到点再查；
+- `v.Preempts < MaxPreempts`。
+
+多个候选时抢优先级数最大（最不急）的，同级抢这次调用跑得最短的（损失最少）。一次只抢一个，被抢的任务交还之后再查下一次。检查的触发点：任务进入就绪队列、`SetPriority` 提交之后、上面的定时器到点。
+
+**被抢的调用**：用 `errPreempted` 作为原因取消这次调用的 context（任务自己的 context 不受影响），适配器像对待取消一样返回。组开着抢占时，机器总是用流式调用（适配器实现了 `Streamer` 就用，不管有没有增量接收方），自己累加收到的正文增量（`Delta.Text`）。然后一次提交：`step` 和 `preempted`（`{by, kept, ran_ms, n}`：抢它的任务、保留的字符数、这次调用跑了多久、这一步第几次被抢）；任务回 `Ready`，PC 不变，`ReadySince = now`，`Preempts + 1`；`Partial` 追加这次收到的正文，适配器不支持续写（`Caps.Prefill` 为假）时清空、`kept` 为 0。
+
+- 不计 `Used.Steps`（没有回答），不计 `Retries`，不计 `Unconfirmed`：请求是机器自己切断的，结果已知。本地后端不计费；远端服务商上开抢占，被切断的那部分用量就算不进 `Used`，这是配置者的选择。
+- 限流器按"被取消打断的调用"一行结算（7.2）；不向执行组报告结果（同 `Canceled`），窗口和熔断都不受影响。
+- 这次调用用掉的插话退回待送达，和失败的调用一样。
+- `ReadySince = now`，不保留原来的：保留的话，一个等了很久的后台任务会被老化立刻提成交互级，按先进先出又排在 `h` 前面，抢占就成了空转。
+- 抢占和取消同时到达时取消赢，按 9.5 的被取消打断处理，`Partial` 随任务一起丢弃。
+
+**续写**：下一次模型步，`Partial` 不为空时：
+
+- 没有待送达的插话，当前组的适配器 `Caps.Prefill` 为真：请求末尾加一条 assistant 文本消息，内容就是 `Partial`。回答的正文接在 `Partial` 后面合成一条消息：第一段文本前面接上 `Partial`，没有文本段时把 `Partial` 作为第一段；工具调用照常。用量只计这次的。
+- 有待送达的插话：`Partial` 先作为一条完整的 assistant 消息进寄存器（被打断的那一轮），插话跟在后面，像人打断别人说话。这一步不再续写。
+- 适配器不支持续写（例如任务迁到了别的组）：丢弃 `Partial`，从头生成。
+- 有回答（包括截断）时 `Partial` 清空、`Preempts` 清零。合并后的消息有内容，所以续写的回答被截断时按"有内容的截断"处理，和平时一样。
+- 窗口估算（5.3）把 `Partial` 算在请求里。
+
+**流中断也续写**：调用以 `Transient` 且 `ErrResponseLost` 失败时（流读到一半断了、空闲超时），已收到的正文同样追加进 `Partial`，随退避的提交落盘，重试时续写。`Unconfirmed` 照旧加一。
+
+**持久化**：`Partial` 只随提交持久化。在调用中途崩溃，重启后按 4.5 重做，用的是最近一次提交的 `Partial`。加字段之前写下的 TCB 解码为空。
+
+**重排**：`m.SetPriority(ctx, id, p)`（`p ≥ 0`，0 交互、越大越不急）。任务在调度器手里（就绪、退避、熔断等待、待核对、待批准）时取出，提交新的 `Priority` 和 `priority_set`（`{priority, was}`）事件，再交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试。已结束的返回 `ErrFinished`。提交之后做一次抢占检查。
 
 ## 7. 限流器
 
@@ -504,7 +548,7 @@ type RateReporter interface { // 可选
 
 ### 9.3 出队顺序
 
-组内交互级先于后台级；同级按 `ReadySince` 先进先出，每步之后 `ReadySince` 更新，所以同组任务轮转推进；后台任务 `ReadySince` 早于 `now - AgingAfter`（默认 30s）时按交互级排序。退避中的任务不在就绪队列里。
+组内交互级先于后台级；同级按 `ReadySince` 先进先出，每步之后 `ReadySince` 更新，所以同组任务轮转推进；后台任务 `ReadySince` 早于 `now - AgingAfter`（默认 30s）时按交互级排序。退避中的任务不在就绪队列里。优先级数可以大于 1，数越小越先；老化把任何大于 0 的提成 0。组开着抢占时，更急的任务还能把正在调用模型的任务换下来（6.4）。
 
 ### 9.4 Deadline
 
@@ -723,6 +767,10 @@ type Classifier interface{ Classify(err error) ErrClass }
 type RateReporter interface{ RateInfo(resp *Response, err error) *RateInfo }
 ```
 
+`Caps` 另有三项，给本地后端用（6.4）：`Parallel`（后端同时处理的请求数，0 = 未知，约束组的窗口上限）、`Prefill`（以 assistant 消息结尾的请求会被续写，只返回接下来的部分）、`ThinkOff`（`Request.NoThink` 能关掉思考）。`Request.NoThink` 为真时适配器关掉思考：OpenAI 兼容适配器发配置的 `ThinkOff` 值（Ollama 上是 `reasoning_effort: "none"`，实测只生成 3 个 token 就作答），没配置时 `Caps.ThinkOff` 为假、这个字段被忽略；Anthropic 适配器不发 `thinking`。
+
+OpenAI 兼容适配器的本地选项：`Parallel`、`Prefill`、`ThinkOff` 原样进 `Caps`；超时分三种，`Timeout`（整次调用，默认 5 分钟，0 = 不限）、`FirstByteTimeout`（发出到第一个字节，默认 0 = 只受 `Timeout` 约束）、`IdleTimeout`（流式时相邻两块之间，默认 0 = 不限）。本地后端处理长提示词时首字节可能很慢，生成时却一直有数据，所以本地配置是 `Timeout = 0`、首字节 10 分钟、空闲 2 分钟，失控的生成靠输出上限截住（13）。三种超时都按单次请求超时处理：调用方还有时间，就是 `Transient`；流中途超时包 `ErrResponseLost`，已收到的正文进 `Partial`（6.4）。
+
 错误分类：
 
 | 类别 | 例子 | 执行组 | 限流器 | 任务 |
@@ -802,7 +850,7 @@ type Event struct {
 
 `Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
-任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_delivered`（带发送方的插话送达，10.1）、`steer_dropped`（带发送方的多一个 `from`）。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
+任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_delivered`（带发送方的插话送达，10.1）、`steer_dropped`（带发送方的多一个 `from`）、`preempted`（`{by, kept, ran_ms, n}`，6.4）、`priority_set`（`{priority, was}`，6.4）。`step` 在流式调用收到第一块数据时带 `first_ms`（发出到第一块的毫秒数），用来区分后端排队和生成；续写的调用带 `prefill`（续写前缀的字符数）。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
 
 `compacted`：`{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（5.3）。`step` 的 `pc` 为 `model`、`tools` 或 `compact`。`model_retry` 的 `class` 可以是 `context_length`（`wait = "compact"`）。
 
@@ -814,7 +862,7 @@ type Event struct {
 
 stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。`steer` 可带 `from`（发送方，10.1）；stdio 的对端就是操作员，它给的 `from` 不做核实。
 
-操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`suspend`、`resume`、`priority` 仍回 `unsupported`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`，`args` 必须是对象）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
+操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`priority`（`task_id`、`priority`）对应 `m.SetPriority`，任务正在执行时 `task_busy`。`suspend`、`resume` 仍回 `unsupported`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`，`args` 必须是对象）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
 
 实现在 `proto/jsonl`（线格式的完整说明在它的包文档里），`cmd/neumann` 把它接到 stdin/stdout。回复和事件共用 stdout，每行第一个字段 `"type"` 是 `"reply"` 或 `"event"`：宿主进程（Node、Python）天然只有 stdout，多开一个 fd 两边都别扭；共用一个流还给出了顺序，`subscribe` 的回复恰好落在旧流最后一个事件和新流第一个事件之间。指令可带 `"id"`，回复原样带回；指令按到达顺序逐条执行。读得慢的一方不阻塞机器：事件按输出写出的速度从主存读，回复优先于积压的事件写出。
 
@@ -823,7 +871,8 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 | 情况 | 处理 |
 |---|---|
 | 模型请求失败 | 按第 11 节分类：限流、过载、临时错误退避重试，额度耗尽等执行组，永久错误 `Failed`（`model_error`） |
-| 截断且无内容 | `MaxOut` 乘 4 重做，最多两次，之后 `Failed`（`truncated`） |
+| 截断且无内容 | `MaxOut` 乘 4 重做，最多两次，之后 `Failed`（`truncated`）。截断的回答里只有思考、适配器 `Caps.ThinkOff` 为真时，第一次重做先关掉思考（`NoThink`），`MaxOut` 不变；关掉思考仍被截断才按倍数放大 |
+| 思考停不下来 | 本地小模型会在思考里打转（实测 qwen3.5 9B 写 150 字小故事，连续三次跑满 5 分钟超时）。本地配置给默认输出上限，打转到上限时变成"只有思考的截断"，按上一行关掉思考重做，不再原样重发同一个请求 |
 | 上下文超过阈值 / 服务商拒绝为超出上下文 | 压缩（5.3）；怎么压都放不下 `Failed`（`context_overflow`） |
 | 预占量永远放不下 | `Failed`（`too_large`） |
 | 工具出错 / 超时 / 越权 | 错误文本作为该调用的结果交给模型 |
@@ -844,9 +893,10 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 - `Tracer`：从事件重建 OpenTelemetry trace，一个任务一个 trace。根 span `task`（accepted → 终态，`failed` 为错误状态），子 span：每条模型 / 压缩指令一个（失败带错误类别），每轮工具一个 `tools`，其下每个调用一个 `tool <名字>`；每个待批准的调用一个 `approval <工具>`（首次宣布 → 决定，带 `verdict`）；被拒的调用 span 在 `tool_denied` 结束、错误状态；重试、限流、迁移、恢复、核对、策略与批准事件（不带参数和原因）是根 span 上的事件；终态之后提交的（`steer_dropped`、`tool_late`）是根下零长度的 span，这样 trace 不取决于何时 flush。时间全用 `Event.Time`，id 由任务 id 和打开该 span 的事件的 `Seq` 经 SHA-256 得到（trace id = `SHA-256("neumann/trace/"+任务)` 前 16 字节），所以从 0 补读重建的 trace 与在线导出的逐字段相同；从中途接着读时，根 span 从第一个看到的事件开始并标 `neumann.partial`，id 不变。直接把 span 交给 `SpanExporter`（OTLP、内存），不经过 TracerProvider：后者自己生成 id 和时间。
 - `Log`：slog，每个值得一提的事件一行，消息是事件种类，`seq`、`task`、`class` 等是可以 grep 的键值，`at` 是提交时刻。生命周期 info；重试、限流、熔断、迁移被拒、插话丢弃、晚到结果、`tool_denied`、`approval_needed`（操作员要处理）warn；`approved` 带 `verdict` 与等待时长；`failed`、`reconcile_needed` error；`step`、`usage`、工具调用和结果 debug。`LogResources` 定期写一行资源。
 - 压缩（5.3）：`compacted` 是 `Metrics` 的 `neumann.compactions`（每块一次）、`neumann.compaction.rounds`（换出的轮次）、`neumann.compaction.tokens`（`tokens_before_est - tokens_after_est`），都按类；`compact` span 延到同一提交里的 `compacted` 事件结束，带它的数字（`neumann.compact.*`），任务根 span 上也记一个 `compacted` 事件；`Log` 以 info 写一行，带轮次、消息数、估算 token 和块号。没落地的压缩（被取消抢先）仍是一个 `compact` span，不计数。
+- 抢占与续写（6.4）：`preempted` 结束它那条模型指令的 span，`outcome = preempted`、不是错误，带 `neumann.preempt.kept`；根 span 上记一个 `preempted` 事件；`neumann.model.preemptions`（按类）；`Log` 以 info 写一行（`by`、`kept`、`ran_ms`、`n`）。续写的模型 span 带 `neumann.prefill`。`priority_set` 是根 span 上的事件和一行 info 日志。`step` 的 `first_ms` 是模型 span 上的 `first_byte` 事件和直方图 `neumann.model.first_byte`（按类、`pc`）。`steer_delivered` 是根 span 上的事件（`seq`、`from`）和 `neumann.steers.delivered`（按类）。
 - `NewHandler`：只读的 HTTP 视图，`GET /status`、`/queue`、`/tasks/{id}`（TCB + 调用记录）、`/events?from_seq=N`（Server-Sent Events，先补读再在线，`Last-Event-ID` 续读，`task=` 过滤），可选 `/metrics`（OTel 的 Prometheus 导出器）和 `/debug/pprof/`（默认关；自己实现，不引入 `net/http/pprof`，它会注册到 `DefaultServeMux`）。没有任何会改状态的端点，其他方法 405。`/tasks`、`/events` 带任务内容（提示词、工具参数和结果），只能给操作员看；可以要求 bearer token。指标、trace、活动日志都不带任务内容。
 
-`cmd/neumann`：`-observe-addr`（空 = 关）在那里挂 `NewHandler`，`-metrics` 加 `/metrics`，`-pprof` 加 pprof，`NEUMANN_OBSERVE_TOKEN` 设了就要求 token；设了标准的 `OTEL_EXPORTER_OTLP_ENDPOINT` 时 trace 和指标经 OTLP/HTTP 导出，`service.name` 为 `neumann`。观测从启动时的日志末尾开始；退出时先等机器停、观测读到日志末尾，再 flush 导出器，每步有时限。
+`cmd/neumann`：`-observe-addr`（空 = 关）在那里挂 `NewHandler`，`-metrics` 加 `/metrics`，`-pprof` 加 pprof，`NEUMANN_OBSERVE_TOKEN` 设了就要求 token；设了标准的 `OTEL_EXPORTER_OTLP_ENDPOINT` 时 trace 和指标经 OTLP/HTTP 导出，`service.name` 为 `neumann`。`-local` 一次配好本地后端：`Parallel = 1`（`-parallel` 可改，`Cores` 取它）、`Prefill`、`Preempt`、`ThinkOff = "none"`、超时按 11 节的本地配置、默认输出上限 8192（`-max-tokens` 可改）。观测从启动时的日志末尾开始；退出时先等机器停、观测读到日志末尾，再 flush 导出器，每步有时限。
 
 ## 15. 公开 API
 
@@ -940,6 +990,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
 
 7. **插话的发送方与 tasks 设备**（10.1）：`m.SteerWith` 与 `SteerOptions{From, Key}`、`ValidFrom`、`Config.MessageFormat` / `DefaultMessageFormat` / `QuoteMessage`、`HasSteer`、`Tasks`；`From`、`Key` 随中断提交（两个 Store、一致性套件、SQLite 旧库补列），`steer_delivered` 由 vCore 写，`steer_dropped` 带 `from`，不带 `From` 的逐字节不变；`Key` 去重（按任务加锁）、停机排空期间放行带键插话；`Submit` 拒绝 `from`；stdio `steer` 的 `from`；`DeviceCall.Task`；`bus/tasks` 的 `tasks_send`（`Idempotent`，先按键查、再校验，配额）、`tasks_list`、`WithVisible`（默认同类）、`Bind`；`examples/messaging`。
    验证：`SteerSenderAndKeyRoundTrip`、`SteerWithASenderIsReportedDropped`（一致性套件）、`TestOpenAddsTheSenderColumns`（旧库的中断照常读出、丢弃）、`TestSteerWithASenderIsFramedAndReported`（默认与自定义格式、`steer_delivered` 紧挨在它的 `step` 之前）、`TestAMessageCannotForgeItsFrame`、`TestSendersAreRestricted`、`TestSteerWithASenderIsReportedDropped`、`TestSteerWithoutASenderIsDeliveredSilently`（事件序列与以前相同）、`TestSteerWithChecksItsSenderAndKeepsItsKey`、`TestSteerWithASenderDuringTheCheck`、`TestFeedbackAndASteerWithASender`、`TestTwoTasksExchangeMessages`、`TestSendAcrossACrashIsSentOnce`（插话落盘后立刻崩溃，恢复用同一个键重发，设备两个进程各跑一次、对方只收到一条，重启后送达）、`TestRepeatAfterTheReceiverFinished`（重发时对方已结束、可见性隐藏已结束的任务，仍回 `sent`）、`TestSendDuringStopIsCommitted`、`bus/tasks` 的发送、列表、错误结果、默认同类可见、可见性、配额（互相回复的两个任务停在配额上）、先查键再校验、页表与策略测试、`TestSteerWithASender`（stdio）、`examples/messaging` 的测试。
+
+8. **本地模型：抢占、续写、重排**（6.4）：`Caps.Parallel` / `Prefill` / `ThinkOff`、`Request.NoThink`；组的 `Preempt` / `PreemptAfter` / `MaxPreempts`；抢占检查（就绪、`SetPriority`、定时器）、`preempted` 提交、`Partial` 续写与合并、有插话时先落成一轮、流中断续写；`m.SetPriority` 与 stdio `priority`；只有思考的截断先关思考；OpenAI 兼容适配器的本地选项与三种超时；`-local`；观测接上。
+   计划的验证：`TestPreemptTakesTheLeastUrgentCall`、`TestPreemptedCallIsContinued`（模拟模型收到以 `Partial` 结尾的请求，最终答案 = 前缀 + 续写）、`TestPreemptWaitsForTheQuantum`、`TestPreemptLimitPerStep`、`TestAgedTaskDoesNotPreempt`、`TestPreemptWithoutPrefillRestarts`、`TestPreemptedPartialThenSteer`、`TestCancelBeatsPreempt`、`TestLostStreamIsContinued`、`TestSetPriority`（就绪、等待、在 vCore 上、已结束；提交后触发抢占）、`TestThinkingOnlyTruncationTurnsThinkingOff`、`TestParallelCapsTheWindow`、`TestCrashAtEveryCommitPointWithAPreemption`（被抢、续写，每个提交点前后各崩一次）、`TestOldTaskBlobsDecode`、适配器的续写渲染 / `NoThink` / 三种超时、stdio `priority`、`observe` 的 span / 指标 / 日志；真实验收：本机 Ollama `qwen3.5:9b-mlx`，`-local`，后台长任务被交互任务抢占后续写完成，`first_ms`、`preempted` 进 trace。
 
 ## 18. 测试
 

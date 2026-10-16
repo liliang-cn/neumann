@@ -65,6 +65,16 @@ type Caps struct {
 	MaxOut   int  // the output cap a request is sent with when it carries none; 0 = unknown
 	Tools    bool // the model takes tool definitions and calls tools
 	MaxTools int  // most tool definitions one request may carry; 0 = no limit
+	// Parallel is how many requests the backend serves at once; 0 = unknown.
+	// It caps the group's window (design §6): a local backend that serves one
+	// request at a time would otherwise queue the rest where the machine can
+	// neither see nor reorder them.
+	Parallel int
+	// Prefill: a request that ends with an assistant message is continued,
+	// and the response carries only what comes after it (design §6.4).
+	Prefill bool
+	// ThinkOff: Request.NoThink turns the model's thinking off.
+	ThinkOff bool
 }
 
 // CapsReporter is an adapter that says what its model can take.

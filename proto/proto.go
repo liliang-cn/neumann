@@ -47,6 +47,13 @@ const (
 	// the steer has one.
 	EvSteerDelivered = "steer_delivered"
 
+	// A model call was preempted for a more urgent task of its group:
+	// {by, kept, ran_ms, n}; the task is Ready again and its next call
+	// continues the kept text (design §6.4).
+	EvPreempted = "preempted"
+	// An operator changed a task's priority: {priority, was} (design §6.4).
+	EvPrioritySet = "priority_set"
+
 	// Recovery after a restart, and an operator's answer for a call whose
 	// outcome became unknown.
 	EvRecovered       = "recovered"
