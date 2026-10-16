@@ -121,6 +121,7 @@ type TCB struct {
     Archived   int             // 压缩移进归档的消息数（5.3）
     Rejections int             // 被答案检查驳回的最终答案数（9.8）；检查看到的 Attempt
     Partial    string          // 被抢占或流中断的模型调用已收到的正文，下一次调用续写（6.4）；有回答时清空
+    PartialThink string        // 同上，但调用还在思考、没有正文：已收到的思考，下一次调用接着想（6.4）；与 Partial 至多一个非空
     Preempts   int             // 本步被抢占的次数，有回答时清零（6.4）
     NoThink    bool            // 下一次调用关掉思考：只想不答的截断之后（13）；有回答时清除
     StopReason string
@@ -411,7 +412,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 
 本地后端（Ollama、llama.cpp、LM Studio）一次只处理很少几个请求：实测 Ollama 的 MLX runner 严格串行，多发的请求在后端内部排队。那个队列机器看不见、不能重排，排队时间还算进请求超时（2026-10-16 实测：第二个请求在 Ollama 里排了 4 分 48 秒）。原则是**队列留在机器里**：并发对齐到后端能力（`Caps.Parallel`，6 节），其余任务在就绪队列里等，重排和抢占才有意义。
 
-一颗被占满的"CPU"上来了更急的任务，就该像操作系统一样抢占。和 CPU 不同的是，模型调用的"寄存器现场"是已经生成的文字：丢掉就要重新生成。所以被抢的调用**保留已收到的正文，下次让模型接着写**（续写，prefill）。实测 Ollama 收到以 assistant 消息结尾的请求时只返回接下来的部分，而且跳过思考；把半截思考作为 assistant 的 reasoning 回传则不行，模型会从头重想，还把正文混进思考里。所以只保留正文，思考和半截的工具调用参数都丢弃。
+一颗被占满的"CPU"上来了更急的任务，就该像操作系统一样抢占。和 CPU 不同的是，模型调用的"寄存器现场"是已经生成的文字：丢掉就要重新生成。所以被抢的调用**保留已收到的正文，下次让模型接着写**（续写，prefill）。实测 Ollama 收到以 assistant 消息结尾的请求时只返回接下来的部分，而且跳过思考；把半截思考作为 assistant 的 reasoning 回传则不行，模型会从头重想，还把正文混进思考里。但把半截思考放在 assistant 消息的**正文**里、前面加上开标签（`<think>\n` + 思考）可以：Ollama 接着想下去，回答全在 `content` 里——剩下的思考、`</think>`、正文（2026-10-16 实测，qwen3.5:9b-mlx）。这个模型连简单任务也先想几千块，抢占几乎总落在思考里，只留正文就等于丢掉全部思考（实测丢了 40 秒，重想 4 分钟）。所以：正文已经开始时只保留正文（思考已经结束）；还在思考时，适配器能接着想（`Caps.ThinkPrefill`）就保留思考，下次接着想。半截的工具调用参数总是丢弃。
 
 **抢占条件**（组的 `Preempt` 开着才会发生）：本组有就绪任务 `h`；存活 vCore 已经达到窗口、没有空闲的；在途的模型调用（`StepModel`，压缩不抢）里有任务 `v` 满足：
 
@@ -434,10 +435,11 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 - 没有待送达的插话，当前组的适配器 `Caps.Prefill` 为真：请求末尾加一条 assistant 文本消息，内容就是 `Partial`。回答的正文接在 `Partial` 后面合成一条消息：第一段文本前面接上 `Partial`，没有文本段时把 `Partial` 作为第一段；工具调用照常。用量只计这次的。
 - 有待送达的插话：`Partial` 先作为一条完整的 assistant 消息进寄存器（被打断的那一轮），插话跟在后面，像人打断别人说话。这一步不再续写。
 - 适配器不支持续写（例如任务迁到了别的组）：丢弃 `Partial`，从头生成。
-- 有回答（包括截断）时 `Partial` 清空、`Preempts` 清零。合并后的消息有内容，所以续写的回答被截断时按"有内容的截断"处理，和平时一样。
+- **接着想**：`Partial` 为空、`PartialThink` 不为空、没有待送达的插话、适配器 `Caps.ThinkPrefill` 为真：请求末尾加一条只有 reasoning 段（内容就是 `PartialThink`）、没有正文的 assistant 消息。回答的 reasoning 接在 `PartialThink` 后面（第一个 reasoning 段前面接上，没有就作为第一段），正文照常。有待送达的插话、或适配器不能接着想时丢掉 `PartialThink`：问题变了，或者没法接。
+- 有回答时 `Partial`、`PartialThink` 清空、`Preempts` 清零。**截断与否只看这次调用自己产出了什么**：续写的调用回来 `length`、没有新正文也没有工具调用，就是"截断且无内容"，按 13 处理（只有思考时先关思考），`Partial` 留着给重做续写，`PartialThink` 清空（跑满上限的思考不再接着想）；不是只把前缀当作答案结束任务。有新内容的截断照常按"有内容的截断"处理。
 - 窗口估算（5.3）把 `Partial` 算在请求里。
 
-**流中断也续写**：调用以 `Transient` 且 `ErrResponseLost` 失败时（流读到一半断了、空闲超时），已收到的正文同样追加进 `Partial`，随退避的提交落盘，重试时续写。`Unconfirmed` 照旧加一。
+**流中断也续写**：调用以 `Transient` 且 `ErrResponseLost` 失败时（流读到一半断了、空闲超时），已收到的正文（或还在思考时的思考）同样保留，随退避的提交落盘，重试时续写。`Unconfirmed` 照旧加一。
 
 **持久化**：`Partial` 只随提交持久化。在调用中途崩溃，重启后按 4.5 重做，用的是最近一次提交的 `Partial`。加字段之前写下的 TCB 解码为空。
 
@@ -445,14 +447,16 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 
 实现中的决定（`internal/core/preempt.go`，续写在 `internal/core/model.go` 的 `modelStep` / `modelCall`）：
 
-- **登记**：开着抢占的组，每个模型步（压缩不登记）在 `Running` 提交、插话合并之后、调用之前登记一条在途记录（任务、原始优先级、`Preempts`、vCore、开始时刻、调用自己的 `context.WithCancelCause`），调用返回即注销。注销时取消原因是 `errPreempted`、调用出了错、任务自己的 context 还没结束，才算被抢；被选中的同时回答已经到了，回答照常采用。
+- **登记**：开着抢占的组，每个模型步（压缩不登记）在 `Running` 提交、插话合并之后、调用之前登记一条在途记录（任务、原始优先级、`Preempts`、vCore、开始时刻、调用自己的 `context.WithCancelCause`），调用返回即注销。注销时取消原因是 `errPreempted`、调用出了错、任务自己的 context 还没结束，才算被抢；被选中的同时回答已经到了，回答照常采用。**登记之后立刻查一次**：调用从取到任务到真正发出之间（老化让它排在更急的任务前面被取走、在限流器上等额度、`Running` 提交）可能已经有更急的任务就绪，那时的检查看不到这次调用，之后也没有别的触发点，它就会一直跑完（评审发现，`TestPreemptACallTakenAheadByAging`、`TestPreemptACallThatWaitedForRoom`）。
+- **熔断探测不被抢**：半开时放出去的探测请求不登记。被抢的调用不向执行组报告结果，探测被抢就永远没有结论，组要等熔断器放弃这个探测（`OpenFor`）才再放一个，期间本组什么都发不出去（`TestProbeIsNeverPreempted`）。其他被放行的请求没有这种特殊身份。
+- **空出的 vCore 给谁**：被选中的 vCore 记下它是为哪个任务让出的；执行完这条指令后，它下一次取指先直接取那个任务（`Sched.TakeReady`），那个任务已经不在就绪队列（被别的 vCore 取走、被取消）才照常按队列取。否则老化会把它交给一个等得更久的后台任务，抢占就白做了，`h` 还得再抢一次（`TestFreedVCoreGoesToTheUrgentTask`）。vCore 因窗口缩小退役、没去取时，再查一次。
 - **"没有空闲 vCore"**：`存活 ≥ floor(W)` 且 `存活 − 忙碌 + 让出中 = 0`。"让出中"是被选为牺牲者、还没执行完这条指令的 vCore：它马上会空出来，算作空闲，所以被抢的任务交还时（`OnReady`）、那个 vCore `Release` 之后都不会再抢第二个。**"一次只抢一个"的下一次检查放在空出来的 vCore 取到下一条指令时**（`runCore` 里 `Acquire` 之后），而不是交还时：交还发生在 `Release` 之前，那时忙碌数里还算着它，若在那里查就会为同一个 `h` 多抢一个。`Release` 之后清掉让出标记再查一次（vCore 因窗口缩小退役时由这一查补上）。
 - **候选与选择**：`h` 是就绪队列里原始优先级最小的（同级 `ReadySince` 最早，`Sched.Urgent`）；不看老化。多个候选：优先级数最大的，同级开始最晚的（跑得最短），再同取任务 id 小的，结果确定。未满 `PreemptAfter` 的候选只决定定时器：组里只挂一个，取最早到期的那个，更早的到期会换掉它；到点再查一次。停机开始后（`Sched.Stopping`）或强制停机后不抢。
 - **取消一个调用**：只结束调用自己的 context（原因 `errPreempted`）；`errPreempted` 不会到达任务的 context，所以取消信号、Deadline 照旧各走各的。之后的判断顺序：先看强制停机，再看取消（`Sched.Cancelled`，取消赢，按被取消打断处理，`Unconfirmed + 1`），再看抢占。取消已提交但信号未到时，`preempted` 提交被 `ErrCancelPending` 拒绝，`cancelInstead` 照常最终提交，没有 `preempted` 事件（`TestCancelBeatsPreempt` 两种都测）。
-- **提交的事件**：`step` 在前、`preempted` 在后，没有 `usage`（`observe` 把 `usage` 当作有回答的调用）；没有 `steer_delivered`（插话退回）。前面可能有 `throttled`。`kept`、`prefill` 按字符（rune）计。
-- **保留哪段文字**：只有这次调用没合并插话时，收到的正文才进 `Partial`（续写的调用，或没有 `Partial` 的新调用）。合并了插话的调用是对插话的新回答：插话退回待送达，它的文字也丢掉（`kept` 为 0），先前的 `Partial` 原样恢复——否则下一步会把"对插话的回答"当作被打断的一轮放到插话前面。流中断同理。
-- **插话与 `Partial`**：`Partial` 落成 assistant 消息这件事在 `apply` 钩子里做（`Running` 提交之后，和合并插话同一处），调用没有回答（失败、退避、被抢、被取消、截断且无内容）时连同插话一起撤回、`Partial` 恢复。所以"截断且无内容"时 `Partial` 不清空——它随插话退回，重做时再落成一轮；这与"有回答（包括截断）时 `Partial` 清空"不同，是唯一的例外。`Preempts` 在任何有回答的调用后清零。
-- **合并**：`Partial` 接在回答第一段文本的前面；回答没有文本时作为一段文本插在工具调用之前、开头的 reasoning 之后（服务商要求 reasoning 在前）。截断判断在合并之后做。
+- **提交的事件**：`step` 在前、`preempted` 在后，没有 `usage`（`observe` 把 `usage` 当作有回答的调用）；没有 `steer_delivered`（插话退回）。前面可能有 `throttled`。`preempted` 是 `{by, kept, kept_think, ran_ms, n}`：`kept` 是留下的正文字符数，`kept_think` 是留下的思考字符数（两者至多一个不为 0）。接着想的调用的 `step` 带 `prefill_think`（思考前缀的字符数），续写正文的带 `prefill`。都按字符（rune）计。
+- **保留哪段文字**（`keepPartial`，被抢和流中断同一个函数）：只有这次调用没合并插话时才保留（续写的调用，或没有 `Partial` 的新调用）。任务已有 `Partial`（续写正文，或插话要打断的那一轮）：适配器能续写就把收到的正文接上，不能就什么都不加，但**已有的 `Partial` 不清**——它是插话要打断的那一轮，下一步照样落成 assistant 消息再送插话（评审指出原来被抢时清掉、流中断时保留，两条路不一致）。没有 `Partial`、正文已经开始、能续写：正文进 `Partial`，`PartialThink` 清空。还没有正文、能接着想：思考追加进 `PartialThink`。合并了插话的调用是对插话的新回答：插话退回待送达，收到的东西都丢掉（`kept`、`kept_think` 为 0），先前的 `Partial` 原样恢复——否则下一步会把"对插话的回答"当作被打断的一轮放到插话前面。
+- **插话与 `Partial`**：`Partial` 落成 assistant 消息这件事在 `apply` 钩子里做（`Running` 提交之后，和合并插话同一处），调用没有回答（失败、退避、被抢、被取消、截断且无内容）时连同插话一起撤回、`Partial` 恢复。所以"截断且无内容"时 `Partial` 不清空——它随插话退回，重做时再落成一轮。`Preempts` 在任何有回答的调用后清零。
+- **合并**：`Partial` 接在回答第一段文本的前面；回答没有文本时作为一段文本插在工具调用之前、开头的 reasoning 之后（服务商要求 reasoning 在前）。`PartialThink` 接在第一个 reasoning 段前面，没有就作为第一段。截断判断在合并**之前**、只看这次调用的回答做（评审发现：原来先合并，只想不答、跑满上限的续写因为合并后"有内容"，任务就以被截断的前缀作为答案结束了，`TestThinkingOnlyContinuationIsRedone`）。
 - **始终流式**：组开着抢占、或机器有增量接收方（`Machine` 总是有）时，适配器实现了 `Streamer` 就流式调用；收到的 `Delta.Text` 累加在 vCore 上，有接收方才转发。所以"流中断也续写"不要求组开着抢占：只要这次调用是流式的、适配器 `Caps.Prefill` 为真。
 - **`first_ms`**：机器时钟上从调用适配器前一刻到第一块增量（正文或推理都算）的毫秒数，`step` 事件在调用之后改写带上它；`prefill` 在合并插话的钩子里写上。`check_ms` 也改为在原事件上改写，三者可以同时出现。
 - **`SetPriority`**：优先级没变时什么都不提交、返回 nil；`ReadySince` 不变（不重新排队尾）。负数报错。`Submit` 也放开到任何 `≥ 0` 的优先级（原来只接受 0、1）。调度器本来就按数值比较、老化把任何大于 0 的提成 0，`Queue` 的 `Background` 计所有大于 0 的。
@@ -782,9 +786,9 @@ type Classifier interface{ Classify(err error) ErrClass }
 type RateReporter interface{ RateInfo(resp *Response, err error) *RateInfo }
 ```
 
-`Caps` 另有三项，给本地后端用（6.4）：`Parallel`（后端同时处理的请求数，0 = 未知，约束组的窗口上限）、`Prefill`（以 assistant 消息结尾的请求会被续写，只返回接下来的部分）、`ThinkOff`（`Request.NoThink` 能关掉思考）。`Request.NoThink` 为真时适配器关掉思考：OpenAI 兼容适配器发配置的 `ThinkOff` 值（Ollama 上是 `reasoning_effort: "none"`，实测只生成 3 个 token 就作答），没配置时 `Caps.ThinkOff` 为假、这个字段被忽略；Anthropic 适配器不发 `thinking`（配了 `ThinkingBudget` 也不发），所以它的 `Caps.ThinkOff` 恒为真。Anthropic 适配器的 `Caps.Prefill` 为假：Anthropic 拒绝以空白结尾的 assistant 前缀、开着思考时不许前缀，有的模型根本不收前缀，被抢的调用在这个组上从头生成。
+`Caps` 另有四项，给本地后端用（6.4）：`ThinkPrefill`（以只有 reasoning、没有正文的 assistant 消息结尾的请求会接着想下去，回答只带之后的思考和正文）、`Parallel`（后端同时处理的请求数，0 = 未知，约束组的窗口上限）、`Prefill`（以 assistant 消息结尾的请求会被续写，只返回接下来的部分）、`ThinkOff`（`Request.NoThink` 能关掉思考）。`Request.NoThink` 为真时适配器关掉思考：OpenAI 兼容适配器发配置的 `ThinkOff` 值（Ollama 上是 `reasoning_effort: "none"`，实测只生成 3 个 token 就作答），没配置时 `Caps.ThinkOff` 为假、这个字段被忽略；Anthropic 适配器不发 `thinking`（配了 `ThinkingBudget` 也不发），所以它的 `Caps.ThinkOff` 恒为真。Anthropic 适配器的 `Caps.Prefill` 为假：Anthropic 拒绝以空白结尾的 assistant 前缀、开着思考时不许前缀，有的模型根本不收前缀，被抢的调用在这个组上从头生成。
 
-OpenAI 兼容适配器的本地选项：`Parallel`、`Prefill`、`ThinkOff` 原样进 `Caps`；超时分三种，`Timeout`（整次调用，默认 5 分钟，0 = 不限）、`FirstByteTimeout`（发出到第一个字节，默认 0 = 只受 `Timeout` 约束）、`IdleTimeout`（流式时相邻两块之间，默认 0 = 不限）。本地后端处理长提示词时首字节可能很慢，生成时却一直有数据，所以本地配置是 `Timeout = 0`、首字节 10 分钟、空闲 2 分钟，失控的生成靠输出上限截住（13）。三种超时都按单次请求超时处理：调用方还有时间，就是 `Transient`；流中途超时包 `ErrResponseLost`，已收到的正文进 `Partial`（6.4）。
+OpenAI 兼容适配器的本地选项：`Parallel`、`Prefill`、`ThinkOff` 原样进 `Caps`；`ThinkTags`（开、闭标签，`-local` 设为 `<think>`、`</think>`）设了就报 `ThinkPrefill`：末尾只有 reasoning 的 assistant 消息以 `content = 开标签 + "\n" + 思考` 发出，这时回答（Ollama 全在 `content` 里）在闭标签处切开，之前是 reasoning（流式时是 `Delta.Reasoning`，跨块的标签也认得出，可能是标签开头的尾巴先压着等下一块），之后是正文（去掉开头的换行）；回答里没有闭标签就全是思考。超时分三种，`Timeout`（整次调用，默认 5 分钟，0 = 不限）、`FirstByteTimeout`（发出到第一个字节，默认 0 = 只受 `Timeout` 约束）、`IdleTimeout`（流式时相邻两块之间，默认 0 = 不限）。本地后端处理长提示词时首字节可能很慢，生成时却一直有数据，所以本地配置是 `Timeout = 0`、首字节 10 分钟、空闲 2 分钟，失控的生成靠输出上限截住（13）。三种超时都按单次请求超时处理：调用方还有时间，就是 `Transient`；流中途超时包 `ErrResponseLost`，已收到的正文进 `Partial`（6.4）。
 
 实现：三种超时由适配器自己用请求的 context 实现（以 `*openai.TimeoutError` 为原因取消，`Which` 为 `call` / `first byte` / `idle`），不再用 `http.Client.Timeout`，所以共用的传输层（HTTP/2 连接、HTTP/3 回退）不受影响；`HTTP.Timeout` 若另外设了，叠加生效。错误链里是 `*TimeoutError`，没有 `context.Canceled`，所以不会被误判为取消；调用方的 ctx 已结束时仍按取消处理。"第一个字节"指响应体的第一个字节：本地后端排队时可能先回响应头、正文迟迟不来，只看响应头量不到排队。非流式调用的响应体要等整个回答生成完才来，所以对 `Call` 来说 `FirstByteTimeout` 约束的是整次生成。`IdleTimeout` 从第一个字节之后开始，每次读到数据重新计时。响应头之前超时不包 `ErrResponseLost`（和原来的 `http.Client.Timeout` 一样），收到响应头之后超时包。流式增量的思考除了 `reasoning_content`（DeepSeek）也认 Ollama 的 `reasoning`，作为 `Delta.Reasoning` 报出；回答本身不带思考。
 
@@ -867,7 +871,7 @@ type Event struct {
 
 `Time` 由 Store 在提交时盖上，和 `Seq` 一样：同一个提交集里的事件是同一时刻；按 `Seq` 单调不减（墙上时钟回拨时停在上一次的时刻，等时钟追上）；持久化，补读得到的与在线时逐纳秒相同。`mem.Memory` 的 `Now` 字段、`sqlite.WithClock` 可注入时钟。SQLite 存为 Unix 纳秒，`Open` 给旧库的事件表补列，旧事件读出零值；消费方把零值当作未知（JSON 里省略）。
 
-任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_delivered`（带发送方的插话送达，10.1）、`steer_dropped`（带发送方的多一个 `from`）、`preempted`（`{by, kept, ran_ms, n}`，6.4）、`priority_set`（`{priority, was}`，6.4）。`step` 在流式调用收到第一块数据时带 `first_ms`（发出到第一块的毫秒数），用来区分后端排队和生成；续写的调用带 `prefill`（续写前缀的字符数）。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
+任务事件：`accepted`、`model_call`（随 `Running` 提交、请求即将发出，`{pc, core}`；到带结果的 `step` 为服务商时延）、`step`、`tool_call`、`tool_result`、`tool_late`、`usage`、`answer`、`model_retry`、`compacted`、`migrated`、`migrate_refused`、`recovered`（重启时恢复了这个任务，`{from, ...}`）、`reconcile_needed`、`resolved`（操作员处理了一个待核对的调用）、`tool_denied`、`tool_rewritten`、`approval_needed`、`approved`（9.7）、`answer_rejected`（9.8）、`done`、`failed`、`cancelled`、`steer_delivered`（带发送方的插话送达，10.1）、`steer_dropped`（带发送方的多一个 `from`）、`preempted`（`{by, kept, kept_think, ran_ms, n}`，6.4）、`priority_set`（`{priority, was}`，6.4）。`step` 在流式调用收到第一块数据时带 `first_ms`（发出到第一块的毫秒数），用来区分后端排队和生成；续写的调用带 `prefill`（续写前缀的字符数），接着想的调用带 `prefill_think`（思考前缀的字符数）。配置了答案检查时，检查看过的答案的 `answer`、`done` 带 `checked`（9.8）。
 
 `compacted`：`{rounds, messages_before, messages_after, tokens_before_est, tokens_after_est, chunk, chunks}`（5.3）。`step` 的 `pc` 为 `model`、`tools` 或 `compact`。`model_retry` 的 `class` 可以是 `context_length`（`wait = "compact"`）。
 
@@ -1012,7 +1016,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
 8. **本地模型：抢占、续写、重排**（6.4）：`Caps.Parallel` / `Prefill` / `ThinkOff`、`Request.NoThink`；组的 `Preempt` / `PreemptAfter` / `MaxPreempts`；抢占检查（就绪、`SetPriority`、定时器）、`preempted` 提交、`Partial` 续写与合并、有插话时先落成一轮、流中断续写；`m.SetPriority` 与 stdio `priority`；只有思考的截断先关思考；OpenAI 兼容适配器的本地选项与三种超时；`-local`；观测接上。
    核心已完成（`internal/core/preempt.go`、`model.go`；实现中的决定见 6.4 末尾）：TCB 的 `Partial` / `Preempts` / `NoThink`（gob、JSON 都向后兼容）；`GroupConfig` 和单组简写的 `Preempt` / `PreemptAfter`（默认 2s）/ `MaxPreempts`（默认 2），`Caps.Parallel` 约束 `Max`、简写 `Cores` 和 `SetCores`；每组在途模型调用登记、抢占检查（`OnReady`、`SetPriority` 之后、量子定时器、空出的 vCore 取到下一条指令时）、`preempted` 提交、取消优先；开着抢占时总是流式并在核心累加正文；续写（末尾 assistant 前缀、合并、有插话时先落成一轮并可撤回、不支持续写时丢弃、窗口估算计入）；流中断续写；`step` 的 `prefill`、`first_ms`；只有思考的截断先关思考（含只从流里看得出的思考）；`Sched.Urgent`，优先级可以大于 1，`Submit` 接受任何 `≥ 0` 的优先级；`m.SetPriority`；stdio `priority`（`task_busy`），不再是 `unsupported`；`sim.Model` 可以按假时钟分块流式、报告 `Caps`、记下收到的请求（`Requests`），`sim.Prefill` / `sim.Continue` 只回续写部分。
    验证：`TestPreemptedCallIsContinued`（模拟模型收到以 `Partial` 结尾的请求，最终答案 = 前缀 + 续写，被抢的提交只有 `step`、`preempted`，续写的 `step` 带 `prefill`，两次都带 `first_ms`）、`TestPreemptTakesTheLeastUrgentCall`（最不急的；同级跑得最短的；另一个不被抢）、`TestPreemptWaitsForTheQuantum`、`TestPreemptLimitPerStep`、`TestAgedTaskDoesNotPreempt`、`TestPreemptWithoutPrefillRestarts`、`TestPreemptedPartialThenSteer`、`TestCancelBeatsPreempt`（取消信号先到；只有取消的提交先到）、`TestLostStreamIsContinued`、`TestLostStreamWithoutPrefillStartsOver`、`TestSetPriority`（就绪、退避等待、在 vCore 上、已结束、不存在、负数、同值；提交后立刻触发抢占）、`TestThinkingOnlyTruncationTurnsThinkingOff`（关思考后回答；关思考仍截断再放大；没有 `ThinkOff` 直接放大；思考只从流里看得出）、`TestParallelCapsTheWindow`、`TestCrashAtEveryCommitPointWithAPreemption`（付款后回答被紧急任务抢占、紧急任务跑完、续写，每个提交点前后各崩一次，SQLite；重启后从 `Partial` 续写的崩溃点有 8 个）、`TestPrioritiesAboveOne`（sched）、`TestPacedStreamAndPrefill`（sim）、`TestPriorityOverTheWire`（stdio）、一致性套件的整 TCB 往返和 `TestOldTaskBlobsDecode` 覆盖三个新字段。
-   适配器的本地选项与三种超时、`-local`、`observe` 的 span / 指标 / 日志在各自的分支里做、各自验证。`-local` 打开组的 `Preempt` 还待接上（`cmd/neumann` 里留着 TODO）。真实验收（本机 Ollama `qwen3.5:9b-mlx`，`-local`，后台长任务被交互任务抢占后续写完成，`first_ms`、`preempted` 进 trace）还没做。
+   评审后修正：登记之后立刻查一次（取到任务到发出之间就绪的更急任务）、熔断探测不被抢、空出的 vCore 先取为之让出的任务、截断只看续写这次自己的产出、被抢与流中断保留 `Partial` 的规则一致（`keepPartial`）。验证：`TestPreemptACallTakenAheadByAging`、`TestPreemptACallThatWaitedForRoom`、`TestFreedVCoreGoesToTheUrgentTask`、`TestProbeIsNeverPreempted`、`TestThinkingOnlyContinuationIsRedone`、`TestAgedTaskDoesNotPreempt` 断言空出的 vCore 先跑谁、`TestKeepPartial` / `TestContinuedJoins`（core）。
+   接着想：TCB 的 `PartialThink`、`Caps.ThinkPrefill`，OpenAI 兼容适配器的 `ThinkTags`（渲染与切分，含流式跨块标签），`-local` 设 `ThinkTags` 并打开组的 `Preempt`；`preempted` 的 `kept_think`、`step` 的 `prefill_think`；`sim.Think` / `sim.PrefillThink` / `sim.ContinueThink`，`sim.Model` 先流思考后流正文。验证：`TestPreemptedThinkingIsContinued`（思考中被抢：留下思考，下次请求以只有思考的 assistant 消息结尾，答案的 reasoning 是两段接起来的；正文已开始：只留正文）、`TestThinkTagsContinueAThought`、`TestThinkTagsSplitTheStream`（openai）、`TestLocal`（cmd）。
+   真实验收（`acceptance/local`，`NEUMANN_ACCEPT_LIVE=1`，本机 Ollama `qwen3.5:9b-mlx`，单 vCore、`Preempt`、`-local` 的适配器配置）：后台任务（17 × 23）思考 40 块后提交交互任务，后台调用立即被抢（已跑过 2 秒的量子），只留思考，交互任务答完，后台任务下一次调用带 `prefill_think`，接着想完、答 391。两次运行：被抢于 5.5 秒 / 2.1 秒，`kept_think` 168 / 159、`kept` 0，续写调用首块 393 / 430ms，交互任务 39 / 24 秒答完，后台任务 2 分 29 秒 / 1 分 27 秒完成；第二次断言答案的 reasoning 只开头一次（"Thinking Process:" 只出现一次，没有从头重想）。`observe` 的 span / 指标 / 日志在 `obs` 分支里做；`kept_think`、`prefill_think` 待它同步。
 
 ## 18. 测试
 

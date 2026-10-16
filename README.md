@@ -150,7 +150,8 @@ A local backend (Ollama, llama.cpp, LM Studio) needs a few more settings on
 the OpenAI-compatible adapter: `Parallel` (how many requests it serves at
 once; Ollama's MLX runner serves one), `Prefill` (it continues a trailing
 assistant message), `ThinkOff` (the `reasoning_effort` value that turns
-thinking off, `"none"` on Ollama), and timeouts that fit it: `Timeout` bounds
+thinking off, `"none"` on Ollama), `ThinkTags` (the tags the model writes its
+thinking between, so a thought cut off is continued too), and timeouts that fit it: `Timeout` bounds
 the whole call (5 minutes by default, 0 for none), `FirstByteTimeout` the wait
 for the first byte of the answer, `IdleTimeout` the gap between stream chunks.
 The package documentation of `model/openai` shows a local configuration;
@@ -575,8 +576,9 @@ every flag and its environment variable. Without `-store` state is in memory
 and nothing is durable.
 
 For a local model, `-local` configures the backend in one switch: one request
-at a time (`-parallel N` for more) and as many vCores, continuation of a
-cut-off answer, thinking turned off with `reasoning_effort: "none"` when a
+at a time (`-parallel N` for more) and as many vCores, preemption of a less
+urgent task's call for a more urgent task (`Preempt`, design §6.4) with its
+answer or its thinking continued afterwards, thinking turned off with `reasoning_effort: "none"` when a
 turn is cut off while still thinking, 10 minutes to the first byte and 2
 minutes between stream chunks with no limit on the whole call, and an output
 cap of 8192 tokens unless `-max-tokens` is given. The base URL defaults to
