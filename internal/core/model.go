@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/liliang-cn/neumann/internal/group"
@@ -99,7 +100,27 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 		return e.groupGone(t, c, g), nil, nil
 	}
 	a := e.adapter(g)
-	switch d := e.windowFor(t, g, a, false, steerMessages(pending, e.frameSteer)); {
+	caps := capsOf(a)
+	// A task cut off mid-answer (design §6.4) carries the text it had in
+	// Partial. With steers to deliver, that text becomes the turn the steers
+	// interrupt, a whole assistant message ahead of them; otherwise a model
+	// that can continue a prefill is asked to, and one that cannot starts
+	// the answer afresh.
+	partial := t.Partial
+	steers := steerMessages(pending, e.frameSteer)
+	var prefill string
+	extra := steers // what the request carries after the registers
+	switch {
+	case partial == "":
+	case len(steers) > 0:
+		extra = append([]task.Message{task.Text(task.RoleAssistant, partial)}, steers...)
+	case caps.Prefill:
+		prefill = partial
+		extra = []task.Message{task.Text(task.RoleAssistant, partial)}
+	default:
+		t.Partial, partial = "", ""
+	}
+	switch d := e.windowFor(t, g, a, false, extra); {
 	case d.overflow != "":
 		// Not an instruction either: nothing is sent.
 		return failWith(t, c, StopContextOverflow, d.overflow), nil, nil
@@ -109,29 +130,60 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 	t.CompactChunk, t.CompactRaise, t.CompactLimit = 0, 0, 0 // a pass that found nothing more to swap out is over
 
 	base := len(t.Regs)
-	req := model.Request{System: t.System, Tools: t.Tools, Messages: forProvider(t.Regs, a.Provider()), MaxOut: e.sendOut(g, t)}
-	resp, c, out := e.modelCall(ctx, t, core, g, a, task.StepModel, req, func(c *mem.CommitSet) model.Request {
+	withPrefill := func(msgs []task.Message) []task.Message {
+		if prefill == "" {
+			return msgs
+		}
+		return append(msgs[:len(msgs):len(msgs)], task.Text(task.RoleAssistant, prefill))
+	}
+	req := model.Request{System: t.System, Tools: t.Tools, Messages: withPrefill(forProvider(t.Regs, a.Provider())), MaxOut: e.sendOut(g, t), NoThink: t.NoThink}
+	resp, c, thought, out := e.modelCall(ctx, t, core, g, a, task.StepModel, req, func(c *mem.CommitSet) model.Request {
 		// Steers are applied after the Running commit, so a crash cannot
 		// leave a steer in the registers that the interrupt table still
-		// lists as pending.
+		// lists as pending. So is a Partial they interrupt: modelCall puts
+		// it back if the call is not answered.
+		if partial != "" && len(steers) > 0 {
+			t.Regs = append(t.Regs, task.Text(task.RoleAssistant, partial))
+			t.Partial = ""
+		}
 		c.Applied = applySteers(t, pending, e.frameSteer)
-		req.Messages = forProvider(t.Regs, a.Provider())
+		req.Messages = withPrefill(forProvider(t.Regs, a.Provider()))
+		if prefill != "" {
+			amendStep(c, func(d *stepData) { d.Prefill = runes(prefill) })
+		}
 		return req
 	})
 	if out != nil {
 		return out.c, out.batch, out.err
 	}
 	t.Retries = 0
+	// Answered: the step's preemptions are over, and a continued answer is
+	// joined onto the text it continues, so it is never one with nothing in
+	// it (a cut-off continuation is a cut-off answer with content).
+	t.Preempts = 0
+	if prefill != "" {
+		resp.Message = continued(prefill, resp.Message)
+	}
 	if truncated(resp) {
 		// Nothing came back to keep: the redo sends the same turn, steers
-		// included, with a larger output cap.
+		// included, with a larger output cap; a Partial they interrupted
+		// goes back with them.
 		t.Regs = t.Regs[:base]
 		c.Applied = nil
+		t.Partial = partial
+		if caps.ThinkOff && !t.NoThink && (thought || thinkingOnly(resp.Message, resp.Usage.ReasoningTokens)) {
+			// It spent its whole cap thinking (design §13): asked again with
+			// thinking off, at the same cap, before any raise.
+			return e.redoWithoutThinking(g, t, c), nil, nil
+		}
 		return e.redoTruncated(g, t, c), nil, nil
 	}
 	// Answered, and not cut off: a cap raised for a truncated turn is
-	// dropped, and the next call goes back to the task's own.
+	// dropped, and the next call goes back to the task's own, thinking
+	// included.
 	t.Truncations = 0
+	t.NoThink = false
+	t.Partial = ""
 
 	msg := resp.Message
 	msg.Parts = slices.Clone(msg.Parts) // the adapter's slice is not ours to write
@@ -173,7 +225,7 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 	// verdict is dropped either way.
 	began := e.Clock.Now()
 	v := e.checkAnswer(t, msg.TextContent())
-	checkTook(&c, core, e.Clock.Now().Sub(began))
+	checkTook(&c, e.Clock.Now().Sub(began))
 	if out := e.arrived(ctx, t, c, base, resp); out != nil {
 		return out.c, out.batch, out.err
 	}
@@ -182,12 +234,8 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 
 // checkTook notes on the step event in c how long the answer check held the
 // step, so that an observer can tell the provider's latency from it.
-func checkTook(c *mem.CommitSet, core int, d time.Duration) {
-	for i, ev := range c.Events {
-		if ev.Kind == proto.EvStep {
-			c.Events[i] = proto.NewEvent(proto.EvStep, ev.TaskID, stepData{PC: task.StepModel.String(), Core: core, CheckMS: max(d.Milliseconds(), 0)})
-		}
-	}
+func checkTook(c *mem.CommitSet, d time.Duration) {
+	amendStep(c, func(s *stepData) { s.CheckMS = max(d.Milliseconds(), 0) })
 }
 
 // arrived ends a model step whose final answer is in hand (the last of t's
@@ -231,16 +279,22 @@ type stepOut struct {
 // model step applies its steers there); nil sends req as it is.
 //
 // It returns the response and the commit set so far (the step and usage
-// events, the steers applied) when the call was answered. Otherwise it
+// events, the steers applied) when the call was answered, and whether the
+// call streamed any reasoning (a backend that streams its thinking may
+// report it nowhere else). Otherwise it
 // returns how the instruction ends: not started, cancelled, waiting for
 // the group or a backoff, failed, or compacting after a context-length
 // rejection.
 func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a model.Adapter, pc task.PC, req model.Request,
-	apply func(c *mem.CommitSet) model.Request) (model.Response, mem.CommitSet, *stepOut) {
+	apply func(c *mem.CommitSet) model.Request) (model.Response, mem.CommitSet, bool, *stepOut) {
 	var c mem.CommitSet
 	base := len(t.Regs)
-	end := func(c mem.CommitSet, err error) (model.Response, mem.CommitSet, *stepOut) {
-		return model.Response{}, mem.CommitSet{}, &stepOut{c: c, err: err}
+	// apply may move the task's Partial into its registers (a preempted
+	// answer interrupted by steers, design §6.4); a call that is not answered
+	// puts it back, as it takes the steers back.
+	partial0 := t.Partial
+	end := func(c mem.CommitSet, err error) (model.Response, mem.CommitSet, bool, *stepOut) {
+		return model.Response{}, mem.CommitSet{}, false, &stepOut{c: c, err: err}
 	}
 
 	// The call runs under the task's own context: a cancel or deadline ends
@@ -325,26 +379,62 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		// Signalled since the start commit: no request goes out.
 		unsent()
 		cs, batch, err := e.cancelledStep(ctx, t, c, base, model.Response{}, nil, false, false)
-		return model.Response{}, mem.CommitSet{}, &stepOut{cs, batch, err}
+		return model.Response{}, mem.CommitSet{}, false, &stepOut{cs, batch, err}
 	}
 	c.Events = append(c.Events, proto.NewEvent(proto.EvStep, t.ID, stepData{PC: pc.String(), Core: core}))
 	if apply != nil {
 		req = apply(&c)
 	}
 
-	var emit func(model.Delta)
+	// The text the call streams is kept as it comes: a call cut off by a
+	// preemption, or whose stream breaks off, leaves it for the next call to
+	// continue (design §6.4). A group that preempts streams every model call
+	// its adapter can, whether or not anyone watches the deltas.
+	var (
+		emit    func(model.Delta)
+		got     strings.Builder
+		first   time.Time
+		thought bool
+	)
+	force := g != nil && g.Preempt
 	if pc == task.StepModel {
 		// A compaction's summary is not an answer: it is not streamed.
 		stepNo := t.Used.Steps + 1
 		emit = func(d model.Delta) {
-			e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
+			if first.IsZero() {
+				first = e.Clock.Now()
+			}
+			got.WriteString(d.Text)
+			thought = thought || d.Reasoning != ""
+			if e.Delta != nil {
+				e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
+			}
 		}
 	}
-	resp, err := e.callModel(tctx, a, req, emit)
+	callCtx, fl := tctx, (*flight)(nil)
+	if pc == task.StepModel {
+		callCtx, fl = e.fly(tctx, g, t, core)
+	}
+	sent := e.Clock.Now()
+	resp, err := e.callModel(callCtx, a, req, emit, force)
+	by, ran, preempted := e.land(g, fl, callCtx)
+	// Cut off by a preemption, and not by its task's cancel or the halt:
+	// the machine ended the call itself, and knows how it ended.
+	preempted = preempted && err != nil && tctx.Err() == nil
+	if !first.IsZero() {
+		amendStep(&c, func(d *stepData) { ms := max(first.Sub(sent).Milliseconds(), 0); d.FirstMS = &ms })
+	}
+	// Text kept from a call that was not answered continues the task's
+	// Partial only when the call did: one that carried steers was a new
+	// turn, and goes back with them.
+	keep := got.String()
+	if len(c.Applied) > 0 || t.Partial != partial0 {
+		keep = ""
+	}
 	class := model.Unknown
 	var p *panicError
 	panicked := errors.As(err, &p)
-	lost := err != nil && errors.Is(err, model.ErrResponseLost)
+	lost := err != nil && errors.Is(err, model.ErrResponseLost) && !preempted
 	// The adapter's hooks run under the same guard as the call: a panic in
 	// any of them is the adapter panicking, and fails the task (the call's
 	// response, if it had one, is not used).
@@ -355,7 +445,11 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		err, panicked, class = perr, true, model.Unknown
 		return true
 	}
-	if err != nil && !panicked && !hookPanicked(guarded("Classify", func() { class = model.ClassifyWith(a, err) })) {
+	if preempted && !panicked {
+		// Settled as a call interrupted by a cancel, and not reported to the
+		// group: it says nothing about the provider.
+		class = model.Canceled
+	} else if err != nil && !panicked && !hookPanicked(guarded("Classify", func() { class = model.ClassifyWith(a, err) })) {
 		if class == model.Canceled && tctx.Err() == nil {
 			// The task was not cancelled: the adapter gave up on its own (a
 			// timeout it reported as a bare deadline). The provider was slow.
@@ -407,8 +501,9 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		if pc != task.StepModel {
 			kept = model.Response{} // a summary is never kept
 		}
+		t.Partial = partial0
 		cs, batch, cerr := e.cancelledStep(ctx, t, c, base, kept, err, true, err != nil && !lost && tctx.Err() != nil)
-		return model.Response{}, mem.CommitSet{}, &stepOut{cs, batch, cerr}
+		return model.Response{}, mem.CommitSet{}, false, &stepOut{cs, batch, cerr}
 	}
 	if err != nil {
 		// Steers applied for this call were never answered: take them back.
@@ -416,12 +511,21 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		// commit reports them dropped.
 		t.Regs = t.Regs[:base]
 		c.Applied = nil
+		t.Partial = partial0
+		if preempted && !panicked {
+			return end(e.preempted(t, c, by, ran, keep, capsOf(a).Prefill), nil)
+		}
+		if lost && !panicked && capsOf(a).Prefill {
+			// The stream broke off: what came is continued by the retry
+			// (design §6.4), committed with the backoff.
+			t.Partial += keep
+		}
 		if class == model.ContextLength && !panicked {
 			return end(e.contextRejected(t, c, g, a, req, err), nil)
 		}
 		return end(e.modelFailed(t, c, class, err, info, panicked), nil)
 	}
-	return resp, c, nil
+	return resp, c, thought, nil
 }
 
 // plan gives each tool call in msg its id and returns their planned call
@@ -512,14 +616,16 @@ func guarded(in string, f func()) (err error) {
 }
 
 // callModel calls the adapter, streaming through emit when the adapter can,
-// a Delta sink is set and emit is not nil; a panic in it fails the task, not the process.
-func (e *Env) callModel(ctx context.Context, a model.Adapter, req model.Request, emit func(model.Delta)) (resp model.Response, err error) {
+// emit is not nil, and either a Delta sink is set or force (a group that
+// preempts keeps what a call streams); a panic in it fails the task, not the
+// process.
+func (e *Env) callModel(ctx context.Context, a model.Adapter, req model.Request, emit func(model.Delta), force bool) (resp model.Response, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			resp, err = model.Response{}, &panicError{v: r}
 		}
 	}()
-	if s, ok := a.(model.Streamer); ok && e.Delta != nil && emit != nil {
+	if s, ok := a.(model.Streamer); ok && (e.Delta != nil || force) && emit != nil {
 		return s.Stream(ctx, req, emit)
 	}
 	return a.Call(ctx, req)

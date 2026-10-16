@@ -239,10 +239,12 @@ func TestSubmitCopiesPageTables(t *testing.T) {
 
 func TestSubmitAndSteerValidation(t *testing.T) {
 	m, _ := start(t, neumann.Config{}, func(model.Request) (model.Response, error) { return sim.Reply("x"), nil })
-	for _, p := range []int{-1, 2} {
-		if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x", Priority: p}); err == nil {
-			t.Errorf("priority %d accepted", p)
-		}
+	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x", Priority: -1}); err == nil {
+		t.Error("priority -1 accepted")
+	}
+	// Any priority from 0 up (design §6.4, §9.3): larger is less urgent.
+	if _, err := m.Submit(bg, proto.Instruction{Kind: proto.KindSubmit, Input: "x", Priority: 2}); err != nil {
+		t.Errorf("priority 2 refused: %v", err)
 	}
 	id := submit(t, m, proto.Instruction{Input: "q", Priority: 1})
 	if err := m.Steer(bg, id, "  \n"); err == nil {

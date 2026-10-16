@@ -85,6 +85,36 @@ type world struct {
 
 	check        neumann.AnswerCheck // the machines' answer check; nil: none
 	checkRetries int
+
+	preempt bool        // one vCore that preempts, over a local model that continues a prefill and streams on the clock
+	urgent  atomic.Bool // preemptModel has submitted the urgent task (or tried to)
+}
+
+// preemptible is the preemption scenario's local model: it continues a
+// prefill, and streams an answer in two halves. Between them, in pay-1's
+// first answer call, it moves the clock past the preemption quantum: the
+// urgent task submitted during that call, if it is ready, cuts the call off
+// there (the timer fires inside Advance), keeping the first half.
+type preemptible struct {
+	*sim.Model
+	w *world
+}
+
+func (p preemptible) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
+	resp, err := p.Call(ctx, req)
+	if err != nil {
+		return resp, err
+	}
+	r := []rune(resp.Message.TextContent())
+	emit(model.Delta{Text: string(r[:len(r)/2])})
+	if sim.FirstUser(req) == "pay the bill" && sim.ToolRounds(req) > 0 && sim.Prefill(req) == "" {
+		p.w.clock.Advance(2 * time.Second)
+		if err := ctx.Err(); err != nil {
+			return model.Response{}, err
+		}
+	}
+	emit(model.Delta{Text: string(r[len(r)/2:])})
+	return resp, nil
 }
 
 // approvalPolicy holds every payment for an operator and allows the rest. A
@@ -213,6 +243,11 @@ type crashScenario struct {
 	caps     *model.Caps   // what the model reports (its window); nil: tools, unknown window
 	rounds   int           // > 0: the task compacts, and its history must hold this many tool rounds
 	mid      *atomic.Int32 // counts runs whose first process died inside a compaction call (Running at StepCompact)
+	// preempt: the task runs at priority 1 on one vCore that preempts;
+	// cont counts the runs whose first process committed a preemption and
+	// left the task to continue it.
+	preempt bool
+	cont    *atomic.Int32
 	// wide bounds how many of the sweep's runs share the disk at once; 0:
 	// as many as run in parallel. A scenario with many commits per run
 	// needs it: each commit is a full fsync, and a few dozen runs at once
@@ -299,6 +334,12 @@ var (
 	// retry, finishes the task with that answer, marked check_failed.
 	checkExhaustedScenario = crashScenario{name: "check_exhausted", model: fixed(checkedPayModel), check: rejectAll, checkFailed: true,
 		maxPays: 1, rejected: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
+	// After the payment, the answer streams on a local model; an urgent task
+	// submitted during it cuts it off after its first piece, runs, and the
+	// task's next call continues the kept text: the preempted commit, and
+	// the continued call's Running and answer commits, are commit points.
+	preemptScenario = crashScenario{name: "preempt", model: preemptModel, preempt: true, maxPays: 1, cont: new(atomic.Int32),
+		ends: map[task.State]string{task.Done: "end_turn"}}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
 	}, maxPays: 1, retries: "quota_exhausted", class: "little", moved: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
@@ -356,6 +397,25 @@ func flakyModel(w *world) modelFn {
 			return model.Response{}, sim.RateLimited(time.Second)
 		}
 		return sim.Reply("done"), nil
+	}
+}
+
+// preemptModel pays, then answers "done", streamed in two pieces; during
+// the first answer call it submits an urgent task (once, across processes),
+// which preempts the call (preemptible). A call that continues "do" sends
+// only "ne".
+func preemptModel(w *world) modelFn {
+	return func(req model.Request) (model.Response, error) {
+		if sim.FirstUser(req) == "urgent" {
+			return sim.Reply("urgent done"), nil
+		}
+		if sim.ToolRounds(req) == 0 {
+			return sim.CallTools("dev_pay", "dev_look"), nil
+		}
+		if sim.Prefill(req) == "" && w.urgent.CompareAndSwap(false, true) {
+			w.m.Load().Submit(bg, proto.Instruction{Kind: proto.KindSubmit, TaskID: "urgent-1", Input: "urgent"})
+		}
+		return sim.Continue(req, "done"), nil
 	}
 }
 
@@ -420,6 +480,10 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 	}
 	if w.caps != nil {
 		cfg.Model = &sim.Model{Fn: fn, Info: w.caps}
+	}
+	if w.preempt {
+		cfg.Model = preemptible{&sim.Model{Fn: fn, Info: &model.Caps{Tools: true, Prefill: true}}, w}
+		cfg.Cores, cfg.Preempt = 1, true
 	}
 	m, err := neumann.New(cfg)
 	if err != nil {
@@ -486,6 +550,8 @@ type crashRun struct {
 	fromGroup bool     // the second machine recovered the task from Waiting(Group)
 	retries   []string // the classes of the model_retry events, in order
 	compacted int      // compacted events, both processes
+	preempted int      // preempted events of the task, both processes
+	prefilled int      // its steps that continued a prefill
 }
 
 // runAndCrash runs sc on a machine that dies after n commits (after: right
@@ -502,6 +568,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		w.flaky = true
 		defer w.tick()()
 	}
+	w.preempt = sc.preempt
 
 	s1, err := sqlite.Open(path)
 	if err != nil {
@@ -514,6 +581,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		t.Fatal(err)
 	}
 	in := proto.Instruction{Kind: proto.KindSubmit, TaskID: "pay-1", Input: "pay the bill"}
+	if sc.preempt {
+		in.Priority = 1
+	}
 	if sc.deadline > 0 {
 		w.deadline = w.clock.Now().Add(sc.deadline)
 		in.Budget = &task.Budget{Deadline: w.deadline}
@@ -581,6 +651,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	if tc, err := s2.Load(bg, id); err == nil && sc.rejected != nil && tc.Rejections > 0 && !tc.State.Terminal() {
 		sc.rejected.Add(1)
+	}
+	if tc, err := s2.Load(bg, id); err == nil && sc.cont != nil && tc.Partial != "" && !tc.State.Terminal() {
+		sc.cont.Add(1)
 	}
 	m2 := newMachine(t, s2, w, sc.model(w))
 	finish := sweepPatience
@@ -706,6 +779,12 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	for _, ev := range all {
 		if ev.Kind == proto.EvCompacted && ev.TaskID == id {
 			run.compacted++
+		}
+		if ev.Kind == proto.EvPreempted && ev.TaskID == id {
+			run.preempted++
+		}
+		if ev.Kind == proto.EvStep && ev.TaskID == id && strings.Contains(string(ev.Data), `"prefill"`) {
+			run.prefilled++
 		}
 		if ev.Kind == proto.EvModelRetry {
 			var d struct {
@@ -887,6 +966,9 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 	}
 	if sc.rounds > 0 && clean.compacted < 2 {
 		t.Fatalf("a clean run compacted %d times", clean.compacted)
+	}
+	if sc.preempt && (clean.preempted != 1 || clean.prefilled != 1) {
+		t.Fatalf("a clean run was preempted %d times and continued %d calls", clean.preempted, clean.prefilled)
 	}
 	if strings.Join(clean.retries, ",") != sc.retries {
 		t.Fatalf("the clean run retried %v", clean.retries)
@@ -1114,4 +1196,22 @@ func TestCrashAtEveryCommitPointWithAnAnswerCheck(t *testing.T) {
 			t.Logf("%d crash points; the operator was needed at %d; the restart resumed after a rejection at %d", points, held, sc.rejected.Load())
 		})
 	}
+}
+
+// The same sweep with a preemption after the payment: the task's answer is
+// cut off for an urgent task, which runs, and the task's next call
+// continues the text it kept. A crash before and after every commit, the
+// preempted commit and the continued call's included, still finishes the
+// task once, paying once, with its answer whole: a crash before the
+// preemption lands redoes the call, one after it continues from Partial.
+func TestCrashAtEveryCommitPointWithAPreemption(t *testing.T) {
+	preemptScenario.cont.Store(0)
+	points, held, _ := sweep(t, preemptScenario)
+	if held == 0 {
+		t.Fatal("no crash point left the payment's outcome unknown")
+	}
+	if preemptScenario.cont.Load() == 0 {
+		t.Fatal("no crash point fell between a preemption and the call that continues it")
+	}
+	t.Logf("%d crash points; the operator was needed at %d; the restart continued a preempted answer at %d", points, held, preemptScenario.cont.Load())
 }

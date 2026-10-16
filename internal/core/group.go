@@ -42,6 +42,19 @@ type Group struct {
 	CompactAt   float64
 	CompactKeep float64
 
+	// Preempt lets a model call of the group be cut off for a more urgent
+	// task of the group when it has no vCore free (design §6.4): after the
+	// call has run PreemptAfter (0: DefaultPreemptAfter), and at most
+	// MaxPreempts times in one step of a task (0: DefaultMaxPreempts).
+	// With it on, every model call is streamed when the adapter can, so
+	// the text a cut-off call produced is kept for the next call to
+	// continue.
+	Preempt      bool
+	PreemptAfter time.Duration
+	MaxPreempts  int
+
+	pre preemption
+
 	mu   sync.Mutex
 	kick func() bool // the half-open timer, armed while tasks wait for the group
 }

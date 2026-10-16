@@ -60,12 +60,16 @@ type Config struct {
 	// class Class (default DefaultClass) on Model, taking room in Limits,
 	// whose window is pinned at Cores (default DefaultCores) — at most Cores
 	// vCores, started as work arrives, as before execution groups existed.
-	// AutoScale(class, true) lets it adapt. Setting any of them together
-	// with Groups is an error.
-	Model  model.Adapter
-	Cores  int
-	Class  string
-	Limits []string
+	// AutoScale(class, true) lets it adapt. Preempt, PreemptAfter and
+	// MaxPreempts are the group's preemption, as in GroupConfig. Setting any
+	// of them together with Groups is an error.
+	Model        model.Adapter
+	Cores        int
+	Class        string
+	Limits       []string
+	Preempt      bool
+	PreemptAfter time.Duration
+	MaxPreempts  int
 
 	Devices      []bus.Device
 	Store        mem.Store // nil: in-memory, not durable
@@ -170,6 +174,20 @@ type GroupConfig struct {
 	// too long.
 	CompactAt   float64
 	CompactKeep float64
+
+	// Preemption (design §6.4), off by default. With Preempt, when a task
+	// of the group is ready and every vCore the group may run is busy, a
+	// model call of a less urgent task (by the tasks' own priorities, not
+	// aged) that has run at least PreemptAfter (default 2s) is cut off for
+	// it: that task is ready again, keeps the text the call had streamed,
+	// and its next call asks the model to continue it when the adapter can
+	// (model.Caps.Prefill). A task is preempted at most MaxPreempts times
+	// (default 2) in one step. Meant for local backends that serve a request
+	// or two at a time (model.Caps.Parallel, which caps Max): on a provider
+	// that bills, the cut-off part of a call is not in the task's usage.
+	Preempt      bool
+	PreemptAfter time.Duration
+	MaxPreempts  int
 }
 
 // What a task does when its group is down and the fallback cannot take it.
@@ -183,9 +201,9 @@ const (
 // "context", or "caps" when the target's adapter panicked reporting them.
 type MigrateError = core.MigrateError
 
-// ErrTaskBusy is returned by SetClass for a task that is executing an
-// instruction or waiting for its tools: it can be moved between instructions
-// only, and the caller may try again.
+// ErrTaskBusy is returned by SetClass and SetPriority for a task that is
+// executing an instruction or waiting for its tools: it can be changed
+// between instructions only, and the caller may try again.
 var ErrTaskBusy = errors.New("neumann: task is executing an instruction or waiting for its tools")
 
 // DefaultSteerFormat tells the model that a message arrived while it was
@@ -359,6 +377,9 @@ func New(cfg Config) (*Machine, error) {
 			OnMigrateFail: gc.OnMigrateFail,
 			CompactAt:     gc.CompactAt,
 			CompactKeep:   gc.CompactKeep,
+			Preempt:       gc.Preempt,
+			PreemptAfter:  gc.PreemptAfter,
+			MaxPreempts:   gc.MaxPreempts,
 		}
 		for _, name := range gc.Limits {
 			g.Limiters = append(g.Limiters, limiters[name])
@@ -386,7 +407,7 @@ func New(cfg Config) (*Machine, error) {
 	m.sched.SetContext(haltCtx)
 	m.sched.OnDeadline(m.deadline)
 	m.sched.OnWake(m.wake)
-	m.sched.OnReady(m.env.Grow)
+	m.sched.OnReady(m.env.OnReady)
 	return m, nil
 }
 
@@ -407,9 +428,10 @@ func groupConfigs(cfg Config) ([]GroupConfig, int, error) {
 		if pinned <= 0 {
 			pinned = DefaultCores
 		}
-		groups = []GroupConfig{{Class: class, Model: cfg.Model, Limits: slices.Clone(cfg.Limits), Initial: float64(pinned)}}
-	} else if cfg.Model != nil || cfg.Cores != 0 || cfg.Class != "" || len(cfg.Limits) > 0 {
-		return nil, 0, errors.New("neumann: Config.Model, Cores, Class and Limits describe one group; with Groups, set them in each GroupConfig")
+		groups = []GroupConfig{{Class: class, Model: cfg.Model, Limits: slices.Clone(cfg.Limits), Initial: float64(pinned),
+			Preempt: cfg.Preempt, PreemptAfter: cfg.PreemptAfter, MaxPreempts: cfg.MaxPreempts}}
+	} else if cfg.Model != nil || cfg.Cores != 0 || cfg.Class != "" || len(cfg.Limits) > 0 || cfg.Preempt || cfg.PreemptAfter != 0 || cfg.MaxPreempts != 0 {
+		return nil, 0, errors.New("neumann: Config.Model, Cores, Class, Limits, Preempt, PreemptAfter and MaxPreempts describe one group; with Groups, set them in each GroupConfig")
 	}
 	byClass := map[string]GroupConfig{}
 	for _, g := range groups {
@@ -420,7 +442,8 @@ func groupConfigs(cfg Config) ([]GroupConfig, int, error) {
 			return nil, 0, fmt.Errorf("neumann: class %q must not contain '/'", g.Class)
 		case g.Model == nil:
 			return nil, 0, fmt.Errorf("neumann: group %q has no Model", g.Class)
-		case g.Min < 0 || g.Max < 0 || g.Initial < 0 || g.MaxQueued < 0 || g.IdleRetire < 0 || g.Cooldown < 0 || g.BreakerThreshold < 0 || g.BreakerOpenFor < 0:
+		case g.Min < 0 || g.Max < 0 || g.Initial < 0 || g.MaxQueued < 0 || g.IdleRetire < 0 || g.Cooldown < 0 || g.BreakerThreshold < 0 || g.BreakerOpenFor < 0 ||
+			g.PreemptAfter < 0 || g.MaxPreempts < 0:
 			return nil, 0, fmt.Errorf("neumann: group %q has a negative setting", g.Class)
 		case g.Max > 0 && g.Max < g.Min:
 			return nil, 0, fmt.Errorf("neumann: group %q has Max %d below Min %d", g.Class, g.Max, g.Min)
@@ -429,10 +452,22 @@ func groupConfigs(cfg Config) ([]GroupConfig, int, error) {
 		case g.OnMigrateFail != "" && g.OnMigrateFail != MigrateWait && g.OnMigrateFail != MigrateFail:
 			return nil, 0, fmt.Errorf("neumann: group %q: OnMigrateFail %q is neither %q nor %q", g.Class, g.OnMigrateFail, MigrateWait, MigrateFail)
 		}
+		if p := parallel(g.Model); p > 0 && g.Min > p {
+			return nil, 0, fmt.Errorf("neumann: group %q has Min %d above its model's Parallel %d", g.Class, g.Min, p)
+		}
 		if _, dup := byClass[g.Class]; dup {
 			return nil, 0, fmt.Errorf("neumann: two groups of class %q", g.Class)
 		}
 		byClass[g.Class] = g
+	}
+	for i := range groups {
+		// The backend's own concurrency caps the window (design §6), and
+		// with it a pinned window (the shorthand's Cores, SetCores): requests
+		// past it would queue inside the backend, where the machine can
+		// neither see nor reorder them.
+		if p := parallel(groups[i].Model); p > 0 && (groups[i].Max == 0 || p < groups[i].Max) {
+			groups[i].Max = p
+		}
 	}
 	for _, g := range groups {
 		seen := map[string]bool{g.Class: true}
@@ -452,6 +487,17 @@ func groupConfigs(cfg Config) ([]GroupConfig, int, error) {
 		}
 	}
 	return groups, pinned, nil
+}
+
+// parallel is how many requests a's backend serves at once
+// (model.Caps.Parallel), 0 when unknown or when the adapter panics saying.
+func parallel(a model.Adapter) (n int) {
+	defer func() {
+		if recover() != nil {
+			n = 0
+		}
+	}()
+	return max(model.CapsOf(a).Parallel, 0)
 }
 
 // compactAt is a group's compaction threshold, the default for 0.
@@ -734,8 +780,8 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 	if in.From != "" {
 		return "", errors.New("neumann: submit takes no from; a sender names a steer (SteerWith)")
 	}
-	if in.Priority < 0 || in.Priority > 1 {
-		return "", fmt.Errorf("neumann: priority %d out of range 0..1", in.Priority)
+	if in.Priority < 0 {
+		return "", fmt.Errorf("neumann: priority %d is negative; 0 is interactive, larger is less urgent", in.Priority)
 	}
 	class := in.Class
 	if class == "" {
@@ -1162,6 +1208,58 @@ func (m *Machine) SetClass(ctx context.Context, taskID, class string) error {
 	}
 	m.env.HandBack(ctx, t, nil) // t is unchanged when err != nil
 	return err
+}
+
+// SetPriority changes a task's priority (design §6.4, §9.6): 0 is
+// interactive, a larger number is less urgent, and a ready queue takes the
+// smaller first (a background task that waits long enough competes as 0).
+// It returns once the change is committed (a priority_set event {priority,
+// was} records it); the task keeps its place in its queue. Then, in a group
+// that preempts, a call of a less urgent task may be cut off for it.
+//
+// A task can be changed between instructions only: one executing an
+// instruction or waiting for its tools gives ErrTaskBusy, and the caller may
+// try again. A finished task gives ErrFinished, an unknown one ErrNotFound,
+// a negative priority an error. The task's own priority commits nothing.
+func (m *Machine) SetPriority(ctx context.Context, taskID string, p int) error {
+	if p < 0 {
+		return fmt.Errorf("neumann: priority %d is negative; 0 is interactive, larger is less urgent", p)
+	}
+	if err := m.enter(); err != nil {
+		return err
+	}
+	defer m.inflight.Done()
+	t, ok := m.sched.Take(taskID, func(t *task.TCB) bool {
+		switch t.State {
+		case task.Ready, task.Suspended:
+			return true
+		case task.Waiting:
+			return t.Wait != task.WaitIO
+		}
+		return false
+	})
+	if !ok {
+		tc, err := m.store.Load(ctx, taskID)
+		switch {
+		case err != nil:
+			return err
+		case tc.State.Terminal():
+			return fmt.Errorf("neumann: task %s: %w", taskID, ErrFinished)
+		}
+		return fmt.Errorf("neumann: task %s: %w", taskID, ErrTaskBusy)
+	}
+	err := m.env.SetPriority(ctx, t, p)
+	if errors.Is(err, mem.ErrCancelPending) {
+		m.env.Finalise(ctx, t) // cancelled first: it ends where it is
+		return fmt.Errorf("neumann: task %s was cancelled before its priority changed: %w", taskID, ErrFinished)
+	}
+	class := t.Class            // read before the hand-back: t is the scheduler's after it
+	m.env.HandBack(ctx, t, nil) // t is unchanged when err != nil
+	if err != nil {
+		return err
+	}
+	m.env.CheckPreempt(class)
+	return nil
 }
 
 type recoveredDispatch struct {

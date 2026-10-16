@@ -105,8 +105,13 @@ func (e *Env) runCore(g *Group, id int, up group.Reason) {
 		}
 		sc.Acquire()
 		e.Grow(g.Class)
+		// A vCore freed by a preemption has taken its task: a call may now
+		// be cut off for the next urgent one (design §6.4).
+		e.preemptCheck(g)
 		e.step(e.halt(), t, id)
-		if retire, reason := sc.Release(); retire {
+		retire, reason := sc.Release()
+		e.instructionOver(g, id)
+		if retire {
 			e.coreEvent(proto.EvCoreDown, g, id, reason)
 			return
 		}

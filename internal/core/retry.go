@@ -209,6 +209,27 @@ func (e *Env) redoTruncated(g *Group, t *task.TCB, c mem.CommitSet) mem.CommitSe
 	return c
 }
 
+// redoWithoutThinking asks again, at the same output cap, with the model's
+// thinking off (TCB.NoThink, model.Request.NoThink): the turn was cut off
+// with nothing in it but thinking, and the adapter can turn thinking off
+// (design §13). It does not count as one of the fourfold raises: those come
+// only if the turn is still cut off without thinking. Like those, the redo
+// was an answered call; its model_retry event says no_think.
+func (e *Env) redoWithoutThinking(g *Group, t *task.TCB, c mem.CommitSet) mem.CommitSet {
+	sent := e.sendOut(g, t)
+	if sent == 0 {
+		sent = e.maxOut(t)
+	}
+	t.NoThink = true
+	c.Events = append(c.Events, proto.NewEvent(proto.EvModelRetry, t.ID, map[string]any{
+		"class": "truncated", "attempt": t.Truncations, "delay_ms": 0, "wait": "none", "max_out": sent, "no_think": true,
+		"error": fmt.Sprintf("cut off at %d output tokens with nothing but thinking", sent),
+	}))
+	e.ready(t, task.StepModel)
+	c.Task = t
+	return c
+}
+
 // failWith ends t Failed with a stop reason, the error text in its event.
 func failWith(t *task.TCB, c mem.CommitSet, reason, text string) mem.CommitSet {
 	t.State = task.Failed

@@ -4,6 +4,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -162,6 +163,30 @@ type stepData struct {
 	// call answered (design §9.8): the step's commit is that much later
 	// than the provider's answer. Omitted when no check ran.
 	CheckMS int64 `json:"check_ms,omitempty"`
+	// Prefill is how many characters of the task's Partial the call asked
+	// the model to continue (design §6.4); omitted when it continued none.
+	Prefill int `json:"prefill,omitempty"`
+	// FirstMS is how long, in milliseconds on the machine's clock, the
+	// streamed call took from being sent to its first piece: queueing in the
+	// backend, told apart from generating. Omitted when no piece came.
+	FirstMS *int64 `json:"first_ms,omitempty"`
+}
+
+// amendStep changes the step event in c, the one a model call's
+// instruction carries, with f.
+func amendStep(c *mem.CommitSet, f func(*stepData)) {
+	for i, ev := range c.Events {
+		if ev.Kind != proto.EvStep {
+			continue
+		}
+		var d stepData
+		if err := json.Unmarshal(ev.Data, &d); err != nil {
+			continue
+		}
+		f(&d)
+		amended := proto.NewEvent(proto.EvStep, ev.TaskID, d)
+		c.Events[i] = amended
+	}
 }
 
 // taskContext is what work for a task runs under: it ends when the task is
@@ -192,6 +217,7 @@ func (e *Env) RunVCore(ctx context.Context, class string, core int) {
 			return
 		}
 		e.step(e.halt(), t, core)
+		e.instructionOver(e.groupOf(class), core)
 	}
 }
 

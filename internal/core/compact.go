@@ -376,7 +376,7 @@ func (e *Env) windowFor(t *task.TCB, g *Group, a model.Adapter, must bool, extra
 func (e *Env) execCompact(ctx context.Context, t *task.TCB, core int, g *Group, a model.Adapter, d decision) (mem.CommitSet, []Send, error) {
 	chunk := task.CloneMessages(t.Regs[d.from:d.to])
 	req := model.Request{System: task.CompactSystem, Messages: task.CompactMessages(chunk), MaxOut: d.sz.out}
-	resp, c, out := e.modelCall(ctx, t, core, g, a, task.StepCompact, req, nil)
+	resp, c, _, out := e.modelCall(ctx, t, core, g, a, task.StepCompact, req, nil)
 	if out != nil {
 		return out.c, out.batch, out.err
 	}
