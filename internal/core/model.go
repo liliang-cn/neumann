@@ -175,7 +175,11 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 	t.Retries = 0
 	// Answered: the step's preemptions are over.
 	t.Preempts = 0
-	if truncated(resp) {
+	// A continued thought that came back with reasoning alone, not cut off
+	// (the model stopped without answering), is taken as one cut off while
+	// still thinking: sent again as it was, it would come back the same.
+	thoughtOnly := prefill != nil && partial == "" && resp.Message.TextContent() == "" && len(resp.Message.ToolCalls()) == 0
+	if truncated(resp) || thoughtOnly {
 		// Cut off with nothing in it: judged on what this call produced, not
 		// on the prefix it continued, which is not an answer by itself. The
 		// redo sends the same turn, steers included; a Partial they

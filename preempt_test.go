@@ -1082,3 +1082,51 @@ func TestPreemptedThinkingIsContinued(t *testing.T) {
 		})
 	}
 }
+
+// A continued thought that comes back with reasoning alone and finish
+// "stop" (the model stopped thinking without answering) is not taken as an
+// answer, and not sent again as it was: like a thought cut off at the cap,
+// it is asked again with thinking off and the kept thinking dropped
+// (design §6.4, §13).
+func TestAThoughtThatStopsIsRedoneWithoutThinking(t *testing.T) {
+	clk := sim.NewClock(clock0)
+	var calls atomic.Int32
+	lm := newLocal(clk, model.Caps{Tools: true, Prefill: true, ThinkPrefill: true, ThinkOff: true}, func(req model.Request) (model.Response, error) {
+		switch {
+		case sim.FirstUser(req) != "B":
+			return storyFn(req)
+		case req.NoThink:
+			return sim.Reply("B, briefly."), nil
+		case calls.Add(1) == 1:
+			return sim.Think("Let me think about the machine and its queue, slowly and at length.", story("B")), nil
+		}
+		r := sim.Think(" and so on.", "") // stopped without an answer
+		r.Message.Parts = r.Message.Parts[:1]
+		return r, nil
+	})
+	m := preemptMachine(t, neumann.Config{}, lm, clk)
+	submitAs(t, m, "B", 1)
+	onAir(t, lm, "B", 1)
+	submitAs(t, m, "A", 0)
+	clk.Advance(2 * time.Second)
+	if p := one(t, waitPreempted(t, m, "B", 1), proto.EvPreempted); p["kept_think"] == float64(0) {
+		t.Fatalf("preempted %v", p)
+	}
+	drive(t, m, clk, time.Minute, "A", "B")
+	b := loadTask(t, m, "B")
+	if b.LastAnswer() != "B, briefly." || b.PartialThink != "" || b.NoThink {
+		t.Fatalf("B ended %q: %+v", b.LastAnswer(), b)
+	}
+	var bs []model.Request
+	for _, r := range lm.Requests() {
+		if sim.FirstUser(r) == "B" {
+			bs = append(bs, r)
+		}
+	}
+	if len(bs) != 3 || sim.PrefillThink(bs[1]) == "" || !bs[2].NoThink || sim.PrefillThink(bs[2]) != "" {
+		t.Fatalf("%d requests for B", len(bs))
+	}
+	if d := eventData(t, m, "B", proto.EvModelRetry); len(d) != 1 || d[0]["no_think"] != true {
+		t.Fatalf("model_retry %v", d)
+	}
+}
