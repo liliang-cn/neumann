@@ -9,6 +9,11 @@
 // NEUMANN_API_KEY, else OPENAI_API_KEY or ANTHROPIC_API_KEY for the chosen
 // provider — and is never printed.
 //
+// -local configures a local OpenAI-compatible backend (Ollama, llama.cpp,
+// LM Studio) in one switch; -help lists what it sets:
+//
+//	neumann -local -model qwen3.5:9b-mlx -store state.db
+//
 // End of stdin, SIGINT or SIGTERM stop the machine gracefully (within
 // -stop-timeout) and exit 0. A configuration or startup failure exits 1, a
 // usage error 2.
@@ -53,6 +58,18 @@ var defaultBaseURL = map[string]string{
 	"anthropic": "https://api.anthropic.com/v1",
 }
 
+// What -local sets (design §11, §14). A local backend reads a long prompt
+// slowly and then streams steadily: the first byte gets a generous limit, a
+// stalled stream a short one, and the whole call none. The output cap stops
+// a model that loops in its thinking.
+const (
+	localBaseURL   = "http://127.0.0.1:11434/v1" // Ollama
+	localThinkOff  = "none"
+	localFirstByte = 10 * time.Minute
+	localIdle      = 2 * time.Minute
+	localMaxTokens = 8192
+)
+
 type config struct {
 	provider, baseURL, model, key string
 	store, systemFile             string
@@ -60,18 +77,23 @@ type config struct {
 	echo                          bool
 	stopTimeout                   time.Duration
 
+	local    bool
+	parallel int
+	set      map[string]bool // names of the flags and variables that were given
+
 	observeAddr, observeToken string
 	metrics, pprof            bool
 }
 
 // parse reads flags over environment defaults. The key comes only from env.
 func parse(args []string, getenv func(string) string, stderr io.Writer) (config, error) {
-	var c config
+	c := config{set: map[string]bool{}}
 	fs := flag.NewFlagSet("neumann", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	envInt := func(name string, def int) int {
 		if v := getenv(name); v != "" {
 			if n, err := strconv.Atoi(v); err == nil {
+				c.set[name] = true
 				return n
 			}
 		}
@@ -97,6 +119,8 @@ func parse(args []string, getenv func(string) string, stderr io.Writer) (config,
 	fs.IntVar(&c.cores, "cores", envInt("NEUMANN_CORES", neumann.DefaultCores), "vCores [NEUMANN_CORES]")
 	fs.IntVar(&c.maxQueued, "max-queued", envInt("NEUMANN_MAX_QUEUED", neumann.DefaultMaxQueued), "unfinished tasks admitted at once [NEUMANN_MAX_QUEUED]")
 	fs.IntVar(&c.maxTokens, "max-tokens", envInt("NEUMANN_MAX_TOKENS", 0), "output token limit per model call; 0: the adapter's default [NEUMANN_MAX_TOKENS]")
+	fs.BoolVar(&c.local, "local", getenv("NEUMANN_LOCAL") == "1", fmt.Sprintf("a local OpenAI-compatible backend (Ollama, llama.cpp, LM Studio): -parallel 1 and -cores equal to it unless given, answers cut off are continued, reasoning_effort %q turns thinking off, %s to the first byte and %s between stream chunks with no limit on the whole call, -max-tokens %d unless given, -base-url %s unless given [NEUMANN_LOCAL=1]", localThinkOff, localFirstByte, localIdle, localMaxTokens, localBaseURL))
+	fs.IntVar(&c.parallel, "parallel", envInt("NEUMANN_PARALLEL", 0), "requests the backend serves at once; it caps the vCores working on it. 0: unknown, or 1 with -local. OpenAI-compatible provider only [NEUMANN_PARALLEL]")
 	fs.BoolVar(&c.echo, "echo", getenv("NEUMANN_ECHO") == "1", "attach a builtin device with one tool, util_echo, for testing [NEUMANN_ECHO=1]")
 	fs.DurationVar(&c.stopTimeout, "stop-timeout", envDur("NEUMANN_STOP_TIMEOUT", jsonl.DefaultStopTimeout), "how long a graceful stop may take [NEUMANN_STOP_TIMEOUT]")
 	fs.StringVar(&c.observeAddr, "observe-addr", getenv("NEUMANN_OBSERVE_ADDR"), "serve the read-only observe HTTP view (/status, /queue, /tasks/{id}, /events) here, e.g. 127.0.0.1:43517; empty: off. It shows task content: keep it private or set NEUMANN_OBSERVE_TOKEN [NEUMANN_OBSERVE_ADDR]")
@@ -115,6 +139,7 @@ func parse(args []string, getenv func(string) string, stderr io.Writer) (config,
 	if fs.NArg() > 0 {
 		return c, fmt.Errorf("unexpected arguments: %q", fs.Args())
 	}
+	fs.Visit(func(f *flag.Flag) { c.set[f.Name] = true })
 	return c, nil
 }
 
@@ -122,6 +147,22 @@ func (c *config) resolve(getenv func(string) string) error {
 	def, ok := defaultBaseURL[c.provider]
 	if !ok {
 		return fmt.Errorf("unknown provider %q: want openai or anthropic", c.provider)
+	}
+	if (c.local || c.parallel != 0) && c.provider != "openai" {
+		return errors.New("-local and -parallel are for an OpenAI-compatible backend: -provider openai")
+	}
+	if c.parallel < 0 {
+		return errors.New("-parallel must not be negative")
+	}
+	if c.local {
+		def = localBaseURL
+		c.parallel = max(c.parallel, 1)
+		if !c.set["cores"] && !c.set["NEUMANN_CORES"] {
+			c.cores = c.parallel
+		}
+		if !c.set["max-tokens"] && !c.set["NEUMANN_MAX_TOKENS"] {
+			c.maxTokens = localMaxTokens
+		}
 	}
 	if c.baseURL == "" {
 		c.baseURL = def
@@ -153,6 +194,11 @@ func (c *config) adapter() model.Adapter {
 	}
 	a := openai.New(c.baseURL, c.key, c.model)
 	a.MaxTokens = c.maxTokens
+	a.Parallel = c.parallel
+	if c.local {
+		a.Prefill, a.ThinkOff = true, localThinkOff
+		a.Timeout, a.FirstByteTimeout, a.IdleTimeout = 0, localFirstByte, localIdle
+	}
 	return a
 }
 
@@ -213,6 +259,8 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdin i
 	if c.echo {
 		devices = append(devices, echoDevice())
 	}
+	// TODO(preempt): -local turns on preemption for the group (GroupConfig
+	// Preempt, design §6.4, §14) once the core has it.
 	m, err := neumann.New(neumann.Config{
 		Model:     c.adapter(),
 		Devices:   devices,
@@ -238,7 +286,11 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdin i
 		m.Stop(sctx)
 		return 1
 	}
-	logger.Printf("neumann: ready: provider %s, model %s, %d vCores, store %s", c.provider, c.model, c.cores, where)
+	backend := c.provider
+	if c.local {
+		backend = fmt.Sprintf("local (%d at once)", c.parallel)
+	}
+	logger.Printf("neumann: ready: provider %s, model %s, %d vCores, store %s", backend, c.model, c.cores, where)
 	srv := &jsonl.Server{Machine: m, StopTimeout: c.stopTimeout, Logf: logger.Printf}
 	err = srv.Serve(ctx, stdin, stdout)
 	obs.stop() // the machine has stopped: observers read to the end and flush

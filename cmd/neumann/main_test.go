@@ -27,9 +27,10 @@ const secret = "sk-test-do-not-print-me"
 // does by default.
 type fakeOpenAI struct {
 	*httptest.Server
-	mu    sync.Mutex
-	auth  []string
-	calls int
+	mu        sync.Mutex
+	auth      []string
+	maxTokens []int // max_tokens of every request, 0 when absent
+	calls     int
 }
 
 func newFake(t *testing.T) *fakeOpenAI {
@@ -40,8 +41,9 @@ func newFake(t *testing.T) *fakeOpenAI {
 			return
 		}
 		var body struct {
-			Stream   bool `json:"stream"`
-			Messages []struct {
+			Stream    bool `json:"stream"`
+			MaxTokens int  `json:"max_tokens"`
+			Messages  []struct {
 				Role    string  `json:"role"`
 				Content *string `json:"content"`
 			} `json:"messages"`
@@ -52,6 +54,7 @@ func newFake(t *testing.T) *fakeOpenAI {
 		}
 		f.mu.Lock()
 		f.auth = append(f.auth, r.Header.Get("Authorization"))
+		f.maxTokens = append(f.maxTokens, body.MaxTokens)
 		f.calls++
 		f.mu.Unlock()
 		var input, result string
