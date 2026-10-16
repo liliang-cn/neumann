@@ -772,9 +772,9 @@ answer checks. The API may change before v1.
 Designed but not built yet:
 
 - long-term memory and RAG, sub-agents, multimodal input;
-- the operator controls `Pause` / `Resume` / `Drain`, per-task
-  `Suspend` / `Resume` and `SetPriority` (the stdio frontend answers
-  `suspend`, `resume` and `priority` with `unsupported`);
+- the operator controls `Pause` / `Resume` / `Drain` and per-task
+  `Suspend` / `Resume` (the stdio frontend answers `suspend` and `resume`
+  with `unsupported`);
 - a token budget per task (`Budget` has `MaxSteps` and `Deadline`);
 - retention for the event log, which grows without bound for now.
 

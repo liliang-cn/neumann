@@ -348,11 +348,11 @@ type GroupConfig struct {
 }
 ```
 
-窗口上限还受适配器的 `Caps.Parallel`（后端同时处理的请求数，0 = 未知）约束：有效上限是 `Max` 和 `Parallel` 中不为 0 的较小者，单组简写的 `Cores` 同样取较小者，`SetCores` 超过它时按它截断。
+窗口上限还受适配器的 `Caps.Parallel`（后端同时处理的请求数，0 = 未知）约束：有效上限是 `Max` 和 `Parallel` 中不为 0 的较小者，单组简写的 `Cores` 同样取较小者，`SetCores` 超过它时按它截断。`Min` 大于 `Parallel` 是配置错误（`New` 报错）。`Parallel` 在 `New` 时读一次（适配器 panic 按未知）。
 
 `New` 时校验：类名非空、不重复、不含 `/`；每组有 `Model`；`0 ≤ CompactKeep < CompactAt ≤ 1`（0 取默认）；`Limits` 里的名字都在 `Config.Limiters` 里；`Fallback` 指向存在的组，沿 `Fallback` 链走不会回到起点（无环）；`OnMigrateFail` 只能是 `wait` / `fail`；`Max > 0` 时不小于 `Min`。`Config.Default` 是不带 `Class` 提交的任务的类，空则取第一个组。
 
-单组简写：`Config.Groups` 为空时，`Model`、`Class`（默认 `default`）、`Cores`（默认 4）、`Limits` 构成一个组，窗口用 `SetCores(Cores)` 固定：至多 `Cores` 个 vCore、有活才启动，和以前的固定 vCore 数一致；`AutoScale(class, true)` 可让它自适应。简写字段与 `Groups` 同时出现是配置错误。
+单组简写：`Config.Groups` 为空时，`Model`、`Class`（默认 `default`）、`Cores`（默认 4）、`Limits` 构成一个组，窗口用 `SetCores(Cores)` 固定：至多 `Cores` 个 vCore、有活才启动，和以前的固定 vCore 数一致；`AutoScale(class, true)` 可让它自适应。`Preempt`、`PreemptAfter`、`MaxPreempts` 也有简写（`Config` 上同名字段）。简写字段与 `Groups` 同时出现是配置错误。
 
 ### 6.1 拥塞窗口只管并发
 
@@ -442,6 +442,21 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 **持久化**：`Partial` 只随提交持久化。在调用中途崩溃，重启后按 4.5 重做，用的是最近一次提交的 `Partial`。加字段之前写下的 TCB 解码为空。
 
 **重排**：`m.SetPriority(ctx, id, p)`（`p ≥ 0`，0 交互、越大越不急）。任务在调度器手里（就绪、退避、熔断等待、待核对、待批准）时取出，提交新的 `Priority` 和 `priority_set`（`{priority, was}`）事件，再交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试。已结束的返回 `ErrFinished`。提交之后做一次抢占检查。
+
+实现中的决定（`internal/core/preempt.go`，续写在 `internal/core/model.go` 的 `modelStep` / `modelCall`）：
+
+- **登记**：开着抢占的组，每个模型步（压缩不登记）在 `Running` 提交、插话合并之后、调用之前登记一条在途记录（任务、原始优先级、`Preempts`、vCore、开始时刻、调用自己的 `context.WithCancelCause`），调用返回即注销。注销时取消原因是 `errPreempted`、调用出了错、任务自己的 context 还没结束，才算被抢；被选中的同时回答已经到了，回答照常采用。
+- **"没有空闲 vCore"**：`存活 ≥ floor(W)` 且 `存活 − 忙碌 + 让出中 = 0`。"让出中"是被选为牺牲者、还没执行完这条指令的 vCore：它马上会空出来，算作空闲，所以被抢的任务交还时（`OnReady`）、那个 vCore `Release` 之后都不会再抢第二个。**"一次只抢一个"的下一次检查放在空出来的 vCore 取到下一条指令时**（`runCore` 里 `Acquire` 之后），而不是交还时：交还发生在 `Release` 之前，那时忙碌数里还算着它，若在那里查就会为同一个 `h` 多抢一个。`Release` 之后清掉让出标记再查一次（vCore 因窗口缩小退役时由这一查补上）。
+- **候选与选择**：`h` 是就绪队列里原始优先级最小的（同级 `ReadySince` 最早，`Sched.Urgent`）；不看老化。多个候选：优先级数最大的，同级开始最晚的（跑得最短），再同取任务 id 小的，结果确定。未满 `PreemptAfter` 的候选只决定定时器：组里只挂一个，取最早到期的那个，更早的到期会换掉它；到点再查一次。停机开始后（`Sched.Stopping`）或强制停机后不抢。
+- **取消一个调用**：只结束调用自己的 context（原因 `errPreempted`）；`errPreempted` 不会到达任务的 context，所以取消信号、Deadline 照旧各走各的。之后的判断顺序：先看强制停机，再看取消（`Sched.Cancelled`，取消赢，按被取消打断处理，`Unconfirmed + 1`），再看抢占。取消已提交但信号未到时，`preempted` 提交被 `ErrCancelPending` 拒绝，`cancelInstead` 照常最终提交，没有 `preempted` 事件（`TestCancelBeatsPreempt` 两种都测）。
+- **提交的事件**：`step` 在前、`preempted` 在后，没有 `usage`（`observe` 把 `usage` 当作有回答的调用）；没有 `steer_delivered`（插话退回）。前面可能有 `throttled`。`kept`、`prefill` 按字符（rune）计。
+- **保留哪段文字**：只有这次调用没合并插话时，收到的正文才进 `Partial`（续写的调用，或没有 `Partial` 的新调用）。合并了插话的调用是对插话的新回答：插话退回待送达，它的文字也丢掉（`kept` 为 0），先前的 `Partial` 原样恢复——否则下一步会把"对插话的回答"当作被打断的一轮放到插话前面。流中断同理。
+- **插话与 `Partial`**：`Partial` 落成 assistant 消息这件事在 `apply` 钩子里做（`Running` 提交之后，和合并插话同一处），调用没有回答（失败、退避、被抢、被取消、截断且无内容）时连同插话一起撤回、`Partial` 恢复。所以"截断且无内容"时 `Partial` 不清空——它随插话退回，重做时再落成一轮；这与"有回答（包括截断）时 `Partial` 清空"不同，是唯一的例外。`Preempts` 在任何有回答的调用后清零。
+- **合并**：`Partial` 接在回答第一段文本的前面；回答没有文本时作为一段文本插在工具调用之前、开头的 reasoning 之后（服务商要求 reasoning 在前）。截断判断在合并之后做。
+- **始终流式**：组开着抢占、或机器有增量接收方（`Machine` 总是有）时，适配器实现了 `Streamer` 就流式调用；收到的 `Delta.Text` 累加在 vCore 上，有接收方才转发。所以"流中断也续写"不要求组开着抢占：只要这次调用是流式的、适配器 `Caps.Prefill` 为真。
+- **`first_ms`**：机器时钟上从调用适配器前一刻到第一块增量（正文或推理都算）的毫秒数，`step` 事件在调用之后改写带上它；`prefill` 在合并插话的钩子里写上。`check_ms` 也改为在原事件上改写，三者可以同时出现。
+- **`SetPriority`**：优先级没变时什么都不提交、返回 nil；`ReadySince` 不变（不重新排队尾）。负数报错。`Submit` 也放开到任何 `≥ 0` 的优先级（原来只接受 0、1）。调度器本来就按数值比较、老化把任何大于 0 的提成 0，`Queue` 的 `Background` 计所有大于 0 的。
+- **只有思考的截断**（13）：判定为截断且无内容，并且回答里有 reasoning 段、或用量报了推理 token、或**这次调用流出过 `Delta.Reasoning`**（Ollama 两者都不报，截断的回答连段都没有，只能从流里看）。适配器 `Caps.ThinkOff` 为真且任务还没关思考时，置 `NoThink`、`MaxOut` 不变重做：一次有回答的调用，发 `model_retry`（`class = "truncated"`，`no_think: true`，`max_out` 是这次的上限，`attempt` 不变），不计入 `Truncations`；关掉思考仍被截断才走两次放大，`NoThink` 一直开着。下一次有回答且没被截断的调用清除 `NoThink`（和 `Truncations` 同时）。请求的 `NoThink` 取自 TCB，适配器 `ThinkOff` 为假时它自己忽略。
 
 ## 7. 限流器
 
@@ -873,7 +888,7 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 | 情况 | 处理 |
 |---|---|
 | 模型请求失败 | 按第 11 节分类：限流、过载、临时错误退避重试，额度耗尽等执行组，永久错误 `Failed`（`model_error`） |
-| 截断且无内容 | `MaxOut` 乘 4 重做，最多两次，之后 `Failed`（`truncated`）。截断的回答里只有思考、适配器 `Caps.ThinkOff` 为真时，第一次重做先关掉思考（`NoThink`），`MaxOut` 不变；关掉思考仍被截断才按倍数放大 |
+| 截断且无内容 | `MaxOut` 乘 4 重做，最多两次，之后 `Failed`（`truncated`）。截断的回答里只有思考（reasoning 段、推理 token，或这次调用流出过推理增量）、适配器 `Caps.ThinkOff` 为真时，第一次重做先关掉思考（`NoThink`），`MaxOut` 不变，不算两次放大之一；关掉思考仍被截断才按倍数放大 |
 | 思考停不下来 | 本地小模型会在思考里打转（实测 qwen3.5 9B 写 150 字小故事，连续三次跑满 5 分钟超时）。本地配置给默认输出上限，打转到上限时变成"只有思考的截断"，按上一行关掉思考重做，不再原样重发同一个请求 |
 | 上下文超过阈值 / 服务商拒绝为超出上下文 | 压缩（5.3）；怎么压都放不下 `Failed`（`context_overflow`） |
 | 预占量永远放不下 | `Failed`（`too_large`） |
@@ -929,6 +944,7 @@ err = m.Stop(ctx)                          // 停止取指，等在途指令和�
 err = m.SetCores("little", 8)              // 固定窗口；多出的 vCore 执行完当前指令后退役
 err = m.AutoScale("little", true)          // 恢复自适应
 err = m.SetClass(ctx, id, "little")        // 手动迁移：*MigrateError / ErrTaskBusy / ErrFinished / ErrNotFound
+err = m.SetPriority(ctx, id, 0)            // 重排（6.4）：ErrTaskBusy / ErrFinished / ErrNotFound；之后可能抢占
 err = m.GroupReset(ctx, "big")             // 额度耗尽熔断后复位
 err = m.Approve(ctx, id, "c-3", neumann.ApprovalDecision{Verdict: neumann.ApproveAllow}) // 回答待批准的调用：ErrNotAwaitingApproval / ErrNotFound
 err = m.SteerWith(ctx, id, "…", neumann.SteerOptions{From: "operator"}) // 带发送方、幂等键的插话（10.1）
@@ -994,7 +1010,9 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
    验证：`SteerSenderAndKeyRoundTrip`、`SteerWithASenderIsReportedDropped`（一致性套件）、`TestOpenAddsTheSenderColumns`（旧库的中断照常读出、丢弃）、`TestSteerWithASenderIsFramedAndReported`（默认与自定义格式、`steer_delivered` 紧挨在它的 `step` 之前）、`TestAMessageCannotForgeItsFrame`、`TestSendersAreRestricted`、`TestSteerWithASenderIsReportedDropped`、`TestSteerWithoutASenderIsDeliveredSilently`（事件序列与以前相同）、`TestSteerWithChecksItsSenderAndKeepsItsKey`、`TestSteerWithASenderDuringTheCheck`、`TestFeedbackAndASteerWithASender`、`TestTwoTasksExchangeMessages`、`TestSendAcrossACrashIsSentOnce`（插话落盘后立刻崩溃，恢复用同一个键重发，设备两个进程各跑一次、对方只收到一条，重启后送达）、`TestRepeatAfterTheReceiverFinished`（重发时对方已结束、可见性隐藏已结束的任务，仍回 `sent`）、`TestSendDuringStopIsCommitted`、`bus/tasks` 的发送、列表、错误结果、默认同类可见、可见性、配额（互相回复的两个任务停在配额上）、先查键再校验、页表与策略测试、`TestSteerWithASender`（stdio）、`examples/messaging` 的测试。
 
 8. **本地模型：抢占、续写、重排**（6.4）：`Caps.Parallel` / `Prefill` / `ThinkOff`、`Request.NoThink`；组的 `Preempt` / `PreemptAfter` / `MaxPreempts`；抢占检查（就绪、`SetPriority`、定时器）、`preempted` 提交、`Partial` 续写与合并、有插话时先落成一轮、流中断续写；`m.SetPriority` 与 stdio `priority`；只有思考的截断先关思考；OpenAI 兼容适配器的本地选项与三种超时；`-local`；观测接上。
-   计划的验证：`TestPreemptTakesTheLeastUrgentCall`、`TestPreemptedCallIsContinued`（模拟模型收到以 `Partial` 结尾的请求，最终答案 = 前缀 + 续写）、`TestPreemptWaitsForTheQuantum`、`TestPreemptLimitPerStep`、`TestAgedTaskDoesNotPreempt`、`TestPreemptWithoutPrefillRestarts`、`TestPreemptedPartialThenSteer`、`TestCancelBeatsPreempt`、`TestLostStreamIsContinued`、`TestSetPriority`（就绪、等待、在 vCore 上、已结束；提交后触发抢占）、`TestThinkingOnlyTruncationTurnsThinkingOff`、`TestParallelCapsTheWindow`、`TestCrashAtEveryCommitPointWithAPreemption`（被抢、续写，每个提交点前后各崩一次）、`TestOldTaskBlobsDecode`、适配器的续写渲染 / `NoThink` / 三种超时、stdio `priority`、`observe` 的 span / 指标 / 日志；真实验收：本机 Ollama `qwen3.5:9b-mlx`，`-local`，后台长任务被交互任务抢占后续写完成，`first_ms`、`preempted` 进 trace。
+   核心已完成（`internal/core/preempt.go`、`model.go`；实现中的决定见 6.4 末尾）：TCB 的 `Partial` / `Preempts` / `NoThink`（gob、JSON 都向后兼容）；`GroupConfig` 和单组简写的 `Preempt` / `PreemptAfter`（默认 2s）/ `MaxPreempts`（默认 2），`Caps.Parallel` 约束 `Max`、简写 `Cores` 和 `SetCores`；每组在途模型调用登记、抢占检查（`OnReady`、`SetPriority` 之后、量子定时器、空出的 vCore 取到下一条指令时）、`preempted` 提交、取消优先；开着抢占时总是流式并在核心累加正文；续写（末尾 assistant 前缀、合并、有插话时先落成一轮并可撤回、不支持续写时丢弃、窗口估算计入）；流中断续写；`step` 的 `prefill`、`first_ms`；只有思考的截断先关思考（含只从流里看得出的思考）；`Sched.Urgent`，优先级可以大于 1，`Submit` 接受任何 `≥ 0` 的优先级；`m.SetPriority`；stdio `priority`（`task_busy`），不再是 `unsupported`；`sim.Model` 可以按假时钟分块流式、报告 `Caps`、记下收到的请求（`Requests`），`sim.Prefill` / `sim.Continue` 只回续写部分。
+   验证：`TestPreemptedCallIsContinued`（模拟模型收到以 `Partial` 结尾的请求，最终答案 = 前缀 + 续写，被抢的提交只有 `step`、`preempted`，续写的 `step` 带 `prefill`，两次都带 `first_ms`）、`TestPreemptTakesTheLeastUrgentCall`（最不急的；同级跑得最短的；另一个不被抢）、`TestPreemptWaitsForTheQuantum`、`TestPreemptLimitPerStep`、`TestAgedTaskDoesNotPreempt`、`TestPreemptWithoutPrefillRestarts`、`TestPreemptedPartialThenSteer`、`TestCancelBeatsPreempt`（取消信号先到；只有取消的提交先到）、`TestLostStreamIsContinued`、`TestLostStreamWithoutPrefillStartsOver`、`TestSetPriority`（就绪、退避等待、在 vCore 上、已结束、不存在、负数、同值；提交后立刻触发抢占）、`TestThinkingOnlyTruncationTurnsThinkingOff`（关思考后回答；关思考仍截断再放大；没有 `ThinkOff` 直接放大；思考只从流里看得出）、`TestParallelCapsTheWindow`、`TestCrashAtEveryCommitPointWithAPreemption`（付款后回答被紧急任务抢占、紧急任务跑完、续写，每个提交点前后各崩一次，SQLite；重启后从 `Partial` 续写的崩溃点有 8 个）、`TestPrioritiesAboveOne`（sched）、`TestPacedStreamAndPrefill`（sim）、`TestPriorityOverTheWire`（stdio）、一致性套件的整 TCB 往返和 `TestOldTaskBlobsDecode` 覆盖三个新字段。
+   适配器的本地选项与三种超时、`-local`、`observe` 的 span / 指标 / 日志在各自的分支里做、各自验证。`-local` 打开组的 `Preempt` 还待接上（`cmd/neumann` 里留着 TODO）。真实验收（本机 Ollama `qwen3.5:9b-mlx`，`-local`，后台长任务被交互任务抢占后续写完成，`first_ms`、`preempted` 进 trace）还没做。
 
 ## 18. 测试
 
