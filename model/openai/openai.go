@@ -51,9 +51,12 @@ type Adapter struct {
 	// the close tag, the answer. The adapter splits it at the close tag, in
 	// a stream too (a tag split across chunks included): what comes before
 	// is reasoning (Delta.Reasoning, a reasoning part), what comes after is
-	// text, leading newlines dropped. Sending the reasoning in the
-	// reasoning field instead does not work on Ollama: the model thinks
-	// again from the start.
+	// text, leading newlines dropped. A backend that parses the tags out
+	// itself (llama.cpp with reasoning parsing) answers in the reasoning
+	// field and untagged content instead: once reasoning arrives in its own
+	// field, the content from there on is text. Sending the reasoning in
+	// the reasoning field does not work on Ollama: the model thinks again
+	// from the start.
 	ThinkTags [2]string
 	// Per-request timeouts (design §11). Timeout bounds the whole call,
 	// from sending the request to the end of the response body; New sets
@@ -150,8 +153,10 @@ type wireCall struct {
 type wireResp struct {
 	Choices []struct {
 		Message struct {
-			Content   *string           `json:"content"`
-			ToolCalls []json.RawMessage `json:"tool_calls"`
+			Content          *string           `json:"content"`
+			ReasoningContent *string           `json:"reasoning_content"`
+			Reasoning        *string           `json:"reasoning"` // Ollama's spelling
+			ToolCalls        []json.RawMessage `json:"tool_calls"`
 		} `json:"message"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -269,7 +274,18 @@ func (a *Adapter) parse(data []byte, thinking bool) (model.Response, error) {
 	if ch.Message.Content != nil {
 		text = *ch.Message.Content
 	}
-	if thinking {
+	native := ""
+	for _, r := range []*string{ch.Message.ReasoningContent, ch.Message.Reasoning} {
+		if r != nil {
+			native += *r
+		}
+	}
+	switch {
+	case thinking && native != "":
+		// The backend parsed the thinking out itself: the content is the
+		// answer, untagged.
+		reasoning = native
+	case thinking:
 		sp := a.splitter()
 		reasoning, text = sp.feed(text)
 		r, t := sp.flush()
@@ -279,11 +295,14 @@ func (a *Adapter) parse(data []byte, thinking bool) (model.Response, error) {
 }
 
 // response assembles the neutral turn from the provider's text, the
-// reasoning split off a continued thought (ThinkTags), its complete
-// tool-call objects (kept whole as Opaque for replay) and the usage.
+// reasoning of a continued thought (ThinkTags), its complete tool-call
+// objects (kept whole as Opaque for replay) and the usage. A turn with
+// nothing at all is a Transient error unless it was cut off; a continued
+// thought that ends in reasoning alone is returned as it is, for the machine
+// to judge (design §6.4).
 func (a *Adapter) response(text, reasoning string, calls []json.RawMessage, finish string, u task.Usage) (model.Response, error) {
 	msg := task.Message{Role: task.RoleAssistant}
-	if text == "" && len(calls) == 0 && finish != "length" {
+	if text == "" && reasoning == "" && len(calls) == 0 && finish != "length" {
 		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls"}
 	}
 	if reasoning != "" {
@@ -418,6 +437,18 @@ func (s *thinkSplit) feed(piece string) (reasoning, text string) {
 	}
 	s.pend = buf[len(buf)-k:]
 	return buf[:len(buf)-k], ""
+}
+
+// parsed says the backend parses the thinking out itself: reasoning came in
+// its own field (reasoning, reasoning_content). From here on content is
+// text, untagged; what was held back is returned as reasoning.
+func (s *thinkSplit) parsed() (held string) {
+	if !s.thinking {
+		return ""
+	}
+	s.thinking = false
+	held, s.pend = s.pend, ""
+	return held
 }
 
 // flush ends the content: what was held back was reasoning after all.

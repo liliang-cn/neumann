@@ -147,9 +147,20 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		for _, c := range ch.Choices {
 			d := c.Delta
 			for _, r := range []*string{d.ReasoningContent, d.Reasoning} {
-				if r != nil && *r != "" {
-					emit(model.Delta{Reasoning: *r})
+				if r == nil || *r == "" {
+					continue
 				}
+				if split != nil {
+					// A continued thought, and the backend parses the
+					// thinking itself: its reasoning is the thought's rest,
+					// and content from here on is the answer (parsed).
+					if held := split.parsed(); held != "" {
+						reasoning.WriteString(held)
+						emit(model.Delta{Reasoning: held})
+					}
+					reasoning.WriteString(*r)
+				}
+				emit(model.Delta{Reasoning: *r})
 			}
 			if d.Content != nil && *d.Content != "" {
 				content(*d.Content)

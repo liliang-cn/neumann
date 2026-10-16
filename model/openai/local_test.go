@@ -373,3 +373,101 @@ func TestThinkTagsSplitTheStream(t *testing.T) {
 		t.Fatalf("unclosed thought: %q / %q, %+v, %v", think.String(), text.String(), resp, err)
 	}
 }
+
+// The splitter gives the same reasoning and text however the content is cut
+// into pieces: at every pair of offsets, tags and multi-byte characters
+// split across pieces included.
+func TestThinkSplitAtEveryOffset(t *testing.T) {
+	a := New("http://x", "k", "m")
+	a.ThinkTags = [2]string{"<think>", "</think>"}
+	cases := []struct{ in, r, x string }{
+		{"rest of thought</think>\n\nThe answer <think> stays", "rest of thought", "The answer <think> stays"},
+		{"a </b> c </thin k</think>x</think>y", "a </b> c </thin k", "x</think>y"},
+		{"</think>\nonly answer", "", "only answer"},
+		{"never closed <", "never closed <", ""},
+		{"ünïcødé 思考</think>\r\n\n答案", "ünïcødé 思考", "答案"},
+	}
+	for _, c := range cases {
+		for i := 0; i <= len(c.in); i++ {
+			for j := i; j <= len(c.in); j++ {
+				sp := a.splitter()
+				var r, x string
+				for _, p := range []string{c.in[:i], c.in[i:j], c.in[j:]} {
+					rr, xx := sp.feed(p)
+					r, x = r+rr, x+xx
+				}
+				rr, xx := sp.flush()
+				r, x = r+rr, x+xx
+				if r != c.r || x != c.x {
+					t.Fatalf("%q split at %d,%d: reasoning %q text %q", c.in, i, j, r, x)
+				}
+			}
+		}
+	}
+}
+
+// Only a request that continues a thought is split: with ThinkTags set, an
+// answer to any other request that writes the tags is text as it is.
+func TestThinkTagsLeaveOtherAnswersWhole(t *testing.T) {
+	ts, _ := sseServer(t,
+		`data: {"choices":[{"delta":{"content":"x</think>y"}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`)
+	a := New(ts.URL+"/v1", "k", "m")
+	a.ThinkTags = [2]string{"<think>", "</think>"}
+	resp, err := a.Stream(context.Background(), hi, func(model.Delta) {})
+	if err != nil || resp.Message.TextContent() != "x</think>y" {
+		t.Fatalf("%q %v", resp.Message.TextContent(), err)
+	}
+}
+
+// A backend that parses the thinking out itself (llama.cpp with reasoning
+// parsing) continues a thought in the reasoning field and answers in
+// untagged content: once reasoning arrives in its own field, content is
+// text, in a stream and in a whole response alike.
+func TestThinkTagsWithABackendThatParsesThinking(t *testing.T) {
+	ts, _ := sseServer(t,
+		`data: {"choices":[{"delta":{"content":" and"}}]}`,
+		`data: {"choices":[{"delta":{"reasoning":" so it is 4."}}]}`,
+		`data: {"choices":[{"delta":{"content":"The answer is 4."}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		`data: [DONE]`)
+	a := New(ts.URL+"/v1", "k", "m")
+	a.ThinkTags = [2]string{"<think>", "</think>"}
+	var think, text strings.Builder
+	resp, err := a.Stream(context.Background(), thinking, func(d model.Delta) {
+		think.WriteString(d.Reasoning)
+		text.WriteString(d.Text)
+	})
+	if err != nil || resp.Message.TextContent() != "The answer is 4." || resp.Message.Parts[0].Text != " and so it is 4." {
+		t.Fatalf("stream: %+v, %v", resp.Message.Parts, err)
+	}
+	if think.String() != " and so it is 4." || text.String() != "The answer is 4." {
+		t.Fatalf("streamed reasoning %q, text %q", think.String(), text.String())
+	}
+
+	s := newServer(t, 200, `{"choices":[{"message":{"reasoning_content":" so it is 4.","content":"The answer is 4."},"finish_reason":"stop"}]}`)
+	a.BaseURL = s.URL + "/v1"
+	resp, err = a.Call(context.Background(), thinking)
+	if err != nil || resp.Message.TextContent() != "The answer is 4." || resp.Message.Parts[0].Text != " so it is 4." {
+		t.Fatalf("call: %+v, %v", resp.Message.Parts, err)
+	}
+}
+
+// A continued thought that stops without an answer comes back as the
+// reasoning alone, not as an error: the machine judges it (design §6.4). A
+// turn with nothing at all is still an error.
+func TestAThoughtThatStopsWithoutAnAnswer(t *testing.T) {
+	s := newServer(t, 200,
+		`{"choices":[{"message":{"content":" and that is all."},"finish_reason":"stop"}]}`,
+		`{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}`)
+	a := New(s.URL+"/v1", "k", "m")
+	a.ThinkTags = [2]string{"<think>", "</think>"}
+	resp, err := a.Call(context.Background(), thinking)
+	if err != nil || resp.Message.TextContent() != "" || resp.Message.Parts[0].Text != " and that is all." || resp.FinishReason != "stop" {
+		t.Fatalf("%+v, %v", resp, err)
+	}
+	if _, err := a.Call(context.Background(), thinking); err == nil {
+		t.Fatal("an empty turn is not an error")
+	}
+}
