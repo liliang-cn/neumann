@@ -50,8 +50,12 @@ type TracerOptions struct {
 //     (answer_rejected, with neumann.attempt and neumann.final). So are
 //     preemptions (preempted: neumann.preempt.by, the preempting task's
 //     id, .kept, .kept_think, .ran_ms, .n), priority changes (priority_set:
-//     neumann.priority, neumann.priority_was) and steers with a sender
-//     reaching the model (steer_delivered: neumann.steer.seq, neumann.from).
+//     neumann.priority, neumann.priority_was), steers with a sender
+//     reaching the model (steer_delivered: neumann.steer.seq, neumann.from),
+//     and an operator's suspends and resumes (design §9.9: suspended with
+//     neumann.was and, when it kept any, neumann.suspend.kept and
+//     .kept_think; resumed, with neumann.pending when it cancelled a
+//     suspend that had not landed).
 //   - "model" / "compact": one per model instruction, child of the task.
 //     It spans from its model_call, committed as the request goes out (in
 //     a log written before model_call existed: from when the task could
@@ -64,7 +68,11 @@ type TracerOptions struct {
 //     carries neumann.preempt.kept, .kept_think and .n and a link to the
 //     preempting task's root span; a call that continues kept text carries
 //     neumann.prefill (its chars), one that continues a kept thought
-//     neumann.prefill_think. A step with first_ms has a first_byte
+//     neumann.prefill_think. A call cut off by a suspend ends at its
+//     suspended event with neumann.outcome suspended, not an error, and
+//     neumann.suspend.kept / .kept_think when it kept any; after the resume
+//     the task's next call is timed from its own model_call, so the time
+//     suspended is in no model span. A step with first_ms has a first_byte
 //     event that many milliseconds after the span's start (the request),
 //     telling the backend's queue from its generation.
 //     A compaction that was applied carries its compacted event's figures
@@ -82,6 +90,12 @@ type TracerOptions struct {
 //     child of the task, from its first approval_needed to its decision,
 //     with neumann.verdict allow, edit, deny, or cancelled when the task
 //     ended first.
+//   - "suspended": one per suspension (design §9.9), child of the task,
+//     from its suspended event to the resume (neumann.outcome resumed) or
+//     the task's end while suspended (cancelled, failed), with neumann.was
+//     (ready, backoff, group, model, tools, approval, reconcile, check)
+//     and what it kept, as on the event. A resume that cancelled a suspend
+//     that never landed (resumed with pending) opens none.
 //   - "steer_dropped", "tool_late": events committed after the task ended,
 //     zero-length children of the task.
 //
@@ -126,7 +140,7 @@ func TraceID(taskID string) trace.TraceID {
 // TaskSpanID is the id of a task's root span: the first 8 bytes of
 // SHA-256("neumann/span/" + taskID). Every other span's id is the first 8
 // bytes of SHA-256("neumann/span/" + taskID + "/" + kind + "/" + seq), kind
-// one of step, batch, tool, after, and seq the Seq of the event that opened
+// one of step, batch, tool, result, approval, suspend, after, and seq the Seq of the event that opened
 // the span.
 func TaskSpanID(taskID string) trace.SpanID {
 	return hashSpan("neumann/span/" + taskID)
@@ -257,6 +271,9 @@ func (t *Tracer) fact(f fact) {
 					Attributes: []attribute.KeyValue{attribute.String("neumann.link", "preempted_by")}})
 			}
 		}
+		if f.outcome == outSuspended {
+			attrs = append(attrs, keptAttrs(f.d.Kept, f.d.KeptThink)...)
+		}
 		var events []sdktrace.Event
 		if fb := f.firstByte; fb != nil && !f.start.IsZero() {
 			// From the request, which the span starts with (its model_call),
@@ -279,6 +296,14 @@ func (t *Tracer) fact(f fact) {
 				attribute.String("neumann.task.id", f.task), attribute.String("neumann.tool", f.name),
 				attribute.String("neumann.call.id", f.d.CallID), attribute.String("neumann.verdict", f.outcome),
 			}, nil)
+	case factSuspendEnd:
+		// The time an operator held the task off the CPU (design §9.9).
+		attrs := []attribute.KeyValue{
+			attribute.String("neumann.task.id", f.task), attribute.String("neumann.was", f.name),
+			attribute.String("neumann.outcome", f.outcome), attribute.Int64("neumann.seq", f.seq),
+		}
+		attrs = append(attrs, keptAttrs(f.kept, f.keptThink)...)
+		t.emit(f.task, spanID(f.task, "suspend", f.seq), TaskSpanID(f.task), "suspended", f.start, f.end, sdktrace.Status{}, attrs, nil)
 	case factBatchEnd:
 		t.emit(f.task, spanID(f.task, "batch", f.seq), TaskSpanID(f.task), "tools", f.start, f.end, sdktrace.Status{},
 			[]attribute.KeyValue{attribute.String("neumann.task.id", f.task), attribute.Int64("neumann.seq", f.seq)}, nil)
@@ -382,6 +407,13 @@ func markAttrs(f fact) []attribute.KeyValue {
 			attribute.Int("neumann.preempt.n", d.N))
 	case proto.EvPrioritySet:
 		a = append(a, attribute.Int("neumann.priority", d.Priority), attribute.Int("neumann.priority_was", d.Was))
+	case proto.EvSuspended:
+		add("neumann.was", d.WasDoing)
+		a = append(a, keptAttrs(d.Kept, d.KeptThink)...)
+	case proto.EvResumed:
+		if d.Pending {
+			a = append(a, attribute.Bool("neumann.pending", true))
+		}
 	case proto.EvSteerDelivered:
 		// The sender, a name; never the steer's text.
 		a = append(a, attribute.Int64("neumann.steer.seq", d.SteerSeq))
@@ -404,6 +436,19 @@ func markAttrs(f fact) []attribute.KeyValue {
 		if d.Edited {
 			a = append(a, attribute.Bool("neumann.edited", true))
 		}
+	}
+	return a
+}
+
+// keptAttrs are what a suspend kept of the model call it interrupted, when
+// it kept anything.
+func keptAttrs(kept, think int) []attribute.KeyValue {
+	var a []attribute.KeyValue
+	if kept != 0 {
+		a = append(a, attribute.Int("neumann.suspend.kept", kept))
+	}
+	if think != 0 {
+		a = append(a, attribute.Int("neumann.suspend.kept_think", think))
 	}
 	return a
 }

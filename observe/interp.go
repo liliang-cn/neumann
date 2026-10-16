@@ -64,12 +64,15 @@ type data struct {
 	FirstMS      *int64 `json:"first_ms"`      // step: ms from the request to its first streamed chunk; nil when none came
 	Prefill      int    `json:"prefill"`       // step: chars of the continued prefix
 	PrefillThink int    `json:"prefill_think"` // step: chars of the continued thought
-	Kept         int    `json:"kept"`          // preempted: chars kept for the continuation
-	KeptThink    int    `json:"kept_think"`    // preempted: chars of thinking kept for the continuation
+	Kept         int    `json:"kept"`          // preempted, suspended: chars kept for the continuation
+	KeptThink    int    `json:"kept_think"`    // preempted, suspended: chars of thinking kept for the continuation
 	RanMS        int64  `json:"ran_ms"`        // preempted: how long the call ran
 	N            int    `json:"n"`             // preempted: how many times this step was preempted
 	Was          int    `json:"was"`           // priority_set: the priority before
 	SteerSeq     int64  `json:"seq"`           // steer_delivered, steer_dropped: the steer's seq
+	// suspend and resume (design §9.9)
+	WasDoing string `json:"-"`       // suspended: what the task was doing (its "was", a string there)
+	Pending  bool   `json:"pending"` // resumed: the resume cancelled a suspend that had not landed
 	task.Usage
 }
 
@@ -78,6 +81,14 @@ func decode(ev proto.Event) data {
 	if len(ev.Data) > 0 {
 		// A field of an unexpected type is skipped; the rest still decode.
 		_ = json.Unmarshal(ev.Data, &d)
+		if ev.Kind == proto.EvSuspended {
+			// suspended's was names a state; priority_set's is a number.
+			var s struct {
+				Was string `json:"was"`
+			}
+			_ = json.Unmarshal(ev.Data, &s)
+			d.WasDoing = s.Was
+		}
 	}
 	return d
 }
@@ -96,6 +107,13 @@ const (
 	// A model call cut off for a more urgent task (design §6.4): not an
 	// error, the task runs it again and continues the kept text.
 	outPreempted = "preempted"
+	// A model call cut off by an operator's suspend (design §9.9): not an
+	// error either; after the resume the task runs it again, continuing the
+	// kept text.
+	outSuspended = "suspended"
+	// A suspension that ended with a resume (the others end with their
+	// task: cancelled, failed).
+	outResumed = "resumed"
 )
 
 // Verdicts of a call held for approval (design §9.7), as metric labels and
@@ -119,6 +137,7 @@ const (
 	factAfter                          // an event committed after its task ended (steer_dropped, tool_late)
 	factApprovalNeeded                 // a call was held for an operator, announced for the first time
 	factApprovalEnd                    // a held call was decided, or its task ended first (outcome: the verdict)
+	factSuspendEnd                     // a suspension ended: resumed, or its task ended first (outcome: resumed or the task's)
 )
 
 // fact is what one event means once the events before it are known: the
@@ -146,6 +165,8 @@ type fact struct {
 	firstByte    *time.Duration // step: from the request to its first streamed chunk
 	prefill      int            // step: chars of the continued prefix
 	prefillThink int            // step: chars of the continued thought
+	kept         int            // suspension: chars of text kept from the call it interrupted
+	keptThink    int            // suspension: chars of thinking kept
 }
 
 type openStep struct {
@@ -174,6 +195,15 @@ type openApproval struct {
 	at   time.Time
 }
 
+// openSuspend is a task an operator suspended (design §9.9), from the
+// suspended event on.
+type openSuspend struct {
+	seq             int64
+	at              time.Time
+	was             string
+	kept, keptThink int
+}
+
 type openBatch struct {
 	seq     int64
 	at      time.Time
@@ -195,6 +225,7 @@ type taskState struct {
 	held        map[string]*openApproval
 	calls       map[string]*openCall // every call seen, for late results
 	batch       *openBatch
+	suspend     *openSuspend // suspended and not yet resumed
 	usage       task.Usage
 	steps       int
 	ended       bool
@@ -212,6 +243,9 @@ type interp struct {
 	order []string // ended, oldest first
 	// lookup gives the class of a task first seen mid-way; nil: unknown.
 	lookup func(id string) string
+	// suspended counts the tasks with an open suspension: suspended, and
+	// neither resumed nor ended since.
+	suspended int
 }
 
 func newInterp(lookup func(id string) string) *interp {
@@ -251,8 +285,11 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 	}
 
 	// The step a commit opened ends with the first event after it (in the
-	// same commit, as the core commits a step with its result).
-	if t.step != nil && ev.Kind != proto.EvUsage && ev.Kind != proto.EvStep {
+	// same commit, as the core commits a step with its result). A resume
+	// that cancelled a suspend that had not landed rides on the commit of
+	// the instruction it let go on, which it neither ends nor times.
+	pendingResume := ev.Kind == proto.EvResumed && d.Pending
+	if t.step != nil && ev.Kind != proto.EvUsage && ev.Kind != proto.EvStep && !pendingResume {
 		in.endStep(ev, d, t, emit)
 	}
 	switch ev.Kind {
@@ -345,6 +382,29 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 	case proto.EvPrioritySet:
 		emit(f(factMark))
 		t.priority = &d.Priority
+	case proto.EvSuspended:
+		// A model call it interrupted ended above, outcome suspended. The
+		// task is held until a resume; its next instruction is timed from
+		// the resume's commit (ready, below) or its own model_call, never
+		// from here.
+		emit(f(factMark))
+		if t.suspend == nil {
+			// A second suspended without a resume (a restart landing it
+			// again) is the same suspension, timed from the first.
+			t.suspend = &openSuspend{seq: ev.Seq, at: ev.Time, was: d.WasDoing, kept: d.Kept, keptThink: d.KeptThink}
+			in.suspended++
+		}
+	case proto.EvResumed:
+		emit(f(factMark))
+		if d.Pending {
+			// The resume cancelled a suspend that never landed: there is
+			// no suspension to end, and the task went on as it was.
+			return t.class, d
+		}
+		// Ready again from this commit: the next instruction is timed from
+		// here (or its model_call), not from the suspend or a backoff the
+		// suspend dropped.
+		in.endSuspend(ev, d, t, outResumed, emit)
 	case proto.EvSteerDelivered:
 		// At the head of the commit of the step that sent the steer: that
 		// step's call began at its model_call, not here.
@@ -434,6 +494,8 @@ func (in *interp) endStep(ev proto.Event, d data, t *taskState, emit func(fact))
 			f.outcome = outCancelled
 		case proto.EvPreempted:
 			f.outcome = outPreempted
+		case proto.EvSuspended:
+			f.outcome = outSuspended
 		}
 	}
 	emit(f)
@@ -478,6 +540,18 @@ func (in *interp) endApproval(ev proto.Event, d data, t *taskState, id, verdict 
 		outcome: verdict, start: a.at, end: ev.Time, timed: true})
 }
 
+// endSuspend ends a task's suspension, if it has one, with outcome.
+func (in *interp) endSuspend(ev proto.Event, d data, t *taskState, outcome string, emit func(fact)) {
+	s := t.suspend
+	if s == nil {
+		return // suspended before this interpreter began following, or not at all
+	}
+	t.suspend = nil
+	in.suspended--
+	emit(fact{kind: factSuspendEnd, ev: ev, d: d, task: ev.TaskID, class: t.class, seq: s.seq, name: s.was,
+		outcome: outcome, start: s.at, end: ev.Time, timed: true, kept: s.kept, keptThink: s.keptThink})
+}
+
 func (in *interp) endBatch(ev proto.Event, t *taskState, end time.Time, emit func(fact)) {
 	b := t.batch
 	t.batch = nil
@@ -485,6 +559,16 @@ func (in *interp) endBatch(ev proto.Event, t *taskState, end time.Time, emit fun
 }
 
 func (in *interp) endTask(ev proto.Event, d data, t *taskState, emit func(fact)) {
+	outcome := outCancelled
+	switch ev.Kind {
+	case proto.EvDone:
+		outcome = "done"
+	case proto.EvFailed:
+		outcome = "failed"
+	}
+	// A task cancelled, or out of time, while suspended: the suspension ends
+	// with it.
+	in.endSuspend(ev, d, t, outcome, emit)
 	// Calls still held for approval when the task ends were never decided.
 	for _, id := range heldInOrder(t) {
 		in.endApproval(ev, d, t, id, outCancelled, emit)
@@ -497,15 +581,7 @@ func (in *interp) endTask(ev proto.Event, d data, t *taskState, emit func(fact))
 		in.endBatch(ev, t, ev.Time, emit)
 	}
 	f := fact{kind: factTaskEnd, ev: ev, d: d, task: ev.TaskID, class: t.class, name: ev.Kind, start: t.start, end: ev.Time,
-		partial: t.partial, total: t.usage, steps: t.steps, priority: t.priority}
-	switch ev.Kind {
-	case proto.EvDone:
-		f.outcome = "done"
-	case proto.EvFailed:
-		f.outcome = "failed"
-	default:
-		f.outcome = outCancelled
-	}
+		partial: t.partial, total: t.usage, steps: t.steps, priority: t.priority, outcome: outcome}
 	emit(f)
 	delete(in.tasks, ev.TaskID)
 	t.ended, t.open, t.batch, t.step, t.held = true, nil, nil, nil, nil

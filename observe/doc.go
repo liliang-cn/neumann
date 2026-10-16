@@ -74,7 +74,9 @@
 // outcome of a model step: ok, error, cancelled, preempted (cut off for a
 // more urgent task of its group, design §6.4: not a failure, so not in
 // neumann.model.failures; the task runs the step again, continuing the
-// kept text); error_class is the
+// kept text), suspended (cut off by an operator's suspend, design §9.9:
+// not a failure either; after the resume the task runs the step again,
+// continuing the kept text); error_class is the
 // model_retry class (rate_limited, quota_exhausted, overload, transient,
 // truncated, ...) or, for a call that failed its task, the stop reason. A
 // tool call's outcome: ok, error, cached (served by L2), denied (tool_denied:
@@ -98,9 +100,11 @@
 // A log written before model_call existed falls back to the moment the task
 // could run (its previous commit, the end of its backoff, or the throttled
 // event that let its call go), which includes those waits. A preempted
-// call's duration (outcome preempted) is the time it held the backend before
-// it was cut off; its continuation is another call, timed from its own
-// model_call.
+// call's duration (outcome preempted, or suspended) is the time it held the
+// backend before it was cut off; its continuation is another call, timed
+// from its own model_call, so the time a task spends suspended counts in no
+// model call (in a log without model_call, the continuation is timed from
+// the resume).
 //
 // neumann.model.first_byte: first_ms of a streamed step, from the request
 // to its first chunk, for every outcome. On a local backend it tells the
@@ -114,6 +118,7 @@
 //	neumann.tasks.unfinished      gauge    {task}        —
 //	neumann.tasks.held            gauge    {task}        —                  on a vCore or a tool batch
 //	neumann.tasks.awaiting_approval gauge  {task}        —                  Status.Approval
+//	neumann.tasks.suspended       gauge    {task}        —                  suspended, not yet resumed or ended (see below)
 //	neumann.vcores.live           gauge    {vcore}       class
 //	neumann.vcores.busy           gauge    {vcore}       class
 //	neumann.group.window          gauge    {request}     class              congestion window W
@@ -140,6 +145,12 @@
 //	neumann.process.goroutines    gauge    {goroutine}   —
 //	neumann.process.heap          gauge    By            —                  live and unswept heap objects
 //	neumann.process.rss           gauge    By            —                  Linux only
+//
+// neumann.tasks.suspended (design §9.9) is counted from the events this
+// observer read, not from Status: a task's suspended event adds it, its
+// resumed (not a pending one) or its terminal event takes it off. A task
+// suspended before the seq Follow began from is not counted. A Metrics
+// without a Source has it too.
 //
 // # Traces
 //

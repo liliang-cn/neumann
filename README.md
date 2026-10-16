@@ -609,7 +609,7 @@ http.Handle("/", observe.NewHandler(m, observe.HandlerOptions{Metrics: prom, Tok
   latency and failures by error class, time to the first streamed chunk,
   preemptions, tokens, retries, throttling, tool calls by outcome (incl.
   denied, cached, late), approvals, compactions, migrations, delivered and
-  dropped steers, vCore changes; gauges for live/busy vCores, the window and breaker per
+  dropped steers, vCore changes; gauges for live/busy vCores, suspended tasks, the window and breaker per
   group, queues, limiter headroom, the cache and the process. Labels are
   bounded; nothing is labelled by task id. The full table is in
   `go doc github.com/liliang-cn/neumann/observe`.
@@ -622,7 +622,11 @@ http.Handle("/", observe.NewHandler(m, observe.HandlerOptions{Metrics: prom, Tok
   a `first_byte` event marks the first streamed chunk. A preempted call ends
   with outcome `preempted` (not an error) and links to the task that took
   the backend; its continuation carries `neumann.prefill`
-  (`neumann.prefill_think` when it continues a kept thought).
+  (`neumann.prefill_think` when it continues a kept thought). An operator's
+  suspend is a `suspended` span under the task, from the suspend to the
+  resume (or the task's end while suspended), with what the task was doing;
+  a call it cut off ends with outcome `suspended`, not an error, and the
+  time suspended is in no model or tool span.
 - **Activity log**: one `key=value` line per notable event through
   `log/slog` (no prompts or arguments).
 - **HTTP** (`observe.NewHandler`, read-only): `/status`, `/queue`,

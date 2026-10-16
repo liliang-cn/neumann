@@ -38,6 +38,8 @@ func (m *Metrics) gauges(meter metric.Meter) error {
 	unfinished := ig("neumann.tasks.unfinished", "{task}", "Tasks admitted and not yet terminal.")
 	held := ig("neumann.tasks.held", "{task}", "Tasks on a vCore or being completed by a tool batch.")
 	awaiting := ig("neumann.tasks.awaiting_approval", "{task}", "Tasks whose tool round waits for an operator's approval (Waiting(Approval)).")
+	suspended, err := m.suspendedGauge(meter)
+	errs, all = append(errs, err), append(all, suspended)
 	live := ig("neumann.vcores.live", "{vcore}", "vCores alive, by class.")
 	busy := ig("neumann.vcores.busy", "{vcore}", "vCores executing an instruction, by class.")
 	window := fg("neumann.group.window", "{request}", "Congestion window W, by class.")
@@ -68,13 +70,13 @@ func (m *Metrics) gauges(meter metric.Meter) error {
 		return err
 	}
 	samples := []metrics.Sample{{Name: "/sched/goroutines:goroutines"}, {Name: "/memory/classes/heap/objects:bytes"}}
-	var err error
 	m.reg, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 		o.ObserveInt64(seq, m.seq.Load())
 		st, q := m.src.Status(), m.src.Queue()
 		o.ObserveInt64(unfinished, int64(st.Unfinished))
 		o.ObserveInt64(held, int64(st.Held))
 		o.ObserveInt64(awaiting, int64(st.Approval))
+		o.ObserveInt64(suspended, m.suspended.Load())
 		for _, g := range st.Groups {
 			c := metric.WithAttributes(attribute.String("class", g.Class))
 			o.ObserveInt64(live, int64(g.Live), c)

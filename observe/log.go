@@ -16,6 +16,9 @@ import (
 //   - info: lifecycle — accepted, done, cancelled, compacted, migrated,
 //     recovered, resolved, approved, tool_rewritten, answer_rejected,
 //     preempted (by, kept, kept_think, ran_ms, n), priority_set (priority, was),
+//     suspended (was, and kept, kept_think when it kept any), resumed
+//     (pending when it cancelled a suspend that had not landed; otherwise
+//     was, and how long the task was suspended),
 //     steer_delivered (from), group_up, core_up, core_down, and kinds this
 //     package does not know;
 //   - warn: model_retry, throttled, group_down, migrate_refused,
@@ -45,9 +48,13 @@ func NewLog(l *slog.Logger) *Log {
 // Observe logs ev if it is notable at the logger's level.
 func (g *Log) Observe(ev proto.Event) {
 	var decided *fact // the approval this event decided
+	var resumed *fact // the suspension this event ended
 	class, d := g.in.feed(ev, func(f fact) {
-		if f.kind == factApprovalEnd {
+		switch f.kind {
+		case factApprovalEnd:
 			decided = &f
+		case factSuspendEnd:
+			resumed = &f
 		}
 	})
 	level, ok := levelOf(ev.Kind)
@@ -126,6 +133,24 @@ func (g *Log) Observe(ev proto.Event) {
 		a = append(a, slog.Int("kept", d.Kept), slog.Int("kept_think", d.KeptThink), slog.Int64("ran_ms", d.RanMS), slog.Int("n", d.N))
 	case proto.EvPrioritySet:
 		a = append(a, slog.Int("priority", d.Priority), slog.Int("was", d.Was))
+	case proto.EvSuspended:
+		str("was", d.WasDoing)
+		if d.Kept != 0 {
+			a = append(a, slog.Int("kept", d.Kept))
+		}
+		if d.KeptThink != 0 {
+			a = append(a, slog.Int("kept_think", d.KeptThink))
+		}
+	case proto.EvResumed:
+		if d.Pending {
+			a = append(a, slog.Bool("pending", true))
+		}
+		if f := resumed; f != nil {
+			str("was", f.name)
+			if s, ok := timed(f.start, f.end); ok {
+				a = append(a, slog.Duration("suspended", time.Duration(s*float64(time.Second))))
+			}
+		}
 	case proto.EvCoreUp, proto.EvCoreDown:
 		a = append(a, slog.Int("core", d.Core), slog.String("reason", d.Reason), slog.Int("live", d.Live))
 	case proto.EvGroupDown:

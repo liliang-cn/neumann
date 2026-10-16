@@ -39,12 +39,15 @@ var durationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5
 // collects. It costs nothing until it is fed or collected. Every metric is
 // listed in the package documentation.
 type Metrics struct {
-	src    Source
-	in     *interp
-	seq    atomic.Int64
-	reg    metric.Registration
-	labels map[string]*bounded
-	o      MetricsOptions
+	src Source
+	in  *interp
+	seq atomic.Int64
+	// suspended is the tasks the events say are suspended, for the
+	// neumann.tasks.suspended gauge: Status has no such count yet.
+	suspended atomic.Int64
+	reg       metric.Registration
+	labels    map[string]*bounded
+	o         MetricsOptions
 
 	events, accepted, terminal, recovered      metric.Int64Counter
 	modelCalls, modelFailures, retries, tokens metric.Int64Counter
@@ -101,7 +104,7 @@ func NewMetrics(src Source, mp metric.MeterProvider, o MetricsOptions) (*Metrics
 	m.accepted = counter("neumann.tasks.accepted", "{task}", "Tasks accepted, by class.")
 	m.terminal = counter("neumann.tasks.terminal", "{task}", "Tasks ended, by class, outcome (done, failed, cancelled) and stop reason.")
 	m.recovered = counter("neumann.tasks.recovered", "{task}", "Tasks recovered at a restart, by class and the state they were found in.")
-	m.modelCalls = counter("neumann.model.calls", "{call}", "Model instructions, by class, pc (model, compact) and outcome (ok, error, cancelled, preempted).")
+	m.modelCalls = counter("neumann.model.calls", "{call}", "Model instructions, by class, pc (model, compact) and outcome (ok, error, cancelled, preempted, suspended).")
 	m.modelFailures = counter("neumann.model.failures", "{call}", "Model instructions that failed, by class and error class.")
 	m.retries = counter("neumann.model.retries", "{retry}", "Model retries decided, by class, error class and what the task waits for.")
 	m.tokens = counter("neumann.model.tokens", "{token}", "Confirmed tokens, by class and type (prompt, completion, reasoning, cached).")
@@ -141,15 +144,29 @@ func NewMetrics(src Source, mp metric.MeterProvider, o MetricsOptions) (*Metrics
 		if err != nil {
 			return nil, err
 		}
+		susp, err := m.suspendedGauge(meter)
+		if err != nil {
+			return nil, err
+		}
 		m.reg, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
 			o.ObserveInt64(g, m.seq.Load())
+			o.ObserveInt64(susp, m.suspended.Load())
 			return nil
-		}, g)
+		}, g, susp)
 		if err != nil {
 			return nil, err
 		}
 	}
 	return m, nil
+}
+
+// suspendedGauge is neumann.tasks.suspended. It is counted from the events
+// (suspended, then resumed or the task's end), as Status does not count
+// suspended tasks: a task suspended before the seq this observer began
+// from is not in it.
+func (m *Metrics) suspendedGauge(meter metric.Meter) (metric.Int64ObservableGauge, error) {
+	return meter.Int64ObservableGauge("neumann.tasks.suspended", metric.WithUnit("{task}"),
+		metric.WithDescription("Tasks an operator suspended and has not resumed (design §9.9), from the events this observer read."))
 }
 
 // Seq is the Seq of the last event observed.
@@ -259,6 +276,7 @@ func (m *Metrics) Observe(ev proto.Event) {
 		m.compactRounds.Add(bg, int64(d.Rounds), m.attrs("class", class))
 		m.compactTokens.Add(bg, max(d.TokensBefore-d.TokensAfter, 0), m.attrs("class", class))
 	}
+	m.suspended.Store(int64(m.in.suspended))
 	m.seq.Store(ev.Seq)
 }
 
