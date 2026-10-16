@@ -27,6 +27,7 @@
 //	a.Parallel = 1         // Ollama's MLX runner serves one request at a time
 //	a.Prefill = true       // a trailing assistant message is continued
 //	a.ThinkOff = "none"    // reasoning_effort that turns thinking off
+//	a.ThinkTags = [2]string{"<think>", "</think>"} // a thought cut off is continued too
 //	a.MaxTokens = 8192     // a model looping in its thinking stops here
 //	a.Timeout = 0          // no limit on the whole call...
 //	a.FirstByteTimeout = 10 * time.Minute // ...but on reading the prompt

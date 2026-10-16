@@ -90,12 +90,31 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 	defer resp.Body.Close()
 
 	var (
-		text   strings.Builder
-		calls  = map[int]*callAcc{}
-		finish string
-		usage  wireUsage
-		done   bool
+		text      strings.Builder
+		reasoning strings.Builder // split off a continued thought (ThinkTags)
+		split     *thinkSplit
+		calls     = map[int]*callAcc{}
+		finish    string
+		usage     wireUsage
+		done      bool
 	)
+	if a.thinkPrefill(req) {
+		split = a.splitter()
+	}
+	content := func(piece string) {
+		r, t := "", piece
+		if split != nil {
+			r, t = split.feed(piece)
+		}
+		if r != "" {
+			reasoning.WriteString(r)
+			emit(model.Delta{Reasoning: r})
+		}
+		if t != "" {
+			text.WriteString(t)
+			emit(model.Delta{Text: t})
+		}
+	}
 	r := bufio.NewReaderSize(resp.Body, 64<<10)
 	for !done {
 		line, err := r.ReadString('\n')
@@ -133,8 +152,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 				}
 			}
 			if d.Content != nil && *d.Content != "" {
-				text.WriteString(*d.Content)
-				emit(model.Delta{Text: *d.Content})
+				content(*d.Content)
 			}
 			for _, raw := range d.ToolCalls {
 				var idx struct {
@@ -164,6 +182,12 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		return model.Response{}, a.lostError("stream ended before the answer was complete", nil)
 	}
 
+	if split != nil {
+		if r, _ := split.flush(); r != "" {
+			reasoning.WriteString(r)
+			emit(model.Delta{Reasoning: r})
+		}
+	}
 	idxs := make([]int, 0, len(calls))
 	for i := range calls {
 		idxs = append(idxs, i)
@@ -177,7 +201,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		}
 		objs = append(objs, obj)
 	}
-	out, err := a.response(text.String(), objs, finish, usage.usage())
+	out, err := a.response(text.String(), reasoning.String(), objs, finish, usage.usage())
 	if err != nil {
 		return model.Response{}, err
 	}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -271,5 +272,104 @@ func TestStreamReportsOllamaReasoning(t *testing.T) {
 	}
 	if len(deltas) != 1 || deltas[0].Reasoning != "Thinking" {
 		t.Fatalf("deltas %+v", deltas)
+	}
+}
+
+// thinking is a request that asks the model to go on thinking: it ends with
+// an assistant message holding only reasoning.
+var thinking = model.Request{Messages: []task.Message{
+	task.Text(task.RoleUser, "Count the hens."),
+	{Role: task.RoleAssistant, Parts: []task.Part{{Kind: task.PartReasoning, Text: "There are three hens in the"}}},
+}}
+
+// With ThinkTags, a call cut off while thinking is continued (design §6.4):
+// the trailing reasoning goes out as content inside the open tag, and the
+// answer, all in content, is split at the close tag into the rest of the
+// thinking and the text. Without ThinkTags the reasoning-only message goes
+// out empty, and the content is all text.
+func TestThinkTagsContinueAThought(t *testing.T) {
+	s := newServer(t, 200,
+		`{"choices":[{"message":{"content":" yard.\n</think>\n\nThree."},"finish_reason":"stop"}]}`,
+		`{"choices":[{"message":{"content":" yard, and"},"finish_reason":"length"}]}`,
+		`{"choices":[{"message":{"content":"Three."},"finish_reason":"stop"}]}`)
+	a := New(s.URL+"/v1", "k", "m")
+	a.ThinkTags = [2]string{"<think>", "</think>"}
+	if !a.Caps().ThinkPrefill {
+		t.Fatal("ThinkTags do not report ThinkPrefill")
+	}
+	resp, err := a.Call(context.Background(), thinking)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := s.body(0)["messages"].([]any)
+	if last := msgs[len(msgs)-1].(map[string]any); last["role"] != "assistant" || last["content"] != "<think>\nThere are three hens in the" {
+		t.Fatalf("last message %v", last)
+	}
+	if p := resp.Message.Parts; len(p) != 2 || p[0].Kind != task.PartReasoning || p[0].Text != " yard.\n" || p[0].Provider != a.Provider() || p[1].Text != "Three." {
+		t.Fatalf("answer %+v", p)
+	}
+	// Cut off while still thinking: all reasoning, no text.
+	resp, err = a.Call(context.Background(), thinking)
+	if err != nil || resp.FinishReason != "length" || resp.Message.TextContent() != "" || resp.Message.Parts[0].Text != " yard, and" {
+		t.Fatalf("cut off: %+v, %v", resp, err)
+	}
+	a.ThinkTags = [2]string{}
+	if a.Caps().ThinkPrefill {
+		t.Fatal("ThinkPrefill without ThinkTags")
+	}
+	resp, err = a.Call(context.Background(), thinking)
+	if err != nil || resp.Message.TextContent() != "Three." {
+		t.Fatalf("without ThinkTags: %+v, %v", resp, err)
+	}
+	msgs = s.body(2)["messages"].([]any)
+	if last := msgs[len(msgs)-1].(map[string]any); last["content"] != "" {
+		t.Fatalf("without ThinkTags the last message is %v", last)
+	}
+}
+
+// A continued thought streams as reasoning up to the close tag and as text
+// after it, a tag split across chunks included; nothing of the tag leaks.
+func TestThinkTagsSplitTheStream(t *testing.T) {
+	ts, _ := sseServer(t,
+		`data: {"choices":[{"index":0,"delta":{"content":" yard. Three"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":" in all.</th"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":"ink"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":">\n"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":"\nThree."},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+	)
+	a := New(ts.URL+"/v1", "k", "m")
+	a.ThinkTags = [2]string{"<think>", "</think>"}
+	var think, text strings.Builder
+	resp, err := a.Stream(context.Background(), thinking, func(d model.Delta) {
+		think.WriteString(d.Reasoning)
+		text.WriteString(d.Text)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if think.String() != " yard. Three in all." || text.String() != "Three." {
+		t.Fatalf("streamed reasoning %q, text %q", think.String(), text.String())
+	}
+	if p := resp.Message.Parts; len(p) != 2 || p[0].Text != " yard. Three in all." || p[1].Text != "Three." {
+		t.Fatalf("answer %+v", p)
+	}
+
+	// A stream that never closes the thought is all reasoning, the held-back
+	// end included.
+	ts2, _ := sseServer(t,
+		`data: {"choices":[{"index":0,"delta":{"content":" still thinking </t"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":""},"finish_reason":"length"}]}`,
+		`data: [DONE]`,
+	)
+	a.BaseURL = ts2.URL + "/v1"
+	think.Reset()
+	text.Reset()
+	resp, err = a.Stream(context.Background(), thinking, func(d model.Delta) {
+		think.WriteString(d.Reasoning)
+		text.WriteString(d.Text)
+	})
+	if err != nil || think.String() != " still thinking </t" || text.String() != "" || resp.Message.Parts[0].Text != " still thinking </t" {
+		t.Fatalf("unclosed thought: %q / %q, %+v, %v", think.String(), text.String(), resp, err)
 	}
 }

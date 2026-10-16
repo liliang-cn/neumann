@@ -40,6 +40,21 @@ type Adapter struct {
 	Parallel int
 	Prefill  bool
 	ThinkOff string
+	// ThinkTags are the tags the model writes its thinking between when
+	// thinking is part of its content ("<think>", "</think>" on Ollama's
+	// qwen models). Set (the open tag not empty), a call cut off while the
+	// model was still thinking can be continued (Caps.ThinkPrefill, design
+	// §6.4): a request ending with an assistant message that holds only
+	// reasoning is sent with that message's content set to the open tag, a
+	// newline and the reasoning, and the model goes on thinking from there.
+	// Its answer then comes back all in content: the rest of the thinking,
+	// the close tag, the answer. The adapter splits it at the close tag, in
+	// a stream too (a tag split across chunks included): what comes before
+	// is reasoning (Delta.Reasoning, a reasoning part), what comes after is
+	// text, leading newlines dropped. Sending the reasoning in the
+	// reasoning field instead does not work on Ollama: the model thinks
+	// again from the start.
+	ThinkTags [2]string
 	// Per-request timeouts (design §11). Timeout bounds the whole call,
 	// from sending the request to the end of the response body; New sets
 	// DefaultTimeout, 0 is no limit. FirstByteTimeout bounds sending to the
@@ -90,7 +105,8 @@ func (a *Adapter) MaxOut() int { return max(a.MaxTokens, 0) }
 const DefaultMaxTools = 128
 
 // Caps reports ContextWindow, the output cap, NoTools, MaxTools, Parallel,
-// Prefill, and whether ThinkOff is set (model.CapsReporter).
+// Prefill, whether ThinkOff is set, and whether ThinkTags are
+// (ThinkPrefill) (model.CapsReporter).
 func (a *Adapter) Caps() model.Caps {
 	n := a.MaxTools
 	switch {
@@ -102,6 +118,7 @@ func (a *Adapter) Caps() model.Caps {
 	return model.Caps{
 		Window: max(a.ContextWindow, 0), MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: n,
 		Parallel: max(a.Parallel, 0), Prefill: a.Prefill, ThinkOff: a.ThinkOff != "",
+		ThinkPrefill: a.ThinkTags[0] != "" && a.ThinkTags[1] != "",
 	}
 }
 
@@ -175,7 +192,7 @@ func (a *Adapter) Call(ctx context.Context, req model.Request) (model.Response, 
 	if err != nil {
 		return model.Response{}, a.ioError(ctx, "read response", err, true, resp.Header)
 	}
-	out, err := a.parse(data)
+	out, err := a.parse(data, a.thinkPrefill(req))
 	if err != nil {
 		return model.Response{}, err
 	}
@@ -237,7 +254,7 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 	return resp, nil
 }
 
-func (a *Adapter) parse(data []byte) (model.Response, error) {
+func (a *Adapter) parse(data []byte, thinking bool) (model.Response, error) {
 	var w wireResp
 	if err := json.Unmarshal(data, &w); err != nil {
 		return model.Response{}, a.lostError("decode response: "+snippet(data), err)
@@ -248,17 +265,30 @@ func (a *Adapter) parse(data []byte) (model.Response, error) {
 		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has no choices: " + a.redact(snippet(data))}
 	}
 	ch := w.Choices[0]
-	text := ""
+	text, reasoning := "", ""
 	if ch.Message.Content != nil {
 		text = *ch.Message.Content
 	}
-	return a.response(text, ch.Message.ToolCalls, ch.FinishReason, w.Usage.usage())
+	if thinking {
+		sp := a.splitter()
+		reasoning, text = sp.feed(text)
+		r, t := sp.flush()
+		reasoning, text = reasoning+r, text+t
+	}
+	return a.response(text, reasoning, ch.Message.ToolCalls, ch.FinishReason, w.Usage.usage())
 }
 
-// response assembles the neutral turn from the provider's text, its complete
+// response assembles the neutral turn from the provider's text, the
+// reasoning split off a continued thought (ThinkTags), its complete
 // tool-call objects (kept whole as Opaque for replay) and the usage.
-func (a *Adapter) response(text string, calls []json.RawMessage, finish string, u task.Usage) (model.Response, error) {
+func (a *Adapter) response(text, reasoning string, calls []json.RawMessage, finish string, u task.Usage) (model.Response, error) {
 	msg := task.Message{Role: task.RoleAssistant}
+	if text == "" && len(calls) == 0 && finish != "length" {
+		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls"}
+	}
+	if reasoning != "" {
+		msg.Parts = append(msg.Parts, task.Part{Kind: task.PartReasoning, Text: reasoning, Provider: a.Provider()})
+	}
 	if text != "" {
 		msg.Parts = append(msg.Parts, task.Part{Kind: task.PartText, Text: text})
 	}
@@ -276,9 +306,6 @@ func (a *Adapter) response(text string, calls []json.RawMessage, finish string, 
 			Opaque:         bytes.Clone(rc),
 		})
 	}
-	if len(msg.Parts) == 0 && finish != "length" {
-		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls"}
-	}
 	return model.Response{Message: msg, FinishReason: finish, Usage: u}, nil
 }
 
@@ -287,14 +314,16 @@ func (a *Adapter) response(text string, calls []json.RawMessage, finish string, 
 // because gateways put fields there (Gemini's thought signatures, for one)
 // that must come back; any other call is rendered under the machine's id.
 // A request that ends with an assistant text message ends with it as is: a
-// backend with Prefill continues it.
+// backend with Prefill continues it. One that ends with an assistant message
+// holding only reasoning, with ThinkTags set, ends with that reasoning
+// inside the open tag (thinkPrefill).
 func (a *Adapter) messages(req model.Request) ([]wireMsg, error) {
 	var out []wireMsg
 	if req.System != "" {
 		out = append(out, wireMsg{Role: "system", Content: ptr(req.System)})
 	}
 	ids := map[string]string{} // machine CallID -> id sent on the wire
-	for _, m := range req.Messages {
+	for i, m := range req.Messages {
 		switch m.Role {
 		case task.RoleSystem, task.RoleUser:
 			out = append(out, wireMsg{Role: string(m.Role), Content: ptr(m.TextContent())})
@@ -314,6 +343,9 @@ func (a *Adapter) messages(req model.Request) ([]wireMsg, error) {
 			if w.Content == nil && len(w.ToolCalls) == 0 {
 				w.Content = ptr("")
 			}
+			if i == len(req.Messages)-1 && a.thinkPrefill(req) {
+				w.Content = ptr(a.ThinkTags[0] + "\n" + reasoningOf(m))
+			}
 			out = append(out, w)
 		case task.RoleTool:
 			for _, p := range m.Parts {
@@ -329,6 +361,78 @@ func (a *Adapter) messages(req model.Request) ([]wireMsg, error) {
 		}
 	}
 	return out, nil
+}
+
+// thinkPrefill reports whether req asks the model to go on thinking: it ends
+// with an assistant message holding reasoning and no text or tool call, and
+// ThinkTags are set.
+func (a *Adapter) thinkPrefill(req model.Request) bool {
+	if a.ThinkTags[0] == "" || a.ThinkTags[1] == "" || len(req.Messages) == 0 {
+		return false
+	}
+	m := req.Messages[len(req.Messages)-1]
+	return m.Role == task.RoleAssistant && m.TextContent() == "" && len(m.ToolCalls()) == 0 && reasoningOf(m) != ""
+}
+
+// reasoningOf is the text of m's reasoning parts, joined.
+func reasoningOf(m task.Message) string {
+	var b strings.Builder
+	for _, p := range m.Parts {
+		if p.Kind == task.PartReasoning {
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
+}
+
+// thinkSplit splits the content of an answer that continues a thought
+// (ThinkTags): reasoning up to the close tag, text after it, its leading
+// newlines dropped. Fed piece by piece, it holds back the end of a piece
+// that may be the start of the close tag until the next piece says.
+type thinkSplit struct {
+	close    string
+	thinking bool
+	pend     string
+	begun    bool // text other than newlines has come
+}
+
+func (a *Adapter) splitter() *thinkSplit { return &thinkSplit{close: a.ThinkTags[1], thinking: true} }
+
+// feed takes the next piece of content and returns what of it is now known
+// to be reasoning and text.
+func (s *thinkSplit) feed(piece string) (reasoning, text string) {
+	if !s.thinking {
+		return "", s.text(piece)
+	}
+	buf := s.pend + piece
+	if i := strings.Index(buf, s.close); i >= 0 {
+		s.thinking, s.pend = false, ""
+		return buf[:i], s.text(buf[i+len(s.close):])
+	}
+	k := 0 // the longest end of buf that starts the close tag
+	for n := min(len(s.close)-1, len(buf)); n > 0; n-- {
+		if strings.HasSuffix(buf, s.close[:n]) {
+			k = n
+			break
+		}
+	}
+	s.pend = buf[len(buf)-k:]
+	return buf[:len(buf)-k], ""
+}
+
+// flush ends the content: what was held back was reasoning after all.
+func (s *thinkSplit) flush() (reasoning, text string) {
+	r := s.pend
+	s.pend = ""
+	return r, ""
+}
+
+func (s *thinkSplit) text(piece string) string {
+	if !s.begun {
+		piece = strings.TrimLeft(piece, "\r\n")
+		s.begun = piece != ""
+	}
+	return piece
 }
 
 func (a *Adapter) toolCall(p task.Part) (json.RawMessage, string, error) {
