@@ -80,25 +80,36 @@ func (m *Model) Call(ctx context.Context, req model.Request) (model.Response, er
 // Lost).
 func (m *Model) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
 	resp, err := m.Call(ctx, req)
-	if err != nil && resp.Message.TextContent() == "" {
+	think, text := []rune(reasoningOf(resp.Message)), []rune(resp.Message.TextContent())
+	if err != nil && len(think)+len(text) == 0 {
 		return resp, err
 	}
 	n := m.Pieces
 	if n <= 0 {
 		n = 3
 	}
-	r := []rune(resp.Message.TextContent())
-	for i, k := 0, 0; i < n && len(r) > 0; i++ {
-		piece := string(r[i*len(r)/n : (i+1)*len(r)/n])
-		if piece == "" {
+	// The reasoning streams first, then the text, as a thinking model's
+	// answer does; a piece may hold the end of one and the start of the
+	// other.
+	all, cut := append(think, text...), len(think)
+	for i, k := 0, 0; i < n && len(all) > 0; i++ {
+		lo, hi := i*len(all)/n, (i+1)*len(all)/n
+		if lo == hi {
 			continue
+		}
+		var d model.Delta
+		if lo < cut {
+			d.Reasoning = string(all[lo:min(hi, cut)])
+		}
+		if hi > cut {
+			d.Text = string(all[max(lo, cut):hi])
 		}
 		if k > 0 {
 			if werr := m.wait(ctx); werr != nil {
 				return model.Response{}, werr
 			}
 		}
-		emit(model.Delta{Text: piece})
+		emit(d)
 		m.mu.Lock()
 		m.emitted++
 		m.mu.Unlock()
@@ -198,6 +209,49 @@ func Prefill(req model.Request) string {
 // with it; full whole otherwise.
 func Continue(req model.Request, full string) model.Response {
 	return Reply(strings.TrimPrefix(full, Prefill(req)))
+}
+
+// reasoningOf is the text of msg's reasoning parts, joined.
+func reasoningOf(msg task.Message) string {
+	var b strings.Builder
+	for _, p := range msg.Parts {
+		if p.Kind == task.PartReasoning {
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
+}
+
+// Think is a final answer that thought first: a reasoning part, then the
+// text. Stream sends the reasoning as Delta.Reasoning before the text.
+func Think(reasoning, text string) model.Response {
+	r := Reply(text)
+	if reasoning != "" {
+		r.Message.Parts = append([]task.Part{{Kind: task.PartReasoning, Text: reasoning, Provider: "sim"}}, r.Message.Parts...)
+	}
+	return r
+}
+
+// PrefillThink is the reasoning of the assistant message req ends with when
+// it holds reasoning and no text: the thinking the machine asks a model
+// whose Caps.ThinkPrefill is true to go on with (design §6.4). Empty
+// otherwise.
+func PrefillThink(req model.Request) string {
+	if n := len(req.Messages); n > 0 && req.Messages[n-1].Role == task.RoleAssistant && req.Messages[n-1].TextContent() == "" {
+		return reasoningOf(req.Messages[n-1])
+	}
+	return ""
+}
+
+// ContinueThink is Think(reasoning, text) as a model that continues a
+// reasoning prefix gives it: only the reasoning after the prefix req ends
+// with (PrefillThink), when reasoning starts with it, then the text; and
+// as Continue for a text prefix.
+func ContinueThink(req model.Request, reasoning, text string) model.Response {
+	if p := Prefill(req); p != "" {
+		return Continue(req, text)
+	}
+	return Think(strings.TrimPrefix(reasoning, PrefillThink(req)), text)
 }
 
 // FirstUser is the first user message's text; tests use it as a task's name.
