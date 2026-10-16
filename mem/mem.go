@@ -75,10 +75,16 @@ const (
 )
 
 // Interrupt kinds. A steer's Text is the message; a cancel's Text is its
-// reason, the StopReason the task ends with ("cancelled" or "deadline").
+// reason, the StopReason the task ends with ("cancelled" or "deadline"). A
+// suspend and a resume carry no text (design §9.9): the holder of the task
+// applies them at its next instruction boundary, in seq order, and only the
+// last of them counts. Unlike a cancel, neither refuses any commit; a
+// terminal commit applies them silently, as any interrupt but a steer.
 const (
-	InterruptSteer  = "steer"
-	InterruptCancel = "cancel"
+	InterruptSteer   = "steer"
+	InterruptCancel  = "cancel"
+	InterruptSuspend = "suspend"
+	InterruptResume  = "resume"
 )
 
 // CancelReason is the StopReason that the final commit of the cancel in must

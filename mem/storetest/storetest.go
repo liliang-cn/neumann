@@ -67,6 +67,9 @@ func Run(t *testing.T, newStore Factory) {
 		{"EventTimesAreCommitTimes", testEventTimesAreCommitTimes},
 		{"ArchiveAppendsWithItsTask", testArchiveAppendsWithItsTask},
 		{"ArchiveIsAllOrNothing", testArchiveIsAllOrNothing},
+		{"SuspendAndResumeRoundTripInOrder", testSuspendAndResumeRoundTripInOrder},
+		{"PendingSuspendRefusesNothing", testPendingSuspendRefusesNothing},
+		{"SuspendAndResumeAreAppliedSilently", testSuspendAndResumeAreAppliedSilently},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore) })
@@ -801,5 +804,90 @@ func testSteerWithASenderIsReportedDropped(t *testing.T, newStore Factory) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("events:\n got %q\nwant %q", got, want)
+	}
+}
+
+func suspension(id, kind string) mem.CommitSet {
+	return mem.CommitSet{NewInterrupts: []mem.Interrupt{{TaskID: id, Kind: kind}}}
+}
+
+// Suspends and resumes keep their kinds and their order among the task's
+// other interrupts (design §9.9: the last of them counts), and a commit
+// that lands them marks exactly those applied.
+func testSuspendAndResumeRoundTripInOrder(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, suspension("a", mem.InterruptSuspend))
+	mustCommit(t, s, steer("a", "s"))
+	mustCommit(t, s, suspension("a", mem.InterruptResume))
+	mustCommit(t, s, suspension("a", mem.InterruptSuspend))
+	pending, err := s.Interrupts(ctx, "a", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	for i, in := range pending {
+		kinds = append(kinds, in.Kind)
+		if in.Applied || in.Kind != mem.InterruptSteer && in.Text != "" || i > 0 && in.Seq <= pending[i-1].Seq {
+			t.Fatalf("pending %+v", pending)
+		}
+	}
+	if strings.Join(kinds, ",") != "suspend,steer,resume,suspend" {
+		t.Fatalf("kinds %v", kinds)
+	}
+	tc.State, tc.Version = task.Suspended, 2
+	mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{pending[0].Seq, pending[2].Seq, pending[3].Seq}})
+	left, _ := s.Interrupts(ctx, "a", true)
+	if len(left) != 1 || left[0].Kind != mem.InterruptSteer {
+		t.Fatalf("left pending %+v", left)
+	}
+	all, _ := s.Interrupts(ctx, "a", false)
+	if len(all) != 4 || !all[0].Applied || all[1].Applied || !all[2].Applied || !all[3].Applied {
+		t.Fatalf("all %+v", all)
+	}
+	if got, _ := s.Load(ctx, "a"); got.State != task.Suspended {
+		t.Fatalf("state %s", got.State)
+	}
+}
+
+// Unlike a cancel, a pending suspend or resume refuses no commit: the
+// task's holder lands it at its own boundary, and may go on meanwhile,
+// dispatching calls included.
+func testPendingSuspendRefusesNothing(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, suspension("a", mem.InterruptSuspend))
+	mustCommit(t, s, suspension("a", mem.InterruptResume))
+	tc.State, tc.Wait, tc.Version = task.Waiting, task.WaitIO, 2
+	r := mem.CallRecord{TaskID: "a", CallID: "c-1", Index: 1, Tool: "x", Status: mem.CallDispatched, Attempt: 1}
+	mustCommit(t, s, mem.CommitSet{Task: tc, Calls: []mem.CallRecord{r}})
+	if pending, _ := s.Interrupts(ctx, "a", true); len(pending) != 2 {
+		t.Fatalf("pending %+v", pending)
+	}
+}
+
+// A terminal commit applies pending suspends and resumes with every other
+// interrupt, and reports neither: only steers are reported dropped.
+func testSuspendAndResumeAreAppliedSilently(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, suspension("a", mem.InterruptSuspend))
+	mustCommit(t, s, suspension("a", mem.InterruptResume))
+	mustCommit(t, s, suspension("a", mem.InterruptSuspend))
+	tc.State, tc.StopReason, tc.Version = task.Done, "end_turn", 2
+	if evs := mustCommit(t, s, mem.CommitSet{Task: tc}); len(evs) != 0 {
+		t.Fatalf("events %+v", evs)
+	}
+	if pending, _ := s.Interrupts(ctx, "a", true); len(pending) != 0 {
+		t.Fatalf("pending %+v", pending)
+	}
+	if _, err := s.Commit(ctx, suspension("a", mem.InterruptSuspend)); !errors.Is(err, mem.ErrFinished) {
+		t.Fatalf("suspend of a finished task: %v, want ErrFinished", err)
+	}
+	if _, err := s.Commit(ctx, suspension("b", mem.InterruptResume)); !errors.Is(err, mem.ErrNotFound) {
+		t.Fatalf("resume of an unknown task: %v, want ErrNotFound", err)
 	}
 }
