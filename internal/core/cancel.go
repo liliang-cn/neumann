@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
@@ -308,9 +309,16 @@ func (e *Env) cancelInstead(ctx context.Context, t *task.TCB, c mem.CommitSet) {
 // recorded as dispatched but that never reached the bus. It reports whether
 // t went back as committed: false means the holder must not act on that
 // commit (dispatch nothing).
+//
+// A task nudged by a suspend or resume while it was held (design §9.9) is
+// not taken back where that lands at once (sched.Hand): handBack lands it
+// (landHeld) and hands it back again, as often as it takes. A landing the
+// store refuses for a cancel finalises the task; one that fails otherwise
+// is left to the task's next instruction, or its restart.
 func (e *Env) handBack(ctx context.Context, t *task.TCB, unsent []Send) bool {
-	if e.Sched.Requeue(t) {
-		return true
+	queued, done := e.handOver(context.WithoutCancel(ctx), t)
+	if queued || done {
+		return queued
 	}
 	fates := make(map[string]fate, len(unsent))
 	for _, r := range unsent {
@@ -318,6 +326,32 @@ func (e *Env) handBack(ctx context.Context, t *task.TCB, unsent []Send) bool {
 	}
 	e.finalise(context.WithoutCancel(ctx), t, mem.CommitSet{}, fates, ReasonCancelled)
 	return false
+}
+
+// handOver hands t back, landing what nudged it on the way (handBack). It
+// reports whether the scheduler took it, or else whether it is done with
+// (finalised); neither means it was cancelled while held.
+func (e *Env) handOver(ctx context.Context, t *task.TCB) (queued, done bool) {
+	for {
+		switch e.Sched.Hand(t) {
+		case sched.Queued:
+			return true, false
+		case sched.Refused:
+			return false, false
+		}
+		if e.halt().Err() != nil {
+			return e.Sched.Requeue(t), false // halted: nothing more is committed
+		}
+		err := e.landHeld(ctx, t)
+		if errors.Is(err, mem.ErrCancelPending) {
+			e.finalise(ctx, t, mem.CommitSet{}, nil, ReasonCancelled)
+			return false, true
+		}
+		if err != nil {
+			e.Logf("neumann: task %s: landing a suspend or resume failed; its next instruction or restart lands it: %v", t.ID, err)
+			return e.Sched.Requeue(t), false
+		}
+	}
 }
 
 // HandBack is handBack for the machine's own holders (an operator's Resolve).

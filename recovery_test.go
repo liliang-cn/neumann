@@ -88,6 +88,48 @@ type world struct {
 
 	preempt bool        // one vCore that preempts, over a local model that continues a prefill and streams on the clock
 	urgent  atomic.Bool // preemptModel has submitted the urgent task (or tried to)
+
+	// suspend: an operator suspends the task twice, while its payment runs
+	// (dev_spay) and during its answer (suspendible), once each across
+	// processes, and resumes it whenever it is suspended.
+	suspend   bool
+	suspTools atomic.Bool
+	suspCall  atomic.Bool
+}
+
+// suspendible is the suspend scenario's model: it continues a prefill, and
+// streams an answer in two halves; between them, in pay-1's first answer
+// call, the operator suspends the task, which cuts the call off there,
+// keeping the first half.
+type suspendible struct {
+	*sim.Model
+	w *world
+}
+
+func (p suspendible) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
+	resp, err := p.Call(ctx, req)
+	if err != nil {
+		return resp, err
+	}
+	r := []rune(resp.Message.TextContent())
+	emit(model.Delta{Text: string(r[:len(r)/2])})
+	if sim.FirstUser(req) == "pay the bill" && sim.ToolRounds(req) > 0 && sim.Prefill(req) == "" && p.w.suspCall.CompareAndSwap(false, true) {
+		p.w.m.Load().Suspend(bg, "pay-1")
+		if err := ctx.Err(); err != nil {
+			return model.Response{}, err
+		}
+	}
+	emit(model.Delta{Text: string(r[len(r)/2:])})
+	return resp, nil
+}
+
+// suspendModel pays with dev_spay and reads, then answers "done"; a call
+// that continues "do" sends only "ne".
+func suspendModel(req model.Request) (model.Response, error) {
+	if sim.ToolRounds(req) == 0 {
+		return sim.CallTools("dev_spay", "dev_look"), nil
+	}
+	return sim.Continue(req, "done"), nil
 }
 
 // preemptible is the preemption scenario's local model: it continues a
@@ -182,6 +224,15 @@ func (w *world) devices() []bus.Device {
 			<-ctx.Done()
 			return "paid", nil
 		}).
+		// spay pays, and the operator suspends the task while it does (once).
+		Add(bus.ToolDef{Name: "spay"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
+			w.note(c)
+			w.pays.Add(1)
+			if w.suspTools.CompareAndSwap(false, true) {
+				w.m.Load().Suspend(bg, c.Key[:strings.Index(c.Key, "/")])
+			}
+			return "paid", nil
+		}).
 		// xlook reads, and takes so long that the task's deadline passes.
 		Add(bus.ToolDef{Name: "xlook", Effect: bus.ReadOnly}, func(_ context.Context, c bus.DeviceCall) (string, error) {
 			w.note(c)
@@ -248,6 +299,11 @@ type crashScenario struct {
 	// left the task to continue it.
 	preempt bool
 	cont    *atomic.Int32
+	// suspend: the operator suspends the task while it pays and during its
+	// answer, and resumes it; parked counts the runs whose first process
+	// left the task Suspended.
+	suspend bool
+	parked  *atomic.Int32
 	// wide bounds how many of the sweep's runs share the disk at once; 0:
 	// as many as run in parallel. A scenario with many commits per run
 	// needs it: each commit is a full fsync, and a few dozen runs at once
@@ -339,6 +395,13 @@ var (
 	// task's next call continues the kept text: the preempted commit, and
 	// the continued call's Running and answer commits, are commit points.
 	preemptScenario = crashScenario{name: "preempt", model: preemptModel, preempt: true, maxPays: 1, cont: new(atomic.Int32),
+		ends: map[task.State]string{task.Done: "end_turn"}}
+	// The operator suspends the task while its payment runs (it lands when
+	// the round's results are in) and again during its answer (the call is
+	// cut off, keeping half), and resumes it each time; the task's next
+	// call continues the kept half. The suspend's interrupt, its landing,
+	// the resume and its landing are commit points like any other.
+	suspendScenario = crashScenario{name: "suspend", model: fixed(suspendModel), suspend: true, maxPays: 1, parked: new(atomic.Int32),
 		ends: map[task.State]string{task.Done: "end_turn"}}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
@@ -485,6 +548,10 @@ func newMachine(t *testing.T, store mem.Store, w *world, fn modelFn) *neumann.Ma
 		cfg.Model = preemptible{&sim.Model{Fn: fn, Info: &model.Caps{Tools: true, Prefill: true}}, w}
 		cfg.Cores, cfg.Preempt = 1, true
 	}
+	if w.suspend {
+		cfg.Model = suspendible{&sim.Model{Fn: fn, Info: &model.Caps{Tools: true, Prefill: true}}, w}
+		cfg.Cores = 1
+	}
 	m, err := neumann.New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -552,6 +619,7 @@ type crashRun struct {
 	compacted int      // compacted events, both processes
 	preempted int      // preempted events of the task, both processes
 	prefilled int      // its steps that continued a prefill
+	suspended int      // suspended events of the task, both processes
 }
 
 // runAndCrash runs sc on a machine that dies after n commits (after: right
@@ -569,6 +637,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		defer w.tick()()
 	}
 	w.preempt = sc.preempt
+	w.suspend = sc.suspend
 
 	s1, err := sqlite.Open(path)
 	if err != nil {
@@ -604,6 +673,16 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 			}
 		}()
 	}
+	if w.suspend {
+		// The operator resumes the task whenever it is suspended.
+		go func() {
+			for ev := range m1.Events(opCtx, 0) {
+				if ev.Kind == proto.EvSuspended {
+					m1.ResumeTask(bg, ev.TaskID)
+				}
+			}
+		}()
+	}
 	id, submitErr := m1.Submit(bg, in)
 	if submitErr != nil && !errors.Is(submitErr, errCrashed) {
 		t.Fatalf("submit: %v", submitErr)
@@ -613,7 +692,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		if sc.patience > 0 {
 			patience = sc.patience
 		}
-		quiesceOr(t, m1, s1, id, patience, func() bool { return w.approve && cs.crashed.Load() })
+		quiesceOr(t, m1, s1, id, patience, func() bool { return (w.approve || w.suspend) && cs.crashed.Load() })
 	}
 	stop(t, m1)
 	opStop()
@@ -654,6 +733,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	if tc, err := s2.Load(bg, id); err == nil && sc.cont != nil && tc.Partial != "" && !tc.State.Terminal() {
 		sc.cont.Add(1)
+	}
+	if tc, err := s2.Load(bg, id); err == nil && sc.parked != nil && tc.State == task.Suspended {
+		sc.parked.Add(1)
 	}
 	m2 := newMachine(t, s2, w, sc.model(w))
 	finish := sweepPatience
@@ -701,6 +783,14 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 				// announced twice (before the crash and by the restart).
 			default:
 				t.Fatalf("approve: %v", err)
+			}
+		}
+		if ev.Kind == proto.EvSuspended {
+			// Suspended by the first process, or landed by the restart: the
+			// operator resumes it (one it no longer needs is refused: resumed
+			// already, or finished).
+			if err := m2.ResumeTask(bg, id); err != nil && !errors.Is(err, neumann.ErrNotSuspended) && !errors.Is(err, neumann.ErrFinished) {
+				t.Fatalf("resume: %v", err)
 			}
 		}
 		if ev.Kind == proto.EvReconcileNeeded && !d.Cancelled {
@@ -782,6 +872,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		}
 		if ev.Kind == proto.EvPreempted && ev.TaskID == id {
 			run.preempted++
+		}
+		if ev.Kind == proto.EvSuspended && ev.TaskID == id {
+			run.suspended++
 		}
 		if ev.Kind == proto.EvStep && ev.TaskID == id && strings.Contains(string(ev.Data), `"prefill"`) {
 			run.prefilled++
@@ -969,6 +1062,9 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 	}
 	if sc.preempt && (clean.preempted != 1 || clean.prefilled != 1) {
 		t.Fatalf("a clean run was preempted %d times and continued %d calls", clean.preempted, clean.prefilled)
+	}
+	if sc.suspend && (clean.suspended != 2 || clean.prefilled != 1) {
+		t.Fatalf("a clean run was suspended %d times and continued %d calls", clean.suspended, clean.prefilled)
 	}
 	if strings.Join(clean.retries, ",") != sc.retries {
 		t.Fatalf("the clean run retried %v", clean.retries)
@@ -1214,4 +1310,24 @@ func TestCrashAtEveryCommitPointWithAPreemption(t *testing.T) {
 		t.Fatal("no crash point fell between a preemption and the call that continues it")
 	}
 	t.Logf("%d crash points; the operator was needed at %d; the restart continued a preempted answer at %d", points, held, preemptScenario.cont.Load())
+}
+
+// The same sweep with an operator suspending the task twice and resuming
+// it: once while its payment runs (the suspend lands when the round's
+// results are in), once during its answer (the call is cut off, keeping
+// half, and the call after the resume continues it). A crash before and
+// after every commit, the suspends', their landings' and the resumes'
+// included, still finishes the task once, paying once, with its answer
+// whole: a suspend committed and not landed lands at the restart, and a
+// suspended task stays suspended until the operator resumes it.
+func TestCrashAtEveryCommitPointWithASuspend(t *testing.T) {
+	suspendScenario.parked.Store(0)
+	points, held, _ := sweep(t, suspendScenario)
+	if held == 0 {
+		t.Fatal("no crash point left the payment's outcome unknown")
+	}
+	if suspendScenario.parked.Load() == 0 {
+		t.Fatal("no crash point left the task suspended for the restart")
+	}
+	t.Logf("%d crash points; the operator was needed at %d; the restart found the task suspended at %d", points, held, suspendScenario.parked.Load())
 }

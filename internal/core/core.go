@@ -94,6 +94,8 @@ type Env struct {
 	refusedMu sync.Mutex
 	refused   map[string]bool // parked after migrate_refused: a fallback coming back does not wake them
 
+	cuts cuts // what a suspend cuts off of a task on a vCore (design §9.9)
+
 	lateMu     sync.Mutex // guards lateClosed against lates.Add
 	lateClosed bool
 	lates      sync.WaitGroup // late results being recorded
@@ -246,6 +248,13 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 		e.Sched.Forget(t.ID)
 		return
 	}
+	// The instruction reads the task's interrupts at its start: every
+	// suspend or resume nudged before this is among them (design §9.9).
+	e.Sched.Heard(t.ID)
+	was := wasModel
+	if t.PC == task.StepTools {
+		was = wasTools
+	}
 	switch t.PC {
 	case task.StepModel, task.StepCompact:
 		// A compaction pass decides afresh at each of its instructions
@@ -288,6 +297,13 @@ func (e *Env) step(ctx context.Context, t *task.TCB, core int) {
 	if err != nil {
 		c, batch = e.fail(t, c, err.Error()), nil
 	}
+	// A suspend or resume committed while the instruction ran lands in its
+	// commit (design §9.9); the answer check's rejection is where one that
+	// came during the check lands.
+	if slices.ContainsFunc(c.Events, func(ev proto.Event) bool { return ev.Kind == proto.EvAnswerRejected }) {
+		was = wasCheck
+	}
+	c = e.foldSuspend(ctx, t, c, was)
 	// A commit that has started is allowed to finish.
 	if err := e.Commit(context.WithoutCancel(ctx), c); err != nil {
 		if errors.Is(err, mem.ErrCancelPending) {

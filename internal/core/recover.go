@@ -66,9 +66,17 @@ func round(t *task.TCB, recs []mem.CallRecord) []mem.CallRecord {
 //   - Waiting on I/O: the current round is settled call by call (settle).
 //   - Waiting in backoff or for its group: Ready (timers and breakers are
 //     not durable).
-//   - Anything else (Ready, waiting for reconciliation) resumes as it is.
+//   - Anything else (Ready, Suspended, waiting for reconciliation or
+//     approval) resumes as it is.
 //
 // A task with a committed cancel is finalised instead, whatever its state.
+// Pending suspends and resumes land as at any boundary (design §9.9): with
+// the commit that settles a Running task (redone, it is Suspended instead
+// when suspended), one in backoff or waiting for its group, and a round the
+// call log answers; on a Ready or Suspended task by a commit of their own.
+// A suspended task stays Suspended, and is announced again (recovered,
+// from "suspended"). A suspend left pending (a tool round in flight, a call
+// held for an operator) is marked for the commit that ends the wait.
 func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
@@ -91,15 +99,19 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 		}
 		return nil, e.Commit(ctx, c)
 	}
+	if len(suspensions(pending, nil)) > 0 {
+		e.Sched.Mark(t.ID) // whoever holds it next lands what is left
+	}
 	switch {
 	case t.State == task.Running:
 		// Running is committed before a model call or a compaction call; the
 		// instruction its PC names is done again (a compaction never half
-		// applied: its result is one commit).
+		// applied: its result is one commit), unless a suspend came first.
 		t.Unconfirmed++
 		e.ready(t, modelPC(t))
 		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "running", "unconfirmed": t.Unconfirmed})
-		return nil, e.Commit(ctx, mem.CommitSet{Task: t, Events: []proto.Event{ev}})
+		c := e.landSuspend(t, mem.CommitSet{Task: t, Events: []proto.Event{ev}}, pending, wasModel, "", "")
+		return nil, e.Commit(ctx, c)
 	case t.State == task.Waiting && t.Wait == task.WaitIO:
 		recs, err := e.Store.Calls(ctx, t.ID)
 		if err != nil {
@@ -121,6 +133,7 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 			}
 			c.Events = append(decided, c.Events...)
 		}
+		c = e.landSuspend(t, c, pending, wasTools, "", "")
 		if err := e.Commit(ctx, c); err != nil {
 			return nil, err
 		}
@@ -130,11 +143,15 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 		// now (a failure starts a new backoff from its retry count), and a
 		// restarted machine's groups start closed. ReadySince is kept: the
 		// task keeps its place in the queue.
-		from := "waiting_" + t.Wait.String()
+		from, was := "waiting_"+t.Wait.String(), wasBackoff
+		if t.Wait == task.WaitGroup {
+			was = wasGroup
+		}
 		t.State, t.Wait, t.WakeAt, t.PC = task.Ready, task.WaitNone, time.Time{}, modelPC(t)
 		t.Version++
 		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": from, "retries": t.Retries})
-		return nil, e.Commit(ctx, mem.CommitSet{Task: t, Events: []proto.Event{ev}})
+		c := e.landSuspend(t, mem.CommitSet{Task: t, Events: []proto.Event{ev}}, pending, was, "", "")
+		return nil, e.Commit(ctx, c)
 	case t.State == task.Waiting && t.Wait == task.WaitReconcile:
 		// Still held from an earlier run. Announced again: an operator
 		// reading events from now on must learn that it waits for them.
@@ -166,6 +183,20 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 		}
 		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "waiting_approval", "pending": len(evs)})
 		return nil, e.Commit(ctx, mem.CommitSet{Events: append([]proto.Event{ev}, evs...)})
+	case t.State == task.Suspended:
+		// Still suspended, unless a resume is pending: an operator reading
+		// events from now on learns that it waits for them.
+		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "suspended"})
+		t.Version++
+		c := e.landSuspend(t, mem.CommitSet{Task: t, Events: []proto.Event{ev}}, pending, wasReady, "", "")
+		if len(c.Applied) == 0 {
+			t.Version--
+			c.Task = nil
+		}
+		return nil, e.Commit(ctx, c)
+	case t.State == task.Ready && len(suspensions(pending, nil)) > 0:
+		t.Version++
+		return nil, e.Commit(ctx, e.landSuspend(t, mem.CommitSet{Task: t}, pending, wasReady, "", ""))
 	}
 	return nil, nil
 }
@@ -223,7 +254,9 @@ func (e *Env) Resolve(ctx context.Context, t *task.TCB, callID string, o Outcome
 		c.Calls = append(c.Calls, rs[i]) // settle wrote it already if it sent it
 	}
 	c.Events = append([]proto.Event{ev}, c.Events...)
+	c = e.foldSuspend(ctx, clone, c, wasReconcile) // as for an approval (Approve)
 	if err := e.Commit(ctx, c); err != nil {
+		e.Sched.Mark(t.ID) // a suspend it read lands at a later hand-back
 		return nil, err
 	}
 	*t = *clone

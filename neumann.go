@@ -1021,6 +1021,7 @@ type Status struct {
 	Held       int `json:"held"`       // on a vCore or being completed by a tool batch
 	Unfinished int `json:"unfinished"` // admitted and not yet terminal
 	Approval   int `json:"approval"`   // waiting for an operator's approval (Approve)
+	Suspended  int `json:"suspended"`  // suspended by an operator (Suspend)
 
 	DeltasDropped int64 `json:"deltas_dropped"` // streamed pieces a slow subscriber missed
 
@@ -1037,20 +1038,21 @@ type GroupStatus struct {
 	Limits   []string `json:"limits,omitempty"`
 	Fallback string   `json:"fallback,omitempty"`
 
-	W        float64       `json:"w"`      // congestion window
-	Target   int           `json:"target"` // floor(W) within [Min, Max]: the vCores the group runs at most
-	Min      int           `json:"min"`
-	Max      int           `json:"max"`   // 0 = no limit
-	Auto     bool          `json:"auto"`  // false while an operator pins W (SetCores)
-	Epoch    uint64        `json:"epoch"` // congestion epoch: one halving each
-	Cooling  bool          `json:"cooling"`
-	Live     int           `json:"live"` // vCores alive
-	Busy     int           `json:"busy"` // ...executing an instruction
-	Ready    int           `json:"ready"`
-	Waiting  int           `json:"waiting"`       // in the wait set, for any reason
-	ForGroup int           `json:"waiting_group"` // ...of which for this group to come back
-	Approval int           `json:"approval"`      // ...of which for an operator's approval
-	Longest  time.Duration `json:"longest_wait"`  // how long the oldest ready task has been ready
+	W         float64       `json:"w"`      // congestion window
+	Target    int           `json:"target"` // floor(W) within [Min, Max]: the vCores the group runs at most
+	Min       int           `json:"min"`
+	Max       int           `json:"max"`   // 0 = no limit
+	Auto      bool          `json:"auto"`  // false while an operator pins W (SetCores)
+	Epoch     uint64        `json:"epoch"` // congestion epoch: one halving each
+	Cooling   bool          `json:"cooling"`
+	Live      int           `json:"live"` // vCores alive
+	Busy      int           `json:"busy"` // ...executing an instruction
+	Ready     int           `json:"ready"`
+	Waiting   int           `json:"waiting"`       // in the wait set, for any reason
+	ForGroup  int           `json:"waiting_group"` // ...of which for this group to come back
+	Approval  int           `json:"approval"`      // ...of which for an operator's approval
+	Suspended int           `json:"suspended"`     // ...of which suspended (Suspend)
+	Longest   time.Duration `json:"longest_wait"`  // how long the oldest ready task has been ready
 
 	Breaker   string    `json:"breaker"`         // closed, open, half_open
 	Cause     string    `json:"cause,omitempty"` // why it is open: transient, quota
@@ -1074,12 +1076,13 @@ func (m *Machine) Status() Status {
 		st.Groups = append(st.Groups, GroupStatus{
 			Class: g.Class, Model: g.Model.Provider(), Limits: slices.Clone(g.Limits), Fallback: g.Fallback,
 			W: win.W, Target: win.Target, Min: win.Min, Max: win.Max, Auto: win.Auto, Epoch: win.Epoch, Cooling: win.Cooling,
-			Live: gs.Running, Busy: gs.Busy, Ready: q.Ready, Waiting: q.Waiting, ForGroup: q.ForGroup, Approval: q.Approval, Longest: longest(q, now),
+			Live: gs.Running, Busy: gs.Busy, Ready: q.Ready, Waiting: q.Waiting, ForGroup: q.ForGroup, Approval: q.Approval, Suspended: q.Suspended, Longest: longest(q, now),
 			Breaker: br.State.String(), Cause: string(br.Cause), Failures: br.Failures, OpenedAt: br.OpenedAt, NextProbe: br.NextProbe,
 		})
 	}
 	for _, q := range queues {
 		st.Approval += q.Approval
+		st.Suspended += q.Suspended
 	}
 	for _, l := range m.limiters {
 		st.Limiters = append(st.Limiters, l.Status())
@@ -1109,6 +1112,7 @@ type ClassQueue struct {
 	Waiting    int           `json:"waiting"`
 	ForGroup   int           `json:"waiting_group"`
 	Approval   int           `json:"approval"`
+	Suspended  int           `json:"suspended"`
 	Longest    time.Duration `json:"longest_wait"`
 }
 
@@ -1120,7 +1124,8 @@ func (m *Machine) Queue() QueueStatus {
 	var out QueueStatus
 	add := func(class string, q sched.Queue) {
 		out.Classes = append(out.Classes, ClassQueue{
-			Class: class, Ready: q.Ready, Background: q.Background, Waiting: q.Waiting, ForGroup: q.ForGroup, Approval: q.Approval, Longest: longest(q, now),
+			Class: class, Ready: q.Ready, Background: q.Background, Waiting: q.Waiting, ForGroup: q.ForGroup, Approval: q.Approval, Suspended: q.Suspended,
+			Longest: longest(q, now),
 		})
 	}
 	for _, g := range m.groups {
@@ -1260,6 +1265,52 @@ func (m *Machine) SetPriority(ctx context.Context, taskID string, p int) error {
 	}
 	m.env.CheckPreempt(class)
 	return nil
+}
+
+// ErrNotSuspended is returned by ResumeTask for a task that is neither
+// suspended nor has a suspend pending.
+var ErrNotSuspended = core.ErrNotSuspended
+
+// Suspend takes a task off the machine until ResumeTask (design §9.9): it
+// is no longer scheduled. It returns once the suspend is committed, and
+// from then on it holds across a restart. It lands at the task's next
+// instruction boundary: at once for a task that is ready, backing off or
+// waiting for its group; a model call in flight is cut off, keeping what it
+// had streamed for the call after the resume to continue (like a
+// preemption, but not counted as one), and a wait for room in a limiter
+// ends with nothing sent; a compaction, a tool round (tools are never cut
+// off: they may have effects) and a round held for an operator finish
+// first, and the commit that ends them suspends the task instead. A
+// suspended event {was, kept, kept_think} records it. A model step that
+// answers before the cut ends the task as it would have.
+//
+// While suspended, a task's deadline still runs, a cancel ends it, steers
+// are kept for its first step after the resume, and SetPriority and
+// SetClass change it. Suspend returns ErrFinished for a task that has ended,
+// ErrNotFound for an unknown one; suspending a suspended task commits
+// nothing.
+func (m *Machine) Suspend(ctx context.Context, taskID string) error {
+	if err := m.enter(); err != nil {
+		return err
+	}
+	defer m.inflight.Done()
+	return m.env.Suspend(ctx, taskID)
+}
+
+// ResumeTask puts a suspended task back on the machine (design §9.9): it is
+// ready again, queued from now, with a resumed event, and in a group that
+// preempts a less urgent call may be cut off for it. It returns once the
+// resume is committed. A suspend that has not landed yet is cancelled by
+// it: the task goes on, and a resumed event {pending: true} records it.
+// ResumeTask returns ErrNotSuspended for a task that is neither suspended
+// nor has a suspend pending, ErrFinished for one that has ended, and
+// ErrNotFound for an unknown one.
+func (m *Machine) ResumeTask(ctx context.Context, taskID string) error {
+	if err := m.enter(); err != nil {
+		return err
+	}
+	defer m.inflight.Done()
+	return m.env.ResumeTask(ctx, taskID)
 }
 
 type recoveredDispatch struct {

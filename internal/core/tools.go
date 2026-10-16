@@ -34,6 +34,9 @@ func (e *Env) execTools(ctx context.Context, t *task.TCB, core int) (mem.CommitS
 		c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, reason)
 		return c, nil, err
 	}
+	if c, ok := e.landAtStart(t, pending); ok {
+		return c, nil, nil // suspended before the calls were sent: they wait for the resume
+	}
 	c := mem.CommitSet{Events: []proto.Event{
 		proto.NewEvent(proto.EvStep, t.ID, stepData{PC: task.StepTools.String(), Core: core}),
 	}}
@@ -255,6 +258,9 @@ func (e *Env) complete(ctx context.Context, taskID string, batch []Send, b *outc
 	t.Regs = append(t.Regs, toolMessage(rs))
 	e.ready(t, task.StepModel)
 	c := mem.CommitSet{Task: t, Calls: done, Events: events}
+	// A suspend committed while the tools ran lands now that the round is
+	// answered (design §9.9): they are never cut off.
+	c = e.foldSuspend(ctx, t, c, wasTools)
 	if err := e.Commit(ctx, c); err != nil {
 		if errors.Is(err, mem.ErrCancelPending) {
 			e.cancelInstead(ctx, t, c) // cancelled before the round was answered

@@ -79,6 +79,11 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 		c, err := e.cancelSet(ctx, t, mem.CommitSet{}, nil, reason)
 		return c, nil, err
 	}
+	if c, ok := e.landAtStart(t, pending); ok {
+		// Suspended before this instruction began: nothing runs, and its
+		// steers wait for the resume.
+		return c, nil, nil
+	}
 	var c mem.CommitSet
 	// Unconfirmed requests count too: they may have reached the provider, and
 	// a task that keeps crashing mid-call must not re-send past its budget.
@@ -328,16 +333,19 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	tctx, release := e.taskContext(t.ID)
 	defer release()
 	// The wait for room also ends when the machine stops fetching: nothing
-	// is committed yet, so the task goes back as it is.
-	rctx, stopWaiting := context.WithCancel(tctx)
-	defer stopWaiting()
-	unhook := context.AfterFunc(e.Sched.Stopping(), stopWaiting)
+	// is committed yet, so the task goes back as it is. A suspend cuts it
+	// off too (design §9.9).
+	rctx, stopWaiting := context.WithCancelCause(tctx)
+	defer stopWaiting(nil)
+	unhook := context.AfterFunc(e.Sched.Stopping(), func() { stopWaiting(nil) })
+	uncut := e.cuttable(t.ID, stopWaiting)
 	out := req.MaxOut
 	if out == 0 {
 		out = e.maxOut(t)
 	}
 	res, pre, err := e.reserve(rctx, g, t.ID, req, out)
 	unhook()
+	uncut()
 	if err != nil {
 		switch {
 		case errors.Is(err, limit.ErrTooLarge):
@@ -349,6 +357,9 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		case tctx.Err() != nil:
 			// Cancelled, or out of time, while waiting for room: nothing ran.
 			return end(e.cancelSet(ctx, t, mem.CommitSet{}, nil, ReasonCancelled))
+		case context.Cause(rctx) == errSuspended:
+			// Suspended while waiting for room: nothing was sent.
+			return end(e.suspendedWait(ctx, t))
 		}
 		return end(failWith(t, c, StopModelError, "reserve: "+err.Error()), nil)
 	}
@@ -444,10 +455,11 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	}
 	sent := e.Clock.Now()
 	resp, err := e.callModel(callCtx, a, req, emit, force)
-	by, ran, preempted := e.land(g, fl, callCtx)
-	// Cut off by a preemption, and not by its task's cancel or the halt:
-	// the machine ended the call itself, and knows how it ended.
+	by, ran, preempted, cutOff := e.land(fl, callCtx)
+	// Cut off by a preemption or a suspend, and not by its task's cancel or
+	// the halt: the machine ended the call itself, and knows how it ended.
 	preempted = preempted && err != nil && tctx.Err() == nil
+	suspended := !preempted && cutOff && err != nil && tctx.Err() == nil
 	if !first.IsZero() {
 		amendStep(&c, func(d *stepData) { ms := max(first.Sub(sent).Milliseconds(), 0); d.FirstMS = &ms })
 	}
@@ -462,7 +474,7 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	class := model.Unknown
 	var p *panicError
 	panicked := errors.As(err, &p)
-	lost := err != nil && errors.Is(err, model.ErrResponseLost) && !preempted
+	lost := err != nil && errors.Is(err, model.ErrResponseLost) && !preempted && !suspended
 	// The adapter's hooks run under the same guard as the call: a panic in
 	// any of them is the adapter panicking, and fails the task (the call's
 	// response, if it had one, is not used).
@@ -473,7 +485,7 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		err, panicked, class = perr, true, model.Unknown
 		return true
 	}
-	if preempted && !panicked {
+	if (preempted || suspended) && !panicked {
 		// Settled as a call interrupted by a cancel, and not reported to the
 		// group: it says nothing about the provider.
 		class = model.Canceled
@@ -542,6 +554,9 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		t.Partial = partial0
 		if preempted && !panicked {
 			return end(e.preempted(t, c, by, ran, keep, keepThink, capsOf(a)), nil)
+		}
+		if suspended && !panicked {
+			return end(e.suspendedCall(ctx, t, c, keep, keepThink, capsOf(a)), nil)
 		}
 		if lost && !panicked && pc == task.StepModel {
 			// The stream broke off: what came is continued by the retry

@@ -34,6 +34,8 @@ type flight struct {
 	start    time.Time
 	cancel   context.CancelCauseFunc
 	by       string // the task it was cut off for; empty until chosen
+	pre      *Group // the group it is registered with for preemption; nil when none
+	uncut    func() // ends its registration for a suspend's cut (cuttable)
 }
 
 // preemption is a group's registry of model calls in flight (StepModel
@@ -63,46 +65,59 @@ func (g *Group) maxPreempts() int {
 	return DefaultMaxPreempts
 }
 
-// fly registers t's model call in its group, when the group preempts, and
-// returns the context the call runs under: ctx (the task's), plus the cut a
-// preemption makes. land must follow the call. The half-open breaker's
-// probe is not registered: cut off, it would never be reported, and the
-// group would stay down until the breaker gave the lost probe up.
+// fly registers t's model call, and returns the context the call runs
+// under: ctx (the task's), plus the cut a preemption or a suspend makes.
+// land must follow the call. The call is registered for a suspend's cut
+// (cuttable, design §9.9), and in its group, when the group preempts. The
+// half-open breaker's probe is registered with neither: cut off, it would
+// never be reported, and the group would stay down until the breaker gave
+// the lost probe up.
 //
 // It ends with a preemption check: a more urgent task may have become ready
 // while this call was on its way (taken ahead of it by aging, or waiting for
 // room in a limiter), and no other check would see this call then.
 func (e *Env) fly(ctx context.Context, g *Group, t *task.TCB, core int, probe bool) (context.Context, *flight) {
-	if g == nil || !g.Preempt || probe {
+	if probe {
 		return ctx, nil
 	}
-	defer e.preemptCheck(g)
 	cctx, cancel := context.WithCancelCause(ctx)
 	f := &flight{id: t.ID, priority: t.Priority, preempts: t.Preempts, core: core, start: e.Clock.Now(), cancel: cancel}
-	g.pre.mu.Lock()
-	if g.pre.flights == nil {
-		g.pre.flights = map[string]*flight{}
+	if g != nil && g.Preempt {
+		defer e.preemptCheck(g)
+		f.pre = g
+		g.pre.mu.Lock()
+		if g.pre.flights == nil {
+			g.pre.flights = map[string]*flight{}
+		}
+		g.pre.flights[t.ID] = f
+		g.pre.mu.Unlock()
 	}
-	g.pre.flights[t.ID] = f
-	g.pre.mu.Unlock()
+	f.uncut = e.cuttable(t.ID, cancel)
 	return cctx, f
 }
 
-// land takes a call that has returned out of the registry. It reports the
+// land takes a call that has returned out of the registries. It reports the
 // task the call was cut off for, and whether it was: chosen as a victim and
-// its context ended by that choice. A call chosen just as it answered was
-// not preempted: its answer stands.
-func (e *Env) land(g *Group, f *flight, ctx context.Context) (by string, ran time.Duration, preempted bool) {
+// its context ended by that choice; and whether a suspend cut it off
+// instead. Whichever cut came first is the call's: a victim a suspend had
+// cut already was not preempted, and a call chosen just as it answered was
+// cut off by neither: its answer stands.
+func (e *Env) land(f *flight, ctx context.Context) (by string, ran time.Duration, preempted, suspended bool) {
 	if f == nil {
-		return "", 0, false
+		return "", 0, false, false
 	}
-	g.pre.mu.Lock()
-	delete(g.pre.flights, f.id)
-	by = f.by
-	g.pre.mu.Unlock()
-	preempted = by != "" && context.Cause(ctx) == errPreempted
+	f.uncut()
+	if f.pre != nil {
+		f.pre.pre.mu.Lock()
+		delete(f.pre.pre.flights, f.id)
+		by = f.by
+		f.pre.pre.mu.Unlock()
+	}
+	cause := context.Cause(ctx)
+	preempted = by != "" && cause == errPreempted
+	suspended = cause == errSuspended
 	f.cancel(nil)
-	return by, e.Clock.Now().Sub(f.start), preempted
+	return by, e.Clock.Now().Sub(f.start), preempted, suspended
 }
 
 // CheckPreempt runs the preemption check of class's group (design §6.4).

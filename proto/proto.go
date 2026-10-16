@@ -57,8 +57,10 @@ const (
 	// until resumed. {was, kept, kept_think}: what the task was doing, and
 	// the text or thinking kept from a model call it interrupted (design §9.9).
 	EvSuspended = "suspended"
-	// The task is Ready again after a suspend, or a resume cancelled a
-	// suspend that had not landed yet ({pending: true}) (design §9.9).
+	// The task is Ready again after a suspend ({pending: false}), or a
+	// resume cancelled a suspend that had not landed yet ({pending: true}):
+	// committed with the instruction it let go on, after that instruction's
+	// own events (design §9.9).
 	EvResumed = "resumed"
 
 	// Recovery after a restart, and an operator's answer for a call whose

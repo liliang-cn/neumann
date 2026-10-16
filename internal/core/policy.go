@@ -331,7 +331,12 @@ func (e *Env) Approve(ctx context.Context, t *task.TCB, callID string, d Approva
 		c.Calls = append(c.Calls, *r) // settleRound wrote it already if it sent it
 	}
 	c.Events = append([]proto.Event{ev}, c.Events...)
+	// A suspend committed while the round waited lands here when the
+	// decision answers the round; one that sends it lands once its results
+	// are in (design §9.9).
+	c = e.foldSuspend(ctx, clone, c, wasApproval)
 	if err := e.Commit(ctx, c); err != nil {
+		e.Sched.Mark(t.ID) // a suspend it read lands at a later hand-back
 		return nil, err
 	}
 	*t = *clone
