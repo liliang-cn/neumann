@@ -251,7 +251,7 @@ type CallRecord struct {
 1. 加载所有未结束的 TCB、它们的调用记录和未送达的中断。
 2. `Running` → `Ready`（这一步重做，可能重复一次模型调用的花费，`Unconfirmed + 1`；`PC` 保留：压缩调用中途崩溃，重启后重做这次压缩）。`Running` 在模型调用之前提交，含义是"请求可能已经发出"：提交之后、调用之前被停机打断时，会多算一次未确认。这一步要送达的插话在 `Running` 提交之后才合并，崩溃不会留下"上下文里有、中断表里却还未送达"的插话。预算按 `Used.Steps + Unconfirmed` 计，反复崩溃的任务不会越过预算重发。
 3. 调用记录按 4.2 的表处理。
-4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；所有未结束任务重设 Deadline 定时器。`Waiting(Reconcile)` 和 `Waiting(Approval)` 保持原状，各自再宣布一次等待的调用（9.7）。`Waiting(Backoff)` 和 `Waiting(Group)` 提交为 `Ready`（`ReadySince` 不变，`Retries` 保留）：退避定时器和熔断状态都不持久，重启后各组从闭合开始，退避从下一次失败重新起算。
+4. 按 `Class`、`Priority`、`ReadySince` 重建就绪队列；所有未结束任务重设 Deadline 定时器。`Waiting(Reconcile)` 和 `Waiting(Approval)` 保持原状，各自再宣布一次等待的调用（9.7）。`Suspended` 保持原状（`recovered`，`from = "suspended"`）；未落地的挂起、恢复中断按 9.9 在这里落地。`Waiting(Backoff)` 和 `Waiting(Group)` 提交为 `Ready`（`ReadySince` 不变，`Retries` 保留）：退避定时器和熔断状态都不持久，重启后各组从闭合开始，退避从下一次失败重新起算。
 5. `Class` 已不在配置里的任务（换了配置重启），在第 2、3 步之前移到 `Config.Default` 的组：先做 6.3 的能力校验，通过则提交 `Class` 改变（状态不变）和 `migrated`（`reason = "class_removed"`）；不通过则提交一个原因为 `class_removed` 的取消中断和 `migrate_refused`（带不满足的那一条），随后按取消做最终提交（调用照 9.5 处理），任务 `Failed`，`StopReason = "class_removed"`。不留没有 vCore 会取的任务。
 6. 各执行组的 `W` 回到 `Initial`，vCore 按恢复出的就绪队列启动（6.1：有积压才启动，`Min` 只是空闲回收的下限）；限流器从空状态开始，由服务商响应头重新校准（7.3）。
 
@@ -694,27 +694,40 @@ m.Suspend(ctx, id) error     // 提交后返回；ErrNotFound / ErrFinished
 m.ResumeTask(ctx, id) error  // 提交后返回；ErrNotFound / ErrFinished / ErrNotSuspended
 ```
 
-挂起是操作员把一个任务"拿下 CPU、放在一边"：它不再被调度，直到恢复。和取消一样，两条指令都先作为中断提交（中断表的新种类 `suspend`、`resume`），提交之后才返回，崩溃后仍然有效。
+挂起是操作员把一个任务"拿下 CPU、放在一边"：它不再被调度，直到恢复。和取消一样，两条指令都先作为中断提交（中断表的新种类 `suspend`、`resume`），提交之后才返回，崩溃后仍然有效。和取消不同，未送达的挂起、恢复不拒绝任何提交（4.1 规则 4 只管取消）：它们由持有任务的一方在下一个边界取用。
 
 **落地**：挂起不一定立刻生效，它在任务的下一个指令边界落地，由当时持有任务的一方执行：
 
 - 任务在调度器手里、没人在干活（就绪、退避、熔断等待）：挂起方取出任务，直接提交 `Suspended`（退避定时器停掉，`WakeAt` 不保留，恢复后直接就绪）。
-- 在 vCore 上、模型调用在途：像抢占一样打断这次调用（6.4），用 `errSuspended` 作为原因取消这次调用的 context，按 `keepPartial` 保留已收到的正文或思考，提交 `Suspended`。不计 `Preempts`。还在限流器上等额度时同样打断，什么都没发出。压缩调用不打断，压缩结束后的那次提交落地。
-- 在 vCore 上、其他指令（派发工具、答案检查）：这条指令的提交落地。
+- 在 vCore 上、模型调用在途：像抢占一样打断这次调用（6.4），用 `errSuspended` 作为原因取消这次调用的 context，按 `keepPartial` 保留已收到的正文或思考，一次提交 `step` 和 `suspended`（没有 `usage`，插话退回待送达，没有 `steer_delivered`）。不计 `Preempts`、`Used.Steps`、`Retries`、`Unconfirmed`；限流器按"被取消打断的调用"结算，不向执行组报告。还在限流器上等额度时同样打断，什么都没发出，提交只有 `suspended`（`was = "model"`）。压缩调用不打断，压缩结束后的那次提交落地；熔断探测也不打断（被打断的探测永远没有结论，同 6.4），它的结果提交落地。
+- 在 vCore 上、其他时刻（调用有回答之后、答案检查、派发工具）：这条指令的提交落地。指令开头读中断表时已有挂起：什么都不跑，直接提交 `Suspended`（`was = "ready"`）。
 - 等工具（`Waiting(IO)`）：工具不打断（可能有副作用），整轮结果回来后的那次提交改为 `Suspended`。
-- 待批准、待核对：照常等操作员；决定到了，那次提交改为 `Suspended`，而不是 `Ready`。
+- 待批准、待核对：照常等操作员；决定到了，那次提交若是整轮已有结果（全被拒、全部核对完），改为 `Suspended`；若是派发这一轮，这一轮照常跑完，结果回来后的那次提交落地（`was = "tools"`）。
+- 终态提交（最终答案、预算、失败、取消）不挂起：任务按它自己的提交结束，挂起中断由终态提交标为已送达，没有事件。
 
-落地的提交把挂起中断标为已送达，带 `suspended` 事件（`{was, kept, kept_think}`：`was` 是落地前在做什么，`ready` / `backoff` / `group` / `model` / `tools` / `approval` / `reconcile` / `check`；后两项只在打断模型调用时非 0）。
+落地的提交把挂起中断标为已送达，带 `suspended` 事件（`{was, kept, kept_think}`：`was` 是落地前在做什么，`ready` / `backoff` / `group` / `model` / `tools` / `approval` / `reconcile` / `check`；后两项只在打断模型调用时非 0），事件排在这次提交自己的事件之后。
 
-**恢复**：任务是 `Suspended` 时，恢复方从等待集合取出，提交 `Ready`（`ReadySince = now`）和 `resumed`，交还调度器，触发一次抢占检查（6.4）。挂起还没落地（任务在 vCore 上或等工具）时，恢复抵消它：落地方按序号依次看待送达的挂起、恢复中断，最后一条是恢复就不挂起，两条都标为已送达，事件是 `resumed`（`{pending: true}`），任务照常往下走。既没挂起、也没有待落地的挂起：`ErrNotSuspended`。重复挂起一个已挂起的任务：成功，什么都不提交。
+**恢复**：任务是 `Suspended` 时，恢复方从等待集合取出，提交 `Ready`（`ReadySince = now`）和 `resumed`（`{pending: false}`），交还调度器，触发一次抢占检查（6.4）。挂起还没落地（任务在 vCore 上或等工具）时，恢复抵消它：落地方按序号依次看待送达的挂起、恢复中断，最后一条是恢复就不挂起，全部标为已送达，事件是 `resumed`（`{pending: true}`），跟在它放行的那条指令的提交里、排在那条指令自己的 `step` / `usage` 之后，任务照常往下走。最后一条是挂起就落地，前面的恢复一并标为已送达，只有一个 `suspended`。前面没有挂起的恢复（并发的重复恢复）标为已送达，没有事件。既没挂起、也没有待落地的挂起：`ErrNotSuspended`，什么都不提交。重复挂起一个已挂起（或挂起已待落地）的任务：成功，什么都不提交。
 
-**挂起期间**：Deadline 照常触发（9.4），取消照常生效（9.5：由取消方从等待集合取出做最终提交）。插话照收，留在中断表里，恢复后的第一步送达。`SetPriority`、`SetClass` 可以改挂起中的任务。挂起的任务仍计入未结束任务数（9.2）。保留的 `Partial` / `PartialThink` 恢复后续写，规则同 6.4。
+**挂起期间**：Deadline 照常触发（9.4），取消照常生效（9.5：由取消方从等待集合取出做最终提交）。插话照收，留在中断表里，恢复后的第一步送达。`SetPriority`、`SetClass` 可以改挂起中的任务，任务仍是 `Suspended`。挂起的任务仍计入未结束任务数（9.2）。保留的 `Partial` / `PartialThink` 恢复后续写，规则同 6.4（换了组、适配器不能续写就丢掉）。
 
-**持久化**：`Suspended` 重启后仍是 `Suspended`（4.5）。有待落地的挂起中断的任务，恢复流程按上面的规则直接落地；`Running` 中崩溃的任务按 4.5 重做时，先看挂起中断。
+**持久化**：`Suspended` 重启后仍是 `Suspended`（4.5），再发一次 `recovered`（`{from: "suspended"}`）。待送达的挂起、恢复中断在恢复流程里按上面的规则落地：`Running` 中崩溃的任务先看挂起，最后一条是挂起就提交 `Suspended`（`recovered` + `suspended`，`was = "model"`，`Unconfirmed + 1`）而不是重做；退避、熔断等待的任务同理（`was` 为 `backoff` / `group`）；就绪的任务单独一次提交；挂起的任务有待送达的恢复就 `Ready`；等工具、待批准、待核对的照常等，等完那次提交落地。
 
-**观测**：`Status` / `Queue` 带挂起数；`observe` 在根 span 下开一个 `suspended` span（`suspended` → `resumed` 或终态，带 `was`），根 span 上记 `suspended`、`resumed` 事件；仪表 `neumann.tasks.suspended`；`Log` 两行 info。被挂起打断的模型调用 `outcome = suspended`，不算失败；挂起的时间不算进任何模型、工具 span（细节见 14 节）。
+**观测**：`Status.Suspended`（JSON `suspended`）、`GroupStatus.Suspended`、`ClassQueue.Suspended` 是挂起的任务数；`observe` 在根 span 下开一个 `suspended` span（`suspended` → `resumed` 或终态，带 `was`），根 span 上记 `suspended`、`resumed` 事件；仪表 `neumann.tasks.suspended`；`Log` 两行 info。被挂起打断的模型调用 `outcome = suspended`，不算失败；挂起的时间不算进任何模型、工具 span（细节见 14 节）。
 
 stdio：`suspend`、`resume`（`task_id`），错误码 `not_suspended`。
+
+实现中的决定（`internal/core/suspend.go`，调度器一侧在 `internal/sched`）：
+
+- **通知与交还**：挂起、恢复提交中断之后调 `Sched.Nudge`，和取消的 `Sched.Cancel` 同一个模式。任务在就绪队列或等待集合里、且处在会立刻落地的状态（就绪、`Suspended`、退避、熔断等待，`sched.Landable`）：交给挂起方 / 恢复方，它读中断表、落地、交还。否则在调度器里给任务打一个标记（`nudged`；挂起另打 `cutting`）：持有方交还时（`Sched.Hand`），任务已被标记、交还的状态又会立刻落地，调度器就不收，持有方读中断表、落地、再交还，直到收下。判断在调度器那把锁下做，所以"持有方读完中断表、交还之前"提交的挂起或恢复不会漏（挂起与落地、恢复与落地交错时都靠它）。持有方在读中断表之前清标记（`Sched.Heard`）：vCore 在每条指令开头，工具批次、`Approve`、`Resolve` 在提交前看到标记时再读一次中断表。取消在先：已取消的任务不收标记，交还按取消处理。
+- **切断在途的调用**：每个模型步的调用（探测除外）和每条模型指令的等额度都登记在一张按任务的表里（`cuttable`），不管组开不开抢占；挂起方在 `Nudge` 之后切断登记了的那个。登记之后检查 `cutting` 标记：挂起若在登记之前就到了，登记方自己切断。两边都在锁下，顺序是"先标记后切断"对"先登记后查标记"，不会两边都错过。
+- **挂起与抢占打的是同一个调用**：先到的取消原因算数。先被抢的，照常提交 `preempted`，挂起在同一次提交里落地（`was = "model"`，`kept` 为 0，留下的正文已记在 `preempted` 上），或在交还时落地（`was = "ready"`）；先被挂起切断的，之后再被选作牺牲者也不算被抢，那个 vCore 照样先去取为之让出的任务。被让出给的任务在 vCore 取到它之前被挂起：`TakeReady` 取不到，vCore 照常按队列取。
+- **挂起后紧跟恢复**：调用若已被切断，任务照常 `Ready`（保留的正文照 6.4 续写），带 `resumed`（`pending: true`），不算被抢；这是一次白切的调用，只在两条指令几乎同时到达时发生。
+- **答案检查**：检查期间到达的挂起在检查之后落地：驳回的那次提交改为 `Suspended`（`was = "check"`）；通过则任务结束，挂起没有效果。
+- **`execTools`**（恢复时留下的 `planned` 调用）：指令开头已有挂起时调用不派发，任务 `Suspended`，`PC = StepTools`，恢复后由 `execTools` 派发。其余路径上，挂起的任务一轮工具总是已经有结果（`PC` 为 `StepModel` / `StepCompact`）。
+- **读中断表失败**：落地推迟，任务保留标记，下一次交还或下一条指令开头再落地，不因此失败任务。
+- **重启**：标记不持久。恢复流程给仍有待落地挂起的任务（等工具、待批准、待核对）重新打标记，等完那次提交照样落地。
+- stdio 的 `UnsupportedKinds` 保留为空表：设计里的操作员指令都已实现。
 
 ## 10. 总线与设备
 
@@ -934,7 +947,7 @@ stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id
 
 ## 14. 观测
 
-`m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态（当前实现：`Status.Groups` 每组给出模型、`Fallback`、`W` / `Target` / `Min` / `Max` / `Auto` / `epoch` / 冷却、存活与忙碌的 vCore 数、就绪数、等待数（其中等本组的）、最老就绪任务已等多久、熔断状态与下一次放探测的时刻；`Status.Cores` 是全部存活 vCore 数；`Status.Limiters` 给出各限流器的 `limit.Status`；`Status.Cache` 是总线 L2 的 `CacheStats`；`Status.Approval` 等批准的任务数；`m.Queue()` 按类给出就绪数、其中后台数、等待数（其中等批准的）、最长等待）；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
+`m.Status()`：每个执行组的 `W`、`epoch`、存活 vCore 数、冷却/熔断状态（当前实现：`Status.Groups` 每组给出模型、`Fallback`、`W` / `Target` / `Min` / `Max` / `Auto` / `epoch` / 冷却、存活与忙碌的 vCore 数、就绪数、等待数（其中等本组的）、最老就绪任务已等多久、熔断状态与下一次放探测的时刻；`Status.Cores` 是全部存活 vCore 数；`Status.Limiters` 给出各限流器的 `limit.Status`；`Status.Cache` 是总线 L2 的 `CacheStats`；`Status.Approval` 等批准的任务数；`Status.Suspended` 挂起的任务数（每组同名字段）；`m.Queue()` 按类给出就绪数、其中后台数、等待数（其中等批准的、挂起的）、最长等待）；每个限流器各维度的剩余额度和下次重置时间；每个 vCore 在做什么；每条队列长度和最长等待；待核对的调用列表；每个未结束任务的状态、组、步数、已确认用量和未确认请求数。加锁拷贝，不调模型、不读主存。
 
 `observe` 包只用公开 API（`Events`、`EventLog`、`Status`、`Queue`、`Load`、`Calls`），任何宿主都能挂；不挂就没有任何开销。事件从主存按序号读，消费方慢只会落后，不会挡住机器；`Follow` 返回最后读到的 `Seq`，宿主存下来重启后接着读；`Head` 用 O(log n) 次单条读找到日志末尾，只想统计"从现在起"的就从那里开始。
 
@@ -1051,7 +1064,8 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
    真实验收（`acceptance/local`，`NEUMANN_ACCEPT_LIVE=1`，本机 Ollama `qwen3.5:9b-mlx`，单 vCore、`Preempt`、`-local` 的适配器配置）：后台任务（17 × 23）思考 40 块后提交交互任务，后台调用立即被抢（已跑过 2 秒的量子），只留思考，交互任务答完，后台任务下一次调用带 `prefill_think`，接着想完、答 391。两次运行：被抢于 5.5 秒 / 2.1 秒，`kept_think` 168 / 159、`kept` 0，续写调用首块 393 / 430ms，交互任务 39 / 24 秒答完，后台任务 2 分 29 秒 / 1 分 27 秒完成；第二次断言答案的 reasoning 只开头一次（"Thinking Process:" 只出现一次，没有从头重想）。`observe` 的 span / 指标 / 日志在 `obs` 分支里做；`kept_think`、`prefill_think` 待它同步。
 
 9. **挂起与恢复**（9.9）：中断表的 `suspend` / `resume`、各状态下的落地、打断在途模型调用（复用 6.4 的打断与 `keepPartial`）、恢复抵消未落地的挂起、`suspended` / `resumed` 事件、`ErrNotSuspended`、重启、stdio、观测。
-   计划的验证：`TestSuspendReadyTask`、`TestSuspendBackoffAndGroupWait`、`TestSuspendInterruptsTheModelCall`（保留正文、恢复后续写）、`TestSuspendWhileThinkingKeepsTheThought`、`TestSuspendWaitsForTools`、`TestSuspendDuringApproval`、`TestSuspendDuringCompaction`、`TestResumeBeforeSuspendLands`、`TestSuspendResumeSuspendInOrder`、`TestDeadlineWhileSuspended`、`TestCancelWhileSuspended`、`TestSteerWhileSuspended`、`TestSetPriorityAndClassWhileSuspended`、`TestResumeTriggersPreemption`、`TestSuspendedSurvivesARestart`、`TestCrashAtEveryCommitPointWithASuspend`（各落地路径与恢复，每个提交点前后各崩一次）、存储一致性套件的新中断种类、stdio `suspend` / `resume`、`observe` 的 span / 仪表 / 日志。
+   已完成（实现中的决定见 9.9 末尾）：`mem.InterruptSuspend` / `InterruptResume`（两个 Store 不用改表，种类本来就是字符串）；`Machine.Suspend` / `ResumeTask`、`ErrNotSuspended`；`Sched.Nudge` / `Hand` / `Heard` / `Mark` / `Landable`，交还被标记的任务时落地；所有模型步调用与等额度可被挂起切断（`cuttable`）；指令开头、指令提交、工具轮结束、`Approve`、`Resolve`、交还、恢复流程各处落地；`Status` / `GroupStatus` / `ClassQueue` 的 `Suspended`；stdio `suspend` / `resume`、`not_suspended`（不再是 `unsupported`）；README。
+   验证：`TestSuspendReadyTask`（立即挂起、重复挂起不提交、`Status` / `Queue`、各种错误、恢复后运行）、`TestSuspendBackoffAndGroupWait`（`WakeAt` 丢弃、时钟走过和 `GroupReset` 都不唤醒）、`TestSuspendInterruptsTheModelCall`（组不开抢占也切断；`step` + `suspended`、保留正文、什么都不计；恢复后续写）、`TestSuspendWhileThinkingKeepsTheThought`、`TestSuspendWaitsForTools`、`TestSuspendDuringApproval`（拒绝：`was = approval`；放行：这一轮跑完，`was = tools`）、`TestSuspendDuringCompaction`、`TestSuspendWhileWaitingForRoom`、`TestResumeBeforeSuspendLands`（`resumed` `pending: true` 跟在完成工具轮的提交里、没有 `suspended`、第二次恢复 `ErrNotSuspended`）、`TestSuspendResumeSuspendInOrder`、`TestDeadlineAndCancelWhileSuspended`（含插话 `steer_dropped`）、`TestSteerWhileSuspended`、`TestSetPriorityAndClassWhileSuspended`、`TestResumeTriggersPreemption`、`TestSuspendAPreemptedCall`、`TestSuspendTheTaskAVCoreWasFreedFor`、`TestSuspendDuringTheCheck`（驳回：`was = check`；通过：任务结束）、`TestSuspendedSurvivesARestart`（挂起的任务、`Running` 中待落地的挂起、挂起任务待落地的恢复、就绪任务被抵消的挂起）、`TestCrashAtEveryCommitPointWithASuspend`（付款期间挂起、回答流到一半再挂起，操作员每次恢复，每个提交点前后各崩一次，SQLite：38 个崩溃点，重启时任务处于挂起的 8 个）、`TestLandSuspend` / `TestSuspendedAfter`（core）、`TestNudgeTakesALandableTask` / `TestNudgeMarksAWaitThatLandsLater` / `TestHandRefusesANudgedTask` / `TestNudgeLeavesUnknownAndCancelledTasks`（sched）、一致性套件的 `SuspendAndResumeRoundTripInOrder` / `PendingSuspendRefusesNothing` / `SuspendAndResumeAreAppliedSilently`、`TestSuspendAndResumeOverTheWire`（stdio）。`observe` 的 span / 仪表 / 日志在 `obs2` 分支里做。
 
 ## 18. 测试
 

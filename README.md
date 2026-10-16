@@ -547,6 +547,15 @@ moves a task to another group between instructions (`ErrTaskBusy` means try
 again). `m.GroupReset(ctx, class)` closes a breaker, which an exhausted quota
 never does by itself.
 
+**Suspend and resume.** `m.Suspend(ctx, id)` takes a task off the machine
+until `m.ResumeTask(ctx, id)`; both return once committed and hold across a
+restart. A ready or backing-off task is suspended at once, a model call in
+flight is cut off and its streamed text kept for the call after the resume
+to continue, and a tool round (tools are never cut off) or a round held for
+approval finishes first. A suspended task's deadline still runs, a cancel
+still ends it, and steers wait for its first step after the resume.
+`Status().Suspended` counts suspended tasks.
+
 **The stdio frontend.** `cmd/neumann` runs a machine behind JSON Lines on
 stdin and stdout, for hosts in other languages; logs go to stderr.
 
@@ -568,8 +577,8 @@ NEUMANN_API_KEY=... go run ./cmd/neumann -provider openai -base-url https://host
 {"type":"event","kind":"cancelled","task_id":"t1","seq":2,"task_seq":2,"data":{"stop_reason":"cancelled"}}
 ```
 
-An `"ok":true` reply to `submit`, `steer`, `cancel`, `resolve`, `approve` or `class`
-means the instruction is committed. The other kinds (`status`, `queue`,
+An `"ok":true` reply to `submit`, `steer`, `cancel`, `resolve`, `approve`, `class`,
+`priority`, `suspend` or `resume` means the instruction is committed. The other kinds (`status`, `queue`,
 `cores`, `autoscale`, `group_reset`, `unsubscribe`) and the error codes are
 documented in package `proto/jsonl`. Run `go run ./cmd/neumann -help` for
 every flag and its environment variable. Without `-store` state is in memory
@@ -723,8 +732,9 @@ tests.
 
 What neumann promises:
 
-- **Acknowledged means durable.** `Submit`, `Steer`, `Cancel`, `Resolve` and
-  `SetClass` return success only after the change is committed. An event is
+- **Acknowledged means durable.** `Submit`, `Steer`, `Cancel`, `Resolve`,
+  `SetClass`, `Suspend` and `ResumeTask` return success only after the change
+  is committed. An event is
   published only after the commit that produced it.
 - **Exactly one result per tool call.** Before the model is called again,
   every call of its last turn has one result, in call order: the device's
@@ -771,7 +781,7 @@ v0.1. The core described above is built and tested: commit-before-act state
 machine, SQLite store with group commit, crash recovery and reconciliation,
 cancellation and deadlines, elastic vCores, execution groups with breakers and
 fallback migration, context compaction (including a migration that compacts
-on a smaller target window), shared rate limiters, the OpenAI-compatible and Anthropic
+on a smaller target window), suspend and resume, shared rate limiters, the OpenAI-compatible and Anthropic
 adapters, MCP and skills devices, the tool result cache, the stdio
 frontend, and decision engines (`decide`) for tool policy, routing and
 answer checks. The API may change before v1.
@@ -779,9 +789,8 @@ answer checks. The API may change before v1.
 Designed but not built yet:
 
 - long-term memory and RAG, sub-agents, multimodal input;
-- the operator controls `Pause` / `Resume` / `Drain` and per-task
-  `Suspend` / `Resume` (the stdio frontend answers `suspend` and `resume`
-  with `unsupported`);
+- the operator controls `Pause` / `Resume` / `Drain` (per-task
+  `Suspend` / `ResumeTask` are built);
 - a token budget per task (`Budget` has `MaxSteps` and `Deadline`);
 - retention for the event log, which grows without bound for now.
 
