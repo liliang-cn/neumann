@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
+	"github.com/liliang-cn/neumann"
 	"github.com/liliang-cn/neumann/proto"
 )
 
@@ -333,21 +334,33 @@ func TestMetricsOfSuspension(t *testing.T) {
 	}
 }
 
-// With a Source the gauge is registered with the others, and still counted
-// from the events.
+// suspendedSource is a machine whose Status reports n suspended tasks.
+type suspendedSource struct {
+	*neumann.Machine
+	n int
+}
+
+func (s suspendedSource) Status() neumann.Status {
+	st := s.Machine.Status()
+	st.Suspended = s.n
+	return st
+}
+
+// With a Source the gauge is Status.Suspended, registered with the others,
+// whatever the events this observer read say.
 func TestSuspendedGaugeWithASource(t *testing.T) {
 	r := newRig(t)
 	reader, mp := newReader(t)
-	m, err := NewMetrics(r.m, mp, MetricsOptions{})
+	m, err := NewMetrics(suspendedSource{r.m, 3}, mp, MetricsOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
 	s := suspension()
 	cut := slices.IndexFunc(s.evs, func(e proto.Event) bool { return e.TaskID == "m" && e.Kind == proto.EvSuspended })
-	feed(m, s.evs[:cut+1])
+	feed(m, s.evs[:cut+1]) // the events alone would say 1
 	c := collect(t, reader)
-	c.must("neumann.tasks.suspended", nil, 1)
+	c.must("neumann.tasks.suspended", nil, 3)
 	c.must("neumann.tasks.unfinished", nil, 0)
 }
 

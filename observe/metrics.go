@@ -43,7 +43,7 @@ type Metrics struct {
 	in  *interp
 	seq atomic.Int64
 	// suspended is the tasks the events say are suspended, for the
-	// neumann.tasks.suspended gauge: Status has no such count yet.
+	// neumann.tasks.suspended gauge when there is no Source to ask.
 	suspended atomic.Int64
 	reg       metric.Registration
 	labels    map[string]*bounded
@@ -160,13 +160,13 @@ func NewMetrics(src Source, mp metric.MeterProvider, o MetricsOptions) (*Metrics
 	return m, nil
 }
 
-// suspendedGauge is neumann.tasks.suspended. It is counted from the events
-// (suspended, then resumed or the task's end), as Status does not count
-// suspended tasks: a task suspended before the seq this observer began
-// from is not in it.
+// suspendedGauge is neumann.tasks.suspended. With a Source it is
+// Status.Suspended; without one it is counted from the events (suspended,
+// then resumed or the task's end), so a task suspended before the seq this
+// observer began from is not in it.
 func (m *Metrics) suspendedGauge(meter metric.Meter) (metric.Int64ObservableGauge, error) {
 	return meter.Int64ObservableGauge("neumann.tasks.suspended", metric.WithUnit("{task}"),
-		metric.WithDescription("Tasks an operator suspended and has not resumed (design §9.9), from the events this observer read."))
+		metric.WithDescription("Tasks an operator suspended and has not resumed (design §9.9)."))
 }
 
 // Seq is the Seq of the last event observed.

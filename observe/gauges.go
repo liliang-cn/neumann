@@ -76,7 +76,7 @@ func (m *Metrics) gauges(meter metric.Meter) error {
 		o.ObserveInt64(unfinished, int64(st.Unfinished))
 		o.ObserveInt64(held, int64(st.Held))
 		o.ObserveInt64(awaiting, int64(st.Approval))
-		o.ObserveInt64(suspended, m.suspended.Load())
+		o.ObserveInt64(suspended, int64(st.Suspended))
 		for _, g := range st.Groups {
 			c := metric.WithAttributes(attribute.String("class", g.Class))
 			o.ObserveInt64(live, int64(g.Live), c)

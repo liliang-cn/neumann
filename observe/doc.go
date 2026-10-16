@@ -146,11 +146,11 @@
 //	neumann.process.heap          gauge    By            —                  live and unswept heap objects
 //	neumann.process.rss           gauge    By            —                  Linux only
 //
-// neumann.tasks.suspended (design §9.9) is counted from the events this
-// observer read, not from Status: a task's suspended event adds it, its
-// resumed (not a pending one) or its terminal event takes it off. A task
-// suspended before the seq Follow began from is not counted. A Metrics
-// without a Source has it too.
+// neumann.tasks.suspended (design §9.9) is Status.Suspended. A Metrics
+// without a Source has it too, counted from the events it read instead: a
+// task's suspended event adds it, its resumed (not a pending one) or its
+// terminal event takes it off, so a task suspended before the seq Follow
+// began from is not counted there.
 //
 // # Traces
 //
