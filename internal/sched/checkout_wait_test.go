@@ -31,7 +31,7 @@ func TestCheckoutWaitGivesUpOnceTheTaskIsHandedBackElsewhere(t *testing.T) {
 	// gets the lock back.
 	s.mu.Lock()
 	held.State, held.Wait = task.Ready, task.WaitNone
-	s.requeueLocked(held)
+	s.requeueLocked(held, false)
 	if s.pickLocked("default") == nil {
 		s.mu.Unlock()
 		t.Fatal("the vCore found nothing")

@@ -9,6 +9,11 @@
 // call or tool call in flight stops at once, and its deadline timer. And it
 // owns the timer of a task in Waiting(Backoff): due at WakeAt, it calls the
 // wake handler, which checks the task out and commits it Ready.
+//
+// Suspends and resumes reach a task the same way a cancel does (design
+// §9.9): Nudge hands over a task nobody is at work on, and marks any other,
+// so that its holder's hand-back (Hand) is refused until the holder has
+// landed them.
 package sched
 
 import (
@@ -79,6 +84,13 @@ type control struct {
 	backClass string
 	backState task.State
 	backWait  task.WaitReason
+	// nudged: a suspend or resume of the task was committed while someone
+	// held it (Nudge), and the holder has not read its interrupts since
+	// (Heard); a hand-back where it would land is refused (Hand). cutting:
+	// the same for a suspend, which also cuts off the task's model call
+	// (design §9.9).
+	nudged  bool
+	cutting bool
 }
 
 func New(clock Clock, aging time.Duration) *Sched {
@@ -166,8 +178,33 @@ func (s *Sched) Add(t *task.TCB) bool { return s.Requeue(t) }
 // and the caller still owns it, and must commit its final state (then Requeue
 // it as terminal) or Forget it. Deciding this under the lock that Cancel takes
 // means a cancel is never lost between the holder's commit and its hand-back.
-func (s *Sched) Requeue(t *task.TCB) bool {
-	ok, ready, class := s.requeue(t)
+//
+// Requeue takes a nudged task back all the same (Hand does not): the task's
+// next instruction reads the suspend or resume.
+func (s *Sched) Requeue(t *task.TCB) bool { return s.hand(t, false) == Queued }
+
+// Handed is what became of a task handed back with Hand.
+type Handed int
+
+const (
+	Queued  Handed = iota // the scheduler has it
+	Refused               // cancelled while it was held: the holder finalises it
+	Nudged                // a suspend or resume is to land: the holder lands it and hands the task back again
+)
+
+// Hand is Requeue for a holder that also lands suspends and resumes (design
+// §9.9). A task nudged since its holder last read its interrupts (Nudge,
+// Heard) and handed back where a suspend or resume lands at once (Ready,
+// Suspended, or waiting for a backoff or its group) is not taken back
+// either: Hand reports Nudged, the holder still owns it, must read its
+// interrupts and land what they ask, and hand it back again. Deciding this
+// under the lock Nudge takes means a suspend or resume is never lost
+// between the holder's look at the interrupts and its hand-back. A cancel
+// comes first (Refused).
+func (s *Sched) Hand(t *task.TCB) Handed { return s.hand(t, true) }
+
+func (s *Sched) hand(t *task.TCB, nudge bool) Handed {
+	h, ready, class := s.requeue(t, nudge)
 	if ready {
 		s.mu.Lock()
 		f := s.onReady
@@ -176,23 +213,42 @@ func (s *Sched) Requeue(t *task.TCB) bool {
 			f(class)
 		}
 	}
-	return ok
+	return h
 }
 
-func (s *Sched) requeue(t *task.TCB) (ok, ready bool, class string) {
+func (s *Sched) requeue(t *task.TCB, nudge bool) (h Handed, ready bool, class string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.requeueLocked(t)
+	return s.requeueLocked(t, nudge)
 }
 
-func (s *Sched) requeueLocked(t *task.TCB) (ok, ready bool, class string) {
+// Landable reports whether a suspend or resume of a task in t's state
+// lands at once, by whoever holds it: it is ready, suspended, or waiting
+// for a backoff or for its group. One waiting for its tools, for an
+// operator's approval or for reconciliation lands when that wait is over.
+func Landable(t *task.TCB) bool {
+	switch t.State {
+	case task.Ready, task.Suspended:
+		return true
+	case task.Waiting:
+		return t.Wait == task.WaitBackoff || t.Wait == task.WaitGroup
+	}
+	return false
+}
+
+func (s *Sched) requeueLocked(t *task.TCB, nudge bool) (h Handed, ready bool, class string) {
 	if _, dup := s.loc[t.ID]; dup {
 		panic(fmt.Sprintf("sched: task %s is already queued or waiting", t.ID))
 	}
 	c := s.controlLocked(t.ID)
 	if c.cancelled && !t.State.Terminal() {
 		s.out[t.ID] = true
-		return false, false, ""
+		return Refused, false, ""
+	}
+	if nudge && c.nudged && !t.State.Terminal() && Landable(t) {
+		c.nudged, c.cutting = false, false
+		s.out[t.ID] = true
+		return Nudged, false, ""
 	}
 	switch t.State {
 	case task.Ready:
@@ -220,7 +276,7 @@ func (s *Sched) requeueLocked(t *task.TCB) (ok, ready bool, class string) {
 	c.backClass, c.backState, c.backWait = t.Class, t.State, t.Wait
 	delete(s.out, t.ID)
 	s.cond.Broadcast()
-	return true, ready, class
+	return Queued, ready, class
 }
 
 func (s *Sched) controlLocked(id string) *control {
@@ -369,6 +425,90 @@ func (s *Sched) Cancel(id string) (*task.TCB, bool) {
 		return t, true
 	}
 	return nil, false
+}
+
+// Nudge tells the scheduler that a suspend (cut) or a resume of a task was
+// committed (design §9.9), and hands the task to the caller when nobody is
+// at work on it and idle accepts it: one in a ready queue, or in the wait
+// set (a task in backoff has its wake-up timer stopped). The caller must
+// land what the task's interrupts ask, then hand it back. Any other task is
+// marked nudged (and, for a suspend, cutting), for its holder: a hand-back
+// where the suspend or resume would land is refused (Hand), and a model
+// call it starts sees the mark (Cutting). A cancelled task, and one the
+// scheduler does not know (finished, or not handed to it yet), is left
+// alone: its next instruction reads the interrupts.
+func (s *Sched) Nudge(id string, cut bool, idle func(*task.TCB) bool) (*task.TCB, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.ctl[id]
+	if !ok || c.cancelled {
+		return nil, false
+	}
+	switch s.loc[id] {
+	case inReady:
+		for class, q := range s.ready {
+			i := slices.IndexFunc(q, func(t *task.TCB) bool { return t.ID == id })
+			if i < 0 || !idle(q[i]) {
+				continue
+			}
+			t := q[i]
+			s.ready[class] = slices.Delete(q, i, i+1)
+			delete(s.loc, id)
+			s.out[id] = true
+			c.nudged, c.cutting = false, false
+			return t, true
+		}
+	case inWaiting:
+		if t := s.waiting[id]; idle(t) {
+			delete(s.waiting, id)
+			delete(s.loc, id)
+			s.out[id] = true
+			s.disarmWakeLocked(c)
+			c.nudged, c.cutting = false, false
+			return t, true
+		}
+	}
+	c.nudged = true
+	c.cutting = c.cutting || cut
+	return nil, false
+}
+
+// Mark marks a task its caller holds as nudged: the caller found a suspend
+// or resume pending that it leaves for later in its instruction, and its
+// hand-back must not pass it by. Recovery marks a task before it is handed
+// to the scheduler.
+func (s *Sched) Mark(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.controlLocked(id).nudged = true
+}
+
+// Heard clears a task's nudged and cutting marks: its holder is about to
+// read its interrupts, and sees every suspend and resume nudged before.
+func (s *Sched) Heard(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c, ok := s.ctl[id]; ok {
+		c.nudged, c.cutting = false, false
+	}
+}
+
+// Nudged reports whether a task was nudged since its holder last read its
+// interrupts.
+func (s *Sched) Nudged(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.ctl[id]
+	return ok && c.nudged
+}
+
+// Cutting reports whether a suspend of a task was nudged since its holder
+// last read its interrupts: a model call it is starting must be cut off.
+func (s *Sched) Cutting(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.ctl[id]
+	return ok && c.cutting
 }
 
 // Next blocks until a task of class is ready and hands it to the caller. It
@@ -701,6 +841,7 @@ type Queue struct {
 	Waiting    int       // in the wait set, for any reason
 	ForGroup   int       // ...of which waiting for their group (Waiting(Group))
 	Approval   int       // ...of which waiting for an operator's approval (Waiting(Approval))
+	Suspended  int       // ...of which suspended by an operator (design §9.9)
 }
 
 // Queues reports every class that has a task ready or waiting.
@@ -732,6 +873,9 @@ func (s *Sched) Queues() map[string]Queue {
 		}
 		if t.State == task.Waiting && t.Wait == task.WaitApproval {
 			c.Approval++
+		}
+		if t.State == task.Suspended {
+			c.Suspended++
 		}
 		out[t.Class] = c
 	}
