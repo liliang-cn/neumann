@@ -217,15 +217,15 @@ func TestOldTaskBlobsDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != "a" || got.Version != 3 || got.Used.Steps != 2 || got.Rejections != 0 || len(got.Regs) != 1 || got.Regs[0].TextContent() != "q" || got.Regs[0].Feedback {
+	if got.ID != "a" || got.Version != 3 || got.Used.Steps != 2 || got.Rejections != 0 || got.Partial != "" || got.Preempts != 0 || got.NoThink || len(got.Regs) != 1 || got.Regs[0].TextContent() != "q" || got.Regs[0].Feedback {
 		t.Fatalf("old blob decoded as %+v", got)
 	}
-	got.Rejections, got.Version = 1, 4
+	got.Rejections, got.Partial, got.Preempts, got.NoThink, got.Version = 1, "Once", 1, true, 4
 	got.Regs = append(got.Regs, task.FeedbackMessage("again"))
 	if _, err := s.Commit(ctx, mem.CommitSet{Task: got}); err != nil {
 		t.Fatal(err)
 	}
-	if again, err := s.Load(ctx, "a"); err != nil || again.Rejections != 1 || !again.Regs[1].Feedback {
+	if again, err := s.Load(ctx, "a"); err != nil || again.Rejections != 1 || again.Partial != "Once" || again.Preempts != 1 || !again.NoThink || !again.Regs[1].Feedback {
 		t.Fatalf("after a commit over it: %+v, %v", again, err)
 	}
 }

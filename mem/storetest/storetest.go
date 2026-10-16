@@ -445,6 +445,9 @@ func fullTask(id string) *task.TCB {
 		CompactLimit: 4,
 		Archived:     5,
 		Rejections:   1,
+		Partial:      "Once upon",
+		Preempts:     1,
+		NoThink:      true,
 		StopReason:   "",
 		Version:      1,
 	}
