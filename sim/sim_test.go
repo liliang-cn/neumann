@@ -127,3 +127,46 @@ func TestClock(t *testing.T) {
 		t.Fatal(c.Now())
 	}
 }
+
+// A paced stream sends its first piece at once and each next one Every
+// later on the clock; a ctx that ends between two pieces ends the call with
+// only the pieces sent so far. A prefilled request is answered with the
+// rest.
+func TestPacedStreamAndPrefill(t *testing.T) {
+	clk := NewClock(time.Date(2026, 10, 16, 0, 0, 0, 0, time.UTC))
+	m := &Model{Clock: clk, Every: time.Second, Pieces: 4, Fn: func(req model.Request) (model.Response, error) {
+		return Continue(req, "abcdefgh"), nil
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan string, 8)
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Stream(ctx, model.Request{}, func(d model.Delta) { got <- d.Text })
+		done <- err
+	}()
+	if p := <-got; p != "ab" {
+		t.Fatalf("first piece %q", p)
+	}
+	for m.Clock.Timers() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	clk.Advance(time.Second)
+	if p := <-got; p != "cd" {
+		t.Fatalf("second piece %q", p)
+	}
+	for m.Clock.Timers() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != context.Canceled || m.Emitted() != 2 {
+		t.Fatalf("cut off: %v after %d pieces", err, m.Emitted())
+	}
+	req := model.Request{Messages: []task.Message{task.Text(task.RoleUser, "go"), task.Text(task.RoleAssistant, "abcd")}}
+	if Prefill(req) != "abcd" {
+		t.Fatalf("prefill %q", Prefill(req))
+	}
+	resp, err := m.Call(context.Background(), req)
+	if err != nil || resp.Message.TextContent() != "efgh" || len(m.Requests()) != 2 {
+		t.Fatalf("continued %q, %v, %d requests", resp.Message.TextContent(), err, len(m.Requests()))
+	}
+}

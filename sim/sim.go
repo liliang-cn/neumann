@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,11 +21,24 @@ type Model struct {
 	// Name is the Provider; empty is "sim".
 	Name string
 	// Info is what Caps reports; nil takes tools, any number, with an
-	// unknown window.
+	// unknown window. Its Prefill says the model continues a request that
+	// ends with an assistant message: the script then answers with only the
+	// rest (see Prefill and Continue).
 	Info *model.Caps
 
-	mu    sync.Mutex
-	calls int
+	// Stream pacing. With Clock and Every set, Stream sends a reply's text
+	// in Pieces pieces (0: 3), the first at once and each next one Every
+	// later on Clock, so a call stays in flight until a test moves the
+	// clock; a call whose ctx ends between two pieces returns ctx.Err() with
+	// only the pieces sent so far streamed.
+	Clock  *Clock
+	Every  time.Duration
+	Pieces int
+
+	mu      sync.Mutex
+	calls   int
+	reqs    []model.Request
+	emitted int
 }
 
 // Provider is Name, or "sim".
@@ -43,11 +57,14 @@ func (m *Model) Caps() model.Caps {
 	return model.Caps{Tools: true}
 }
 
-// Call counts the call, returns ctx's error if it has ended, and otherwise
-// whatever Fn decides.
+// Call counts the call, records its request, returns ctx's error if it has
+// ended, and otherwise whatever Fn decides.
 func (m *Model) Call(ctx context.Context, req model.Request) (model.Response, error) {
 	m.mu.Lock()
 	m.calls++
+	r := req
+	r.Messages = task.CloneMessages(req.Messages)
+	m.reqs = append(m.reqs, r)
 	m.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return model.Response{}, err
@@ -55,20 +72,73 @@ func (m *Model) Call(ctx context.Context, req model.Request) (model.Response, er
 	return m.Fn(req)
 }
 
-// Stream is Call that also reports the reply's text in three pieces, so tests
-// exercise the streaming path the machine takes by default.
+// Stream is Call that also reports the reply's text in pieces (three, or
+// Pieces), so tests exercise the streaming path the machine takes by
+// default; paced on Clock when Every is set (see Model). When Fn returns an
+// error together with a reply, the reply's text is streamed first and then
+// the error returned: a stream that broke off after that text (pair it with
+// Lost).
 func (m *Model) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
 	resp, err := m.Call(ctx, req)
-	if err != nil {
+	if err != nil && resp.Message.TextContent() == "" {
 		return resp, err
 	}
+	n := m.Pieces
+	if n <= 0 {
+		n = 3
+	}
 	r := []rune(resp.Message.TextContent())
-	for i, n := 0, len(r); i < 3 && n > 0; i++ {
-		if piece := string(r[i*n/3 : (i+1)*n/3]); piece != "" {
-			emit(model.Delta{Text: piece})
+	for i, k := 0, 0; i < n && len(r) > 0; i++ {
+		piece := string(r[i*len(r)/n : (i+1)*len(r)/n])
+		if piece == "" {
+			continue
 		}
+		if k > 0 {
+			if werr := m.wait(ctx); werr != nil {
+				return model.Response{}, werr
+			}
+		}
+		emit(model.Delta{Text: piece})
+		m.mu.Lock()
+		m.emitted++
+		m.mu.Unlock()
+		k++
+	}
+	if err != nil {
+		return model.Response{}, err
 	}
 	return resp, nil
+}
+
+// wait is the pause between two pieces: Every on Clock, ended early by ctx.
+// Unpaced, there is none, and the reply streams whole whatever ctx says, as
+// a reply already received would.
+func (m *Model) wait(ctx context.Context) error {
+	if m.Clock == nil || m.Every <= 0 {
+		return nil
+	}
+	due := make(chan struct{})
+	stop := m.Clock.AfterFunc(m.Every, func() { close(due) })
+	select {
+	case <-due:
+	case <-ctx.Done():
+		stop()
+	}
+	return ctx.Err()
+}
+
+// Requests is every request Call or Stream received so far, in order.
+func (m *Model) Requests() []model.Request {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.reqs)
+}
+
+// Emitted is how many pieces Stream has emitted so far, over all calls.
+func (m *Model) Emitted() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.emitted
 }
 
 // RateInfo reports the limits a scripted failure carries (see RateLimited),
@@ -111,6 +181,23 @@ func CallTools(names ...string) model.Response {
 		})
 	}
 	return model.Response{Message: msg, FinishReason: "tool_calls", Usage: simUsage}
+}
+
+// Prefill is the text of the assistant message req ends with: what the
+// machine asks a model whose Caps.Prefill is true to continue (design §6.4).
+// Empty when req ends with anything else.
+func Prefill(req model.Request) string {
+	if n := len(req.Messages); n > 0 && req.Messages[n-1].Role == task.RoleAssistant {
+		return req.Messages[n-1].TextContent()
+	}
+	return ""
+}
+
+// Continue is the reply full as a model that continues a prefill gives it:
+// only what comes after the text req ends with (Prefill), when full starts
+// with it; full whole otherwise.
+func Continue(req model.Request, full string) model.Response {
+	return Reply(strings.TrimPrefix(full, Prefill(req)))
 }
 
 // FirstUser is the first user message's text; tests use it as a task's name.
