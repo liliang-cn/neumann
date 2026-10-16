@@ -192,3 +192,59 @@ func TestPriorityOverTheWire(t *testing.T) {
 	}
 	close(gate)
 }
+
+// suspend and resume over the wire (design §9.9, §12): each needs a
+// task_id and nothing else; a ready task is suspended before the reply, a
+// resume of a task that is not suspended is not_suspended, an unknown task
+// not_found.
+func TestSuspendAndResumeOverTheWire(t *testing.T) {
+	for _, line := range []string{
+		`{"kind":"suspend"}`,
+		`{"kind":"resume"}`,
+		`{"kind":"suspend","task_id":"t1","input":"x"}`,
+		`{"kind":"resume","task_id":"t1","priority":1}`,
+	} {
+		decodeErr(t, line, CodeBadRequest)
+	}
+	if req := decodeOK(t, `{"kind":"resume","task_id":"t1"}`); req.TaskID != "t1" || req.Kind != KindResume {
+		t.Fatalf("resume %+v", req)
+	}
+
+	gate := make(chan struct{})
+	h := start(t, neumann.Config{Cores: 1}, func(req model.Request) (model.Response, error) {
+		if sim.FirstUser(req) == "hold" {
+			<-gate
+		}
+		return sim.Reply("done"), nil
+	})
+	mustOK(t, h.do(`{"kind":"submit","input":"hold","task_id":"hold"}`, nil), proto.KindSubmit)
+	deadline := time.Now().Add(wait)
+	for {
+		if tc, err := h.m.Load(bg, "hold"); err == nil && tc.State == task.Running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hold never ran")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mustOK(t, h.do(`{"kind":"submit","input":"q","task_id":"q"}`, nil), proto.KindSubmit)
+	r := h.do(`{"id":8,"kind":"suspend","task_id":"q"}`, nil)
+	mustOK(t, r, KindSuspend)
+	if r.TaskID != "q" || string(r.ID) != "8" {
+		t.Fatalf("suspend reply %+v", r)
+	}
+	if tc, err := h.m.Load(bg, "q"); err != nil || tc.State != task.Suspended {
+		t.Fatalf("q after suspend: %+v, %v", tc, err)
+	}
+	if st := h.m.Status(); st.Suspended != 1 {
+		t.Fatalf("status %+v", st)
+	}
+	mustFail(t, h.do(`{"kind":"resume","task_id":"hold"}`, nil), CodeNotSuspended)
+	mustFail(t, h.do(`{"kind":"suspend","task_id":"nope"}`, nil), CodeNotFound)
+	mustOK(t, h.do(`{"kind":"resume","task_id":"q"}`, nil), KindResume)
+	if tc, err := h.m.Load(bg, "q"); err != nil || tc.State == task.Suspended {
+		t.Fatalf("q after resume: %+v, %v", tc, err)
+	}
+	close(gate)
+}

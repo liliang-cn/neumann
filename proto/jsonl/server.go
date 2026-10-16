@@ -29,6 +29,8 @@ type Machine interface {
 
 	SetClass(ctx context.Context, taskID, class string) error
 	SetPriority(ctx context.Context, taskID string, p int) error
+	Suspend(ctx context.Context, taskID string) error
+	ResumeTask(ctx context.Context, taskID string) error
 	SetCores(class string, n int) error
 	AutoScale(class string, on bool) error
 	GroupReset(ctx context.Context, class string) error
@@ -180,6 +182,12 @@ func (s *Server) handle(ctx context.Context, l line) (*Reply, *subscription) {
 	case KindPriority:
 		r.TaskID = req.TaskID
 		err = s.Machine.SetPriority(ctx, req.TaskID, req.Priority)
+	case KindSuspend:
+		r.TaskID = req.TaskID
+		err = s.Machine.Suspend(ctx, req.TaskID)
+	case KindResume:
+		r.TaskID = req.TaskID
+		err = s.Machine.ResumeTask(ctx, req.TaskID)
 	case KindCores:
 		err = s.Machine.SetCores(req.Class, *req.Cores)
 	case KindAutoScale:
@@ -234,6 +242,8 @@ func errorFor(err error) *Error {
 		e.Code = CodeNotReconciling
 	case errors.Is(err, neumann.ErrNotAwaitingApproval):
 		e.Code = CodeNotAwaiting
+	case errors.Is(err, neumann.ErrNotSuspended):
+		e.Code = CodeNotSuspended
 	case errors.Is(err, neumann.ErrNotFound):
 		e.Code = CodeNotFound
 	case errors.Is(err, neumann.ErrFinished):

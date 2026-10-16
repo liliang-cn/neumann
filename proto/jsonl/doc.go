@@ -25,8 +25,8 @@
 //	{"id":1,"kind":"submit","input":"What is 2+2?"}
 //	{"type":"reply","id":1,"kind":"submit","ok":true,"task_id":"8c0f…"}
 //
-// An ok reply to submit, steer, cancel, resolve, approve, class and priority means the
-// instruction is committed: it survives a crash from that moment on. The
+// An ok reply to submit, steer, cancel, resolve, approve, class, priority, suspend and
+// resume means the instruction is committed: it survives a crash from that moment on. The
 // kinds and their fields (anything else is refused by name):
 //
 //	submit       input (required), task_id, class, pin_class, priority, budget {max_steps, deadline (RFC 3339)}, allow, deny
@@ -46,6 +46,12 @@
 //	priority     task_id, priority (both required, priority >= 0: 0 is interactive, larger is
 //	             less urgent): changes the task's priority, then a call of a less urgent task
 //	             may be preempted for it (Machine.SetPriority)
+//	suspend      task_id (required): takes the task off the machine until a resume; a ready task
+//	             is suspended before the reply, a model call in flight is cut off, and a tool
+//	             round or a round held for approval finishes first (Machine.Suspend); suspending
+//	             a suspended task is ok and changes nothing
+//	resume       task_id (required): puts a suspended task back, or cancels a suspend that has not
+//	             landed yet (Machine.ResumeTask)
 //	cores        class, cores (both required, cores >= 1): pins the group's window (Machine.SetCores)
 //	autoscale    class, on (both required): the group's window adapts again, or freezes (Machine.AutoScale)
 //	group_reset  class (required): closes the group's breaker (Machine.GroupReset)
@@ -57,9 +63,10 @@
 //
 // Codes: bad_request (malformed JSON, an object missing, unknown or ill-typed
 // field; the message names it), unknown_kind, unsupported (a designed
-// operator control the machine does not have yet: suspend, resume),
+// operator control the machine does not have yet; none at present),
 // not_found, finished, not_reconciling, not_awaiting_approval
 // (approve: the task is not waiting for approval, or the call is not held),
+// not_suspended (resume: the task is not suspended and has no suspend pending),
 // busy (with "count" and "limit"), task_busy (class, priority: the task is
 // executing an instruction or waiting for its tools; try again), incompatible (class: the group cannot take the task; "check"
 // names the failed check: tools, tool_count, context or caps), stopped,

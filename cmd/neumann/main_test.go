@@ -341,8 +341,8 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("group_reset: %v", r)
 	}
 	p.send(`{"kind":"suspend","task_id":"e2e-1"}`)
-	if r := p.reply(nil); r["error"].(map[string]any)["code"] != "unsupported" {
-		t.Fatalf("suspend: %v", r)
+	if r := p.reply(nil); r["error"].(map[string]any)["code"] != "finished" {
+		t.Fatalf("suspend of a finished task: %v", r)
 	}
 	p.send(`{"kind":"status"}`)
 	if r := p.reply(nil); r["status"].(map[string]any)["groups"].([]any)[0].(map[string]any)["target"] != float64(2) {

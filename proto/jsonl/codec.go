@@ -31,6 +31,8 @@ const (
 	KindGroupReset = "group_reset" // close a group's breaker: Machine.GroupReset
 	KindQueue      = "queue"       // the queues by class: Machine.Queue
 	KindPriority   = "priority"    // change a task's priority: Machine.SetPriority
+	KindSuspend    = "suspend"     // take a task off the machine: Machine.Suspend
+	KindResume     = "resume"      // put a suspended task back: Machine.ResumeTask
 )
 
 // KnownKinds are the instructions this frontend executes.
@@ -38,12 +40,14 @@ var KnownKinds = []string{
 	proto.KindSubmit, proto.KindSteer, proto.KindCancel, KindResolve, KindApprove,
 	KindStatus, KindSubscribe, KindUnsubscribe,
 	KindClass, KindCores, KindAutoScale, KindGroupReset, KindQueue, KindPriority,
+	KindSuspend, KindResume,
 }
 
 // UnsupportedKinds are operator controls the design names (§9.6) that the
 // machine does not offer yet. They are answered with CodeUnsupported, not
 // CodeUnknownKind, so a client can tell "not yet" from "never heard of it".
-var UnsupportedKinds = []string{"suspend", "resume"}
+// Every control the design names is offered now: the list is empty.
+var UnsupportedKinds []string
 
 // Error codes of a failed reply.
 const (
@@ -64,6 +68,10 @@ const (
 // CodeNotAwaiting fails an approve whose task or call is not held for
 // approval.
 const CodeNotAwaiting = "not_awaiting_approval"
+
+// CodeNotSuspended fails a resume whose task is neither suspended nor has a
+// suspend pending.
+const CodeNotSuspended = "not_suspended"
 
 // Outcome is an operator's answer to a call held for reconciliation: Retry
 // sends the call again; otherwise Result is what the call returned and
@@ -186,6 +194,8 @@ var fields = map[string][]string{
 	KindGroupReset:   {"class"},
 	KindQueue:        {},
 	KindPriority:     {"task_id", "priority"},
+	KindSuspend:      {"task_id"},
+	KindResume:       {"task_id"},
 }
 
 // Decode parses and validates one input line. On error the returned Request
@@ -313,7 +323,7 @@ func (r *Request) validate() *Error {
 			return err
 		}
 		return need("input", r.Input)
-	case proto.KindCancel:
+	case proto.KindCancel, KindSuspend, KindResume:
 		return need("task_id", r.TaskID)
 	case KindResolve:
 		if err := need("task_id", r.TaskID); err != nil {

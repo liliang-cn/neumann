@@ -468,6 +468,7 @@ func TestErrorCodes(t *testing.T) {
 		{fmt.Errorf("x: %w", neumann.ErrNotFound), CodeNotFound},
 		{neumann.ErrFinished, CodeFinished},
 		{fmt.Errorf("task t: %w", neumann.ErrNotReconciling), CodeNotReconciling},
+		{fmt.Errorf("task t: %w", neumann.ErrNotSuspended), CodeNotSuspended},
 		{&neumann.CapacityError{Count: 3, Limit: 3}, CodeBusy},
 		{neumann.ErrBusy, CodeBusy},
 		{neumann.ErrStopped, CodeStopped},
@@ -487,9 +488,9 @@ func TestBadLinesDoNotStopTheServer(t *testing.T) {
 	mustFail(t, h.do(`{"kind":"submit"`, nil), CodeBadRequest)
 	mustFail(t, h.do(`{"id":3,"kind":"teleport"}`, nil), CodeUnknownKind)
 	r := h.do(`{"id":4,"kind":"suspend","task_id":"t1"}`, nil)
-	mustFail(t, r, CodeUnsupported)
+	mustFail(t, r, CodeNotFound)
 	if string(r.ID) != "4" || r.Kind != "suspend" {
-		t.Fatalf("unsupported reply %+v", r)
+		t.Fatalf("not_found reply %+v", r)
 	}
 	h.send("") // blank lines are skipped
 	h.send("   \r")
