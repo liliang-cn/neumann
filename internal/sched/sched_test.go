@@ -218,3 +218,35 @@ func TestNilClockDefaultsToReal(t *testing.T) {
 	s.Add(tcb("a", 1, 0))
 	order(t, s, "a")
 }
+
+// Priorities above 1 (design §6.4, §9.3): the smaller number goes first,
+// aging lifts any of them to 0, and Queues counts every one above 0 as
+// background. Urgent goes by the priority itself, never by aging.
+func TestPrioritiesAboveOne(t *testing.T) {
+	clk := &clock{now: t0.Add(10 * time.Second)}
+	s := sched.New(clk, 30*time.Second)
+	s.Add(tcb("p3", 3, 0))
+	s.Add(tcb("p1", 1, 2*time.Second))
+	s.Add(tcb("p2", 2, time.Second))
+	s.Add(tcb("p0", 0, 5*time.Second))
+	if q := s.Queues()["default"]; q.Ready != 4 || q.Background != 3 {
+		t.Fatalf("queue %+v", q)
+	}
+	if id, p, ok := s.Urgent("default"); !ok || id != "p0" || p != 0 {
+		t.Fatalf("urgent %s %d %v", id, p, ok)
+	}
+	order(t, s, "p0", "p1", "p2", "p3")
+
+	clk.now = t0.Add(31 * time.Second) // p3 has waited past the aging threshold, p2 and p1 not quite
+	s.Add(tcb("p3", 3, 0))
+	s.Add(tcb("p2", 2, 2*time.Second))
+	s.Add(tcb("p1", 1, 3*time.Second))
+	s.Add(tcb("q0", 0, 20*time.Second))
+	if id, p, ok := s.Urgent("default"); !ok || id != "q0" || p != 0 {
+		t.Fatalf("urgent after aging %s %d %v", id, p, ok)
+	}
+	order(t, s, "p3", "q0", "p1", "p2")
+	if _, _, ok := s.Urgent("default"); ok {
+		t.Fatal("an empty queue has an urgent task")
+	}
+}

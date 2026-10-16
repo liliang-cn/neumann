@@ -444,8 +444,30 @@ func (s *Sched) pickLocked(class string) *task.TCB {
 	return t
 }
 
+// Urgent is the most urgent task in class's ready queue by its own
+// priority (TCB.Priority, the smallest number; the earliest ReadySince among
+// equals), not by aging: a background task aging lifted is still background
+// here. Preemption asks it (design §6.4): aging decides only the order tasks
+// are taken in, and must not let one background task cut off another.
+func (s *Sched) Urgent(class string) (id string, priority int, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var best *task.TCB
+	for _, t := range s.ready[class] {
+		if best == nil || t.Priority < best.Priority || t.Priority == best.Priority && t.ReadySince.Before(best.ReadySince) {
+			best = t
+		}
+	}
+	if best == nil {
+		return "", 0, false
+	}
+	return best.ID, best.Priority, true
+}
+
 // effective is the priority used for ordering: a background task that has
 // been ready for longer than the aging threshold competes as interactive.
+// Priorities are any number from 0 (interactive) up, smaller first; aging
+// lifts any of them to 0.
 func (s *Sched) effective(t *task.TCB, now time.Time) int {
 	if t.Priority > 0 && now.Sub(t.ReadySince) >= s.aging {
 		return 0
@@ -652,7 +674,7 @@ func (s *Sched) Counts() (ready, waiting, held int) {
 // Queue is one class's share of the scheduler (design §9.1, §14).
 type Queue struct {
 	Ready      int       // in the ready queue
-	Background int       // ...of which background priority
+	Background int       // ...of which background: any priority above 0
 	Oldest     time.Time // the earliest ReadySince in the ready queue; zero when it is empty
 	Waiting    int       // in the wait set, for any reason
 	ForGroup   int       // ...of which waiting for their group (Waiting(Group))
