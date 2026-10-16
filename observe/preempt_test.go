@@ -384,3 +384,45 @@ func TestLogOfPreemption(t *testing.T) {
 		t.Errorf("task content in the log:\n%s", buf.String())
 	}
 }
+
+// A call preempted while the model was still thinking keeps its thought
+// (kept_think, design §6.4) and the next call continues it (prefill_think):
+// both reach the spans, the task span's preempted event and the log.
+func TestPreemptedThought(t *testing.T) {
+	var s script
+	s.add(0, proto.EvAccepted, "bg", map[string]any{"class": "local", "priority": 1})
+	s.add(time.Second, proto.EvModelCall, "bg", map[string]any{"pc": "model", "core": 1})
+	s.add(3*time.Second, proto.EvStep, "bg", map[string]any{"pc": "model", "core": 1, "first_ms": 500})
+	s.add(3*time.Second, proto.EvPreempted, "bg", map[string]any{"by": "fg", "kept": 0, "kept_think": 160, "ran_ms": 2000, "n": 1})
+	s.add(5*time.Second, proto.EvModelCall, "bg", map[string]any{"pc": "model", "core": 1})
+	s.add(9*time.Second, proto.EvStep, "bg", map[string]any{"pc": "model", "core": 1, "first_ms": 400, "prefill_think": 160})
+	s.add(9*time.Second, proto.EvUsage, "bg", usage(40, 30, 0, 0))
+	s.add(9*time.Second, proto.EvDone, "bg", map[string]any{"stop_reason": "end_turn"})
+
+	exp := tracetest.NewInMemoryExporter()
+	tr := NewTracer(exp, TracerOptions{})
+	feed(tr, s.evs)
+	tr.Flush(context.Background())
+	got := spans(exp)
+	root := one(t, got, "bg", "task")
+	if a := root.EventAttrs[0]; a["neumann.preempt.kept"] != "0" || a["neumann.preempt.kept_think"] != "160" {
+		t.Fatalf("preempted event %v", a)
+	}
+	models := byName(got, "bg", "model")
+	if len(models) != 2 {
+		t.Fatalf("model spans %+v", models)
+	}
+	if cut := models[0]; cut.Attrs["neumann.preempt.kept_think"] != "160" || cut.Attrs["neumann.prefill_think"] != "" {
+		t.Fatalf("preempted span %+v", cut)
+	}
+	if cont := models[1]; cont.Attrs["neumann.prefill_think"] != "160" || cont.Attrs["neumann.prefill"] != "" {
+		t.Fatalf("continued span %+v", cont)
+	}
+
+	var buf bytes.Buffer
+	l := NewLog(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	feed(l, s.evs)
+	ls := lines(&buf)
+	find(t, ls, "level=INFO", "msg=preempted", "task=bg", "kept=0", "kept_think=160")
+	find(t, ls, "level=DEBUG", "msg=step", "task=bg", "prefill_think=160")
+}

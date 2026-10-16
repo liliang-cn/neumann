@@ -61,13 +61,15 @@ type data struct {
 	Chunk          int   `json:"chunk"`
 	Chunks         int   `json:"chunks"`
 	// preemption and continuation (design §6.4)
-	FirstMS  *int64 `json:"first_ms"` // step: ms from the request to its first streamed chunk; nil when none came
-	Prefill  int    `json:"prefill"`  // step: chars of the continued prefix
-	Kept     int    `json:"kept"`     // preempted: chars kept for the continuation
-	RanMS    int64  `json:"ran_ms"`   // preempted: how long the call ran
-	N        int    `json:"n"`        // preempted: how many times this step was preempted
-	Was      int    `json:"was"`      // priority_set: the priority before
-	SteerSeq int64  `json:"seq"`      // steer_delivered, steer_dropped: the steer's seq
+	FirstMS      *int64 `json:"first_ms"`      // step: ms from the request to its first streamed chunk; nil when none came
+	Prefill      int    `json:"prefill"`       // step: chars of the continued prefix
+	PrefillThink int    `json:"prefill_think"` // step: chars of the continued thought
+	Kept         int    `json:"kept"`          // preempted: chars kept for the continuation
+	KeptThink    int    `json:"kept_think"`    // preempted: chars of thinking kept for the continuation
+	RanMS        int64  `json:"ran_ms"`        // preempted: how long the call ran
+	N            int    `json:"n"`             // preempted: how many times this step was preempted
+	Was          int    `json:"was"`           // priority_set: the priority before
+	SteerSeq     int64  `json:"seq"`           // steer_delivered, steer_dropped: the steer's seq
 	task.Usage
 }
 
@@ -128,32 +130,34 @@ type fact struct {
 	task  string
 	class string // the task's execution group (or a machine event's)
 
-	seq        int64 // the event that opened the span: step, tool_call, first tool_call of a batch
-	start, end time.Time
-	name       string // step pc; tool name; terminal kind
-	outcome    string
-	errClass   string // a failed step's error class (model_retry class or the task's stop reason)
-	usage      *task.Usage
-	core       int
-	partial    bool           // the task's start was not seen
-	timed      bool           // tool end: start is when the call was made
-	batch      int64          // tool end: the Seq of its round (the round's first tool_call)
-	total      task.Usage     // task end: the task's confirmed usage
-	steps      int            // task end: answered model calls
-	priority   *int           // task end: the task's last priority, nil when unknown (a partial task)
-	firstByte  *time.Duration // step: from the request to its first streamed chunk
-	prefill    int            // step: chars of the continued prefix
+	seq          int64 // the event that opened the span: step, tool_call, first tool_call of a batch
+	start, end   time.Time
+	name         string // step pc; tool name; terminal kind
+	outcome      string
+	errClass     string // a failed step's error class (model_retry class or the task's stop reason)
+	usage        *task.Usage
+	core         int
+	partial      bool           // the task's start was not seen
+	timed        bool           // tool end: start is when the call was made
+	batch        int64          // tool end: the Seq of its round (the round's first tool_call)
+	total        task.Usage     // task end: the task's confirmed usage
+	steps        int            // task end: answered model calls
+	priority     *int           // task end: the task's last priority, nil when unknown (a partial task)
+	firstByte    *time.Duration // step: from the request to its first streamed chunk
+	prefill      int            // step: chars of the continued prefix
+	prefillThink int            // step: chars of the continued thought
 }
 
 type openStep struct {
-	seq       int64
-	pc        string
-	core      int
-	at, start time.Time
-	usage     *task.Usage
-	check     time.Duration // the answer check's share of the step, after the call answered
-	firstByte *time.Duration
-	prefill   int
+	seq          int64
+	pc           string
+	core         int
+	at, start    time.Time
+	usage        *task.Usage
+	check        time.Duration // the answer check's share of the step, after the call answered
+	firstByte    *time.Duration
+	prefill      int
+	prefillThink int
 }
 
 type openCall struct {
@@ -263,7 +267,7 @@ func (in *interp) feed(ev proto.Event, emit func(fact)) (string, data) {
 		if !t.call.IsZero() {
 			start = t.call
 		}
-		t.step = &openStep{seq: ev.Seq, pc: d.PC, core: d.Core, at: ev.Time, start: start, check: time.Duration(d.CheckMS) * time.Millisecond, prefill: d.Prefill}
+		t.step = &openStep{seq: ev.Seq, pc: d.PC, core: d.Core, at: ev.Time, start: start, check: time.Duration(d.CheckMS) * time.Millisecond, prefill: d.Prefill, prefillThink: d.PrefillThink}
 		if d.FirstMS != nil {
 			fb := time.Duration(*d.FirstMS) * time.Millisecond
 			t.step.firstByte = &fb
@@ -403,7 +407,7 @@ func (in *interp) endStep(ev proto.Event, d data, t *taskState, emit func(fact))
 	s := t.step
 	t.step = nil
 	f := fact{kind: factStep, ev: ev, d: d, task: ev.TaskID, class: t.class, seq: s.seq, name: s.pc, core: s.core, usage: s.usage, outcome: outOK,
-		firstByte: s.firstByte, prefill: s.prefill}
+		firstByte: s.firstByte, prefill: s.prefill, prefillThink: s.prefillThink}
 	f.start, f.end = s.start, ev.Time
 	if s.at.Before(ev.Time) {
 		// The step was committed before its result: the call ran in between.

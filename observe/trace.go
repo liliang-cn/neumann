@@ -49,7 +49,7 @@ type TracerOptions struct {
 //     neumann.recovered) and approved, and the answer check's rejections
 //     (answer_rejected, with neumann.attempt and neumann.final). So are
 //     preemptions (preempted: neumann.preempt.by, the preempting task's
-//     id, .kept, .ran_ms, .n), priority changes (priority_set:
+//     id, .kept, .kept_think, .ran_ms, .n), priority changes (priority_set:
 //     neumann.priority, neumann.priority_was) and steers with a sender
 //     reaching the model (steer_delivered: neumann.steer.seq, neumann.from).
 //   - "model" / "compact": one per model instruction, child of the task.
@@ -61,9 +61,10 @@ type TracerOptions struct {
 //     Status error with the error class for a failed call. A call
 //     preempted for a more urgent task (design §6.4) ends at its preempted
 //     event with neumann.outcome preempted, which is not an error, and
-//     carries neumann.preempt.kept and .n and a link to the preempting
-//     task's root span; a call that continues kept text carries
-//     neumann.prefill (its chars). A step with first_ms has a first_byte
+//     carries neumann.preempt.kept, .kept_think and .n and a link to the
+//     preempting task's root span; a call that continues kept text carries
+//     neumann.prefill (its chars), one that continues a kept thought
+//     neumann.prefill_think. A step with first_ms has a first_byte
 //     event that many milliseconds after the span's start (the request),
 //     telling the backend's queue from its generation.
 //     A compaction that was applied carries its compacted event's figures
@@ -243,9 +244,13 @@ func (t *Tracer) fact(f fact) {
 		if f.prefill > 0 {
 			attrs = append(attrs, attribute.Int("neumann.prefill", f.prefill))
 		}
+		if f.prefillThink > 0 {
+			attrs = append(attrs, attribute.Int("neumann.prefill_think", f.prefillThink))
+		}
 		var links []sdktrace.Link
 		if f.outcome == outPreempted {
-			attrs = append(attrs, attribute.Int("neumann.preempt.kept", f.d.Kept), attribute.Int("neumann.preempt.n", f.d.N))
+			attrs = append(attrs, attribute.Int("neumann.preempt.kept", f.d.Kept), attribute.Int("neumann.preempt.kept_think", f.d.KeptThink),
+				attribute.Int("neumann.preempt.n", f.d.N))
 			if f.d.By != "" {
 				// The task that took the backend: its root span, in its own trace.
 				links = append(links, sdktrace.Link{SpanContext: spanContext(f.d.By, TaskSpanID(f.d.By)),
@@ -373,7 +378,7 @@ func markAttrs(f fact) []attribute.KeyValue {
 	case proto.EvPreempted:
 		// by is the preempting task's id, as on the task span: not content.
 		add("neumann.preempt.by", d.By)
-		a = append(a, attribute.Int("neumann.preempt.kept", d.Kept), attribute.Int64("neumann.preempt.ran_ms", d.RanMS),
+		a = append(a, attribute.Int("neumann.preempt.kept", d.Kept), attribute.Int("neumann.preempt.kept_think", d.KeptThink), attribute.Int64("neumann.preempt.ran_ms", d.RanMS),
 			attribute.Int("neumann.preempt.n", d.N))
 	case proto.EvPrioritySet:
 		a = append(a, attribute.Int("neumann.priority", d.Priority), attribute.Int("neumann.priority_was", d.Was))

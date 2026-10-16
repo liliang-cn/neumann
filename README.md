@@ -621,7 +621,8 @@ http.Handle("/", observe.NewHandler(m, observe.HandlerOptions{Metrics: prom, Tok
   committed as the request goes out, so they measure the provider's latency;
   a `first_byte` event marks the first streamed chunk. A preempted call ends
   with outcome `preempted` (not an error) and links to the task that took
-  the backend; its continuation carries `neumann.prefill`.
+  the backend; its continuation carries `neumann.prefill`
+  (`neumann.prefill_think` when it continues a kept thought).
 - **Activity log**: one `key=value` line per notable event through
   `log/slog` (no prompts or arguments).
 - **HTTP** (`observe.NewHandler`, read-only): `/status`, `/queue`,

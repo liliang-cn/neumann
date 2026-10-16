@@ -15,14 +15,14 @@ import (
 //
 //   - info: lifecycle — accepted, done, cancelled, compacted, migrated,
 //     recovered, resolved, approved, tool_rewritten, answer_rejected,
-//     preempted (by, kept, ran_ms, n), priority_set (priority, was),
+//     preempted (by, kept, kept_think, ran_ms, n), priority_set (priority, was),
 //     steer_delivered (from), group_up, core_up, core_down, and kinds this
 //     package does not know;
 //   - warn: model_retry, throttled, group_down, migrate_refused,
 //     steer_dropped, tool_late, tool_denied, and approval_needed (an
 //     operator must answer it: Machine.Approve);
 //   - error: failed, reconcile_needed;
-//   - debug: step (with first_ms and prefill when the core measured them),
+//   - debug: step (with first_ms, prefill and prefill_think when the core measured them),
 //     usage, tool_call, tool_result, answer.
 //
 // Lines carry no task content: no prompts, answers, tool arguments or
@@ -79,6 +79,9 @@ func (g *Log) Observe(ev proto.Event) {
 		if d.Prefill > 0 {
 			a = append(a, slog.Int("prefill", d.Prefill))
 		}
+		if d.PrefillThink > 0 {
+			a = append(a, slog.Int("prefill_think", d.PrefillThink))
+		}
 	case proto.EvUsage:
 		a = append(a, slog.Int("prompt_tokens", d.PromptTokens), slog.Int("completion_tokens", d.CompletionTokens),
 			slog.Int("reasoning_tokens", d.ReasoningTokens), slog.Int("cached_tokens", d.CachedTokens))
@@ -120,7 +123,7 @@ func (g *Log) Observe(ev proto.Event) {
 		str("from", d.From) // the steer's sender, a name; never its text
 	case proto.EvPreempted:
 		str("by", d.By) // the preempting task
-		a = append(a, slog.Int("kept", d.Kept), slog.Int64("ran_ms", d.RanMS), slog.Int("n", d.N))
+		a = append(a, slog.Int("kept", d.Kept), slog.Int("kept_think", d.KeptThink), slog.Int64("ran_ms", d.RanMS), slog.Int("n", d.N))
 	case proto.EvPrioritySet:
 		a = append(a, slog.Int("priority", d.Priority), slog.Int("was", d.Was))
 	case proto.EvCoreUp, proto.EvCoreDown:
