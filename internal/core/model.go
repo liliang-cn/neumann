@@ -102,23 +102,33 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 	a := e.adapter(g)
 	caps := capsOf(a)
 	// A task cut off mid-answer (design §6.4) carries the text it had in
-	// Partial. With steers to deliver, that text becomes the turn the steers
-	// interrupt, a whole assistant message ahead of them; otherwise a model
-	// that can continue a prefill is asked to, and one that cannot starts
-	// the answer afresh.
-	partial := t.Partial
+	// Partial, or, cut off while still thinking, its thinking in
+	// PartialThink. With steers to deliver, the text becomes the turn the
+	// steers interrupt, a whole assistant message ahead of them, and
+	// thinking about the question before them is dropped; otherwise a model
+	// that can continue the prefix is asked to, and one that cannot starts
+	// afresh.
+	partial, think := t.Partial, t.PartialThink
 	steers := steerMessages(pending, e.frameSteer)
-	var prefill string
-	extra := steers // what the request carries after the registers
+	var prefill *task.Message // what the request ends with for the model to continue
+	extra := steers           // what the request carries after the registers
 	switch {
-	case partial == "":
+	case partial == "" && think == "":
 	case len(steers) > 0:
-		extra = append([]task.Message{task.Text(task.RoleAssistant, partial)}, steers...)
-	case caps.Prefill:
-		prefill = partial
-		extra = []task.Message{task.Text(task.RoleAssistant, partial)}
+		t.PartialThink, think = "", ""
+		if partial != "" {
+			extra = append([]task.Message{task.Text(task.RoleAssistant, partial)}, steers...)
+		}
+	case partial != "" && caps.Prefill:
+		m := task.Text(task.RoleAssistant, partial)
+		prefill = &m
+	case partial == "" && caps.ThinkPrefill:
+		prefill = &task.Message{Role: task.RoleAssistant, Parts: []task.Part{{Kind: task.PartReasoning, Text: think}}}
 	default:
-		t.Partial, partial = "", ""
+		t.Partial, t.PartialThink, partial, think = "", "", "", ""
+	}
+	if prefill != nil {
+		extra = []task.Message{*prefill}
 	}
 	switch d := e.windowFor(t, g, a, false, extra); {
 	case d.overflow != "":
@@ -131,10 +141,10 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 
 	base := len(t.Regs)
 	withPrefill := func(msgs []task.Message) []task.Message {
-		if prefill == "" {
+		if prefill == nil {
 			return msgs
 		}
-		return append(msgs[:len(msgs):len(msgs)], task.Text(task.RoleAssistant, prefill))
+		return append(msgs[:len(msgs):len(msgs)], *prefill)
 	}
 	req := model.Request{System: t.System, Tools: t.Tools, Messages: withPrefill(forProvider(t.Regs, a.Provider())), MaxOut: e.sendOut(g, t), NoThink: t.NoThink}
 	resp, c, thought, out := e.modelCall(ctx, t, core, g, a, task.StepModel, req, func(c *mem.CommitSet) model.Request {
@@ -148,8 +158,14 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 		}
 		c.Applied = applySteers(t, pending, e.frameSteer)
 		req.Messages = withPrefill(forProvider(t.Regs, a.Provider()))
-		if prefill != "" {
-			amendStep(c, func(d *stepData) { d.Prefill = runes(prefill) })
+		if prefill != nil {
+			amendStep(c, func(d *stepData) {
+				if partial != "" {
+					d.Prefill = runes(partial)
+				} else {
+					d.PrefillThink = runes(think)
+				}
+			})
 		}
 		return req
 	})
@@ -157,33 +173,38 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 		return out.c, out.batch, out.err
 	}
 	t.Retries = 0
-	// Answered: the step's preemptions are over, and a continued answer is
-	// joined onto the text it continues, so it is never one with nothing in
-	// it (a cut-off continuation is a cut-off answer with content).
+	// Answered: the step's preemptions are over.
 	t.Preempts = 0
-	if prefill != "" {
-		resp.Message = continued(prefill, resp.Message)
-	}
 	if truncated(resp) {
-		// Nothing came back to keep: the redo sends the same turn, steers
-		// included, with a larger output cap; a Partial they interrupted
-		// goes back with them.
+		// Cut off with nothing in it: judged on what this call produced, not
+		// on the prefix it continued, which is not an answer by itself. The
+		// redo sends the same turn, steers included; a Partial they
+		// interrupted goes back with them, as does a Partial the call was
+		// continuing. Thinking that ran into the cap is not continued: the
+		// redo thinks afresh, or not at all.
 		t.Regs = t.Regs[:base]
 		c.Applied = nil
-		t.Partial = partial
-		if caps.ThinkOff && !t.NoThink && (thought || thinkingOnly(resp.Message, resp.Usage.ReasoningTokens)) {
+		t.Partial, t.PartialThink = partial, ""
+		if caps.ThinkOff && !t.NoThink && (thought || think != "" || thinkingOnly(resp.Message, resp.Usage.ReasoningTokens)) {
 			// It spent its whole cap thinking (design §13): asked again with
 			// thinking off, at the same cap, before any raise.
 			return e.redoWithoutThinking(g, t, c), nil, nil
 		}
 		return e.redoTruncated(g, t, c), nil, nil
 	}
+	// A continued answer is joined onto what it continues: the text before
+	// its text, the thinking before its reasoning.
+	if prefill != nil && partial != "" {
+		resp.Message = continued(partial, resp.Message)
+	} else if prefill != nil {
+		resp.Message = continuedThink(think, resp.Message)
+	}
 	// Answered, and not cut off: a cap raised for a truncated turn is
 	// dropped, and the next call goes back to the task's own, thinking
 	// included.
 	t.Truncations = 0
 	t.NoThink = false
-	t.Partial = ""
+	t.Partial, t.PartialThink = "", ""
 
 	msg := resp.Message
 	msg.Parts = slices.Clone(msg.Parts) // the adapter's slice is not ours to write
@@ -328,8 +349,10 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		return end(failWith(t, c, StopModelError, "reserve: "+err.Error()), nil)
 	}
 	var ticket *group.Ticket
+	probe := false // the half-open breaker's probe: never preempted
 	if g != nil {
-		tk, ok, _ := g.Ctl.Admit()
+		tk, ok, isProbe := g.Ctl.Admit()
+		probe = isProbe
 		if !ok {
 			// Went down while this task waited for room (or another task took
 			// the probe): the room goes back, and the task moves or waits for
@@ -391,10 +414,10 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	// continue (design §6.4). A group that preempts streams every model call
 	// its adapter can, whether or not anyone watches the deltas.
 	var (
-		emit    func(model.Delta)
-		got     strings.Builder
-		first   time.Time
-		thought bool
+		emit     func(model.Delta)
+		got      strings.Builder // text
+		gotThink strings.Builder // reasoning
+		first    time.Time
 	)
 	force := g != nil && g.Preempt
 	if pc == task.StepModel {
@@ -405,7 +428,7 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 				first = e.Clock.Now()
 			}
 			got.WriteString(d.Text)
-			thought = thought || d.Reasoning != ""
+			gotThink.WriteString(d.Reasoning)
 			if e.Delta != nil {
 				e.Delta(proto.Delta{TaskID: t.ID, Step: stepNo, Text: d.Text, Reasoning: d.Reasoning})
 			}
@@ -413,7 +436,7 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	}
 	callCtx, fl := tctx, (*flight)(nil)
 	if pc == task.StepModel {
-		callCtx, fl = e.fly(tctx, g, t, core)
+		callCtx, fl = e.fly(tctx, g, t, core, probe)
 	}
 	sent := e.Clock.Now()
 	resp, err := e.callModel(callCtx, a, req, emit, force)
@@ -424,13 +447,14 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	if !first.IsZero() {
 		amendStep(&c, func(d *stepData) { ms := max(first.Sub(sent).Milliseconds(), 0); d.FirstMS = &ms })
 	}
-	// Text kept from a call that was not answered continues the task's
-	// Partial only when the call did: one that carried steers was a new
-	// turn, and goes back with them.
-	keep := got.String()
+	// What a call that was not answered produced is kept (keepPartial) only
+	// when the call carried no steers: one that did was a new turn
+	// answering them, and goes back with them.
+	keep, keepThink := got.String(), gotThink.String()
 	if len(c.Applied) > 0 || t.Partial != partial0 {
-		keep = ""
+		keep, keepThink = "", ""
 	}
+	thought := gotThink.Len() > 0
 	class := model.Unknown
 	var p *panicError
 	panicked := errors.As(err, &p)
@@ -513,12 +537,12 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		c.Applied = nil
 		t.Partial = partial0
 		if preempted && !panicked {
-			return end(e.preempted(t, c, by, ran, keep, capsOf(a).Prefill), nil)
+			return end(e.preempted(t, c, by, ran, keep, keepThink, capsOf(a)), nil)
 		}
-		if lost && !panicked && capsOf(a).Prefill {
+		if lost && !panicked && pc == task.StepModel {
 			// The stream broke off: what came is continued by the retry
 			// (design §6.4), committed with the backoff.
-			t.Partial += keep
+			keepPartial(t, keep, keepThink, capsOf(a))
 		}
 		if class == model.ContextLength && !panicked {
 			return end(e.contextRejected(t, c, g, a, req, err), nil)

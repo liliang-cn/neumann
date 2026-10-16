@@ -7,6 +7,7 @@ import (
 
 	"github.com/liliang-cn/neumann/internal/group"
 	"github.com/liliang-cn/neumann/proto"
+	"github.com/liliang-cn/neumann/task"
 )
 
 // cores is the bookkeeping of elastic vCores (design §6.1): the context they
@@ -88,9 +89,20 @@ func (e *Env) runCore(g *Group, id int, up group.Reason) {
 	defer e.cores.wg.Done()
 	sc := g.Ctl.Scaler
 	e.coreEvent(proto.EvCoreUp, g, id, up)
+	freedFor := "" // the task a preemption freed this vCore for
 	for {
 		since := e.Clock.Now()
-		t, ok, idle := e.Sched.NextIdle(e.cores.ctx, g.Class, sc.IdleRetire())
+		var (
+			t        *task.TCB
+			ok, idle bool
+		)
+		if freedFor != "" && e.cores.ctx.Err() == nil {
+			t, ok = e.Sched.TakeReady(g.Class, freedFor)
+		}
+		if !ok {
+			t, ok, idle = e.Sched.NextIdle(e.cores.ctx, g.Class, sc.IdleRetire())
+		}
+		freedFor = ""
 		if !ok {
 			if !idle {
 				e.coreEvent(proto.EvCoreDown, g, id, sc.Stop())
@@ -110,9 +122,14 @@ func (e *Env) runCore(g *Group, id int, up group.Reason) {
 		e.preemptCheck(g)
 		e.step(e.halt(), t, id)
 		retire, reason := sc.Release()
-		e.instructionOver(g, id)
+		freedFor = e.instructionOver(g, id)
 		if retire {
 			e.coreEvent(proto.EvCoreDown, g, id, reason)
+			if freedFor != "" {
+				// Retired instead of taking the task it was freed for: that
+				// task may need another call cut off.
+				e.preemptCheck(g)
+			}
 			return
 		}
 	}

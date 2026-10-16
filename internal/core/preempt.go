@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/liliang-cn/neumann/mem"
+	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
 )
@@ -36,13 +37,14 @@ type flight struct {
 }
 
 // preemption is a group's registry of model calls in flight (StepModel
-// only: a compaction is never preempted), the vCores whose call was chosen
-// as a victim and that have not finished their instruction yet, and the
-// timer that checks again once a call has run its quantum.
+// only: a compaction is never preempted, and neither is the half-open
+// breaker's probe), the vCores whose call was chosen as a victim and that
+// have not finished their instruction yet, with the task each was freed
+// for, and the timer that checks again once a call has run its quantum.
 type preemption struct {
 	mu       sync.Mutex
 	flights  map[string]*flight
-	yielding map[int]bool
+	yielding map[int]string // vCore → the task it is freed for
 	stop     func() bool
 	due      time.Time
 }
@@ -63,11 +65,18 @@ func (g *Group) maxPreempts() int {
 
 // fly registers t's model call in its group, when the group preempts, and
 // returns the context the call runs under: ctx (the task's), plus the cut a
-// preemption makes. land must follow the call.
-func (e *Env) fly(ctx context.Context, g *Group, t *task.TCB, core int) (context.Context, *flight) {
-	if g == nil || !g.Preempt {
+// preemption makes. land must follow the call. The half-open breaker's
+// probe is not registered: cut off, it would never be reported, and the
+// group would stay down until the breaker gave the lost probe up.
+//
+// It ends with a preemption check: a more urgent task may have become ready
+// while this call was on its way (taken ahead of it by aging, or waiting for
+// room in a limiter), and no other check would see this call then.
+func (e *Env) fly(ctx context.Context, g *Group, t *task.TCB, core int, probe bool) (context.Context, *flight) {
+	if g == nil || !g.Preempt || probe {
 		return ctx, nil
 	}
+	defer e.preemptCheck(g)
 	cctx, cancel := context.WithCancelCause(ctx)
 	f := &flight{id: t.ID, priority: t.Priority, preempts: t.Preempts, core: core, start: e.Clock.Now(), cancel: cancel}
 	g.pre.mu.Lock()
@@ -164,9 +173,9 @@ func (e *Env) preemptCheck(g *Group) {
 	case victim != nil:
 		victim.by = by
 		if g.pre.yielding == nil {
-			g.pre.yielding = map[int]bool{}
+			g.pre.yielding = map[int]string{}
 		}
-		g.pre.yielding[victim.core] = true
+		g.pre.yielding[victim.core] = by
 	case !next.IsZero() && (g.pre.stop == nil || next.Before(g.pre.due)):
 		if g.pre.stop != nil {
 			g.pre.stop()
@@ -191,42 +200,90 @@ func (e *Env) quantumOver(g *Group) {
 
 // instructionOver is called by a vCore of g after each instruction, once it
 // has released it: a vCore whose call was chosen as a victim no longer
-// counts as about to be free, and the check runs again.
-func (e *Env) instructionOver(g *Group, core int) {
+// counts as about to be free. It returns the task that vCore was freed for,
+// which its next fetch takes if it is still ready (TakeReady): aging must
+// not hand the vCore to another task, or the call was cut off for nothing.
+func (e *Env) instructionOver(g *Group, core int) (freedFor string) {
 	if g == nil || !g.Preempt {
-		return
+		return ""
 	}
 	g.pre.mu.Lock()
-	was := g.pre.yielding[core]
+	freedFor = g.pre.yielding[core]
 	delete(g.pre.yielding, core)
 	g.pre.mu.Unlock()
-	if was {
-		e.preemptCheck(g)
-	}
+	return freedFor
 }
 
 // preempted is the commit of a model call cut off for task by (design §6.4):
 // the task is Ready again at the same instruction, queued from now (its
 // ReadySince is not kept: an old background task would otherwise be aged
-// straight back in front of by), with one more preemption in this step. The
-// text the call had produced, kept, is appended to Partial for the next call
-// to continue; nothing is kept when the adapter cannot continue (prefill
-// false), and Partial is then cleared. The preempted event says how much was
-// kept, in characters, and how long the call ran. The call was not
-// answered: no usage, no step counted, no retry, nothing unconfirmed.
-func (e *Env) preempted(t *task.TCB, c mem.CommitSet, by string, ran time.Duration, kept string, prefill bool) mem.CommitSet {
-	if prefill {
-		t.Partial += kept
-	} else {
-		t.Partial, kept = "", ""
-	}
+// straight back in front of by), with one more preemption in this step.
+// What the call had produced is kept for the next call to continue
+// (keepPartial). The preempted event says how much was kept, in
+// characters, and how long the call ran. The call was not answered: no
+// usage, no step counted, no retry, nothing unconfirmed.
+func (e *Env) preempted(t *task.TCB, c mem.CommitSet, by string, ran time.Duration, text, think string, caps model.Caps) mem.CommitSet {
+	kept, keptThink := keepPartial(t, text, think, caps)
 	t.Preempts++
 	e.ready(t, task.StepModel)
 	c.Task = t
 	c.Events = append(c.Events, proto.NewEvent(proto.EvPreempted, t.ID, map[string]any{
-		"by": by, "kept": runes(kept), "ran_ms": max(ran.Milliseconds(), 0), "n": t.Preempts,
+		"by": by, "kept": runes(kept), "kept_think": runes(keptThink), "ran_ms": max(ran.Milliseconds(), 0), "n": t.Preempts,
 	}))
 	return c
+}
+
+// keepPartial keeps what a call that was not answered (preempted, or its
+// stream broken off) had produced, for the next call to continue (design
+// §6.4), and returns what it kept: text, or thinking.
+//
+//   - Text continues text: the call continued a Partial, or its answer had
+//     begun. The adapter must be able to continue a prefill (caps.Prefill);
+//     otherwise nothing new is kept, and a Partial the task already had
+//     stays (a turn its pending steers interrupt is delivered all the same).
+//     Kept text ends the thinking: PartialThink is cleared.
+//   - Thinking: the call had produced no text, only reasoning, and the
+//     adapter can continue a reasoning prefix (caps.ThinkPrefill): it is
+//     appended to PartialThink. Otherwise the thinking is lost, and the next
+//     call thinks afresh.
+//
+// The caller passes nothing for a call that applied steers: that call was a
+// new turn answering them, and goes back with them.
+func keepPartial(t *task.TCB, text, think string, caps model.Caps) (keptText, keptThink string) {
+	switch {
+	case t.Partial != "":
+		if caps.Prefill {
+			t.Partial += text
+			return text, ""
+		}
+	case text != "" && caps.Prefill:
+		t.Partial, t.PartialThink = text, ""
+		return text, ""
+	case think != "" && caps.ThinkPrefill:
+		t.PartialThink += think
+		return "", think
+	}
+	return "", ""
+}
+
+// continuedThink is msg, the answer to a request that asked the model to
+// continue the reasoning prefix think, with think joined in front of its
+// reasoning: in front of its first reasoning part, or as its first part.
+func continuedThink(think string, msg task.Message) task.Message {
+	parts := make([]task.Part, 0, len(msg.Parts)+1)
+	done := false
+	for _, p := range msg.Parts {
+		if !done && p.Kind == task.PartReasoning {
+			p.Text = think + p.Text
+			done = true
+		}
+		parts = append(parts, p)
+	}
+	if !done {
+		parts = append([]task.Part{{Kind: task.PartReasoning, Text: think}}, parts...)
+	}
+	msg.Parts = parts
+	return msg
 }
 
 // continued is msg, the answer to a request that asked the model to

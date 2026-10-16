@@ -464,6 +464,28 @@ func (s *Sched) Urgent(class string) (id string, priority int, ok bool) {
 	return best.ID, best.Priority, true
 }
 
+// TakeReady takes the task id from class's ready queue, as Next would, if
+// it is there: a vCore freed by a preemption takes the task it was freed
+// for (design §6.4), whatever aging would pick. False once the scheduler is
+// closed.
+func (s *Sched) TakeReady(class, id string) (*task.TCB, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.loc[id] != inReady {
+		return nil, false
+	}
+	q := s.ready[class]
+	i := slices.IndexFunc(q, func(t *task.TCB) bool { return t.ID == id })
+	if i < 0 {
+		return nil, false
+	}
+	t := q[i]
+	s.ready[class] = slices.Delete(q, i, i+1)
+	delete(s.loc, id)
+	s.out[id] = true
+	return t, true
+}
+
 // effective is the priority used for ordering: a background task that has
 // been ready for longer than the aging threshold competes as interactive.
 // Priorities are any number from 0 (interactive) up, smaller first; aging

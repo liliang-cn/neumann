@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/liliang-cn/neumann"
+	"github.com/liliang-cn/neumann/limit"
 	"github.com/liliang-cn/neumann/mem"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
@@ -70,6 +71,13 @@ func (l *local) Stream(ctx context.Context, req model.Request, emit func(model.D
 		l.onCut(name)
 	}
 	return resp, err
+}
+
+// callsOf is how many calls name has made.
+func callsOf(l *local, name string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls[name]
 }
 
 // cut reports whether name's latest call has been cut off, and why.
@@ -396,6 +404,11 @@ func TestAgedTaskDoesNotPreempt(t *testing.T) {
 	}
 	if p := one(t, waitPreempted(t, m, "B1", 1), proto.EvPreempted); p["by"] != "A" {
 		t.Fatalf("preempted %v", p)
+	}
+	// The vCore freed for A goes to A, though aged B2 has waited longer.
+	onAir(t, lm, "A", 1)
+	if n := callsOf(lm, "B2"); n != 0 {
+		t.Fatalf("B2 made %d calls before A", n)
 	}
 	drive(t, m, clk, time.Minute, "A", "B1", "B2")
 	for _, id := range []string{"A", "B1", "B2"} {
@@ -828,5 +841,244 @@ func TestParallelCapsTheWindow(t *testing.T) {
 	}
 	if _, err := neumann.New(neumann.Config{Groups: []neumann.GroupConfig{{Class: "x", Model: two, PreemptAfter: -time.Second}}}); err == nil {
 		t.Fatal("a negative PreemptAfter was accepted")
+	}
+}
+
+// A call taken ahead of a more urgent ready task (by aging) is checked once
+// it is in flight, and cut off after its quantum: no other check would see
+// it (design §6.4).
+func TestPreemptACallTakenAheadByAging(t *testing.T) {
+	clk := sim.NewClock(clock0)
+	lm := newLocal(clk, prefillCaps, nil)
+	m := preemptMachine(t, neumann.Config{AgingAfter: 30 * time.Second}, lm, clk)
+	submitAs(t, m, "X", 0)
+	onAir(t, lm, "X", 1)
+	submitAs(t, m, "V", 1)
+	clk.Advance(40 * time.Second) // V ages
+	submitAs(t, m, "H", 0)        // X is as urgent as H: not a victim
+	driveUntil(t, clk, time.Minute, func() bool { return loadTask(t, m, "X").State == task.Done })
+	onAir(t, lm, "V", 1) // the aged V took the vCore ahead of H
+	if tc := loadTask(t, m, "H"); tc.State != task.Ready {
+		t.Fatalf("H %s", tc.State)
+	}
+	clk.Advance(time.Second)
+	if cut, _ := lm.cut(t, "V"); cut {
+		t.Fatal("V was cut off before its quantum")
+	}
+	clk.Advance(time.Second)
+	if cut, _ := lm.cut(t, "V"); !cut {
+		t.Fatal("V ran its quantum with H ready and no vCore free, and was not cut off")
+	}
+	if p := one(t, waitPreempted(t, m, "V", 1), proto.EvPreempted); p["by"] != "H" {
+		t.Fatalf("preempted %v", p)
+	}
+	onAir(t, lm, "H", 1)
+	drive(t, m, clk, time.Minute, "H", "V")
+}
+
+// A call that waited for room in a limiter while the urgent task arrived is
+// checked once it is in flight, and cut off after its quantum.
+func TestPreemptACallThatWaitedForRoom(t *testing.T) {
+	clk := sim.NewClock(clock0)
+	lm := newLocal(clk, prefillCaps, nil)
+	m := preemptMachine(t, neumann.Config{
+		Limits:   []string{"rpm"},
+		Limiters: []limit.Config{{Name: "rpm", Limits: map[string]limit.Rate{"requests": {Per: 10 * time.Minute, Limit: 1}}}},
+	}, lm, clk)
+	submitAs(t, m, "X", 0)
+	onAir(t, lm, "X", 1)
+	submitAs(t, m, "V", 1)
+	driveUntil(t, clk, time.Minute, func() bool { return loadTask(t, m, "X").State == task.Done })
+	waitFor(t, func() bool { st := m.Status(); return st.Held == 1 && st.Ready == 0 }) // V waits for room on the vCore
+	submitAs(t, m, "H", 0)
+	if callsOf(lm, "V") != 0 {
+		t.Fatal("V was sent without room")
+	}
+	if p := one(t, func() []map[string]any {
+		var got []map[string]any
+		driveUntil(t, clk, time.Second, func() bool { got = preemptions(t, m, "V"); return len(got) > 0 })
+		return got
+	}(), proto.EvPreempted); p["by"] != "H" || p["ran_ms"] != float64(2000) {
+		t.Fatalf("preempted %v", p)
+	}
+	drive(t, m, clk, time.Minute, "H", "V")
+}
+
+// The vCore a preemption frees goes to the task it was freed for, not to an
+// aged background task that would win the queue (design §6.4).
+func TestFreedVCoreGoesToTheUrgentTask(t *testing.T) {
+	clk := sim.NewClock(clock0)
+	lm := newLocal(clk, prefillCaps, nil)
+	m := preemptMachine(t, neumann.Config{AgingAfter: 30 * time.Second}, lm, clk)
+	submitAs(t, m, "V", 1)
+	onAir(t, lm, "V", 1)
+	submitAs(t, m, "Y", 2)
+	clk.Advance(40 * time.Second) // Y ages; V is past its quantum
+	submitAs(t, m, "H", 0)
+	waitPreempted(t, m, "V", 1)
+	onAir(t, lm, "H", 1)
+	if n := callsOf(lm, "Y"); n != 0 {
+		t.Fatalf("aged Y made %d calls on the vCore freed for H", n)
+	}
+	drive(t, m, clk, time.Minute, "H", "V", "Y")
+	// V was cut off once, for H. (Y, once it runs, is less urgent than V
+	// and may be cut off for it in turn.)
+	if p := one(t, preemptions(t, m, "V"), proto.EvPreempted); p["by"] != "H" {
+		t.Fatalf("V preempted %v", p)
+	}
+	for _, p := range preemptions(t, m, "Y") {
+		if p["by"] != "V" {
+			t.Fatalf("Y preempted %v", p)
+		}
+	}
+}
+
+// The half-open breaker's probe is never preempted: cut off, it would never
+// be reported, and the group would stay down until the breaker gave it up.
+// The urgent task runs once the probe has brought the group back.
+func TestProbeIsNeverPreempted(t *testing.T) {
+	clk := sim.NewClock(clock0)
+	var vCalls atomic.Int32
+	lm := newLocal(clk, prefillCaps, func(req model.Request) (model.Response, error) {
+		if sim.FirstUser(req) == "V" && vCalls.Add(1) == 1 {
+			return model.Response{}, sim.Transient()
+		}
+		return storyFn(req)
+	})
+	m, err := neumann.New(neumann.Config{
+		Clock: clk, Logf: t.Logf, SteerFormat: func(s string) string { return s },
+		BackoffJitter: func(d time.Duration) time.Duration { return d },
+		Groups: []neumann.GroupConfig{{Class: "default", Model: lm, Initial: 1, Max: 1, Preempt: true,
+			BreakerThreshold: 1, BreakerOpenFor: 30 * time.Second}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	defer stop(t, m)
+	submitAs(t, m, "V", 1)
+	waitFor(t, func() bool { return vCalls.Load() == 1 })
+	driveUntil(t, clk, time.Second, func() bool { return callsOf(lm, "V") == 2 }) // the probe
+	onAir(t, lm, "V", 2)
+	if st := m.Status().Groups[0]; st.Breaker != "half_open" {
+		t.Fatalf("breaker %s", st.Breaker)
+	}
+	submitAs(t, m, "H", 0)
+	clk.Advance(10 * time.Second)
+	if cut, _ := lm.cut(t, "V"); cut {
+		t.Fatal("the probe was cut off")
+	}
+	drive(t, m, clk, time.Minute, "H", "V")
+	if n := len(preemptions(t, m, "V")); n != 0 {
+		t.Fatalf("the probe was preempted %d times", n)
+	}
+	if st := m.Status().Groups[0]; st.Breaker != "closed" {
+		t.Fatalf("breaker %s after the probe answered", st.Breaker)
+	}
+}
+
+// A continued call that comes back cut off with nothing new in it, only
+// thinking, is a truncation with nothing: the prefix it continued is not an
+// answer by itself (design §6.4, §13). It is asked again with thinking off,
+// still continuing the kept text, and the task ends with the whole answer.
+func TestThinkingOnlyContinuationIsRedone(t *testing.T) {
+	caps := model.Caps{Tools: true, Prefill: true, ThinkOff: true}
+	var calls atomic.Int32
+	sm := &sim.Model{Info: &caps, Fn: func(req model.Request) (model.Response, error) {
+		switch calls.Add(1) {
+		case 1:
+			return sim.Reply("Once upon a"), sim.Lost()
+		case 2:
+			return sim.Truncated(), nil // only thinking, cut off at the cap
+		}
+		return sim.Continue(req, "Once upon a time it ended."), nil
+	}}
+	clk := sim.NewClock(clock0)
+	m, err := neumann.New(neumann.Config{Model: sm, Clock: clk, Logf: t.Logf, BackoffJitter: func(d time.Duration) time.Duration { return d }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	defer stop(t, m)
+	id := submit(t, m, proto.Instruction{Input: "tell"})
+	waitFor(t, func() bool { return loadTask(t, m, id).Partial != "" })
+	clk.Advance(time.Second)
+	got := waitDone(t, m, id)
+	if got.LastAnswer() != "Once upon a time it ended." || got.Partial != "" || got.NoThink {
+		t.Fatalf("ended %s with %q: %+v", got.State, got.LastAnswer(), got)
+	}
+	reqs := sm.Requests()
+	if len(reqs) != 3 || reqs[1].NoThink || !reqs[2].NoThink || sim.Prefill(reqs[1]) != "Once upon a" || sim.Prefill(reqs[2]) != "Once upon a" {
+		t.Fatalf("%d requests", len(reqs))
+	}
+}
+
+// A call cut off while the model is still thinking keeps the thinking, when
+// the adapter can continue a reasoning prefix (Caps.ThinkPrefill): the next
+// call ends with an assistant message holding only that reasoning, the model
+// goes on thinking from it, and the answer's reasoning is the two joined
+// (design §6.4). Once the answer's text has begun, only the text is kept,
+// as for any preemption.
+func TestPreemptedThinkingIsContinued(t *testing.T) {
+	for _, c := range []struct {
+		name, thinking string
+		textKept       bool
+	}{
+		{"while thinking", "Let me think about the machine and its queue, slowly and carefully, before I answer.", false},
+		{"after the text began", "Hm.", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			clk := sim.NewClock(clock0)
+			lm := newLocal(clk, model.Caps{Tools: true, Prefill: true, ThinkPrefill: true}, func(req model.Request) (model.Response, error) {
+				return sim.ContinueThink(req, c.thinking, story(sim.FirstUser(req))), nil
+			})
+			m := preemptMachine(t, neumann.Config{}, lm, clk)
+			submitAs(t, m, "B", 1)
+			onAir(t, lm, "B", 1)
+			submitAs(t, m, "A", 0)
+			clk.Advance(2 * time.Second)
+			p := one(t, waitPreempted(t, m, "B", 1), proto.EvPreempted)
+			all := []rune(c.thinking + story("B"))
+			first := string(all[:len(all)/4])
+			tc := loadTask(t, m, "B")
+			if c.textKept {
+				text := strings.TrimPrefix(first, c.thinking)
+				if p["kept"] != float64(len([]rune(text))) || p["kept_think"] != float64(0) || tc.Partial != text || tc.PartialThink != "" {
+					t.Fatalf("preempted %v; B %q / %q", p, tc.Partial, tc.PartialThink)
+				}
+			} else if p["kept"] != float64(0) || p["kept_think"] != float64(len([]rune(first))) || tc.Partial != "" || tc.PartialThink != first {
+				t.Fatalf("preempted %v; B %q / %q", p, tc.Partial, tc.PartialThink)
+			}
+			drive(t, m, clk, time.Minute, "A", "B")
+
+			b := loadTask(t, m, "B")
+			if b.LastAnswer() != story("B") || b.Partial != "" || b.PartialThink != "" {
+				t.Fatalf("B ended %q: %+v", b.LastAnswer(), b)
+			}
+			var last model.Request
+			for _, r := range lm.Requests() {
+				if sim.FirstUser(r) == "B" {
+					last = r
+				}
+			}
+			steps := eventData(t, m, "B", proto.EvStep)
+			if c.textKept {
+				if sim.PrefillThink(last) != "" || sim.Prefill(last) == "" || steps[1]["prefill"] == nil {
+					t.Fatalf("the continuation ends %+v; steps %v", last.Messages[len(last.Messages)-1], steps)
+				}
+				return
+			}
+			if sim.PrefillThink(last) != first || steps[1]["prefill_think"] != float64(len([]rune(first))) {
+				t.Fatalf("the continuation went on thinking from %q; steps %v", sim.PrefillThink(last), steps)
+			}
+			msg := b.Regs[len(b.Regs)-1]
+			if msg.Parts[0].Kind != task.PartReasoning || msg.Parts[0].Text != c.thinking {
+				t.Fatalf("the answer's reasoning %+v", msg.Parts)
+			}
+		})
 	}
 }

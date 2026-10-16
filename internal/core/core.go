@@ -166,6 +166,9 @@ type stepData struct {
 	// Prefill is how many characters of the task's Partial the call asked
 	// the model to continue (design §6.4); omitted when it continued none.
 	Prefill int `json:"prefill,omitempty"`
+	// PrefillThink is how many characters of the task's PartialThink the
+	// call asked the model to go on thinking from; omitted when none.
+	PrefillThink int `json:"prefill_think,omitempty"`
 	// FirstMS is how long, in milliseconds on the machine's clock, the
 	// streamed call took from being sent to its first piece: queueing in the
 	// backend, told apart from generating. Omitted when no piece came.
@@ -217,7 +220,7 @@ func (e *Env) RunVCore(ctx context.Context, class string, core int) {
 			return
 		}
 		e.step(e.halt(), t, core)
-		e.instructionOver(e.groupOf(class), core)
+		e.instructionOver(e.groupOf(class), core) // a fixed vCore takes no reserved task
 	}
 }
 
