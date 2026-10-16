@@ -30,7 +30,35 @@ type Adapter struct {
 	ContextWindow int
 	NoTools       bool
 	MaxTools      int
-	HTTP          *http.Client
+	// Local backends (design §6.4). Parallel is how many requests the
+	// backend serves at once, 0 unknown; Ollama serves one. Prefill says a
+	// request ending with an assistant message is continued and only the
+	// continuation comes back. ThinkOff is the reasoning_effort value that
+	// turns thinking off ("none" on Ollama), sent when a request asks for
+	// NoThink; empty means the model cannot turn it off and NoThink is
+	// ignored. All three are reported through Caps as they are.
+	Parallel int
+	Prefill  bool
+	ThinkOff string
+	// Per-request timeouts (design §11). Timeout bounds the whole call,
+	// from sending the request to the end of the response body; New sets
+	// DefaultTimeout, 0 is no limit. FirstByteTimeout bounds sending to the
+	// first byte of the response body; 0 leaves it to Timeout. A
+	// non-streaming response body arrives only when the answer is complete,
+	// so for Call it bounds the whole generation. IdleTimeout bounds the gap
+	// between two reads of the body that yield data once the first byte has
+	// arrived (the gap between stream chunks); 0 is no limit. A local
+	// backend takes long to read a long prompt and then sends steadily, so
+	// it wants no Timeout, a generous FirstByteTimeout and a short
+	// IdleTimeout. While the caller's context is alive, any of them running
+	// out is a Transient *model.Error wrapping a *TimeoutError, and also
+	// model.ErrResponseLost once the response had started.
+	Timeout          time.Duration
+	FirstByteTimeout time.Duration
+	IdleTimeout      time.Duration
+	// HTTP sends the requests. Its own Timeout, if set, applies on top of
+	// the ones above.
+	HTTP *http.Client
 	// Now is the clock rate-limit resets are read against; nil: time.Now.
 	Now func() time.Time
 }
@@ -39,13 +67,14 @@ var _ model.Adapter = (*Adapter)(nil)
 
 // New returns an adapter for modelName at baseURL (up to and including the
 // version, e.g. https://api.openai.com/v1), sending apiKey as a bearer token,
-// over HTTP/2.
+// over HTTP/2, with a Timeout of DefaultTimeout.
 func New(baseURL, apiKey, modelName string) *Adapter {
 	return &Adapter{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
 		Model:   modelName,
-		HTTP:    &http.Client{Transport: NewTransport(HTTP2), Timeout: 5 * time.Minute},
+		Timeout: DefaultTimeout,
+		HTTP:    &http.Client{Transport: NewTransport(HTTP2)},
 	}
 }
 
@@ -60,8 +89,8 @@ func (a *Adapter) MaxOut() int { return max(a.MaxTokens, 0) }
 // DefaultMaxTools is the most tools one chat-completions request may carry.
 const DefaultMaxTools = 128
 
-// Caps reports ContextWindow, the output cap, NoTools and MaxTools
-// (model.CapsReporter).
+// Caps reports ContextWindow, the output cap, NoTools, MaxTools, Parallel,
+// Prefill, and whether ThinkOff is set (model.CapsReporter).
 func (a *Adapter) Caps() model.Caps {
 	n := a.MaxTools
 	switch {
@@ -70,7 +99,10 @@ func (a *Adapter) Caps() model.Caps {
 	case n < 0:
 		n = 0
 	}
-	return model.Caps{Window: max(a.ContextWindow, 0), MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: n}
+	return model.Caps{
+		Window: max(a.ContextWindow, 0), MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: n,
+		Parallel: max(a.Parallel, 0), Prefill: a.Prefill, ThinkOff: a.ThinkOff != "",
+	}
 }
 
 // maxTokens is the request's own cap when it has one, else MaxTokens; 0 sends
@@ -152,7 +184,8 @@ func (a *Adapter) Call(ctx context.Context, req model.Request) (model.Response, 
 }
 
 // post sends a chat-completions request and returns the response once its
-// status is known to be 2xx. Every failure is a classified *model.Error.
+// status is known to be 2xx. Every failure is a classified *model.Error. The
+// returned body is under the adapter's timeouts until it is closed.
 func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*http.Response, error) {
 	msgs, err := a.messages(req)
 	if err != nil {
@@ -165,6 +198,9 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 	if n := a.maxTokens(req); n > 0 {
 		body["max_tokens"] = n
 	}
+	if req.NoThink && a.ThinkOff != "" {
+		body["reasoning_effort"] = a.ThinkOff
+	}
 	if stream {
 		body["stream"] = true
 		body["stream_options"] = map[string]bool{"include_usage": true}
@@ -173,8 +209,10 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 	if err != nil {
 		return nil, fmt.Errorf("openai: encode request: %w", err)
 	}
-	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.BaseURL+"/chat/completions", bytes.NewReader(raw))
+	w := a.watch(ctx)
+	hreq, err := http.NewRequestWithContext(w.ctx, http.MethodPost, a.BaseURL+"/chat/completions", bytes.NewReader(raw))
 	if err != nil {
+		w.stop()
 		return nil, fmt.Errorf("openai: %w", err)
 	}
 	hreq.Header.Set("Content-Type", "application/json")
@@ -186,8 +224,11 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 	}
 	resp, err := a.HTTP.Do(hreq)
 	if err != nil {
+		err = w.cause(err)
+		w.stop()
 		return nil, a.ioError(ctx, "send request", err, false, nil)
 	}
+	resp.Body = &watchedBody{ReadCloser: resp.Body, w: w}
 	if resp.StatusCode/100 != 2 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
@@ -245,6 +286,8 @@ func (a *Adapter) response(text string, calls []json.RawMessage, finish string, 
 // call this same provider produced is replayed byte-for-byte from Opaque,
 // because gateways put fields there (Gemini's thought signatures, for one)
 // that must come back; any other call is rendered under the machine's id.
+// A request that ends with an assistant text message ends with it as is: a
+// backend with Prefill continues it.
 func (a *Adapter) messages(req model.Request) ([]wireMsg, error) {
 	var out []wireMsg
 	if req.System != "" {

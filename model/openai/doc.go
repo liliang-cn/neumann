@@ -16,4 +16,21 @@
 // unknown by default), classifies the provider's errors and reads its
 // rate-limit headers. It speaks HTTP/2 by default; [Adapter.WithProtocol]
 // selects HTTP/3 with a fallback to HTTP/2.
+//
+// # Local backends
+//
+// Ollama, llama.cpp and LM Studio serve few requests at once and can be slow
+// to start answering a long prompt. Tell the machine what the backend can do
+// and give the timeouts room:
+//
+//	a := openai.New("http://127.0.0.1:11434/v1", "ollama", "qwen3.5:9b-mlx")
+//	a.Parallel = 1         // Ollama's MLX runner serves one request at a time
+//	a.Prefill = true       // a trailing assistant message is continued
+//	a.ThinkOff = "none"    // reasoning_effort that turns thinking off
+//	a.MaxTokens = 8192     // a model looping in its thinking stops here
+//	a.Timeout = 0          // no limit on the whole call...
+//	a.FirstByteTimeout = 10 * time.Minute // ...but on reading the prompt
+//	a.IdleTimeout = 2 * time.Minute       // and on a stalled stream
+//
+// cmd/neumann's -local flag sets exactly these.
 package openai

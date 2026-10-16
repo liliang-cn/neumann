@@ -77,7 +77,8 @@ func (a *Adapter) streamError(raw json.RawMessage, h http.Header) error {
 // ioError is a failure talking to the provider. If the caller's context is
 // done, that is the reason, and the call is Canceled — including the
 // caller's deadline. Otherwise it is Transient: a network error, or a
-// per-request timeout (http.Client.Timeout) while the caller still has time.
+// per-request timeout (Timeout, FirstByteTimeout, IdleTimeout, or the
+// client's own) while the caller still has time.
 // lost says the request had reached the provider: its response was under way.
 func (a *Adapter) ioError(ctx context.Context, what string, err error, lost bool, h http.Header) error {
 	if cerr := ctx.Err(); cerr != nil {

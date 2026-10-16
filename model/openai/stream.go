@@ -21,6 +21,7 @@ type streamChunk struct {
 		Delta struct {
 			Content          *string           `json:"content"`
 			ReasoningContent *string           `json:"reasoning_content"`
+			Reasoning        *string           `json:"reasoning"` // Ollama's spelling
 			ToolCalls        []json.RawMessage `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
@@ -126,8 +127,10 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		}
 		for _, c := range ch.Choices {
 			d := c.Delta
-			if d.ReasoningContent != nil && *d.ReasoningContent != "" {
-				emit(model.Delta{Reasoning: *d.ReasoningContent})
+			for _, r := range []*string{d.ReasoningContent, d.Reasoning} {
+				if r != nil && *r != "" {
+					emit(model.Delta{Reasoning: *r})
+				}
 			}
 			if d.Content != nil && *d.Content != "" {
 				text.WriteString(*d.Content)
