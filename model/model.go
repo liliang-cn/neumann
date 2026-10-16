@@ -26,6 +26,10 @@ type Request struct {
 	// (its configured default, or the provider's). The machine raises it when
 	// a turn is cut off before producing anything (design §13).
 	MaxOut int
+	// NoThink asks the adapter to turn the model's thinking off for this
+	// call. An adapter whose Caps.ThinkOff is false ignores it. The machine
+	// sets it after a turn was cut off while still thinking (design §13).
+	NoThink bool
 }
 
 // Response carries the assistant turn in neutral form. Tool calls come back
