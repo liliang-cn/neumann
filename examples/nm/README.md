@@ -16,9 +16,75 @@ go build -o nm ./examples/nm
 |---|---|
 | `-backend cloud` (default) | `CPA_BASE_URL`, `CPA_API_KEY`, `CPA_MODEL`; 8 vCores |
 | `-backend local` | Ollama at `http://127.0.0.1:11434/v1`, `qwen3.5:9b-mlx`, configured like `cmd/neumann -local`: one request at a time and as many vCores (`-parallel N` for a backend that serves more, e.g. a GGUF model with `OLLAMA_NUM_PARALLEL`), preemption, continuation of a cut-off answer or thought, `reasoning_effort: "none"` to turn thinking off, 10 min to the first byte, 2 min between chunks, no total limit, 8192 output tokens |
+| `-backend hybrid` | both, as two execution groups: `fast` is the local backend on `qwen3.5:4b` (configured exactly like `-backend local`, `-parallel` vCores, preemption on) and `strong` is the cloud backend (8 vCores, no preemption); `-route` picks each task's group |
 
 `-model`, `-base-url`, `-parallel` and `-cores` override. The key is read from the
 environment only (`NM_API_KEY` for local, default `ollama`) and never printed.
+
+### Hybrid: a fast local group and a strong cloud group
+
+```
+nm -backend hybrid                                 # REPL; a line goes to fast, /strong <text> to the cloud
+nm -backend hybrid -route decide "How many lines does data/sales.csv have?"
+nm bench -backend hybrid -route static -out hybrid-static-solo.json
+```
+
+| flag | default | |
+|---|---|---|
+| `-fast-model`, `-fast-base-url`, `-fast-cores` | `qwen3.5:4b`, Ollama, `-parallel` | the local group |
+| `-strong-model`, `-strong-base-url`, `-strong-cores` | `$CPA_MODEL`, `$CPA_BASE_URL`, 8 | the cloud group (`CPA_API_KEY`) |
+| `-route` | `static` | `static`, `decide`, `fast` or `strong` |
+| `-router-url`, `-router-model` | Ollama, `tev1:4b` | `-route decide`'s System One engine |
+| `-route-timeout`, `-route-floor` | 3s, 0.2 | a decision that takes longer, or is less sure, sends the task to strong |
+| `-fallback` | `true` | fast's tasks move to strong while fast is down |
+
+Each group's window is pinned at its vCores once the machine starts, as
+the one-group backends pin theirs; `-model`, `-base-url` and `-cores` are
+refused with `-backend hybrid`.
+
+**Routing.** The router runs in nm, before `Submit`: the task's class is
+set on the instruction, and the `accepted` event records it.
+
+- `static`: the bench routes by task kind, from what the 4B model was
+  measured to do (same suite, each model alone): it passed every quick
+  probe and repo question, `fix-bug` (2 of 2) and `code-review` (1 of 1),
+  so those run on `fast`; it failed `log-triage` (wrong root cause),
+  `csv-stats` (never summed the column) and `changelog` (skipped a
+  commit), so those run on `strong`. In the REPL and one-shot mode a
+  request goes to `fast`; `/strong <text>` and `/fast <text>` override.
+- `decide`: `decide.Router` asks `tev1:4b` on Ollama's System One API to
+  choose between `fast` ("short lookups, one or two files, quick
+  questions") and `strong` ("reading large data, counting, multi-step
+  analysis, writing summaries of many items"). An engine that fails,
+  times out, or is less sure than `-route-floor` sends the task to
+  `strong`: a wrong pick toward the cloud costs tokens, one toward the
+  small model costs the answer. The engine is loaded at start (a cold load
+  takes seconds); it is another Ollama model, so it shares the GPU and
+  memory with the fast group's model.
+- `fast`, `strong`: everything to one group (baselines on the same
+  machine).
+
+The REPL and one-shot mode print each task's group and why
+(`→ strong (decide p=0.24, 412ms)`); `/status` shows both groups: model,
+vCores, window, queue, breaker and fallback. Answers say which group
+finished the task.
+
+**Fallback.** `fast` falls back to `strong` (`-fallback=false` turns it
+off); `strong` has none, so a cloud task waits for the cloud to come back
+instead of landing on a model that fails long analyses. While fast's
+breaker is open (5 consecutive transient failures: Ollama not running, a
+connection refused, a stream that breaks), its tasks that are not
+`PinClass` move to `strong` with a `migrated` event (`reason:
+group_down`), keep their place in the queue, and their next model step
+runs on the cloud. The capability checks of design §6.3 pass: the cloud
+adapter takes tools (nm has 7, under its limit of 128) and reports no
+context window, so no context check can refuse. A continuation prefix the
+local model left (after a preemption or a broken stream) is dropped: the
+cloud adapter does not continue an assistant message, so that step starts
+afresh there. Tasks stay on `strong` after fast comes back (migration is
+one way; `SetClass` would move them back). A local backend that is slow
+rather than down (a long first byte, a model loading) does not open the
+breaker and moves nothing.
 
 ## Tools
 
@@ -106,6 +172,11 @@ the store in `<work>/.nm/<scenario>.db`. `nm bench -help` lists the tasks.
 - `burst`: `-k` tasks of the mix at once; throughput, latency, retries,
   machine events and the window and breaker sampled each second.
 
+With `-backend hybrid` every scenario routes each task as `-route` says
+(the bench's static rule is by task kind, above). In `mixed`, a probe's
+routing decision is part of what the user waits for: `probe_e2e_*` adds
+it to the probe's wall time.
+
 ### What is measured
 
 Per task, from the committed events: wall time, queue time (ready but not
@@ -121,3 +192,14 @@ the longest call): `overhead ms` = wall − adapter − device − queue −
 suspended, the time the framework added around the calls (commits,
 dispatch, wake-ups). It is shown only when every model call of the task
 could be matched to its adapter call.
+
+Per execution group (`per class:` in the output, `summary.classes` in the
+report): tasks accepted in the class, how many passed, their wall time,
+and the model calls and tokens that ran in it (a migrated task's calls
+after the move count in the class it moved to). A cloud class's tokens are
+the run's cost: `cloud_prompt_tokens`, `cloud_cached_tokens`,
+`cloud_completion_tokens`, and `cloud_tokens_per_passed_task` (cloud
+prompt + completion tokens over every passed task, local or cloud). Each
+result records its route (`route`: class, how it was picked, the engine's
+label and confidence) and `route_ms`; the summary has the picks and the
+router's latency (`route_ms_p50`, `_p95`, `_max`), and `migrations`.
