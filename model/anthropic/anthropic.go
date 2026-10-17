@@ -188,10 +188,14 @@ func (a *Adapter) post(ctx context.Context, req model.Request, stream bool) (*ht
 }
 
 // response assembles the neutral turn from the provider's content blocks.
-// Every block that is not plain text is kept whole as Opaque for replay.
+// Every block that is not plain text is kept whole as Opaque for replay. A
+// turn with no text and no tool call is a Transient error unless it was cut
+// off, or it thought: a turn that ends with thinking alone is a thought that
+// stopped without an answer, returned as it is for the machine to judge
+// (design §6.4).
 func (a *Adapter) response(blocks []json.RawMessage, stop string, u task.Usage) (model.Response, error) {
 	msg := task.Message{Role: task.RoleAssistant}
-	answered := false
+	answered, thought := false, false
 	for _, rb := range blocks {
 		var b struct {
 			Type     string          `json:"type"`
@@ -233,6 +237,7 @@ func (a *Adapter) response(blocks []json.RawMessage, stop string, u task.Usage) 
 		default:
 			// thinking, redacted_thinking, and any block type this adapter
 			// does not know: private to this provider, replayed verbatim.
+			thought = thought || b.Type == "thinking" || b.Type == "redacted_thinking"
 			msg.Parts = append(msg.Parts, task.Part{
 				Kind:     task.PartReasoning,
 				Text:     b.Thinking,
@@ -242,7 +247,7 @@ func (a *Adapter) response(blocks []json.RawMessage, stop string, u task.Usage) 
 		}
 	}
 	finish := finishReason(stop)
-	if !answered && finish != "length" {
+	if !answered && !thought && finish != "length" {
 		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls", Err: model.ErrEmptyResponse}
 	}
 	return model.Response{Message: msg, FinishReason: finish, Usage: u}, nil

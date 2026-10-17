@@ -177,27 +177,42 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 	if out != nil {
 		return out.c, out.batch, out.err
 	}
+	retries := t.Retries
 	t.Retries = 0
 	// Answered: the step's preemptions are over.
 	t.Preempts = 0
-	// A continued thought that came back with reasoning alone, not cut off
-	// (the model stopped without answering), is taken as one cut off while
-	// still thinking: sent again as it was, it would come back the same.
-	thoughtOnly := prefill != nil && partial == "" && resp.Message.TextContent() == "" && len(resp.Message.ToolCalls()) == 0
-	if truncated(resp) || thoughtOnly {
-		// Cut off with nothing in it: judged on what this call produced, not
-		// on the prefix it continued, which is not an answer by itself. The
-		// redo sends the same turn, steers included; a Partial they
-		// interrupted goes back with them, as does a Partial the call was
-		// continuing. Thinking that ran into the cap is not continued: the
-		// redo thinks afresh, or not at all.
+	// A thought that stops (design §6.4): the call ended on its own, not cut
+	// off, with no text and no tool call, only thinking (the model thought
+	// it through and stopped without answering), whether or not it
+	// continued a kept thought. A continued thought that came back with
+	// nothing at all counts too. Sent again as it was, it may well come back
+	// the same. A continued text that comes back with nothing more is the
+	// text, whole.
+	empty := resp.Message.TextContent() == "" && len(resp.Message.ToolCalls()) == 0
+	thinking := thought || think != "" || thinkingOnly(resp.Message, resp.Usage.ReasoningTokens)
+	stopped := !truncated(resp) && empty && (prefill == nil && thinking || prefill != nil && partial == "")
+	if truncated(resp) || stopped {
+		// Cut off with nothing in it, or a thought that stops: judged on what
+		// this call produced, not on the prefix it continued, which is not an
+		// answer by itself. The redo sends the same turn, steers included; a
+		// Partial they interrupted goes back with them, as does a Partial the
+		// call was continuing. Thinking is not continued: the redo thinks
+		// afresh, or not at all.
 		t.Regs = t.Regs[:base]
 		c.Applied = nil
 		t.Partial, t.PartialThink = partial, ""
-		if caps.ThinkOff && !t.NoThink && (thought || think != "" || thinkingOnly(resp.Message, resp.Usage.ReasoningTokens)) {
-			// It spent its whole cap thinking (design §13): asked again with
-			// thinking off, at the same cap, before any raise.
-			return e.redoWithoutThinking(g, t, c), nil, nil
+		if caps.ThinkOff && !t.NoThink && thinking {
+			// It spent its whole cap thinking (design §13), or thought and
+			// stopped: asked again with thinking off, at the same cap, before
+			// any raise.
+			return e.redoWithoutThinking(g, t, c, stopped), nil, nil
+		}
+		if stopped {
+			// Thinking cannot be turned off, or is off and the model thought
+			// anyway: a larger cap would not help a turn that was not cut
+			// off. Asked again as it was, counted as a failed call.
+			t.Retries = retries
+			return e.redoThought(t, c), nil, nil
 		}
 		return e.redoTruncated(g, t, c), nil, nil
 	}

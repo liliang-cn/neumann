@@ -56,7 +56,9 @@ type Adapter struct {
 	// field and untagged content instead: once reasoning arrives in its own
 	// field, the content from there on is text. Sending the reasoning in
 	// the reasoning field does not work on Ollama: the model thinks again
-	// from the start.
+	// from the start. The answer to any other call is split the same way
+	// when its content opens with the open tag (white space before it
+	// aside): a backend that leaves the thinking in content.
 	ThinkTags [2]string
 	// Per-request timeouts (design §11). Timeout bounds the whole call,
 	// from sending the request to the end of the response body; New sets
@@ -280,6 +282,7 @@ func (a *Adapter) parse(data []byte, thinking bool) (model.Response, error) {
 			native += *r
 		}
 	}
+	fresh := "" // the thinking of a call that continued none
 	switch {
 	case thinking && native != "":
 		// The backend parsed the thinking out itself: the content is the
@@ -290,19 +293,44 @@ func (a *Adapter) parse(data []byte, thinking bool) (model.Response, error) {
 		reasoning, text = sp.feed(text)
 		r, t := sp.flush()
 		reasoning, text = reasoning+r, text+t
+	default:
+		fresh = native
+		if rest, ok := a.opensThought(text); ok {
+			sp := a.splitter()
+			r, t := sp.feed(rest)
+			rr, tt := sp.flush()
+			fresh, text = fresh+r+rr, t+tt
+		}
 	}
-	return a.response(text, reasoning, ch.Message.ToolCalls, ch.FinishReason, w.Usage.usage())
+	return a.response(text, reasoning, fresh, ch.Message.ToolCalls, ch.FinishReason, w.Usage.usage())
+}
+
+// opensThought reports whether content, leading white space aside, begins
+// with the open tag of ThinkTags, and returns what follows the tag: an answer
+// to a call that continued no thought, written by a backend that leaves the
+// thinking in content.
+func (a *Adapter) opensThought(content string) (string, bool) {
+	if a.ThinkTags[0] == "" || a.ThinkTags[1] == "" {
+		return "", false
+	}
+	return strings.CutPrefix(strings.TrimLeft(content, " \t\r\n"), a.ThinkTags[0])
 }
 
 // response assembles the neutral turn from the provider's text, the
-// reasoning of a continued thought (ThinkTags), its complete tool-call
-// objects (kept whole as Opaque for replay) and the usage. A turn with
-// nothing at all is a Transient error unless it was cut off; a continued
-// thought that ends in reasoning alone is returned as it is, for the machine
-// to judge (design §6.4).
-func (a *Adapter) response(text, reasoning string, calls []json.RawMessage, finish string, u task.Usage) (model.Response, error) {
+// reasoning of a continued thought (ThinkTags), the thinking of any other
+// call (fresh), its complete tool-call objects (kept whole as Opaque for
+// replay) and the usage. The thinking of a call that continued no thought
+// is not part of an answer; it is kept only when the turn has nothing else,
+// so that the machine can tell a thought that stopped without an answer from
+// an empty turn (design §6.4). A turn with nothing at all, no thinking
+// either (no reasoning text, no reasoning tokens), is a Transient error
+// unless it was cut off.
+func (a *Adapter) response(text, reasoning, fresh string, calls []json.RawMessage, finish string, u task.Usage) (model.Response, error) {
 	msg := task.Message{Role: task.RoleAssistant}
-	if text == "" && reasoning == "" && len(calls) == 0 && finish != "length" {
+	if text == "" && reasoning == "" && len(calls) == 0 {
+		reasoning = fresh
+	}
+	if text == "" && reasoning == "" && len(calls) == 0 && finish != "length" && u.ReasoningTokens == 0 {
 		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls", Err: model.ErrEmptyResponse}
 	}
 	if reasoning != "" {

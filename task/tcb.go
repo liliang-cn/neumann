@@ -184,8 +184,10 @@ type TCB struct {
 	// running machine honours it: after a restart the task is Ready at once.
 	WakeAt time.Time `json:"wake_at,omitzero"`
 	// Retries counts consecutive model calls that failed with an error worth
-	// retrying (overload, transient); a success resets it. Rate limits do not
-	// count. At the machine's limit the task fails with "model_error".
+	// retrying (overload, transient), and thoughts that stopped without an
+	// answer when thinking could not be turned off (design §6.4); a success
+	// resets it. Rate limits do not count. At the machine's limit the task
+	// fails with "model_error".
 	Retries int `json:"retries,omitempty"`
 	// MaxOut is the task's own output cap; 0 is the adapter's default. A turn
 	// cut off before it produced anything is redone with that cap raised
@@ -241,7 +243,8 @@ type TCB struct {
 	Preempts     int    `json:"preempts,omitempty"`
 	// NoThink: the next model call is sent with the model's thinking off
 	// (model.Request.NoThink), after a turn was cut off with nothing in it
-	// but thinking (design §13). Cleared by an answer that is not cut off.
+	// but thinking (design §13), or the model thought and stopped without
+	// answering (design §6.4). Cleared by an answer that is not cut off.
 	NoThink    bool   `json:"no_think,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
 	Version    int64  `json:"version"`

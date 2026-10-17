@@ -28,7 +28,8 @@ type Request struct {
 	MaxOut int
 	// NoThink asks the adapter to turn the model's thinking off for this
 	// call. An adapter whose Caps.ThinkOff is false ignores it. The machine
-	// sets it after a turn was cut off while still thinking (design §13).
+	// sets it after a turn was cut off while still thinking (design §13), or
+	// came back with thinking alone (design §6.4).
 	NoThink bool
 }
 

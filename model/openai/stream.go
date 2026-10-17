@@ -92,23 +92,52 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 	var (
 		text      strings.Builder
 		reasoning strings.Builder // split off a continued thought (ThinkTags)
+		fresh     strings.Builder // the thinking of a call that continues none
 		split     *thinkSplit
 		calls     = map[int]*callAcc{}
 		finish    string
 		usage     wireUsage
 		done      bool
 	)
-	if a.thinkPrefill(req) {
+	continuing := a.thinkPrefill(req)
+	if continuing {
 		split = a.splitter()
 	}
+	// A call that continues no thought, with ThinkTags set: content that
+	// opens with the open tag (opensThought) is a thought written into
+	// content. Its start is held back until it is known to open with the
+	// tag, or not to.
+	var head strings.Builder
+	opening := !continuing && a.ThinkTags[0] != "" && a.ThinkTags[1] != ""
+	think := func(r string) {
+		if continuing {
+			reasoning.WriteString(r)
+		} else {
+			fresh.WriteString(r)
+		}
+		emit(model.Delta{Reasoning: r})
+	}
 	content := func(piece string) {
+		if opening {
+			head.WriteString(piece)
+			buf := head.String()
+			lead := strings.TrimLeft(buf, " \t\r\n")
+			if strings.HasPrefix(a.ThinkTags[0], lead) && len(lead) < len(a.ThinkTags[0]) {
+				return // still may be the open tag
+			}
+			opening = false
+			head.Reset()
+			piece = buf
+			if rest, ok := a.opensThought(buf); ok {
+				split, piece = a.splitter(), rest
+			}
+		}
 		r, t := "", piece
 		if split != nil {
 			r, t = split.feed(piece)
 		}
 		if r != "" {
-			reasoning.WriteString(r)
-			emit(model.Delta{Reasoning: r})
+			think(r)
 		}
 		if t != "" {
 			text.WriteString(t)
@@ -150,17 +179,15 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 				if r == nil || *r == "" {
 					continue
 				}
-				if split != nil {
+				if split != nil && continuing {
 					// A continued thought, and the backend parses the
 					// thinking itself: its reasoning is the thought's rest,
 					// and content from here on is the answer (parsed).
 					if held := split.parsed(); held != "" {
-						reasoning.WriteString(held)
-						emit(model.Delta{Reasoning: held})
+						think(held)
 					}
-					reasoning.WriteString(*r)
 				}
-				emit(model.Delta{Reasoning: *r})
+				think(*r)
 			}
 			if d.Content != nil && *d.Content != "" {
 				content(*d.Content)
@@ -193,10 +220,15 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		return model.Response{}, a.lostError("stream ended before the answer was complete", nil)
 	}
 
+	if opening && head.Len() > 0 {
+		// Ended before it could tell: white space, or the start of the
+		// open tag and no more. Text, as it came.
+		text.WriteString(head.String())
+		emit(model.Delta{Text: head.String()})
+	}
 	if split != nil {
 		if r, _ := split.flush(); r != "" {
-			reasoning.WriteString(r)
-			emit(model.Delta{Reasoning: r})
+			think(r)
 		}
 	}
 	idxs := make([]int, 0, len(calls))
@@ -212,7 +244,7 @@ func (a *Adapter) Stream(ctx context.Context, req model.Request, emit func(model
 		}
 		objs = append(objs, obj)
 	}
-	out, err := a.response(text.String(), reasoning.String(), objs, finish, usage.usage())
+	out, err := a.response(text.String(), reasoning.String(), fresh.String(), objs, finish, usage.usage())
 	if err != nil {
 		return model.Response{}, err
 	}

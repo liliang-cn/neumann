@@ -380,15 +380,19 @@ func (e *Env) execCompact(ctx context.Context, t *task.TCB, core int, g *Group, 
 	if out != nil {
 		return out.c, out.batch, out.err
 	}
-	t.Retries = 0 // answered: the call went through, as for a model step
 	if resp.FinishReason == "length" {
 		// Cut off by its cap, with or without text: never a summary.
+		t.Retries = 0 // answered: the call went through, as for a model step
 		return e.compactTruncated(g, t, c, d), nil, nil
 	}
 	text := strings.TrimSpace(resp.Message.TextContent())
 	if text == "" {
+		// Nothing to put in place of the span (an empty answer, or thinking
+		// alone): a failed call, counted on from the failures before it, so
+		// a model that keeps answering so ends at the retry limit.
 		return e.modelFailed(t, c, model.Transient, errEmptySummary, nil, false), nil, nil
 	}
+	t.Retries = 0 // answered: the call went through, as for a model step
 	t.CompactRaise, t.CompactLimit = 0, 0
 
 	before, inBefore := len(t.Regs), task.EstimateTokens(t.System, t.Tools, forProvider(t.Regs, a.Provider()))

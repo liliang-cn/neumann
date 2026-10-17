@@ -268,20 +268,52 @@ func (e *Env) redoTruncated(g *Group, t *task.TCB, c mem.CommitSet) mem.CommitSe
 
 // redoWithoutThinking asks again, at the same output cap, with the model's
 // thinking off (TCB.NoThink, model.Request.NoThink): the turn was cut off
-// with nothing in it but thinking, and the adapter can turn thinking off
-// (design §13). It does not count as one of the fourfold raises: those come
-// only if the turn is still cut off without thinking. Like those, the redo
-// was an answered call; its model_retry event says no_think.
-func (e *Env) redoWithoutThinking(g *Group, t *task.TCB, c mem.CommitSet) mem.CommitSet {
+// with nothing in it but thinking (design §13), or, stopped, the model
+// thought and stopped without answering (design §6.4), and the adapter can
+// turn thinking off. It does not count as one of the fourfold raises: those
+// come only if the turn is still cut off without thinking. Like those, the
+// redo was an answered call; its model_retry event says no_think, with class
+// "thought" for a thought that stopped.
+func (e *Env) redoWithoutThinking(g *Group, t *task.TCB, c mem.CommitSet, stopped bool) mem.CommitSet {
 	sent := e.sendOut(g, t)
 	if sent == 0 {
 		sent = e.maxOut(t)
 	}
 	t.NoThink = true
+	class, text := "truncated", fmt.Sprintf("cut off at %d output tokens with nothing but thinking", sent)
+	if stopped {
+		class, text = classThought, errThought
+	}
 	c.Events = append(c.Events, proto.NewEvent(proto.EvModelRetry, t.ID, map[string]any{
-		"class": "truncated", "attempt": t.Truncations, "delay_ms": 0, "wait": "none", "max_out": sent, "no_think": true,
-		"error": fmt.Sprintf("cut off at %d output tokens with nothing but thinking", sent),
+		"class": class, "attempt": t.Truncations, "delay_ms": 0, "wait": "none", "max_out": sent, "no_think": true,
+		"error": text,
 	}))
+	e.ready(t, task.StepModel)
+	c.Task = t
+	return c
+}
+
+// The model_retry class and error text of a thought that stopped without an
+// answer (design §6.4).
+const (
+	classThought = "thought"
+	errThought   = "the model stopped after thinking, with no answer"
+)
+
+// redoThought asks again, as it was and at once, after a thought that
+// stopped without an answer when thinking cannot be turned off, or was off
+// already (design §6.4). The call was answered, but the turn is counted in
+// Retries like a failed call, so a model that keeps doing it ends the task
+// with "model_error" at the retry limit instead of looping; t.Retries is the
+// count before this call. No backoff: the provider answered, it is the
+// model that did not. The group saw an answer, so its breaker is not
+// touched.
+func (e *Env) redoThought(t *task.TCB, c mem.CommitSet) mem.CommitSet {
+	t.Retries++
+	if t.Retries >= e.maxRetries() {
+		return failWith(t, c, StopModelError, fmt.Sprintf("%s (%d consecutive failures)", errThought, t.Retries))
+	}
+	c.Events = append(c.Events, retryEvent(t, classThought, 0, "none", errThought))
 	e.ready(t, task.StepModel)
 	c.Task = t
 	return c

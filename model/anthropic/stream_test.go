@@ -234,3 +234,38 @@ func TestStreamErrors(t *testing.T) {
 		t.Fatal("a stream that ends before message_stop was accepted")
 	}
 }
+
+// A turn that ends with thinking alone (end_turn, no text, no tool use) is a
+// thought that stopped without an answer (design §6.4): returned with its
+// thinking blocks, whole or streamed, for the machine to judge (it asks
+// again without thinking, Caps.ThinkOff), not as a transient error. A turn
+// with no blocks at all is still one (TestEmptyAnswerIsAnError), and so is
+// one whose only block is of a type that is not thinking.
+func TestAThoughtThatStops(t *testing.T) {
+	s := newServer(t, 200,
+		`{"content":[{"type":"thinking","thinking":"The columns are order_id and date.","signature":"sig"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":20}}`,
+		`{"content":[{"type":"server_tool_use","id":"x"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":20}}`)
+	a := New(s.URL+"/v1", "k", "claude-x")
+	req := model.Request{Messages: []task.Message{task.Text(task.RoleUser, "hi")}}
+	resp := call(t, a, req)
+	if p := resp.Message.Parts; resp.FinishReason != "stop" || len(p) != 1 || p[0].Kind != task.PartReasoning || p[0].Text != "The columns are order_id and date." {
+		t.Fatalf("whole: %+v", resp)
+	}
+	if _, err := a.Call(context.Background(), req); err == nil {
+		t.Fatal("a turn with no text, no tool use and no thinking was accepted")
+	}
+
+	ts, _ := sseServer(t,
+		start(`{"input_tokens":3,"output_tokens":1}`),
+		blockStart("0", `{"type":"thinking","thinking":"","signature":""}`),
+		delta("0", `{"type":"thinking_delta","thinking":"The columns are order_id and date."}`),
+		delta("0", `{"type":"signature_delta","signature":"sig"}`),
+		blockStop("0"),
+		msgDelta("end_turn", `{"output_tokens":20}`),
+		stop,
+	)
+	resp, deltas, err := stream(t, New(ts.URL+"/v1", "k", "claude-x"))
+	if p := resp.Message.Parts; err != nil || resp.FinishReason != "stop" || len(p) != 1 || p[0].Kind != task.PartReasoning || len(deltas) != 1 || deltas[0].Reasoning == "" {
+		t.Fatalf("streamed: %+v, %+v, %v", resp, deltas, err)
+	}
+}
