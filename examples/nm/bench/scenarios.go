@@ -451,13 +451,15 @@ func (b *Bench) ops(ctx context.Context, rep *Report) error {
 		was, _ := app.Field[string](susEv, "was")
 		kept, _ := app.Field[int](susEv, "kept")
 		keptThink, _ := app.Field[int](susEv, "kept_think")
-		ok := r.Pass && r.Suspends > 0 && was == "model" && ol.modelCallsSuspended == 0 && ol.statusSuspended == 1
+		ok := r.Suspends > 0 && was == "model" && ol.modelCallsSuspended == 0 && ol.statusSuspended == 1
 		r.Extra = map[string]any{"op": "suspend", "was": was, "kept": kept, "kept_think": keptThink, "suspended_ms": r.SuspendedMS,
 			"model_calls_while_suspended": ol.modelCallsSuspended, "status_suspended": ol.statusSuspended, "op_ok": ok}
 		if !ok {
 			r.Detail += fmt.Sprintf("; suspend check failed (was=%q, calls while suspended %d, Status.Suspended %d)", was, ol.modelCallsSuspended, ol.statusSuspended)
+		} else {
+			r.Detail += fmt.Sprintf("; suspend ok (was=model, kept %d/%d, held %.1fs)", kept, keptThink, r.SuspendedMS/1000)
 		}
-		r.Pass = ok
+		r.Pass = ok && r.Pass
 	}
 	// Steer: the answer still passes and answers the extra question.
 	if r := byID[st.ID]; r != nil {
@@ -468,12 +470,12 @@ func (b *Bench) ops(ctx context.Context, rep *Report) error {
 			}
 		}
 		extra := wantNumber(r.Answer, float64(b.Facts.Sales.Q3TopOrders), 0)
-		ok := r.Pass && extra.Pass && dropped == 0 && !ol.steeredAt.IsZero()
+		ok := extra.Pass && dropped == 0 && !ol.steeredAt.IsZero()
 		r.Extra = map[string]any{"op": "steer", "steer": steerText, "want_orders": b.Facts.Sales.Q3TopOrders, "answered_extra": extra.Pass, "steer_dropped": dropped, "op_ok": ok}
 		if !extra.Pass {
 			r.Detail += fmt.Sprintf("; the steer's question (%d orders) is not answered", b.Facts.Sales.Q3TopOrders)
 		}
-		r.Pass = ok
+		r.Pass = ok && r.Pass
 	}
 	// Cancel: it ended cancelled, with no tool call and no write after.
 	if r := byID[cn.ID]; r != nil {
