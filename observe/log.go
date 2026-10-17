@@ -124,6 +124,12 @@ func (g *Log) Observe(ev proto.Event) {
 		a = append(a, slog.Int("attempt", d.Attempt), slog.Int64("delay_ms", d.DelayMS))
 		str("wait", d.Wait)
 		str("error", d.Error)
+		if d.Dropped != 0 {
+			a = append(a, slog.Int("dropped", d.Dropped))
+		}
+		if d.DroppedThink != 0 {
+			a = append(a, slog.Int("dropped_think", d.DroppedThink))
+		}
 	case proto.EvThrottled:
 		a = append(a, slog.Int64("waited_ms", d.WaitedMS))
 	case proto.EvSteerDelivered, proto.EvSteerDropped:

@@ -67,6 +67,8 @@ type data struct {
 	Kept         int    `json:"kept"`          // preempted, suspended: chars kept for the continuation
 	KeptThink    int    `json:"kept_think"`    // preempted, suspended: chars of thinking kept for the continuation
 	RanMS        int64  `json:"ran_ms"`        // preempted: how long the call ran
+	Dropped      int    `json:"dropped"`       // model_retry: chars of the prefix a failed continuation dropped
+	DroppedThink int    `json:"dropped_think"` // model_retry: chars of the thought a failed continuation dropped
 	N            int    `json:"n"`             // preempted: how many times this step was preempted
 	Was          int    `json:"was"`           // priority_set: the priority before
 	SteerSeq     int64  `json:"seq"`           // steer_delivered, steer_dropped: the steer's seq

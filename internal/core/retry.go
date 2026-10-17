@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -172,6 +173,30 @@ func retryEvent(t *task.TCB, class string, delay time.Duration, wait, text strin
 	return proto.NewEvent(proto.EvModelRetry, t.ID, map[string]any{
 		"class": class, "attempt": t.Retries, "delay_ms": delay.Milliseconds(), "wait": wait, "error": text,
 	})
+}
+
+// amendRetry notes on the model_retry event in c how many characters of a
+// kept prefix the failed call's commit drops (design §6.4): dropped of its
+// Partial, droppedThink of its PartialThink. A commit without a model_retry
+// event (the task failed) is left as it is.
+func amendRetry(c *mem.CommitSet, dropped, droppedThink int) {
+	for i, ev := range c.Events {
+		if ev.Kind != proto.EvModelRetry {
+			continue
+		}
+		var d map[string]any
+		if err := json.Unmarshal(ev.Data, &d); err != nil {
+			return
+		}
+		if dropped > 0 {
+			d["dropped"] = dropped
+		}
+		if droppedThink > 0 {
+			d["dropped_think"] = droppedThink
+		}
+		c.Events[i] = proto.NewEvent(proto.EvModelRetry, ev.TaskID, d)
+		return
+	}
 }
 
 // truncated reports a turn cut off by its output cap before it produced

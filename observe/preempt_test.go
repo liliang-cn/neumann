@@ -426,3 +426,27 @@ func TestPreemptedThought(t *testing.T) {
 	find(t, ls, "level=INFO", "msg=preempted", "task=bg", "kept=0", "kept_think=160")
 	find(t, ls, "level=DEBUG", "msg=step", "task=bg", "prefill_think=160")
 }
+
+// A continuation that failed drops the prefix it continued (design §6.4):
+// its model_retry says how much, and so does the log line.
+func TestFailedContinuationDropsItsPrefix(t *testing.T) {
+	var s script
+	s.add(0, proto.EvAccepted, "bg", map[string]any{"class": "local", "priority": 1})
+	s.add(time.Second, proto.EvModelCall, "bg", map[string]any{"pc": "model", "core": 1})
+	s.add(2*time.Second, proto.EvStep, "bg", map[string]any{"pc": "model", "core": 1, "prefill_think": 160})
+	s.add(2*time.Second, proto.EvModelRetry, "bg", map[string]any{"class": "transient", "attempt": 2, "delay_ms": 2000, "wait": "backoff", "error": "empty", "dropped_think": 160})
+	s.add(4*time.Second, proto.EvModelCall, "bg", map[string]any{"pc": "model", "core": 1})
+	s.add(4*time.Second, proto.EvStep, "bg", map[string]any{"pc": "model", "core": 1, "prefill": 30})
+	s.add(4*time.Second, proto.EvModelRetry, "bg", map[string]any{"class": "transient", "attempt": 3, "delay_ms": 4000, "wait": "backoff", "error": "empty", "dropped": 30})
+
+	var buf bytes.Buffer
+	l := NewLog(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	feed(l, s.evs)
+	ls := lines(&buf)
+	if line := find(t, ls, "level=WARN", "msg=model_retry", "task=bg", "attempt=2", "dropped_think=160"); strings.Contains(line, "dropped=") {
+		t.Errorf("thought drop logged as text: %s", line)
+	}
+	if line := find(t, ls, "level=WARN", "msg=model_retry", "task=bg", "attempt=3", "dropped=30"); strings.Contains(line, "dropped_think") {
+		t.Errorf("text drop logged as thought: %s", line)
+	}
+}

@@ -423,6 +423,10 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	if apply != nil {
 		req = apply(&c)
 	}
+	// A model step that applied no steers and still holds a Partial or a
+	// PartialThink asks the model to continue it (modelStep put it at the
+	// end of the request): a continued call.
+	continuing := pc == task.StepModel && len(c.Applied) == 0 && (t.Partial != "" || t.PartialThink != "")
 
 	// The text the call streams is kept as it comes: a call cut off by a
 	// preemption, or whose stream breaks off, leaves it for the next call to
@@ -558,15 +562,32 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		if suspended && !panicked {
 			return end(e.suspendedCall(ctx, t, c, keep, keepThink, capsOf(a)), nil)
 		}
+		added := false
 		if lost && !panicked && pc == task.StepModel {
 			// The stream broke off: what came is continued by the retry
 			// (design §6.4), committed with the backoff.
-			keepPartial(t, keep, keepThink, capsOf(a))
+			kt, kth := keepPartial(t, keep, keepThink, capsOf(a))
+			added = kt != "" || kth != ""
 		}
 		if class == model.ContextLength && !panicked {
 			return end(e.contextRejected(t, c, g, a, req, err), nil)
 		}
-		return end(e.modelFailed(t, c, class, err, info, panicked), nil)
+		var dropped, droppedThink int
+		if continuing && !added && tctx.Err() == nil {
+			// A continued call that failed and added nothing to its prefix
+			// (design §6.4): sent again, the same request may well fail the
+			// same way (a backend that answers a continued thought with
+			// nothing). The prefix goes in the commit that records the
+			// failure, so neither the retry nor a restart sends it again:
+			// the retry is a fresh call.
+			dropped, droppedThink = runes(t.Partial), runes(t.PartialThink)
+			t.Partial, t.PartialThink = "", ""
+		}
+		c = e.modelFailed(t, c, class, err, info, panicked)
+		if dropped+droppedThink > 0 {
+			amendRetry(&c, dropped, droppedThink)
+		}
+		return end(c, nil)
 	}
 	return resp, c, thought, nil
 }
