@@ -60,7 +60,9 @@ nm bench -scenario solo  -backend local -tasks repo-qa,quick,fix-bug -out solo-l
 nm bench -scenario mixed -backend local -bg repo-qa.cores,code-review -probes 3 -every 60s -baseline solo-local.json -out mixed-local.json
 nm bench -scenario ops   -backend cloud -out ops.json
 nm bench -scenario crash -backend cloud -seed 3 -out crash.json
+nm bench -scenario crash -backend cloud -kill-on fs_write -out crash-write.json
 nm bench -scenario burst -backend cloud -k 30 -out burst.json
+nm bench -rejudge solo-local.json            # run the checkers again on a report's answers and files
 ```
 
 Run it from the repository root (or pass `-repo`): the workspace gets a
@@ -96,7 +98,8 @@ the store in `<work>/.nm/<scenario>.db`. `nm bench -help` lists the tasks.
   passed with no model call while suspended, the extra question answered,
   cancelled with no tool call or write after.
 - `crash`: the batch runs in a child process that is killed with SIGKILL
-  after `-kill-after` tool results (default 3–10 from `-seed`), then started
+  after `-kill-after` tool results (default 3–10 from `-seed`), or as soon as
+  a call of the `-kill-on` tool is dispatched, then started
   again on the same store. Calls of `fs_write` whose outcome is unknown are
   resolved from the write ledger (applied: its result; not applied: retry).
   Every task must finish and no key may be applied twice.
@@ -109,8 +112,10 @@ Per task, from the committed events: wall time, queue time (ready but not
 running: from the commit that made the task ready to its next `model_call`),
 model time (`model_call` → the step's commit), tool time (the dispatching
 commit → the round's last result), suspended time, model calls, answered
-steps, tool calls and rounds, tokens (prompt, completion, reasoning), each
-step's `first_ms`, retries, preemptions. The adapter is wrapped to time its
+steps, tool calls and rounds, tokens (prompt, cached with the cache hit
+rate, completion, reasoning), each step's `first_ms` (only steps that
+streamed text or reasoning have one), retries (their backoff counts as
+queue time), preemptions. The adapter is wrapped to time its
 own calls (`adapter s`) and the devices time theirs (`device s`, per round
 the longest call): `overhead ms` = wall − adapter − device − queue −
 suspended, the time the framework added around the calls (commits,
