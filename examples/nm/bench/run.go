@@ -44,6 +44,8 @@ type Options struct {
 	K        int           // burst: copies
 	Seed     int64         // crash
 	KillAt   int           // crash: tool results before the kill; 0: from the seed
+	KillOn   string        // crash: kill when a call of this tool is dispatched
+	Rejudge  string        // judge the answers of this report again
 	Suspend  time.Duration // ops: how long the task stays suspended
 	Deadline time.Duration // per task; 0: none
 	Timeout  time.Duration // the whole run
@@ -78,6 +80,8 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 	fset.IntVar(&o.K, "k", 30, "burst: tasks submitted at once")
 	fset.Int64Var(&o.Seed, "seed", 1, "crash: seed for the kill point")
 	fset.IntVar(&o.KillAt, "kill-after", 0, "crash: kill -9 after this many tool results (0: 3 to 10, from -seed)")
+	fset.StringVar(&o.KillOn, "kill-on", "", "crash: kill -9 as soon as a call of this tool (e.g. fs_write) is dispatched, instead of after -kill-after results")
+	fset.StringVar(&o.Rejudge, "rejudge", "", "run the checkers again on the answers and files of this report (after a checker fix); writes -out")
 	fset.DurationVar(&o.Suspend, "suspend-for", 15*time.Second, "ops: how long the suspended task stays suspended")
 	fset.DurationVar(&o.Deadline, "deadline", 0, "deadline per task (0: none)")
 	fset.DurationVar(&o.Timeout, "timeout", 3*time.Hour, "give up on the whole run after this long")
@@ -135,6 +139,9 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 	}
 	if o.Scenario == "crash-child" {
 		return b.crashChild(ctx)
+	}
+	if o.Rejudge != "" {
+		return b.rejudge(stdout, stderr)
 	}
 	b.logf("nm bench: scenario %s, backend %s (%s at %s), %d vCores, workspace %s", o.Scenario, cfg.Backend, cfg.Model, cfg.BaseURL, cfg.Cores, o.Work)
 	facts, err := Setup(cfg.Root, o.Repo, testdata)
@@ -385,7 +392,9 @@ func (s *Session) judge(ctx context.Context, inst *Instance) *Result {
 		}
 	}
 	v := Verdict{Detail: "task ended " + r.Outcome + " " + r.StopReason}
-	if r.Outcome == proto.EvDone {
+	if r.Outcome == proto.EvDone && r.StopReason == "budget" {
+		v.Detail = fmt.Sprintf("ran out of model steps (MaxSteps %d) without an answer", s.b.Cfg.MaxSteps)
+	} else if r.Outcome == proto.EvDone {
 		v = inst.Task.Check(&CheckCtx{Answer: r.Answer, Inst: inst, Facts: s.b.Facts, Root: s.b.Cfg.Root, Ledger: mine})
 	}
 	r.Pass, r.Detail = v.Pass, v.Detail
@@ -460,4 +469,64 @@ func percentile(xs []float64, p float64) float64 {
 	sort.Float64s(s)
 	i := int(p*float64(len(s)-1) + 0.5)
 	return s[min(max(i, 0), len(s)-1)]
+}
+
+// rejudge runs the checkers again on a finished report: the answers it
+// recorded and the files its workspace still holds. Scenario-specific
+// checks (ops) are not redone.
+func (b *Bench) rejudge(stdout, stderr io.Writer) int {
+	data, err := os.ReadFile(b.Opt.Rejudge)
+	if err != nil {
+		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		return 1
+	}
+	var rep Report
+	if err := json.Unmarshal(data, &rep); err != nil {
+		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		return 1
+	}
+	root := filepath.Join(rep.Work, "ws")
+	facts, err := Setup(root, b.Opt.Repo, b.Testdata)
+	if err != nil {
+		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		return 1
+	}
+	ledger, _ := tools.ReadLedger(filepath.Join(root, "out", ".ledger"))
+	for _, r := range rep.Results {
+		r.CacheHitRate = hitRate(r.Usage.CachedTokens, r.Usage.PromptTokens)
+		t := TaskByID(r.TaskID)
+		if t == nil || r.Outcome != proto.EvDone {
+			continue
+		}
+		r.Instance.Task = t
+		var mine []tools.LedgerEntry
+		for _, e := range ledger {
+			if e.Task == r.ID {
+				mine = append(mine, e)
+			}
+		}
+		v := t.Check(&CheckCtx{Answer: r.Answer, Inst: r.Instance, Facts: facts, Root: root, Ledger: mine})
+		if v.Pass != r.Pass || v.Detail != r.Detail {
+			if r.Extra == nil {
+				r.Extra = map[string]any{}
+			}
+			r.Extra["first_verdict"] = Verdict{r.Pass, r.Detail}
+			fmt.Fprintf(stdout, "%s: %v (%s) -> %v (%s)\n", r.ID, r.Pass, r.Detail, v.Pass, v.Detail)
+		}
+		r.Pass, r.Detail = v.Pass, v.Detail
+	}
+	rep.Summary = nil
+	rep.summarize()
+	rep.Notes = append(rep.Notes, "rejudged with the current checkers at "+time.Now().Format(time.RFC3339))
+	rep.Print(stdout)
+	out := b.Opt.Out
+	if out == "" {
+		out = b.Opt.Rejudge
+	}
+	if err := rep.Write(out); err != nil {
+		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "report: %s\n", out)
+	return 0
 }

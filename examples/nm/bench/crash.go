@@ -74,13 +74,28 @@ func (b *Bench) crash(ctx context.Context, rep *Report) error {
 		if err := cmd.Start(); err != nil {
 			return info, err
 		}
-		b.logf("crash: run %d started (pid %d)%s", n, cmd.Process.Pid, map[bool]string{true: fmt.Sprintf(", kill -9 after %d tool results", kill), false: ""}[kill > 0])
+		how := ""
+		switch {
+		case kill > 0 && b.Opt.KillOn != "":
+			how = ", kill -9 when " + b.Opt.KillOn + " is dispatched"
+		case kill > 0:
+			how = fmt.Sprintf(", kill -9 after %d tool results", kill)
+		}
+		b.logf("crash: run %d started (pid %d)%s", n, cmd.Process.Pid, how)
 		sc := bufio.NewScanner(out)
 		for sc.Scan() {
 			line := sc.Text()
+			if strings.HasPrefix(line, "TOOL_CALL ") {
+				if f := strings.Fields(line); kill > 0 && b.Opt.KillOn != "" && len(f) == 3 && f[2] == b.Opt.KillOn && !info.Killed {
+					cmd.Process.Signal(syscall.SIGKILL)
+					info.Killed = true
+					b.logf("crash: run %d: kill -9 as %s was dispatched (%s)", n, f[2], f[1])
+				}
+				continue
+			}
 			if strings.HasPrefix(line, "TOOL_RESULT ") {
 				info.ToolResults++
-				if kill > 0 && info.ToolResults >= kill && !info.Killed {
+				if kill > 0 && b.Opt.KillOn == "" && info.ToolResults >= kill && !info.Killed {
 					cmd.Process.Signal(syscall.SIGKILL)
 					info.Killed = true
 					b.logf("crash: run %d: kill -9 after tool result %d (%s)", n, info.ToolResults, strings.TrimPrefix(line, "TOOL_RESULT "))
@@ -205,6 +220,10 @@ func (b *Bench) crashChild(ctx context.Context) int {
 			return
 		}
 		switch ev.Kind {
+		case proto.EvToolCall:
+			id, _ := app.Field[string](ev, "call_id")
+			tool, _ := app.Field[string](ev, "tool")
+			fmt.Printf("TOOL_CALL %s/%s %s\n", ev.TaskID, id, tool)
 		case proto.EvToolResult:
 			id, _ := app.Field[string](ev, "call_id")
 			fmt.Printf("TOOL_RESULT %s/%s\n", ev.TaskID, id)

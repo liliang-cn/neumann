@@ -183,6 +183,7 @@ func TestCheckers(t *testing.T) {
 	}{
 		{"repo-qa.preempt", "The decision is in `internal/core/preempt.go:153`, function `preemptCheck` on *Env.", true},
 		{"repo-qa.preempt", "internal/core/preempt.go, function preemptCheck.", false},
+		{"repo-qa.preempt", "**File:** `repo/internal/core/preempt.go`  \n**Function:** `preemptCheck`  \n**Line:** 153", true},
 		{"repo-qa.preempt", "internal/sched/sched.go:597 in Urgent", false},
 		{"repo-qa.cores", "It runs 4 vCores: DefaultCores = 4 at neumann.go:40.", true},
 		{"repo-qa.cores", "8 vCores, neumann.go:40", false},

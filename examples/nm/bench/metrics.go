@@ -58,9 +58,10 @@ type Metrics struct {
 	Suspends     int        `json:"suspends"`      // suspended events
 	Prefill      int        `json:"prefill"`       // continued calls (prefill or prefill_think)
 	Usage        task.Usage `json:"usage"`
-	Recovered    int        `json:"recovered"` // recovered events (restarts)
-	Reconcile    int        `json:"reconcile"` // reconcile_needed events
-	Outcome      string     `json:"outcome"`   // done, failed, cancelled, or "" if unfinished
+	CacheHitRate float64    `json:"cache_hit_rate"` // cached / prompt tokens, percent
+	Recovered    int        `json:"recovered"`      // recovered events (restarts)
+	Reconcile    int        `json:"reconcile"`      // reconcile_needed events
+	Outcome      string     `json:"outcome"`        // done, failed, cancelled, or "" if unfinished
 	StopReason   string     `json:"stop_reason,omitempty"`
 }
 
@@ -251,6 +252,7 @@ func Compute(evs []proto.Event, fp string, shared bool, calls []app.CallRecord, 
 	for _, d := range byRound {
 		m.DeviceMS += ms(d)
 	}
+	m.CacheHitRate = hitRate(m.Usage.CachedTokens, m.Usage.PromptTokens)
 	if m.WallMS > 0 {
 		m.OverheadMS = m.WallMS - m.AdapterMS - m.DeviceMS - m.QueueMS - m.SuspendedMS
 	}
@@ -279,4 +281,12 @@ func decode(ev proto.Event) evData {
 		_ = json.Unmarshal(ev.Data, &d)
 	}
 	return d
+}
+
+// hitRate is cached as a percentage of prompt; 0 when there was no prompt.
+func hitRate(cached, prompt int) float64 {
+	if prompt <= 0 {
+		return 0
+	}
+	return 100 * float64(cached) / float64(prompt)
 }

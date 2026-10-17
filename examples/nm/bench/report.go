@@ -36,7 +36,7 @@ func (r *Report) summarize() {
 	}
 	pass, done := 0, 0
 	var wall, queue, model, adapter, tool, device, over []float64
-	var tokP, tokC, tokR, calls, toolCalls, retries, preempt int
+	var tokP, tokC, tokR, tokCached, calls, toolCalls, retries, preempt int
 	var first []float64
 	for _, x := range r.Results {
 		if x.Pass {
@@ -57,6 +57,7 @@ func (r *Report) summarize() {
 		tokP += x.Usage.PromptTokens
 		tokC += x.Usage.CompletionTokens
 		tokR += x.Usage.ReasoningTokens
+		tokCached += x.Usage.CachedTokens
 		calls += x.ModelCalls
 		toolCalls += x.ToolCalls
 		retries += x.Retries
@@ -77,6 +78,8 @@ func (r *Report) summarize() {
 	r.Summary["prompt_tokens"] = tokP
 	r.Summary["completion_tokens"] = tokC
 	r.Summary["reasoning_tokens"] = tokR
+	r.Summary["cached_tokens"] = tokCached
+	r.Summary["cache_hit_rate"] = hitRate(tokCached, tokP)
 	r.Summary["first_ms_p50"] = percentile(first, 0.5)
 	r.Summary["first_ms_p95"] = percentile(first, 0.95)
 	r.Summary["sum_wall_ms"] = sum(wall)
@@ -117,7 +120,7 @@ func secs(ms float64) string { return fmt.Sprintf("%.1f", ms/1000) }
 func (r *Report) Print(w io.Writer) {
 	fmt.Fprintf(w, "\n== %s on %s (%s), %d vCores, %.0fs ==\n", r.Scenario, r.Backend, r.Model, r.Cores, r.WallS)
 	tw := tabwriter.NewWriter(w, 0, 0, 1, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(tw, "task\tok\tend\twall s\tqueue s\tmodel s\tadapter s\ttool s\tdevice s\toverhead ms\tcalls\ttools\tprompt\tcompl\treason\tfirst ms\tretry\tpreempt\t")
+	fmt.Fprintln(tw, "task\tok\tend\twall s\tqueue s\tmodel s\tadapter s\ttool s\tdevice s\toverhead ms\tcalls\ttools\tprompt\tcached\tcompl\treason\tfirst ms\tretry\tpreempt\t")
 	for _, x := range r.Results {
 		ok := "FAIL"
 		if x.Pass {
@@ -139,9 +142,9 @@ func (r *Report) Print(w io.Writer) {
 		if i := strings.Index(name, "."); i >= 0 {
 			name = name[i+1:]
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%d\t%d\t\n",
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%d\t%d\t%s\t%d\t%d\t\n",
 			name, ok, x.Outcome, secs(x.WallMS), secs(x.QueueMS), secs(x.ModelMS), secs(x.AdapterMS), secs(x.ToolMS), secs(x.DeviceMS), over,
-			x.ModelCalls, x.ToolCalls, x.Usage.PromptTokens, x.Usage.CompletionTokens, x.Usage.ReasoningTokens, fs, x.Retries, x.Preempted)
+			x.ModelCalls, x.ToolCalls, x.Usage.PromptTokens, fmt.Sprintf("%d (%.0f%%)", x.Usage.CachedTokens, x.CacheHitRate), x.Usage.CompletionTokens, x.Usage.ReasoningTokens, fs, x.Retries, x.Preempted)
 	}
 	tw.Flush()
 	var fails []string

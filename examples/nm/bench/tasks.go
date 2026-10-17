@@ -248,6 +248,19 @@ func fileLine(answer, base string) []int {
 	return out
 }
 
+var intRe = regexp.MustCompile(`\b\d+\b`)
+
+// ints are the whole numbers written in s.
+func ints(s string) []int {
+	var out []int
+	for _, m := range intRe.FindAllString(s, -1) {
+		if n, err := strconv.Atoi(m); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 func inRange(ns []int, lo, hi int) bool {
 	for _, n := range ns {
 		if n >= lo && n <= hi {
@@ -269,8 +282,9 @@ func checkPreempt(c *CheckCtx) Verdict {
 	if !strings.Contains(a, "preemptCheck") {
 		return fail("does not name preemptCheck")
 	}
-	if lines := fileLine(a, "preempt.go"); !inRange(lines, 138, 207) {
-		return fail("no preempt.go:line within 138-207 (got %v)", lines)
+	// file:line, or the line given on its own ("Line: 153").
+	if lines := fileLine(a, "preempt.go"); !inRange(lines, 138, 207) && !inRange(ints(a), 138, 207) {
+		return fail("no line within 138-207 (file:line %v)", lines)
 	}
 	return pass("internal/core/preempt.go preemptCheck with a line in range")
 }
@@ -283,8 +297,8 @@ func checkCores(c *CheckCtx) Verdict {
 	if !strings.Contains(c.Answer, "neumann.go") {
 		return fail("does not name neumann.go")
 	}
-	if lines := fileLine(c.Answer, "neumann.go"); !inRange(lines, 36, 44) {
-		return fail("no neumann.go:line within 36-44 (got %v)", lines)
+	if lines := fileLine(c.Answer, "neumann.go"); !inRange(lines, 36, 44) && !inRange(ints(c.Answer), 36, 44) {
+		return fail("no line within 36-44 (file:line %v)", lines)
 	}
 	return pass("4, neumann.go:40")
 }
