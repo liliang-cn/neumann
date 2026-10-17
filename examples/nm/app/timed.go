@@ -1,0 +1,98 @@
+package app
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"sync"
+	"time"
+
+	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/model/openai"
+	"github.com/liliang-cn/neumann/task"
+)
+
+// CallRecord is one model request as the adapter saw it: from the call to
+// its return, without the machine's commits around it.
+type CallRecord struct {
+	Fingerprint string // of the request's first user message: which task sent it
+	Start       time.Time
+	First       time.Time // first streamed piece; zero if none
+	End         time.Time
+	Err         string
+}
+
+// Timed wraps the OpenAI-compatible adapter and records every call. It
+// forwards each optional interface that adapter implements (OutputCap,
+// CapsReporter, Warmer, Streamer, RateReporter); it implements no others,
+// so the machine sees exactly what it would see without the wrapper.
+type Timed struct {
+	*openai.Adapter
+
+	mu      sync.Mutex
+	records []CallRecord
+}
+
+var (
+	_ model.Adapter      = (*Timed)(nil)
+	_ model.Streamer     = (*Timed)(nil)
+	_ model.CapsReporter = (*Timed)(nil)
+	_ model.OutputCap    = (*Timed)(nil)
+	_ model.Warmer       = (*Timed)(nil)
+	_ model.RateReporter = (*Timed)(nil)
+)
+
+// Fingerprint names a task by its request text.
+func Fingerprint(input string) string {
+	s := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(s[:8])
+}
+
+func requestPrint(req model.Request) string {
+	for _, m := range req.Messages {
+		if m.Role == task.RoleUser {
+			return Fingerprint(m.TextContent())
+		}
+	}
+	return ""
+}
+
+func (t *Timed) record(r CallRecord) {
+	t.mu.Lock()
+	t.records = append(t.records, r)
+	t.mu.Unlock()
+}
+
+// Records returns a copy of every call recorded so far.
+func (t *Timed) Records() []CallRecord {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]CallRecord(nil), t.records...)
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func (t *Timed) Call(ctx context.Context, req model.Request) (model.Response, error) {
+	r := CallRecord{Fingerprint: requestPrint(req), Start: time.Now()}
+	resp, err := t.Adapter.Call(ctx, req)
+	r.End, r.Err = time.Now(), errString(err)
+	t.record(r)
+	return resp, err
+}
+
+func (t *Timed) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
+	r := CallRecord{Fingerprint: requestPrint(req), Start: time.Now()}
+	var once sync.Once
+	resp, err := t.Adapter.Stream(ctx, req, func(d model.Delta) {
+		once.Do(func() { r.First = time.Now() })
+		emit(d)
+	})
+	r.End, r.Err = time.Now(), errString(err)
+	t.record(r)
+	return resp, err
+}

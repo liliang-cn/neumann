@@ -1,0 +1,134 @@
+diff --git a/ratelimit/bucket.go b/ratelimit/bucket.go
+index 2efe581..7d51652 100644
+--- a/ratelimit/bucket.go
++++ b/ratelimit/bucket.go
+@@ -18,20 +18,36 @@ type Bucket struct {
+ 
+ // Allow takes one token if there is one.
+ func (b *Bucket) Allow() bool {
++	return b.AllowN(1)
++}
++
++// AllowN takes n tokens if there are that many; it takes none otherwise.
++func (b *Bucket) AllowN(n float64) bool {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	b.refill(time.Now())
++	if b.tokens < n {
++		return false
++	}
++	b.tokens -= n
++	return true
++}
++
++// Wait reports how long until n tokens are available.
++func (b *Bucket) Wait(n float64) time.Duration {
+ 	b.mu.Lock()
+ 	defer b.mu.Unlock()
+-	now := time.Now()
++	b.refill(time.Now())
++	if b.tokens >= n || b.Rate <= 0 {
++		return 0
++	}
++	return time.Duration((n - b.tokens) / b.Rate * float64(time.Second))
++}
++
++func (b *Bucket) refill(now time.Time) {
+ 	if b.last.IsZero() {
+ 		b.tokens, b.last = b.Burst, now
+ 	}
+-	b.tokens += now.Sub(b.last).Seconds() * b.Rate
+-	if b.tokens > b.Burst {
+-		b.tokens = b.Burst
+-	}
++	b.tokens = min(b.Burst, b.tokens+now.Sub(b.last).Seconds()*b.Rate)
+ 	b.last = now
+-	if b.tokens < 1 {
+-		return false
+-	}
+-	b.tokens--
+-	return true
+ }
+diff --git a/session/store.go b/session/store.go
+index ac8f0c9..bb4ace9 100644
+--- a/session/store.go
++++ b/session/store.go
+@@ -12,31 +12,44 @@ type Session struct {
+ 	LastSeen time.Time
+ }
+ 
+-// Store keeps sessions in memory.
++// Store keeps sessions in memory. Sessions not seen for ttl expire: Get
++// drops them, and Sweep removes all of them at once.
+ type Store struct {
+-	mu    sync.RWMutex
++	mu    sync.Mutex
+ 	items map[string]*Session
+ 	ttl   time.Duration
++	now   func() time.Time
+ }
+ 
+ // NewStore returns an empty store whose sessions expire after ttl.
+ func NewStore(ttl time.Duration) *Store {
+-	return &Store{items: map[string]*Session{}, ttl: ttl}
++	return &Store{items: map[string]*Session{}, ttl: ttl, now: time.Now}
+ }
+ 
+ // Put adds or replaces a session.
+ func (s *Store) Put(sess *Session) {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
++	sess.LastSeen = s.now()
+ 	s.items[sess.ID] = sess
+ }
+ 
+-// Get returns a session by id.
++// Get returns a live session by id and marks it as seen now. An expired
++// session is removed and reported as missing.
+ func (s *Store) Get(id string) (*Session, bool) {
+-	s.mu.RLock()
+-	defer s.mu.RUnlock()
++	s.mu.Lock()
+ 	sess, ok := s.items[id]
+-	return sess, ok
++	if !ok {
++		return nil, false
++	}
++	if s.now().Sub(sess.LastSeen) > s.ttl {
++		delete(s.items, id)
++		s.mu.Unlock()
++		return nil, false
++	}
++	sess.LastSeen = s.now()
++	s.mu.Unlock()
++	return sess, true
+ }
+ 
+ // Delete removes a session.
+@@ -46,9 +59,23 @@ func (s *Store) Delete(id string) {
+ 	delete(s.items, id)
+ }
+ 
+-// Len is the number of sessions held.
++// Sweep removes every expired session and returns how many it removed.
++func (s *Store) Sweep() int {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	n := 0
++	for id, sess := range s.items {
++		if s.now().Sub(sess.LastSeen) > s.ttl {
++			delete(s.items, id)
++			n++
++		}
++	}
++	return n
++}
++
++// Len is the number of sessions held, expired ones included.
+ func (s *Store) Len() int {
+-	s.mu.RLock()
+-	defer s.mu.RUnlock()
++	s.mu.Lock()
++	defer s.mu.Unlock()
+ 	return len(s.items)
+ }
