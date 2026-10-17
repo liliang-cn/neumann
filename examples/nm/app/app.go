@@ -51,6 +51,7 @@ type Config struct {
 	Model    string
 	BaseURL  string
 	Cores    int
+	Parallel int // requests a local backend serves at once
 	Store    string
 	Root     string
 	Writable string // comma-separated, relative to Root
@@ -68,7 +69,8 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&c.Backend, "backend", envOr("NM_BACKEND", "cloud"), "local (Ollama "+LocalModel+") or cloud (CPA_BASE_URL, CPA_API_KEY, CPA_MODEL) [NM_BACKEND]")
 	fs.StringVar(&c.Model, "model", "", "model name; default: "+LocalModel+" (local) or $CPA_MODEL (cloud)")
 	fs.StringVar(&c.BaseURL, "base-url", "", "endpoint up to and including /v1; default: "+LocalBaseURL+" (local) or $CPA_BASE_URL (cloud)")
-	fs.IntVar(&c.Cores, "cores", 0, "vCores; default 1 (local) or 8 (cloud)")
+	fs.IntVar(&c.Cores, "cores", 0, "vCores; default -parallel (local) or 8 (cloud)")
+	fs.IntVar(&c.Parallel, "parallel", 1, "local: requests the backend serves at once (Ollama's MLX runner serves one; a GGUF model, OLLAMA_NUM_PARALLEL)")
 	fs.StringVar(&c.Store, "store", filepath.Join(".nm", "state.db"), "SQLite file holding the machine's state")
 	fs.StringVar(&c.Root, "root", ".", "workspace root; every tool is confined to it")
 	fs.StringVar(&c.Writable, "writable", "out", "comma-separated directories under the root where fs_write may write")
@@ -101,8 +103,11 @@ func (c *Config) Resolve() (key string, err error) {
 		if c.BaseURL == "" {
 			c.BaseURL = LocalBaseURL
 		}
+		if c.Parallel < 1 {
+			return "", errors.New("-parallel must be at least 1")
+		}
 		if c.Cores == 0 {
-			c.Cores = 1
+			c.Cores = c.Parallel
 		}
 		key = envOr("NM_API_KEY", "ollama")
 	case "cloud":
@@ -132,7 +137,7 @@ func (c *Config) Resolve() (key string, err error) {
 func (c *Config) Adapter(key string) *Timed {
 	a := openai.New(c.BaseURL, key, c.Model)
 	if c.Backend == "local" {
-		a.Parallel = 1
+		a.Parallel = c.Parallel
 		a.Prefill, a.ThinkOff = true, localThinkOff
 		a.ThinkTags = [2]string{"<think>", "</think>"}
 		a.Timeout, a.FirstByteTimeout, a.IdleTimeout = 0, localFirstByte, localIdle

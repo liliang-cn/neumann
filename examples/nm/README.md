@@ -15,9 +15,9 @@ go build -o nm ./examples/nm
 | flag | what it uses |
 |---|---|
 | `-backend cloud` (default) | `CPA_BASE_URL`, `CPA_API_KEY`, `CPA_MODEL`; 8 vCores |
-| `-backend local` | Ollama at `http://127.0.0.1:11434/v1`, `qwen3.5:9b-mlx`, configured like `cmd/neumann -local`: one request at a time, 1 vCore, preemption, continuation of a cut-off answer or thought, `reasoning_effort: "none"` to turn thinking off, 10 min to the first byte, 2 min between chunks, no total limit, 8192 output tokens |
+| `-backend local` | Ollama at `http://127.0.0.1:11434/v1`, `qwen3.5:9b-mlx`, configured like `cmd/neumann -local`: one request at a time and as many vCores (`-parallel N` for a backend that serves more, e.g. a GGUF model with `OLLAMA_NUM_PARALLEL`), preemption, continuation of a cut-off answer or thought, `reasoning_effort: "none"` to turn thinking off, 10 min to the first byte, 2 min between chunks, no total limit, 8192 output tokens |
 
-`-model`, `-base-url` and `-cores` override. The key is read from the
+`-model`, `-base-url`, `-parallel` and `-cores` override. The key is read from the
 environment only (`NM_API_KEY` for local, default `ollama`) and never printed.
 
 ## Tools
