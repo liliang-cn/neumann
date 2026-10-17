@@ -101,8 +101,13 @@ type world struct {
 	// is suspended. deny: the operator denies the held calls.
 	suspendOn string
 	suspWait  atomic.Bool
+	suspSent  atomic.Bool // the first process's operator has sent its suspend
 	deny      bool
 }
+
+// suspendDue reports whether the operator is still to suspend the task as
+// it waits for its group: until then, a wait for the group is not quiet.
+func (w *world) suspendDue() bool { return w.suspendOn == "group" && !w.suspSent.Load() }
 
 // waitSuspends reports whether ev starts the wait the operator suspends the
 // task in (suspendOn), the first time it does across processes.
@@ -649,7 +654,7 @@ const sweepPatience = 30 * time.Second
 // in flight, or until dead says the process died while nothing was ready or
 // held: a task left waiting for an approval
 // that could not be committed stays in the wait set for good.
-func quiesceOr(t *testing.T, m *neumann.Machine, store mem.Store, id string, patience time.Duration, dead func() bool) {
+func quiesceOr(t *testing.T, m *neumann.Machine, store mem.Store, id string, patience time.Duration, dead, due func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(patience)
 	for time.Now().Before(deadline) {
@@ -664,8 +669,9 @@ func quiesceOr(t *testing.T, m *neumann.Machine, store mem.Store, id string, pat
 			return
 		}
 		// Waiting for a group that only an operator brings back: nothing
-		// more happens in this process.
-		if tc, err := store.Load(bg, id); err == nil && tc.State == task.Waiting && tc.Wait == task.WaitGroup && st.Ready+st.Held == 0 {
+		// more happens in this process, once its operator has suspended the
+		// task if it means to.
+		if tc, err := store.Load(bg, id); err == nil && tc.State == task.Waiting && tc.Wait == task.WaitGroup && st.Ready+st.Held == 0 && !due() {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
@@ -767,6 +773,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 					m1.ResumeTask(bg, ev.TaskID)
 				case ev.Kind != proto.EvApprovalNeeded && w.waitSuspends(ev):
 					m1.Suspend(bg, ev.TaskID)
+					w.suspSent.Store(true)
 				}
 			}
 		}()
@@ -780,7 +787,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		if sc.patience > 0 {
 			patience = sc.patience
 		}
-		quiesceOr(t, m1, s1, id, patience, func() bool { return (w.approve || w.resumer()) && cs.crashed.Load() })
+		quiesceOr(t, m1, s1, id, patience, func() bool { return (w.approve || w.resumer()) && cs.crashed.Load() }, w.suspendDue)
 	}
 	stop(t, m1)
 	opStop()
