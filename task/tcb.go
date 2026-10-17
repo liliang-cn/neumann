@@ -231,10 +231,11 @@ type TCB struct {
 	// text: the next call continues the thinking, when the adapter can
 	// (model.Caps.ThinkPrefill), and the answer's reasoning is joined onto
 	// it. At most one of the two is set. Both are cleared when a call is
-	// answered, and when a call continuing them fails without adding to
-	// them: the retry starts afresh. Preempts counts the preemptions of the
-	// current step, also cleared by an answer; a call is not preempted once
-	// it reaches its group's limit.
+	// answered, and when the provider refuses a call continuing them (an
+	// empty or lost answer, a rejection) before it streamed anything: the
+	// retry starts afresh. Preempts counts the preemptions of the current
+	// step, also cleared by an answer; a call is not preempted once it
+	// reaches its group's limit.
 	Partial      string `json:"partial,omitempty"`
 	PartialThink string `json:"partial_think,omitempty"`
 	Preempts     int    `json:"preempts,omitempty"`

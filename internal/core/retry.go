@@ -142,6 +142,18 @@ func (e *Env) modelFailed(t *task.TCB, c mem.CommitSet, class model.ErrClass, er
 		}
 		return e.groupGone(t, c, g, retryEvent(t, class.String(), 0, "group", text))
 	}
+	if class != model.Overload && class != model.RateLimited {
+		class = model.Transient
+	}
+	return e.retry(t, c, class, err)
+}
+
+// retry backs t off before it calls the model again, counted in Retries
+// with exponential backoff, never shorter than the provider's retry-after;
+// at the limit the task fails with "model_error". The model_retry event
+// carries class as it is.
+func (e *Env) retry(t *task.TCB, c mem.CommitSet, class model.ErrClass, err error) mem.CommitSet {
+	text := err.Error()
 	t.Retries++
 	if t.Retries >= e.maxRetries() {
 		return failWith(t, c, StopModelError, fmt.Sprintf("%s (%d consecutive failures)", text, t.Retries))
@@ -150,9 +162,6 @@ func (e *Env) modelFailed(t *task.TCB, c mem.CommitSet, class model.ErrClass, er
 	var me *model.Error
 	if errors.As(err, &me) {
 		floor = me.RetryAfter
-	}
-	if class != model.Overload && class != model.RateLimited {
-		class = model.Transient
 	}
 	return e.backoff(t, c, class, e.Clock.Now().Add(e.backoffDelay(t.Retries, floor)), text)
 }
@@ -169,34 +178,57 @@ func (e *Env) backoff(t *task.TCB, c mem.CommitSet, class model.ErrClass, at tim
 	return c
 }
 
+// retryData is a failed call's model_retry event (design §11).
+type retryData struct {
+	Class   string `json:"class"`
+	Attempt int    `json:"attempt"`
+	DelayMS int64  `json:"delay_ms"`
+	Wait    string `json:"wait"`
+	Error   string `json:"error"`
+	// Dropped and DroppedThink are how many characters of the task's
+	// Partial and PartialThink the failed call's commit drops: the call
+	// continued them and its answer was of no use (design §6.4).
+	Dropped      int `json:"dropped,omitempty"`
+	DroppedThink int `json:"dropped_think,omitempty"`
+}
+
 func retryEvent(t *task.TCB, class string, delay time.Duration, wait, text string) proto.Event {
-	return proto.NewEvent(proto.EvModelRetry, t.ID, map[string]any{
-		"class": class, "attempt": t.Retries, "delay_ms": delay.Milliseconds(), "wait": wait, "error": text,
-	})
+	return proto.NewEvent(proto.EvModelRetry, t.ID, retryData{Class: class, Attempt: t.Retries, DelayMS: delay.Milliseconds(), Wait: wait, Error: text})
 }
 
 // amendRetry notes on the model_retry event in c how many characters of a
-// kept prefix the failed call's commit drops (design §6.4): dropped of its
-// Partial, droppedThink of its PartialThink. A commit without a model_retry
-// event (the task failed) is left as it is.
+// kept prefix the failed call's commit drops (design §6.4). A commit
+// without a model_retry event (the task failed) is left as it is.
 func amendRetry(c *mem.CommitSet, dropped, droppedThink int) {
 	for i, ev := range c.Events {
 		if ev.Kind != proto.EvModelRetry {
 			continue
 		}
-		var d map[string]any
+		var d retryData
 		if err := json.Unmarshal(ev.Data, &d); err != nil {
 			return
 		}
-		if dropped > 0 {
-			d["dropped"] = dropped
-		}
-		if droppedThink > 0 {
-			d["dropped_think"] = droppedThink
-		}
+		d.Dropped, d.DroppedThink = dropped, droppedThink
 		c.Events[i] = proto.NewEvent(proto.EvModelRetry, ev.TaskID, d)
 		return
 	}
+}
+
+// prefixRefused reports a failure of a continued call that is the
+// provider's answer to the request it was sent (design §6.4): a whole
+// response with nothing usable in it (ErrEmptyResponse), a response lost or
+// undecodable after the request got there (ErrResponseLost), or a
+// rejection (Permanent). A rate limit, a full quota, an overloaded
+// provider, a refused connection or a server error say nothing about the
+// prefix.
+func prefixRefused(class model.ErrClass, err error) bool {
+	switch class {
+	case model.Permanent:
+		return true
+	case model.Transient:
+		return errors.Is(err, model.ErrEmptyResponse) || errors.Is(err, model.ErrResponseLost)
+	}
+	return false
 }
 
 // truncated reports a turn cut off by its output cap before it produced

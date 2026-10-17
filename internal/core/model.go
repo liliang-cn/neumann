@@ -152,7 +152,7 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 		return append(msgs[:len(msgs):len(msgs)], *prefill)
 	}
 	req := model.Request{System: t.System, Tools: t.Tools, Messages: withPrefill(forProvider(t.Regs, a.Provider())), MaxOut: e.sendOut(g, t), NoThink: t.NoThink}
-	resp, c, thought, out := e.modelCall(ctx, t, core, g, a, task.StepModel, req, func(c *mem.CommitSet) model.Request {
+	resp, c, thought, out := e.modelCall(ctx, t, core, g, a, task.StepModel, req, prefill != nil, func(c *mem.CommitSet) model.Request {
 		// Steers are applied after the Running commit, so a crash cannot
 		// leave a steer in the registers that the interrupt table still
 		// lists as pending. So is a Partial they interrupt: modelCall puts
@@ -306,7 +306,9 @@ type stepOut struct {
 // group, commit Running (with pc as the task's PC), send the request, and
 // settle its outcome with the limiters and the group. apply runs after the
 // Running commit and before the call, and returns the request to send (a
-// model step applies its steers there); nil sends req as it is.
+// model step applies its steers there); nil sends req as it is. cont says
+// the request ends with the task's Partial or PartialThink for the model to
+// continue (design §6.4).
 //
 // It returns the response and the commit set so far (the step and usage
 // events, the steers applied) when the call was answered, and whether the
@@ -316,7 +318,7 @@ type stepOut struct {
 // the group or a backoff, failed, or compacting after a context-length
 // rejection.
 func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a model.Adapter, pc task.PC, req model.Request,
-	apply func(c *mem.CommitSet) model.Request) (model.Response, mem.CommitSet, bool, *stepOut) {
+	cont bool, apply func(c *mem.CommitSet) model.Request) (model.Response, mem.CommitSet, bool, *stepOut) {
 	var c mem.CommitSet
 	base := len(t.Regs)
 	// apply may move the task's Partial into its registers (a preempted
@@ -423,10 +425,6 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 	if apply != nil {
 		req = apply(&c)
 	}
-	// A model step that applied no steers and still holds a Partial or a
-	// PartialThink asks the model to continue it (modelStep put it at the
-	// end of the request): a continued call.
-	continuing := pc == task.StepModel && len(c.Applied) == 0 && (t.Partial != "" || t.PartialThink != "")
 
 	// The text the call streams is kept as it comes: a call cut off by a
 	// preemption, or whose stream breaks off, leaves it for the next call to
@@ -562,32 +560,34 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		if suspended && !panicked {
 			return end(e.suspendedCall(ctx, t, c, keep, keepThink, capsOf(a)), nil)
 		}
-		added := false
 		if lost && !panicked && pc == task.StepModel {
 			// The stream broke off: what came is continued by the retry
 			// (design §6.4), committed with the backoff.
-			kt, kth := keepPartial(t, keep, keepThink, capsOf(a))
-			added = kt != "" || kth != ""
+			keepPartial(t, keep, keepThink, capsOf(a))
 		}
 		if class == model.ContextLength && !panicked {
 			return end(e.contextRejected(t, c, g, a, req, err), nil)
 		}
-		var dropped, droppedThink int
-		if continuing && !added && tctx.Err() == nil {
-			// A continued call that failed and added nothing to its prefix
-			// (design §6.4): sent again, the same request may well fail the
-			// same way (a backend that answers a continued thought with
-			// nothing). The prefix goes in the commit that records the
-			// failure, so neither the retry nor a restart sends it again:
-			// the retry is a fresh call.
-			dropped, droppedThink = runes(t.Partial), runes(t.PartialThink)
+		if cont && !panicked && tctx.Err() == nil && got.Len()+gotThink.Len() == 0 && prefixRefused(class, err) {
+			// The provider answered the continued request, streamed
+			// nothing, and the answer is of no use (design §6.4): sent
+			// again, the same request is likely to fare the same (a backend
+			// that answers a continued thought with nothing). The prefix
+			// goes in the commit that records the failure, so neither the
+			// retry nor a restart sends it again: the retry is a fresh call.
+			// A rejection (Permanent) is retried once that way instead of
+			// failing the task: a fresh call is a different request.
+			dropped, droppedThink := runes(t.Partial), runes(t.PartialThink)
 			t.Partial, t.PartialThink = "", ""
-		}
-		c = e.modelFailed(t, c, class, err, info, panicked)
-		if dropped+droppedThink > 0 {
+			if class == model.Permanent {
+				c = e.retry(t, c, class, err)
+			} else {
+				c = e.modelFailed(t, c, class, err, info, panicked)
+			}
 			amendRetry(&c, dropped, droppedThink)
+			return end(c, nil)
 		}
-		return end(c, nil)
+		return end(e.modelFailed(t, c, class, err, info, panicked), nil)
 	}
 	return resp, c, thought, nil
 }

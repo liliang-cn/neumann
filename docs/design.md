@@ -120,7 +120,7 @@ type TCB struct {
     CompactLimit int           // 最大上限仍被截断后，下一块最多带几个单元，0 = 不限
     Archived   int             // 压缩移进归档的消息数（5.3）
     Rejections int             // 被答案检查驳回的最终答案数（9.8）；检查看到的 Attempt
-    Partial    string          // 被抢占或流中断的模型调用已收到的正文，下一次调用续写（6.4）；有回答时、续写失败时清空
+    Partial    string          // 被抢占或流中断的模型调用已收到的正文，下一次调用续写（6.4）；有回答时、续写被拒时清空
     PartialThink string        // 同上，但调用还在思考、没有正文：已收到的思考，下一次调用接着想（6.4）；与 Partial 至多一个非空
     Preempts   int             // 本步被抢占的次数，有回答时清零（6.4）
     NoThink    bool            // 下一次调用关掉思考：只想不答的截断之后（13）；有回答时清除
@@ -441,12 +441,16 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 
 **流中断也续写**：调用以 `Transient` 且 `ErrResponseLost` 失败时（流读到一半断了、空闲超时），已收到的正文（或还在思考时的思考）同样保留，随退避的提交落盘，重试时续写。`Unconfirmed` 照旧加一。
 
-**续写失败就从头来**：续写的调用（请求以 `Partial` 或 `PartialThink` 结尾，`step` 带 `prefill` / `prefill_think`）失败了，不是被抢、挂起、取消或 Deadline 切断的，也没有给前缀接上任何东西（流中断前收到了新的正文或思考就算接上了，按上一段保留），就在记录这次失败的那个提交里丢掉前缀，`Partial`、`PartialThink` 都清空，重试是一次从头的调用。照原样再发多半得到同样的失败：实测 Ollama 对接着想的请求回空回答（适配器报"既无正文也无工具调用"的临时错误），同一个请求连发 7 次都一样，任务差点以 `model_error` 结束；连续失败还计入执行组，可能打开熔断，把同一后端上的其他任务一起卡住（2026-10-17，qwen3.5:9b-mlx）。机器分不清失败是前缀招来的还是服务商自己的问题，丢掉前缀的代价是重新生成一段，留着的代价可能是整个任务，所以第一次失败就丢，不分错误类别。
+**续写被拒就从头来**：续写的调用（请求以 `Partial` 或 `PartialThink` 结尾，`step` 带 `prefill` / `prefill_think`）失败了，不是被抢、挂起、取消或 Deadline 切断的，这次调用一点东西都没流出来，而且失败是服务商对这个请求的回答，就在记录这次失败的那个提交里丢掉前缀，`Partial`、`PartialThink` 都清空，重试是一次从头的调用。照原样再发多半得到同样的结果：实测 Ollama 对接着想的请求回空回答（适配器报"既无正文也无工具调用"的临时错误），同一个请求连发 7 次都一样，任务差点以 `model_error` 结束；连续失败还计入执行组，可能打开熔断，把同一后端上的其他任务一起卡住（2026-10-17，qwen3.5:9b-mlx）。
 
-- 重试次数、退避、`model_retry` 照旧（这次失败照样计一次 `Retries`）；`model_retry` 多带 `dropped`（丢掉的正文字符数）或 `dropped_think`（丢掉的思考字符数），下一次调用的 `step` 不再带 `prefill` / `prefill_think`。任务因此失败（永久错误、重试用完）时没有 `model_retry`，前缀随任务结束。
+- "服务商对这个请求的回答"指三种：完整回来却没有可用内容的回答（适配器的错误包 `model.ErrEmptyResponse`，11）；请求到达之后回答没有完整回来、或回来了解析不了（`ErrResponseLost`，这次调用什么都没流出来）；拒绝（`Permanent`，例如服务商不收 assistant 前缀、不收以空白结尾的前缀）。限流（带不带提示都一样：服务商什么都没生成，带提示的连重试都不计）、额度耗尽（任务可能迁到别的组，到那里由新组适配器的 `Caps` 决定续不续写）、过载、其他 5xx、连接被拒（请求根本没到，`Unconfirmed` 不加，18.12）都和前缀无关，前缀留着。
+- 流出过东西就不丢：后端显然接得下去。流中断时收到的照上一段接上；以分了类的流内错误（OpenRouter、vLLM 的 `{"error": ...}` 块）结束时，收到的不保留（只有流中断才保留），前缀原样留给重试；这时的拒绝照旧让任务 `Failed`。
+- 拒绝本来让任务 `Failed`；续写被拒时改为丢掉前缀、按临时错误退避重试一次（计一次 `Retries`，`model_retry` 的 `class` 是 `permanent`）：从头的调用是另一个请求，多半能回答。从头的调用再被拒，照旧 `Failed`（`model_error`）。
+- 重试次数、退避、`model_retry` 照旧；`model_retry` 多带 `dropped`（丢掉的正文字符数）或 `dropped_think`（丢掉的思考字符数），下一次调用的 `step` 不再带 `prefill` / `prefill_think`。任务因此失败（重试用完）时没有 `model_retry`，前缀随任务结束。
 - 从头的调用不关思考。"想完了没作答"关思考，是因为照原样重想还会想完不答；这里没有迹象说明思考本身有问题（流断之前那次调用正想得好好的），失败的是续写这个请求，等同于"适配器不能接着想"时的从头生成。`NoThink` 只由截断（13）设置，这里原样保留。
 - 上下文超长的拒绝（`ContextLength`）不在此列：按 5.3 学到更小的窗口、压缩后重发，前缀算在窗口估算里，压缩就是对它的回答。
 - 丢弃和失败在同一个提交里，重启后看到的是没有前缀的任务，不会永远重发过时的前缀；失败还没提交时崩溃，重启按 4.5 重做那次续写，再失败照样丢。
+- 流中断时保留什么仍按 `keepPartial`：接着想的调用已经流出了正文、适配器能续写正文（`Caps.Prefill`），正文进 `Partial`，思考丢掉（正文开始了，思考已经结束）；适配器不能续写正文，这段正文丢掉，思考（加上这次新流出的）留着，重试再接着想。
 
 **持久化**：`Partial` 只随提交持久化。在调用中途崩溃，重启后按 4.5 重做，用的是最近一次提交的 `Partial`。加字段之前写下的 TCB 解码为空。
 
@@ -467,7 +471,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 - **始终流式**：组开着抢占、或机器有增量接收方（`Machine` 总是有）时，适配器实现了 `Streamer` 就流式调用；收到的 `Delta.Text` 累加在 vCore 上，有接收方才转发。所以"流中断也续写"不要求组开着抢占：只要这次调用是流式的、适配器 `Caps.Prefill` 为真。
 - **`first_ms`**：机器时钟上从调用适配器前一刻到第一块增量（正文或推理都算）的毫秒数，`step` 事件在调用之后改写带上它；`prefill` 在合并插话的钩子里写上。`check_ms` 也改为在原事件上改写，三者可以同时出现。
 - **`SetPriority`**：优先级没变时什么都不提交、返回 nil；`ReadySince` 不变（不重新排队尾）。负数报错。`Submit` 也放开到任何 `≥ 0` 的优先级（原来只接受 0、1）。调度器本来就按数值比较、老化把任何大于 0 的提成 0，`Queue` 的 `Background` 计所有大于 0 的。
-- **续写失败**（`modelCall`）：插话合并之后、调用之前判断这次是不是续写：模型步、没有合并插话、任务还有 `Partial` 或 `PartialThink`（`modelStep` 只在这时把它放在请求末尾，不能续写的适配器已经让它清空了）。失败分支里被抢、挂起、取消先走各自的路；流中断先 `keepPartial`，接上了东西就不丢；`ContextLength` 去压缩；其余（包括额度耗尽、带提示的限流、永久错误、适配器 panic）在 `modelFailed` 之前清空两者，再在它产生的 `model_retry` 上补 `dropped` / `dropped_think`（`amendRetry`，和 `amendStep` 一样改写原事件）。任务自己的 context 已经结束（取消、Deadline、强制停机）时不动。没有新增提交点：丢弃随记录失败的那次提交（退避、等组、迁移或失败）落盘（`TestFailedThoughtContinuationStartsOver`、`TestFailedContinuationStartsOver`，后者从这次提交重启；`TestBrokenContinuationKeepsWhatItAdded`；被抢、挂起的续写保留前缀：`TestCutOffContinuationKeepsItsPrefix`）。
+- **续写被拒**（`modelCall`）：`modelStep` 把它是否在请求末尾放了前缀作为参数传给 `modelCall`（压缩传假），不从 TCB 推断。失败分支里被抢、挂起、取消先走各自的路；流中断先 `keepPartial`；`ContextLength` 去压缩；然后，续写的调用、任务的 context 没结束（取消、Deadline、强制停机）、这次调用的流里什么都没收到（正文、思考都算）、`prefixRefused`（`Permanent`，或 `Transient` 且包 `ErrEmptyResponse` / `ErrResponseLost`）时清空两者：`Permanent` 走计次的退避（`retry`，`modelFailed` 的计次部分拆出来的），其余照常 `modelFailed`；再在 `model_retry` 上补 `dropped` / `dropped_think`（`amendRetry`，像 `amendStep` 一样按类型 `retryData` 改写原事件）。适配器 panic 不在此列，任务照旧失败。没有新增提交点：丢弃随记录失败的那次提交落盘（`TestFailedThoughtContinuationStartsOver`、`TestFailedContinuationStartsOver`（从这次提交重启）、`TestLostContinuationThatAddedNothingStartsOver`、`TestRejectedContinuationIsRetriedFresh`；保留前缀：`TestContinuationFailuresThatKeepThePrefix`、`TestContinuationErrorAfterStreamingKeepsItsPrefix`、`TestBrokenContinuationKeepsWhatItAdded`、`TestCutOffContinuationKeepsItsPrefix`（被抢、挂起，包括第一块之前就被挂起））。
 - **只有思考的截断**（13）：判定为截断且无内容，并且回答里有 reasoning 段、或用量报了推理 token、或**这次调用流出过 `Delta.Reasoning`**（Ollama 两者都不报，截断的回答连段都没有，只能从流里看）。适配器 `Caps.ThinkOff` 为真且任务还没关思考时，置 `NoThink`、`MaxOut` 不变重做：一次有回答的调用，发 `model_retry`（`class = "truncated"`，`no_think: true`，`max_out` 是这次的上限，`attempt` 不变），不计入 `Truncations`；关掉思考仍被截断才走两次放大，`NoThink` 一直开着。下一次有回答且没被截断的调用清除 `NoThink`（和 `Truncations` 同时）。请求的 `NoThink` 取自 TCB，适配器 `ThinkOff` 为假时它自己忽略。
 
 ## 7. 限流器
@@ -851,7 +855,7 @@ OpenAI 兼容适配器的本地选项：`Parallel`、`Prefill`、`ThinkOff` 原�
 | `QuotaExhausted` | 额度或账单耗尽 | 熔断，不自动半开 | 退还预占 | `Waiting(Group)` 或迁移 |
 | `Overload` | 529、503 overloaded；无法区分的 429 | 窗口减半（每周期一次） | 保留预占 | 退避后重试，计重试次数 |
 | `Transient` | 其余 5xx、网络错误、超时 | 计入熔断 | 见 7.2 | 退避后重试，计重试次数；响应丢失时 `Unconfirmed + 1` |
-| `Permanent` | 其余 4xx | — | 退还预占 | `Failed`，`StopReason = "model_error"` |
+| `Permanent` | 其余 4xx | — | 退还预占 | `Failed`，`StopReason = "model_error"`；续写的请求被拒时先丢掉前缀从头重试一次（6.4） |
 | `ContextLength` | 请求超出上下文窗口（OpenAI `context_length_exceeded`、Anthropic "prompt is too long"） | 算一次回答（同 `Permanent`） | 退还预占 | 学到更小的窗口，压缩后重发（5.3）；压不下 `Failed`，`StopReason = "context_overflow"` |
 
 退避：第 n 次连续失败等 `min(60s, 1s·2^(n-1))` 的全抖动（在 0 到该值之间均匀取），不短于服务商的 `RetryAfter`；第 8 次（`Config.MaxModelRetries`）连续失败时任务 `Failed`，`StopReason = "model_error"`，错误文字在 `failed` 事件里。`Retries` 记在 TCB 上随提交持久化，成功（包括截断）清零。每个重试决定都是一次提交：`Waiting(Backoff)` + `WakeAt` + `model_retry` 事件（`{class, attempt, delay_ms, wait, error}`，`attempt` 是计入的重试次数，限流时不变；失败的是续写时多带 `dropped` 或 `dropped_think`，6.4），提交之后调度器才挂定时器；`QuotaExhausted` 同样发 `model_retry`（`wait = "group"`）。失败的调用仍是一条指令（发 `step` 事件），但不计入 `Used.Steps`（4.6），`MaxSteps` 不约束它们，约束它们的是重试上限；带提示的限流（`RetryAfter`、`RateInfo.RetryAt` 或已耗尽维度的重置时间）不计重试次数，由服务商的重试时刻和限流器暂停节制；什么提示都没有的 429 和被误判的额度错误分不开，按临时错误退避并计入重试次数，也不暂停限流器，所以服务商一直这么回时任务以 `model_error` 结束，不会无限循环。退避步长到上限前不会溢出（`BackoffMax` 接近最大时长时也一样）。`Unknown`（谁也解释不了的错误）按 `Transient` 处理：网络抖动比请求本身有错更常见，重试上限兜住判断错的代价。适配器报了 `Canceled` 而任务并没有被取消（适配器自己超时、报成裸的 `DeadlineExceeded`）也按 `Transient`。
@@ -863,6 +867,8 @@ OpenAI 兼容适配器的本地选项：`Parallel`、`Prefill`、`ThinkOff` 原�
 实现（`model`）：`ErrClass` 取值 `Unknown`（零值）/ `RateLimited` / `QuotaExhausted` / `Overload` / `Transient` / `Permanent` / `Canceled` / `ContextLength`，`Retryable()` 只对 `RateLimited`、`Overload`、`Transient` 为真。适配器能解释的失败一律返回 `*model.Error{Class, Status, RetryAfter, Provider, Msg, Err, Rate}`，`Msg` 是状态码之外的响应片段，服务端回显的 key 会被抹掉。`model.Classify(err)` 按顺序判断：链上有 `context.Canceled` → `Canceled`（适配器说什么都不改变这一条）；链上有 `*model.Error` 且类别不是 `Unknown` → 用它的类别（所以永久错误不会被文字里的"timeout"翻案——这里根本不读文字）；`context.DeadlineExceeded` → `Canceled`；`net.Error`、`io.ErrUnexpectedEOF`、连接被重置 / 拒绝、`EPIPE`、`model.ErrResponseLost` → `Transient`；其余 `Unknown`。`model.ClassifyWith(adapter, err)` 先排除取消，再问适配器的 `Classifier`，答 `Unknown` 时回落到 `Classify`。
 
 **调用方的 Deadline 和单次请求超时是两回事。** 到达 `Classify` 的裸 `DeadlineExceeded` 是调用方的 ctx 到期，也就是任务的 Deadline（9.4），重试只会越过它，所以算 `Canceled`。单次请求超时（`http.Client.Timeout`、流读到一半卡住）发生时调用方还有时间，是服务商慢，算 `Transient`。两者在错误链上都表现为 `DeadlineExceeded`，只有适配器分得清：出错时看自己调用方的 `ctx.Err()`，非空就是 `Canceled`（`Err` 设为 `ctx.Err()`），为空就包成 `*model.Error{Class: Transient}`。
+
+**空回答**：响应完整回来了，却既没有正文也没有工具调用、也不是被截断，两个适配器都报 `Transient`，错误包裹 `model.ErrEmptyResponse`。服务商回答了，所以它和请求有关；续写的请求得到空回答时机器丢掉前缀（6.4）。
 
 **响应丢失**：请求已经到达服务商、但响应没有完整回来（body 中途断开、流在 finish_reason / `[DONE]` 之前结束、2xx 的 body 解析不了），错误包裹 `model.ErrResponseLost`，类别 `Transient`。服务商可能已经做完并计费，这一点和连接被拒绝（请求根本没出去，不包 `ErrResponseLost`）不同，`Unconfirmed` 只应在前者增加（18.12）。
 

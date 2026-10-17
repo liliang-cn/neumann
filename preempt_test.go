@@ -44,7 +44,9 @@ func firstPiece(s string) string {
 // apart on the machine's clock, so a call stays in flight until the test
 // moves the clock, and it records each task's latest call context, so a test
 // can tell at once whether a call was cut off. onCut, when set, runs when a
-// call of a task returns cut off by its context.
+// call of a task returns cut off by its context. hold, when set and true
+// for a task's n-th call, keeps that call in flight with nothing streamed
+// (and nothing recorded in Requests) until its context ends.
 type local struct {
 	*sim.Model
 	mu     sync.Mutex
@@ -52,6 +54,7 @@ type local struct {
 	calls  map[string]int // calls per task
 	pieces map[string]int // pieces its latest call has streamed
 	onCut  func(name string)
+	hold   func(name string, n int) bool
 }
 
 func (l *local) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
@@ -60,7 +63,12 @@ func (l *local) Stream(ctx context.Context, req model.Request, emit func(model.D
 	l.ctxs[name] = ctx
 	l.calls[name]++
 	l.pieces[name] = 0
+	held := l.hold != nil && l.hold(name, l.calls[name])
 	l.mu.Unlock()
+	if held {
+		<-ctx.Done()
+		return model.Response{}, ctx.Err()
+	}
 	resp, err := l.Model.Stream(ctx, req, func(d model.Delta) {
 		emit(d)
 		l.mu.Lock()
