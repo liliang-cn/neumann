@@ -25,6 +25,9 @@ type Tracker struct {
 // Track starts following the log after seq from.
 func (a *App) Track(ctx context.Context, from int64) *Tracker {
 	t := &Tracker{byTask: map[string][]proto.Event{}, end: map[string]proto.Event{}, waiters: map[string][]chan struct{}{}, last: from, closed: make(chan struct{})}
+	a.mu.Lock()
+	a.trackers = append(a.trackers, t)
+	a.mu.Unlock()
 	evs := a.M.Events(ctx, from)
 	go func() {
 		defer close(t.closed)

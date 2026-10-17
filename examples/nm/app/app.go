@@ -152,6 +152,7 @@ type App struct {
 
 	mu       sync.Mutex
 	toolRecs []tools.CallStat
+	trackers []*Tracker
 	obs      *observing
 	logw     *log.Logger
 }
@@ -256,6 +257,17 @@ func (a *App) Close(timeout time.Duration) error {
 	err := a.M.Stop(ctx)
 	if a.obs != nil {
 		a.obs.stop()
+	}
+	// The machine's event subscribers read the store until they have
+	// everything committed; the store closes after them.
+	a.mu.Lock()
+	trs := a.trackers
+	a.mu.Unlock()
+	for _, t := range trs {
+		select {
+		case <-t.closed:
+		case <-ctx.Done():
+		}
 	}
 	return errors.Join(err, a.Store.Close())
 }
