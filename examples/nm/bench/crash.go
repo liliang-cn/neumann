@@ -43,9 +43,9 @@ func (b *Bench) crash(ctx context.Context, rep *Report) error {
 	for _, t := range b.tasks {
 		ids = append(ids, t.ID)
 	}
-	args := []string{"bench", "-scenario", "crash-child", "-work", b.Opt.Work, "-run-id", b.Opt.RunID,
-		"-backend", b.Cfg.Backend, "-model", b.Cfg.Model, "-base-url", b.Cfg.BaseURL, "-cores", strconv.Itoa(b.Cfg.Cores),
-		"-max-steps", strconv.Itoa(b.Cfg.MaxSteps), "-tasks", strings.Join(ids, ","), "-store", b.Cfg.Store, "-repo", b.Opt.Repo}
+	args := []string{"bench", "-scenario", "crash-child", "-work", b.Opt.Work, "-run-id", b.Opt.RunID}
+	args = append(args, b.Cfg.BackendArgs()...)
+	args = append(args, "-max-steps", strconv.Itoa(b.Cfg.MaxSteps), "-tasks", strings.Join(ids, ","), "-store", b.Cfg.Store, "-repo", b.Opt.Repo)
 	if b.Opt.Verbose {
 		args = append(args, "-v")
 	}

@@ -146,10 +146,12 @@ func (b *Bench) mixed(ctx context.Context, rep *Report) error {
 	rep.Results = append(rep.Results, bgRes...)
 	rep.Results = append(rep.Results, probeRes...)
 	rep.summarize()
-	var mixedLat, soloLat []float64
+	var mixedLat, soloLat, e2eLat []float64
 	type probeRow struct {
 		Task    string  `json:"task"`
+		Class   string  `json:"class,omitempty"`
 		MixedMS float64 `json:"mixed_ms"`
+		RouteMS float64 `json:"route_ms,omitempty"`
 		SoloMS  float64 `json:"solo_ms"`
 		QueueMS float64 `json:"queue_ms"`
 		Pass    bool    `json:"pass"`
@@ -157,8 +159,9 @@ func (b *Bench) mixed(ctx context.Context, rep *Report) error {
 	var rows []probeRow
 	for _, r := range probeRes {
 		mixedLat = append(mixedLat, r.WallMS)
+		e2eLat = append(e2eLat, r.RouteMS+r.WallMS)
 		soloLat = append(soloLat, solo[r.TaskID])
-		rows = append(rows, probeRow{r.TaskID, r.WallMS, solo[r.TaskID], r.QueueMS, r.Pass})
+		rows = append(rows, probeRow{r.TaskID, r.Class, r.WallMS, r.RouteMS, solo[r.TaskID], r.QueueMS, r.Pass})
 	}
 	preempts, bgPass := 0, 0
 	for _, r := range bgRes {
@@ -174,6 +177,16 @@ func (b *Bench) mixed(ctx context.Context, rep *Report) error {
 	rep.Summary["probe_mixed_p50_ms"] = percentile(mixedLat, 0.5)
 	rep.Summary["probe_mixed_p95_ms"] = percentile(mixedLat, 0.95)
 	rep.Summary["probe_mixed_max_ms"] = percentile(mixedLat, 1)
+	// What the user waits for: the routing decision, then the task.
+	rep.Summary["probe_e2e_p50_ms"] = percentile(e2eLat, 0.5)
+	rep.Summary["probe_e2e_p95_ms"] = percentile(e2eLat, 0.95)
+	probePass := 0
+	for _, r := range probeRes {
+		if r.Pass {
+			probePass++
+		}
+	}
+	rep.Summary["probes_passed"] = fmt.Sprintf("%d/%d", probePass, len(probeRes))
 	rep.Summary["probe_solo_p50_ms"] = percentile(soloLat, 0.5)
 	rep.Summary["probe_solo_p95_ms"] = percentile(soloLat, 0.95)
 	rep.Summary["probe_solo_max_ms"] = percentile(soloLat, 1)
@@ -186,8 +199,8 @@ func (b *Bench) mixed(ctx context.Context, rep *Report) error {
 // burst submits K tasks (the selected mix, cycled) at once and samples the
 // machine's status while they run.
 func (b *Bench) burst(ctx context.Context, rep *Report) error {
-	if b.Cfg.Backend != "cloud" {
-		rep.Notes = append(rep.Notes, "burst is meant for the cloud backend")
+	if b.Cfg.Backend == "local" {
+		rep.Notes = append(rep.Notes, "burst is meant for a cloud backend")
 	}
 	s, err := b.start(ctx, 0)
 	if err != nil {

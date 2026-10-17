@@ -19,6 +19,8 @@ import (
 
 const replHelp = `Each line is a task at priority 0 (interactive). Commands:
   /bg <text>          submit at priority 2 (background)
+  /fast <text>        hybrid: submit to the fast (local) group, whatever -route says
+  /strong <text>      hybrid: submit to the strong (cloud) group
   /pri <id> <n>       change a task's priority (0 most urgent)
   /suspend <id>       take a task off the machine
   /resume <id>        put it back
@@ -54,7 +56,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 			go func() { say("%s", outcome(context.WithoutCancel(ctx), a, ev)) }()
 		}
 	})
-	say("nm: %s %s, %d vCore(s), workspace %s. /help for commands.", a.Cfg.Backend, a.Cfg.Model, a.Cfg.Cores, a.Tools.Box.Root())
+	say("nm: %s, workspace %s. /help for commands.", a.Cfg.Describe(), a.Tools.Box.Root())
 	lines := make(chan string)
 	go func() {
 		defer close(lines)
@@ -64,15 +66,20 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 			lines <- sc.Text()
 		}
 	}()
-	submit := func(text string, prio int) {
+	submitTo := func(text string, prio int, pick app.Pick) {
 		id := newID()
-		_, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: text, Priority: prio, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}})
+		_, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: text, Class: pick.Class, Priority: prio, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}})
 		if err != nil {
 			say("error: %v", err)
 			return
 		}
+		if pick.Class != "" {
+			say("[%s] submitted (priority %d) → %s", id, prio, pick)
+			return
+		}
 		say("[%s] submitted (priority %d)", id, prio)
 	}
+	submit := func(text string, prio int) { submitTo(text, prio, a.Route(ctx, text, "")) }
 	for {
 		var line string
 		var ok bool
@@ -108,6 +115,18 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 				continue
 			}
 			submit(rest, 2)
+		case "/fast", "/strong":
+			if rest == "" {
+				say("usage: %s <text>", cmd)
+				continue
+			}
+			pick, ferr := a.Force(cmd[1:])
+			if ferr != nil {
+				say("error: %v", ferr)
+				continue
+			}
+			submitTo(rest, 0, pick)
+			continue
 		case "/pri":
 			var n int
 			if n, err = strconv.Atoi(arg); err == nil {
@@ -126,7 +145,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 		case "/cancel":
 			err = a.M.Cancel(ctx, id)
 		case "/status":
-			say("%s", statusText(a.M.Status()))
+			say("%s", statusText(a, a.M.Status()))
 		case "/tasks":
 			infos := a.M.Tasks()
 			if len(infos) == 0 {
@@ -179,7 +198,11 @@ func outcome(ctx context.Context, a *app.App, ev proto.Event) string {
 	if err != nil {
 		return fmt.Sprintf("[%s] %s (%v)", ev.TaskID, ev.Kind, err)
 	}
-	head := fmt.Sprintf("[%s] %s after %d model calls", ev.TaskID, ev.Kind, t.Used.Steps)
+	on := ""
+	if a.Hybrid() {
+		on = " on " + t.Class
+	}
+	head := fmt.Sprintf("[%s] %s%s after %d model calls", ev.TaskID, ev.Kind, on, t.Used.Steps)
 	if ev.Kind != proto.EvDone {
 		head += " " + string(ev.Data)
 	}
@@ -189,11 +212,26 @@ func outcome(ctx context.Context, a *app.App, ev proto.Event) string {
 	return head
 }
 
-func statusText(s neumann.Status) string {
+func statusText(a *app.App, s neumann.Status) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "vCores %d, ready %d, waiting %d, held %d, unfinished %d, suspended %d", s.Cores, s.Ready, s.Waiting, s.Held, s.Unfinished, s.Suspended)
+	if m := a.RouteMode(); m != "" {
+		fmt.Fprintf(&b, "; route %s", m)
+	}
 	for _, g := range s.Groups {
-		fmt.Fprintf(&b, "\n  group %s (%s): W=%.1f target=%d live=%d busy=%d ready=%d waiting=%d breaker=%s", g.Class, g.Model, g.W, g.Target, g.Live, g.Busy, g.Ready, g.Waiting, g.Breaker)
+		side, _ := a.Side(g.Class)
+		fmt.Fprintf(&b, "\n  group %s: %s %s, %d vCore(s): W=%.1f target=%d live=%d busy=%d ready=%d waiting=%d (for the group %d) breaker=%s",
+			g.Class, side.Kind, side.Model, side.Cores, g.W, g.Target, g.Live, g.Busy, g.Ready, g.Waiting, g.ForGroup, g.Breaker)
+		if g.Breaker != "closed" {
+			fmt.Fprintf(&b, " (%s, failures %d", g.Cause, g.Failures)
+			if !g.NextProbe.IsZero() {
+				fmt.Fprintf(&b, ", next probe in %s", time.Until(g.NextProbe).Round(time.Second))
+			}
+			b.WriteString(")")
+		}
+		if g.Fallback != "" {
+			fmt.Fprintf(&b, " fallback=%s", g.Fallback)
+		}
 	}
 	return b.String()
 }

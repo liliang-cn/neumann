@@ -35,11 +35,10 @@ func TestLocalBackendSettings(t *testing.T) {
 	if err := fs.Parse([]string{"-backend", "local"}); err != nil {
 		t.Fatal(err)
 	}
-	key, err := c.Resolve()
-	if err != nil {
+	if err := c.Resolve(); err != nil {
 		t.Fatal(err)
 	}
-	a := c.Adapter(key).Adapter
+	a := c.Sides()[0].Adapter().Adapter
 	caps := a.Caps()
 	if c.Cores != 1 || c.Model != LocalModel || c.BaseURL != LocalBaseURL || a.Parallel != 1 || !a.Prefill || a.ThinkOff != "none" ||
 		a.ThinkTags != [2]string{"<think>", "</think>"} || a.Timeout != 0 || a.FirstByteTimeout != localFirstByte || a.IdleTimeout != localIdle ||

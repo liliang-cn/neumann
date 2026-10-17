@@ -15,6 +15,7 @@ import (
 // CallRecord is one model request as the adapter saw it: from the call to
 // its return, without the machine's commits around it.
 type CallRecord struct {
+	Class       string // the group whose adapter made it
 	Fingerprint string // of the request's first user message: which task sent it
 	Start       time.Time
 	First       time.Time // first streamed piece; zero if none
@@ -28,6 +29,7 @@ type CallRecord struct {
 // so the machine sees exactly what it would see without the wrapper.
 type Timed struct {
 	*openai.Adapter
+	Class string // the execution group it serves, for records
 
 	mu      sync.Mutex
 	records []CallRecord
@@ -78,7 +80,7 @@ func errString(err error) string {
 }
 
 func (t *Timed) Call(ctx context.Context, req model.Request) (model.Response, error) {
-	r := CallRecord{Fingerprint: requestPrint(req), Start: time.Now()}
+	r := CallRecord{Class: t.Class, Fingerprint: requestPrint(req), Start: time.Now()}
 	resp, err := t.Adapter.Call(ctx, req)
 	r.End, r.Err = time.Now(), errString(err)
 	t.record(r)
@@ -86,7 +88,7 @@ func (t *Timed) Call(ctx context.Context, req model.Request) (model.Response, er
 }
 
 func (t *Timed) Stream(ctx context.Context, req model.Request, emit func(model.Delta)) (model.Response, error) {
-	r := CallRecord{Fingerprint: requestPrint(req), Start: time.Now()}
+	r := CallRecord{Class: t.Class, Fingerprint: requestPrint(req), Start: time.Now()}
 	var once sync.Once
 	resp, err := t.Adapter.Stream(ctx, req, func(d model.Delta) {
 		once.Do(func() { r.First = time.Now() })

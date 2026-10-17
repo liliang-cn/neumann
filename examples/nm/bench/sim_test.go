@@ -131,3 +131,85 @@ func TestSoloOnAScriptedModel(t *testing.T) {
 		t.Errorf("table:\n%s", buf.String())
 	}
 }
+
+// With -backend hybrid and -route static, each task runs in its kind's
+// group, and the report accounts for each class: the cloud class's tokens
+// are the run's cost.
+func TestHybridSoloAccountsPerClass(t *testing.T) {
+	dir, _ := workspace(t)
+	simRoot = dir
+	work := filepath.Dir(dir)
+	t.Setenv("CPA_BASE_URL", "https://cloud.example/v1")
+	t.Setenv("CPA_MODEL", "cloud-model")
+	t.Setenv("CPA_API_KEY", "k")
+	cfg := app.Config{Backend: "hybrid", Parallel: 1, Route: app.RouteStatic, Fallback: true, MaxSteps: 10, Root: dir, Writable: "out,fixbug",
+		Store: filepath.Join(work, ".nm", "hybrid.db"), Quiet: true}
+	if err := cfg.Resolve(); err != nil {
+		t.Fatal(err)
+	}
+	strong := &sim.Model{Name: "sim:strong", Fn: func(req model.Request) (model.Response, error) {
+		r := sim.Reply("West, 1.00")
+		r.Usage = task.Usage{PromptTokens: 1000, CachedTokens: 400, CompletionTokens: 50}
+		return r, nil
+	}}
+	b := &Bench{
+		Cfg:      cfg,
+		Opt:      Options{Scenario: "solo", RunID: fmt.Sprintf("h%d", time.Now().UnixNano()%1e6), Work: work, Timeout: time.Minute},
+		Testdata: testdata,
+		out:      io.Discard,
+		errw:     io.Discard,
+		adapters: map[string]model.Adapter{app.ClassFast: &sim.Model{Name: "sim:fast", Fn: script}, app.ClassStrong: strong},
+	}
+	b.Facts, _ = Setup(dir, "../../..", testdata)
+	var err error
+	if b.tasks, err = Select("quick.lines,csv-stats"); err != nil {
+		t.Fatal(err)
+	}
+	rep := newReport(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := b.solo(ctx, rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Results) != 2 {
+		t.Fatalf("results: %d", len(rep.Results))
+	}
+	q, c := rep.Results[0], rep.Results[1]
+	if q.Class != app.ClassFast || q.FinalClass != app.ClassFast || q.Route.By != app.RouteStatic || !q.Pass {
+		t.Errorf("quick.lines: class %s/%s route %+v pass %v (%s)", q.Class, q.FinalClass, q.Route, q.Pass, q.Detail)
+	}
+	if c.Class != app.ClassStrong || c.UsageByClass[app.ClassStrong].PromptTokens != 1000 || c.CallsByClass[app.ClassStrong] != 1 {
+		t.Errorf("csv-stats: class %s usage %+v calls %v", c.Class, c.UsageByClass, c.CallsByClass)
+	}
+	cs := rep.Summary["classes"].(map[string]*ClassSummary)
+	if f := cs[app.ClassFast]; f.Kind != "local" || f.Tasks != 1 || f.Passed != 1 || f.PromptTokens != q.Usage.PromptTokens || f.PromptTokens == 0 || f.ModelCalls != 2 {
+		t.Errorf("fast: %+v", f)
+	}
+	if s := cs[app.ClassStrong]; s.Kind != "cloud" || s.Tasks != 1 || s.Passed != 0 || s.PromptTokens != 1000 || s.CachedTokens != 400 || s.CompletionTokens != 50 {
+		t.Errorf("strong: %+v", s)
+	}
+	if rep.Summary["cloud_prompt_tokens"] != 1000 || rep.Summary["cloud_cached_tokens"] != 400 || rep.Summary["cloud_completion_tokens"] != 50 {
+		t.Errorf("cloud tokens: %v %v %v", rep.Summary["cloud_prompt_tokens"], rep.Summary["cloud_cached_tokens"], rep.Summary["cloud_completion_tokens"])
+	}
+	if v := rep.Summary["cloud_tokens_per_passed_task"]; v != 1050.0 {
+		t.Errorf("cloud tokens per passed task: %v", v)
+	}
+	var buf strings.Builder
+	rep.Print(&buf)
+	if !strings.Contains(buf.String(), "per class:") || !strings.Contains(buf.String(), "cloud-model") {
+		t.Errorf("table:\n%s", buf.String())
+	}
+}
+
+func TestStaticClassFollowsTheMeasurements(t *testing.T) {
+	for _, tk := range Tasks() {
+		want := app.ClassFast
+		switch tk.Kind {
+		case "log-triage", "csv-stats", "changelog":
+			want = app.ClassStrong
+		}
+		if got := StaticClass(tk.Kind); got != want {
+			t.Errorf("%s: %s, want %s", tk.ID, got, want)
+		}
+	}
+}

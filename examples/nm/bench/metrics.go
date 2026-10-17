@@ -63,6 +63,15 @@ type Metrics struct {
 	Reconcile    int        `json:"reconcile"`      // reconcile_needed events
 	Outcome      string     `json:"outcome"`        // done, failed, cancelled, or "" if unfinished
 	StopReason   string     `json:"stop_reason,omitempty"`
+
+	// Execution groups: the class the task was accepted in, the one it
+	// ended in, every move between them ("fast→strong group_down"), and
+	// the usage and model calls of each class it ran in.
+	Class        string                `json:"class,omitempty"`
+	FinalClass   string                `json:"final_class,omitempty"`
+	Migrations   []string              `json:"migrations,omitempty"`
+	UsageByClass map[string]task.Usage `json:"usage_by_class,omitempty"`
+	CallsByClass map[string]int        `json:"calls_by_class,omitempty"`
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
@@ -91,8 +100,16 @@ func Compute(evs []proto.Event, fp string, shared bool, calls []app.CallRecord, 
 		switch ev.Kind {
 		case proto.EvAccepted:
 			start, ready = ev.Time, ev.Time
+			m.Class, m.FinalClass = d.Class, d.Class
+		case proto.EvMigrated:
+			m.Migrations = append(m.Migrations, d.From+"→"+d.To+" "+d.Reason)
+			m.FinalClass = d.To
 		case proto.EvModelCall:
 			m.ModelCalls++
+			if m.CallsByClass == nil {
+				m.CallsByClass = map[string]int{}
+			}
+			m.CallsByClass[m.FinalClass]++
 			if !ready.IsZero() {
 				m.QueueMS += ms(ev.Time.Sub(ready))
 				ready = time.Time{}
@@ -127,6 +144,12 @@ func Compute(evs []proto.Event, fp string, shared bool, calls []app.CallRecord, 
 		case proto.EvUsage:
 			m.Steps++
 			m.Usage.Add(d.Usage)
+			if m.UsageByClass == nil {
+				m.UsageByClass = map[string]task.Usage{}
+			}
+			u := m.UsageByClass[m.FinalClass]
+			u.Add(d.Usage)
+			m.UsageByClass[m.FinalClass] = u
 		case proto.EvToolCall:
 			m.ToolCalls++
 			if pending == 0 {
@@ -272,6 +295,9 @@ type evData struct {
 	Pending      bool   `json:"pending"`
 	StopReason   string `json:"stop_reason"`
 	Task         string `json:"task"`
+	From         string `json:"from"`
+	To           string `json:"to"`
+	Reason       string `json:"reason"`
 	task.Usage
 }
 

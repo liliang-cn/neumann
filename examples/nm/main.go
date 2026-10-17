@@ -11,7 +11,9 @@
 //
 // -backend local uses Ollama (qwen3.5:9b-mlx, one request at a time,
 // preemption on); -backend cloud uses CPA_BASE_URL, CPA_API_KEY and
-// CPA_MODEL. Keys come from the environment only and are never printed.
+// CPA_MODEL; -backend hybrid runs both as two execution groups, fast
+// (Ollama, qwen3.5:4b) and strong (the cloud model), and -route picks the
+// group of each task. Keys come from the environment only and are never printed.
 // Unfinished tasks continue after a restart (the store is ./.nm/state.db
 // unless -store says otherwise).
 package main
@@ -95,15 +97,19 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, q string, stdout, stderr io.Writer) int {
 	id := newID()
 	tr.Subscribe(func(ev proto.Event) {
-		if ev.TaskID == id {
+		if ev.TaskID == id || ev.TaskID == "" {
 			if line := progress(ev); line != "" {
 				fmt.Fprintln(stderr, line)
 			}
 		}
 	})
-	if _, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: q, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}}); err != nil {
+	pick := a.Route(ctx, q, "")
+	if _, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: q, Class: pick.Class, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}}); err != nil {
 		fmt.Fprintf(stderr, "nm: submit: %v\n", err)
 		return 1
+	}
+	if pick.Class != "" {
+		fmt.Fprintf(stderr, "[%s] → %s\n", id, pick)
 	}
 	ev, err := tr.Wait(ctx, id)
 	if err != nil {
@@ -132,6 +138,16 @@ func newID() string {
 func progress(ev proto.Event) string {
 	tag := "[" + ev.TaskID + "]"
 	switch ev.Kind {
+	case proto.EvGroupDown, proto.EvGroupUp:
+		class, _ := app.Field[string](ev, "class")
+		return fmt.Sprintf("[machine] group %s %s %s", class, strings.TrimPrefix(ev.Kind, "group_"), clip(string(ev.Data), 90))
+	case proto.EvMigrated:
+		from, _ := app.Field[string](ev, "from")
+		to, _ := app.Field[string](ev, "to")
+		reason, _ := app.Field[string](ev, "reason")
+		return fmt.Sprintf("%s moved %s → %s (%s)", tag, from, to, reason)
+	case proto.EvMigrateRefused:
+		return fmt.Sprintf("%s could not move to the fallback group: %s", tag, clip(string(ev.Data), 90))
 	case proto.EvToolCall:
 		tool, _ := app.Field[string](ev, "tool")
 		args, _ := app.Field[string](ev, "args")

@@ -128,7 +128,7 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 	}
 	cfg.Root, cfg.Writable = filepath.Join(o.Work, "ws"), "out,fixbug"
 	cfg.Quiet = !o.Verbose
-	if _, err := cfg.Resolve(); err != nil {
+	if err := cfg.Resolve(); err != nil {
 		fmt.Fprintf(stderr, "nm bench: %v\n", err)
 		return 1
 	}
@@ -143,14 +143,15 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 	if o.Rejudge != "" {
 		return b.rejudge(stdout, stderr)
 	}
-	b.logf("nm bench: scenario %s, backend %s (%s at %s), %d vCores, workspace %s", o.Scenario, cfg.Backend, cfg.Model, cfg.BaseURL, cfg.Cores, o.Work)
+	b.logf("nm bench: scenario %s, backend %s, workspace %s", o.Scenario, cfg.Describe(), o.Work)
 	facts, err := Setup(cfg.Root, o.Repo, testdata)
 	if err != nil {
 		fmt.Fprintf(stderr, "nm bench: fixtures: %v\n", err)
 		return 1
 	}
 	b.Facts = facts
-	rep := &Report{Scenario: o.Scenario, Backend: cfg.Backend, Model: cfg.Model, BaseURL: cfg.BaseURL, Cores: cfg.Cores, Work: o.Work, Store: cfg.Store, RunID: o.RunID, Started: time.Now()}
+	rep := newReport(cfg)
+	rep.Scenario, rep.Work, rep.Store, rep.RunID, rep.Started = o.Scenario, o.Work, cfg.Store, o.RunID, time.Now()
 	switch o.Scenario {
 	case "solo":
 		err = b.solo(ctx, rep)
@@ -197,7 +198,8 @@ type Bench struct {
 	out      io.Writer
 	errw     io.Writer
 	mu       sync.Mutex
-	adapter  model.Adapter // tests: a scripted model instead of the backend
+	adapter  model.Adapter            // tests: a scripted model instead of the backend
+	adapters map[string]model.Adapter // tests: scripted models by class (hybrid)
 
 	lastSession *Session
 }
@@ -263,7 +265,7 @@ type Session struct {
 
 func (b *Bench) start(ctx context.Context, from int64) (*Session, error) {
 	s := &Session{b: b, byID: map[string]*Instance{}, n: map[string]int{}}
-	a, err := app.Build(ctx, b.Cfg, app.Options{Adapter: b.adapter})
+	a, err := app.Build(ctx, b.Cfg, app.Options{Adapter: b.adapter, Adapters: b.adapters})
 	if err != nil {
 		return nil, err
 	}
@@ -275,6 +277,13 @@ func (b *Bench) start(ctx context.Context, from int64) (*Session, error) {
 	s.Tr = a.Track(ctx, from)
 	b.lastSession = s
 	s.Tr.Subscribe(func(ev proto.Event) {
+		if ev.TaskID == "" {
+			switch ev.Kind {
+			case proto.EvGroupDown, proto.EvGroupUp:
+				b.logf("  machine: %s %s", ev.Kind, clip(string(ev.Data), 120))
+			}
+			return
+		}
 		inst := s.inst(ev.TaskID)
 		if inst == nil {
 			return
@@ -286,7 +295,7 @@ func (b *Bench) start(ctx context.Context, from int64) (*Session, error) {
 				args, _ := app.Field[string](ev, "args")
 				b.logf("  [%s] → %s %s", ev.TaskID, tool, clip(args, 100))
 			}
-		case proto.EvPreempted, proto.EvSuspended, proto.EvResumed, proto.EvModelRetry, proto.EvReconcileNeeded, proto.EvRecovered:
+		case proto.EvPreempted, proto.EvSuspended, proto.EvResumed, proto.EvModelRetry, proto.EvReconcileNeeded, proto.EvRecovered, proto.EvMigrated, proto.EvMigrateRefused:
 			b.logf("  [%s] %s %s", ev.TaskID, ev.Kind, clip(string(ev.Data), 120))
 		}
 	})
@@ -339,16 +348,23 @@ func (b *Bench) instance(t *Task, prio, n int, s *Session) (*Instance, error) {
 	return inst, nil
 }
 
-// Submit submits an instance (committed when it returns).
+// Submit routes an instance to its group (hybrid) and submits it
+// (committed when it returns).
 func (s *Session) Submit(ctx context.Context, inst *Instance) error {
-	in := proto.Instruction{TaskID: inst.ID, Input: inst.Input, Priority: inst.Priority, Budget: &task.Budget{MaxSteps: s.b.Cfg.MaxSteps}}
+	pick := s.A.Route(ctx, inst.Input, StaticClass(inst.Task.Kind))
+	inst.Route, inst.RouteMS = pick, float64(pick.Took.Microseconds())/1000
+	in := proto.Instruction{TaskID: inst.ID, Input: inst.Input, Class: pick.Class, Priority: inst.Priority, Budget: &task.Budget{MaxSteps: s.b.Cfg.MaxSteps}}
 	if s.b.Opt.Deadline > 0 {
 		in.Budget.Deadline = time.Now().Add(s.b.Opt.Deadline)
 	}
 	if _, err := s.A.M.Submit(ctx, in); err != nil {
 		return fmt.Errorf("submit %s: %w", inst.ID, err)
 	}
-	s.b.logf("  [%s] submitted (priority %d)", inst.ID, inst.Priority)
+	if pick.Class != "" {
+		s.b.logf("  [%s] submitted (priority %d) → %s", inst.ID, inst.Priority, pick)
+	} else {
+		s.b.logf("  [%s] submitted (priority %d)", inst.ID, inst.Priority)
+	}
 	return nil
 }
 
@@ -402,7 +418,14 @@ func (s *Session) judge(ctx context.Context, inst *Instance) *Result {
 	if r.Pass {
 		mark = "pass"
 	}
-	s.b.logf("  [%s] %s %s in %.1fs (%d calls, %d tools): %s", inst.ID, r.Outcome, mark, r.WallMS/1000, r.ModelCalls, r.ToolCalls, r.Detail)
+	on := ""
+	if r.Class != "" && r.Class != "default" {
+		on = " on " + r.Class
+		if r.FinalClass != r.Class {
+			on += "→" + r.FinalClass
+		}
+	}
+	s.b.logf("  [%s] %s %s%s in %.1fs (%d calls, %d tools): %s", inst.ID, r.Outcome, mark, on, r.WallMS/1000, r.ModelCalls, r.ToolCalls, r.Detail)
 	return r
 }
 

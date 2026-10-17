@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/liliang-cn/neumann/examples/nm/app"
 	"github.com/liliang-cn/neumann/examples/nm/tools"
 )
 
@@ -39,8 +40,13 @@ type Instance struct {
 	Priority int    `json:"priority"`
 	Input    string `json:"-"`
 	FixDir   string `json:"fix_dir,omitempty"` // relative to the root
-	OutDir   string `json:"out_dir,omitempty"`
-	TestSum  string `json:"test_sum,omitempty"`
+	// Route is where the router sent it (hybrid), RouteMS how long the
+	// decision took (decide; it is not part of WallMS, which starts at
+	// the accepted commit).
+	Route   app.Pick `json:"route,omitzero"`
+	RouteMS float64  `json:"route_ms,omitempty"`
+	OutDir  string   `json:"out_dir,omitempty"`
+	TestSum string   `json:"test_sum,omitempty"`
 }
 
 // CheckCtx is what a checker sees.
@@ -61,6 +67,22 @@ type Verdict struct {
 
 func pass(format string, args ...any) Verdict { return Verdict{true, fmt.Sprintf(format, args...)} }
 func fail(format string, args ...any) Verdict { return Verdict{false, fmt.Sprintf(format, args...)} }
+
+// StaticClass is -route static's rule for the suite's kinds, from the
+// measurements (qwen3.5:4b alone vs the cloud model alone, same suite):
+// the 4B model passed every quick probe and repo question, and fix-bug
+// (go test passes; 2 of 2 runs) and code-review (1 of 1) at about the
+// cloud model's speed, so those stay local. It failed log-triage (wrong
+// root cause after 7 steps), csv-stats (never summed the column) and
+// changelog (skipped a commit): reading a lot and counting or covering
+// every item, which the cloud model passed. Those go to strong.
+func StaticClass(kind string) string {
+	switch kind {
+	case "log-triage", "csv-stats", "changelog":
+		return app.ClassStrong
+	}
+	return app.ClassFast
+}
 
 // Tasks is the suite, in the order solo runs it.
 func Tasks() []*Task {

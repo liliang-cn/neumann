@@ -10,30 +10,155 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/liliang-cn/neumann/examples/nm/app"
 )
 
 // Report is what a bench run writes.
 type Report struct {
-	Scenario string         `json:"scenario"`
-	Backend  string         `json:"backend"`
-	Model    string         `json:"model"`
-	BaseURL  string         `json:"base_url"`
-	Cores    int            `json:"cores"`
-	RunID    string         `json:"run_id"`
-	Work     string         `json:"work"`
-	Store    string         `json:"store"`
-	Started  time.Time      `json:"started"`
-	Finished time.Time      `json:"finished"`
-	WallS    float64        `json:"wall_s"`
-	Results  []*Result      `json:"results"`
-	Summary  map[string]any `json:"summary"`
-	Notes    []string       `json:"notes,omitempty"`
+	Scenario string `json:"scenario"`
+	Backend  string `json:"backend"`
+	Model    string `json:"model"`
+	BaseURL  string `json:"base_url"`
+	Cores    int    `json:"cores"`
+	Route    string `json:"route,omitempty"` // hybrid: -route
+	// Classes are the machine's execution groups by class: each one's
+	// side (local or cloud), model and vCores. Cloud classes are billed:
+	// their tokens are the run's cost.
+	Classes  map[string]app.Side `json:"classes,omitempty"`
+	RunID    string              `json:"run_id"`
+	Work     string              `json:"work"`
+	Store    string              `json:"store"`
+	Started  time.Time           `json:"started"`
+	Finished time.Time           `json:"finished"`
+	WallS    float64             `json:"wall_s"`
+	Results  []*Result           `json:"results"`
+	Summary  map[string]any      `json:"summary"`
+	Notes    []string            `json:"notes,omitempty"`
+}
+
+func newReport(cfg app.Config) *Report {
+	r := &Report{Backend: cfg.Backend, Model: cfg.Model, BaseURL: cfg.BaseURL, Cores: cfg.Cores, Classes: map[string]app.Side{}}
+	if cfg.Backend == "hybrid" {
+		r.Model, r.Route = fmt.Sprintf("fast=%s strong=%s", cfg.FastModel, cfg.StrongModel), cfg.Route
+		if cfg.Route == app.RouteDecide {
+			r.Route += " (" + cfg.RouterModel + ")"
+		}
+	}
+	for _, s := range cfg.Sides() {
+		r.Classes[s.Class] = s
+	}
+	return r
+}
+
+// ClassSummary is one execution group's share of a run. Tasks, Passed and
+// WallS count the tasks accepted in the class; tokens and calls count what
+// ran in it (a migrated task's calls after the move count in the class it
+// moved to).
+type ClassSummary struct {
+	Kind             string  `json:"kind"` // local or cloud
+	Model            string  `json:"model"`
+	Tasks            int     `json:"tasks"`
+	Passed           int     `json:"passed"`
+	PassRate         float64 `json:"pass_rate"`
+	WallS            float64 `json:"wall_s"` // sum over its tasks
+	ModelCalls       int     `json:"model_calls"`
+	PromptTokens     int     `json:"prompt_tokens"`
+	CachedTokens     int     `json:"cached_tokens"`
+	CompletionTokens int     `json:"completion_tokens"`
+	ReasoningTokens  int     `json:"reasoning_tokens"`
+	MigratedIn       int     `json:"migrated_in,omitempty"`
+}
+
+// classes is the per-class accounting, and the cloud's share of it.
+func (r *Report) classes() {
+	if len(r.Classes) == 0 {
+		return
+	}
+	by := map[string]*ClassSummary{}
+	get := func(c string) *ClassSummary {
+		if by[c] == nil {
+			side := r.Classes[c]
+			by[c] = &ClassSummary{Kind: side.Kind, Model: side.Model}
+		}
+		return by[c]
+	}
+	var routeMS []float64
+	picks, byHow := map[string]int{}, map[string]int{}
+	migrations := 0
+	cloudPassed := 0
+	for _, x := range r.Results {
+		if x.Class != "" {
+			c := get(x.Class)
+			c.Tasks++
+			c.WallS += x.WallMS / 1000
+			if x.Pass {
+				c.Passed++
+			}
+		}
+		for cl, u := range x.UsageByClass {
+			c := get(cl)
+			c.PromptTokens += u.PromptTokens
+			c.CachedTokens += u.CachedTokens
+			c.CompletionTokens += u.CompletionTokens
+			c.ReasoningTokens += u.ReasoningTokens
+		}
+		for cl, n := range x.CallsByClass {
+			get(cl).ModelCalls += n
+		}
+		if x.FinalClass != x.Class {
+			get(x.FinalClass).MigratedIn++
+		}
+		migrations += len(x.Migrations)
+		if x.Route.Class != "" {
+			picks[x.Route.Class]++
+			byHow[x.Route.By]++
+		}
+		if x.Route.By == app.RouteDecide || x.Route.By == "default" && x.Route.Took > 0 {
+			routeMS = append(routeMS, x.RouteMS)
+		}
+		if x.Pass && r.Classes[x.FinalClass].Kind == "cloud" {
+			cloudPassed++
+		}
+	}
+	var cloud ClassSummary
+	for _, c := range by {
+		if c.Tasks > 0 {
+			c.PassRate = float64(c.Passed) / float64(c.Tasks)
+		}
+		if c.Kind == "cloud" {
+			cloud.PromptTokens += c.PromptTokens
+			cloud.CachedTokens += c.CachedTokens
+			cloud.CompletionTokens += c.CompletionTokens
+			cloud.ReasoningTokens += c.ReasoningTokens
+		}
+	}
+	r.Summary["classes"] = by
+	r.Summary["migrations"] = migrations
+	r.Summary["cloud_prompt_tokens"] = cloud.PromptTokens
+	r.Summary["cloud_cached_tokens"] = cloud.CachedTokens
+	r.Summary["cloud_completion_tokens"] = cloud.CompletionTokens
+	r.Summary["cloud_reasoning_tokens"] = cloud.ReasoningTokens
+	if p, ok := r.Summary["passed"].(int); ok && p > 0 {
+		r.Summary["cloud_tokens_per_passed_task"] = float64(cloud.PromptTokens+cloud.CompletionTokens) / float64(p)
+		r.Summary["cloud_uncached_prompt_per_passed_task"] = float64(cloud.PromptTokens-cloud.CachedTokens) / float64(p)
+	}
+	if len(picks) > 0 {
+		r.Summary["route_picks"] = picks
+		r.Summary["route_by"] = byHow
+	}
+	if len(routeMS) > 0 {
+		r.Summary["route_ms_p50"] = percentile(routeMS, 0.5)
+		r.Summary["route_ms_p95"] = percentile(routeMS, 0.95)
+		r.Summary["route_ms_max"] = percentile(routeMS, 1)
+	}
 }
 
 func (r *Report) summarize() {
 	if r.Summary == nil {
 		r.Summary = map[string]any{}
 	}
+	defer r.classes()
 	pass, done := 0, 0
 	var wall, queue, model, adapter, tool, device, over []float64
 	var tokP, tokC, tokR, tokCached, calls, toolCalls, retries, preempt int
@@ -118,9 +243,13 @@ func secs(ms float64) string { return fmt.Sprintf("%.1f", ms/1000) }
 
 // Print writes a compact table of the results and the summary.
 func (r *Report) Print(w io.Writer) {
-	fmt.Fprintf(w, "\n== %s on %s (%s), %d vCores, %.0fs ==\n", r.Scenario, r.Backend, r.Model, r.Cores, r.WallS)
+	route := ""
+	if r.Route != "" {
+		route = ", route " + r.Route
+	}
+	fmt.Fprintf(w, "\n== %s on %s (%s), %d vCores%s, %.0fs ==\n", r.Scenario, r.Backend, r.Model, r.Cores, route, r.WallS)
 	tw := tabwriter.NewWriter(w, 0, 0, 1, ' ', tabwriter.AlignRight)
-	fmt.Fprintln(tw, "task\tok\tend\twall s\tqueue s\tmodel s\tadapter s\ttool s\tdevice s\toverhead ms\tcalls\ttools\tprompt\tcached\tcompl\treason\tfirst ms\tretry\tpreempt\t")
+	fmt.Fprintln(tw, "task\tclass\tok\tend\twall s\tqueue s\tmodel s\tadapter s\ttool s\tdevice s\toverhead ms\tcalls\ttools\tprompt\tcached\tcompl\treason\tfirst ms\tretry\tpreempt\t")
 	for _, x := range r.Results {
 		ok := "FAIL"
 		if x.Pass {
@@ -142,8 +271,12 @@ func (r *Report) Print(w io.Writer) {
 		if i := strings.Index(name, "."); i >= 0 {
 			name = name[i+1:]
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%d\t%d\t%s\t%d\t%d\t\n",
-			name, ok, x.Outcome, secs(x.WallMS), secs(x.QueueMS), secs(x.ModelMS), secs(x.AdapterMS), secs(x.ToolMS), secs(x.DeviceMS), over,
+		class := x.Class
+		if x.FinalClass != x.Class {
+			class += "→" + x.FinalClass
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%d\t%s\t%d\t%d\t%s\t%d\t%d\t\n",
+			name, class, ok, x.Outcome, secs(x.WallMS), secs(x.QueueMS), secs(x.ModelMS), secs(x.AdapterMS), secs(x.ToolMS), secs(x.DeviceMS), over,
 			x.ModelCalls, x.ToolCalls, x.Usage.PromptTokens, fmt.Sprintf("%d (%.0f%%)", x.Usage.CachedTokens, x.CacheHitRate), x.Usage.CompletionTokens, x.Usage.ReasoningTokens, fs, x.Retries, x.Preempted)
 	}
 	tw.Flush()
@@ -159,7 +292,7 @@ func (r *Report) Print(w io.Writer) {
 	}
 	keys := make([]string, 0, len(r.Summary))
 	for k := range r.Summary {
-		if k == "status_samples" || k == "probes" {
+		if k == "status_samples" || k == "probes" || k == "classes" {
 			continue
 		}
 		keys = append(keys, k)
@@ -172,6 +305,21 @@ func (r *Report) Print(w io.Writer) {
 			v = fmt.Sprintf("%.1f", f)
 		}
 		fmt.Fprintf(w, "  %-28s %v\n", k, v)
+	}
+	if cs, ok := r.Summary["classes"].(map[string]*ClassSummary); ok {
+		names := make([]string, 0, len(cs))
+		for n := range cs {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		fmt.Fprintln(w, "per class:")
+		ctw := tabwriter.NewWriter(w, 0, 0, 1, ' ', tabwriter.AlignRight)
+		fmt.Fprintln(ctw, "class\tside\tmodel\ttasks\tpassed\twall s\tcalls\tprompt\tcached\tcompl\treason\tmigrated in\t")
+		for _, n := range names {
+			c := cs[n]
+			fmt.Fprintf(ctw, "%s\t%s\t%s\t%d\t%d\t%.1f\t%d\t%d\t%d\t%d\t%d\t%d\t\n", n, c.Kind, c.Model, c.Tasks, c.Passed, c.WallS, c.ModelCalls, c.PromptTokens, c.CachedTokens, c.CompletionTokens, c.ReasoningTokens, c.MigratedIn)
+		}
+		ctw.Flush()
 	}
 	if p, ok := r.Summary["probes"]; ok {
 		b, _ := json.Marshal(p)
