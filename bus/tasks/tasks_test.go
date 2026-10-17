@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,6 +134,13 @@ func (w *world) done(t *testing.T, id string) *task.TCB {
 			tc, err := w.m.Load(bg, id)
 			if err != nil {
 				t.Fatal(err)
+			}
+			// The event can be read a moment before Tasks drops the task.
+			for slices.ContainsFunc(w.m.Tasks(), func(i neumann.TaskInfo) bool { return i.ID == id }) {
+				if ctx.Err() != nil {
+					t.Fatalf("task %s finished but is still listed", id)
+				}
+				time.Sleep(time.Millisecond)
 			}
 			return tc
 		}

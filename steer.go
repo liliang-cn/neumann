@@ -233,6 +233,8 @@ func Title(t *task.TCB) string {
 // Tasks is every unfinished task as last committed, ordered by id. Like
 // Status it is a cheap copy kept in memory as commits land: no store read,
 // no registers decoded.
+// It is updated right after a commit's events are stored, so a reader of
+// Events can see a commit a moment before Tasks does.
 func (m *Machine) Tasks() []TaskInfo { return m.index.list() }
 
 // taskIndex is Tasks' source: set from every commit that carries a task,
