@@ -31,8 +31,18 @@ type Adapter struct {
 	MaxTokens int // required by the API; 0 sends DefaultMaxTokens
 	// ThinkingBudget turns on extended thinking with this many tokens when
 	// positive. It must be below MaxTokens. A request with NoThink is sent
-	// without thinking whatever the budget (Caps.ThinkOff).
+	// without thinking whatever the budget: on the models that take a budget,
+	// a request with no thinking field does not think.
 	ThinkingBudget int
+	// ThinkOff is the thinking type a request with NoThink sends to turn
+	// thinking off: "disabled" (Opus 4.7, 4.8, Opus 5 and Haiku 5.5 at effort
+	// high or below, Sonnet 5), "between_tools" (Sonnet 5.5: no up-front
+	// thinking). Current models think when the field is left out, and some
+	// cannot turn thinking off at all (Opus 5.5, Fable): empty, NoThink is
+	// sent with no thinking field, which turns it off only on the models that
+	// do not think by default. Caps.ThinkOff is true when ThinkOff or
+	// ThinkingBudget is set.
+	ThinkOff string
 	// What the model can take (model.Caps), read before a task is moved
 	// onto this adapter's group. ContextWindow 0 is DefaultContextWindow; a
 	// negative value is unknown. NoTools marks a model that cannot call
@@ -80,8 +90,9 @@ func (a *Adapter) MaxOut() int {
 const DefaultContextWindow = 200000
 
 // Caps reports ContextWindow, the output cap, NoTools and MaxTools
-// (model.CapsReporter). ThinkOff is always true: a request with NoThink
-// carries no thinking configuration. Prefill is false: Anthropic rejects an
+// (model.CapsReporter). ThinkOff is true when the adapter knows how to turn
+// thinking off: ThinkOff is set, or ThinkingBudget is (a model that takes a
+// budget does not think without one). Prefill is false: Anthropic rejects an
 // assistant prefix that ends in whitespace and forbids one while thinking is
 // on, and some models take no prefix at all, so the machine never asks this
 // adapter to continue a cut-off answer. Parallel is 0, unknown.
@@ -93,7 +104,8 @@ func (a *Adapter) Caps() model.Caps {
 	case w < 0:
 		w = 0
 	}
-	return model.Caps{Window: w, MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: max(a.MaxTools, 0), ThinkOff: true}
+	return model.Caps{Window: w, MaxOut: a.MaxOut(), Tools: !a.NoTools, MaxTools: max(a.MaxTools, 0),
+		ThinkOff: a.ThinkOff != "" || a.ThinkingBudget > 0}
 }
 
 // WithProtocol switches the adapter's wire protocol and returns it.

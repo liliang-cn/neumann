@@ -13,6 +13,9 @@
 // ids byte for byte to the model that produced them, places cache_control
 // breakpoints, classifies Anthropic's errors and reads its rate-limit headers.
 // ThinkingBudget turns on extended thinking; a request with NoThink goes out
-// without it. The adapter does not offer to continue a cut-off answer
+// without it. ThinkOff names the thinking type that turns thinking off on the
+// model ("disabled", or "between_tools" on Sonnet 5.5); a request with
+// NoThink sends it. Current models think by default and some cannot stop: set
+// it only where the model accepts it. The adapter does not offer to continue a cut-off answer
 // (Caps.Prefill is false).
 package anthropic

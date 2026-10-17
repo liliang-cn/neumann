@@ -34,7 +34,7 @@ type wireTool struct {
 
 type wireThinking struct {
 	Type         string `json:"type"`
-	BudgetTokens int    `json:"budget_tokens"`
+	BudgetTokens int    `json:"budget_tokens,omitempty"`
 }
 
 type cacheControl struct {
@@ -81,7 +81,10 @@ func (a *Adapter) body(req model.Request, stream bool) ([]byte, error) {
 	if req.MaxOut > 0 {
 		w.MaxTokens = req.MaxOut // the request's own cap wins over the default
 	}
-	if a.ThinkingBudget > 0 && !req.NoThink {
+	switch {
+	case req.NoThink && a.ThinkOff != "":
+		w.Thinking = &wireThinking{Type: a.ThinkOff}
+	case a.ThinkingBudget > 0 && !req.NoThink:
 		w.Thinking = &wireThinking{Type: "enabled", BudgetTokens: a.ThinkingBudget}
 	}
 	raw, err := marshal(w)
