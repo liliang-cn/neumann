@@ -467,7 +467,7 @@ func TestAThoughtThatStopsWithoutAnAnswer(t *testing.T) {
 	if err != nil || resp.Message.TextContent() != "" || resp.Message.Parts[0].Text != " and that is all." || resp.FinishReason != "stop" {
 		t.Fatalf("%+v, %v", resp, err)
 	}
-	if _, err := a.Call(context.Background(), thinking); err == nil {
-		t.Fatal("an empty turn is not an error")
+	if _, err := a.Call(context.Background(), thinking); !errors.Is(err, model.ErrEmptyResponse) || model.Classify(err) != model.Transient {
+		t.Fatalf("an empty turn: %v", err)
 	}
 }

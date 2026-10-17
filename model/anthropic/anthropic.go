@@ -243,7 +243,7 @@ func (a *Adapter) response(blocks []json.RawMessage, stop string, u task.Usage) 
 	}
 	finish := finishReason(stop)
 	if !answered && finish != "length" {
-		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls"}
+		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls", Err: model.ErrEmptyResponse}
 	}
 	return model.Response{Message: msg, FinishReason: finish, Usage: u}, nil
 }

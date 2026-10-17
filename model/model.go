@@ -199,6 +199,13 @@ func (c ErrClass) Retryable() bool {
 // out (a refused connection). Its class is Transient.
 var ErrResponseLost = errors.New("model: response lost")
 
+// ErrEmptyResponse marks a response that came back whole and had nothing in
+// it the machine can use: no text, no tool calls, and not cut off. The
+// provider answered, so it says something about the request, which is what
+// distinguishes it from a request that never got there. Its class is
+// Transient.
+var ErrEmptyResponse = errors.New("model: empty response")
+
 // Error is a classified failure of a model call. Adapters return it for
 // every failure they can explain; Classify reads Class from it.
 type Error struct {

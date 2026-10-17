@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -300,8 +301,8 @@ func TestStopReasons(t *testing.T) {
 
 func TestEmptyAnswerIsAnError(t *testing.T) {
 	s := newServer(t, 200, `{"content":[],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":0}}`)
-	if _, err := New(s.URL+"/v1", "k", "m").Call(context.Background(), model.Request{Messages: []task.Message{task.Text(task.RoleUser, "hi")}}); err == nil {
-		t.Fatal("an answer with neither text nor tool calls was accepted")
+	if _, err := New(s.URL+"/v1", "k", "m").Call(context.Background(), model.Request{Messages: []task.Message{task.Text(task.RoleUser, "hi")}}); !errors.Is(err, model.ErrEmptyResponse) || model.Classify(err) != model.Transient {
+		t.Fatalf("an answer with neither text nor tool calls: %v", err)
 	}
 }
 

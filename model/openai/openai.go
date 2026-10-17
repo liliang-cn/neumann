@@ -303,7 +303,7 @@ func (a *Adapter) parse(data []byte, thinking bool) (model.Response, error) {
 func (a *Adapter) response(text, reasoning string, calls []json.RawMessage, finish string, u task.Usage) (model.Response, error) {
 	msg := task.Message{Role: task.RoleAssistant}
 	if text == "" && reasoning == "" && len(calls) == 0 && finish != "length" {
-		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls"}
+		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls", Err: model.ErrEmptyResponse}
 	}
 	if reasoning != "" {
 		msg.Parts = append(msg.Parts, task.Part{Kind: task.PartReasoning, Text: reasoning, Provider: a.Provider()})
