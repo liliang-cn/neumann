@@ -428,19 +428,25 @@ func TestAThoughtForASummaryIsBounded(t *testing.T) {
 // and its continuation. Coming back as a thought again, the redo drops the
 // kept text in its commit (model_retry says how much), as a continuation
 // the provider answered with nothing does, and the next call is fresh.
+// Coming back empty (ErrEmptyResponse, nothing streamed), the continuation
+// is refused (design §6.4, prefixRefused): the failure drops the kept text
+// and the retry after the backoff is fresh.
 func TestAContinuedTextAnsweredWithThinkingOnly(t *testing.T) {
 	kept := "Once upon a time"
 	for _, c := range []struct {
-		name, answer string
-		thoughtAgain bool
+		name, answer        string
+		thoughtAgain, empty bool
 	}{
-		{"continued with thinking off", "Once upon a time it ended.", false},
-		{"a thought again", "A whole story.", true},
+		{"continued with thinking off", "Once upon a time it ended.", false, false},
+		{"a thought again", "A whole story.", true, false},
+		{"empty with thinking off", "A whole story.", false, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			var calls atomic.Int32
 			sm := &sim.Model{Info: &model.Caps{Tools: true, Prefill: true, ThinkOff: true}, Fn: func(req model.Request) (model.Response, error) {
 				switch {
+				case sim.Prefill(req) != "" && req.NoThink && c.empty:
+					return model.Response{}, emptyContinuation()
 				case sim.Prefill(req) != "" && req.NoThink && !c.thoughtAgain:
 					return sim.Continue(req, "Once upon a time it ended."), nil
 				case sim.Prefill(req) != "":
@@ -455,13 +461,20 @@ func TestAContinuedTextAnsweredWithThinkingOnly(t *testing.T) {
 			id := submit(t, m, proto.Instruction{Input: "tell"})
 			waitRetries(t, m, id, 1)
 			clk.Advance(time.Second)
+			if c.empty {
+				// The empty redo backs off, counted, its prefix dropped.
+				if tc := waitRetries(t, m, id, 1); tc.Partial != "" || !tc.NoThink {
+					t.Fatalf("after the empty redo: %+v", tc)
+				}
+				clk.Advance(time.Second)
+			}
 			got := waitDone(t, m, id)
 			if got.State != task.Done || got.LastAnswer() != c.answer || got.Partial != "" || got.NoThink || got.Retries != 0 {
 				t.Fatalf("ended %s %q: %+v", got.State, got.LastAnswer(), got)
 			}
 			reqs := sm.Requests()
 			want := 3
-			if c.thoughtAgain {
+			if c.thoughtAgain || c.empty {
 				want = 4
 			}
 			if len(reqs) != want || sim.Prefill(reqs[1]) != kept || reqs[1].NoThink || sim.Prefill(reqs[2]) != kept || !reqs[2].NoThink {
@@ -470,6 +483,11 @@ func TestAContinuedTextAnsweredWithThinkingOnly(t *testing.T) {
 			rs := eventData(t, m, id, proto.EvModelRetry)
 			if len(rs) != want-1 || rs[1]["class"] != "thought" || rs[1]["no_think"] != true {
 				t.Fatalf("model_retry %v", rs)
+			}
+			if c.empty {
+				if sim.Prefill(reqs[3]) != "" || rs[2]["class"] != "transient" || rs[2]["dropped"] != float64(len(kept)) || rs[2]["attempt"] != float64(1) {
+					t.Fatalf("the empty redo: last request continues %q; model_retry %v", sim.Prefill(reqs[3]), rs[2])
+				}
 			}
 			if c.thoughtAgain {
 				if sim.Prefill(reqs[3]) != "" || rs[2]["class"] != "thought" || rs[2]["dropped"] != float64(len(kept)) || rs[2]["attempt"] != float64(1) {

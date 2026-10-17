@@ -176,3 +176,32 @@ func TestAnEmptyTurn(t *testing.T) {
 		}
 	}
 }
+
+// A request that continues a text (Prefill) and is answered with thinking
+// alone comes back as that thinking, not as ErrEmptyResponse: the machine
+// redoes it with thinking off, keeping the text (design §6.4). Answered with
+// nothing at all, it is ErrEmptyResponse, and the machine drops the text.
+func TestAContinuedTextAnsweredWithThinkingAlone(t *testing.T) {
+	cont := model.Request{Messages: []task.Message{
+		task.Text(task.RoleUser, "Tell a story."),
+		task.Text(task.RoleAssistant, "Once upon a time"),
+	}}
+	call, stream, callErr, streamErr, _, _ := wholeAndStreamed(t,
+		`{"choices":[{"message":{"content":"","reasoning":"The story should go on."},"finish_reason":"stop"}]}`,
+		[]string{`data: {"choices":[{"delta":{"reasoning":"The story should go on."}}]}`,
+			`data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}`}, cont)
+	for _, r := range []struct {
+		resp model.Response
+		err  error
+	}{{call, callErr}, {stream, streamErr}} {
+		if p := r.resp.Message.Parts; r.err != nil || len(p) != 1 || p[0].Kind != task.PartReasoning || p[0].Text != "The story should go on." {
+			t.Fatalf("%+v, %v", r.resp, r.err)
+		}
+	}
+	_, _, callErr, streamErr, _, _ = wholeAndStreamed(t,
+		`{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}`,
+		[]string{`data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}`}, cont)
+	if !errors.Is(callErr, model.ErrEmptyResponse) || !errors.Is(streamErr, model.ErrEmptyResponse) {
+		t.Fatalf("nothing at all: %v / %v", callErr, streamErr)
+	}
+}
