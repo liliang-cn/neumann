@@ -78,7 +78,7 @@
 // not a failure either; after the resume the task runs the step again,
 // continuing the kept text); error_class is the
 // model_retry class (rate_limited, quota_exhausted, overload, transient,
-// truncated, ...) or, for a call that failed its task, the stop reason. A
+// truncated, thought: the model thought and stopped without an answer, ...) or, for a call that failed its task, the stop reason. A
 // tool call's outcome: ok, error, cached (served by L2), denied (tool_denied:
 // refused by the tool policy or an operator, never run), unknown
 // (reconcile_needed, or reported unknown at recovery), resolved, late,

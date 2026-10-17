@@ -184,13 +184,16 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 	// A thought that stops (design §6.4): the call ended on its own, not cut
 	// off, with no text and no tool call, only thinking (the model thought
 	// it through and stopped without answering), whether or not it
-	// continued a kept thought. A continued thought that came back with
-	// nothing at all counts too. Sent again as it was, it may well come back
-	// the same. A continued text that comes back with nothing more is the
-	// text, whole.
-	empty := resp.Message.TextContent() == "" && len(resp.Message.ToolCalls()) == 0
+	// continued a kept thought or a kept text. White space is no text. A
+	// continued thought that came back with nothing at all counts too (an
+	// adapter that returns empty turns; the OpenAI-compatible one reports
+	// them as ErrEmptyResponse, and the failed continuation drops its
+	// prefix). Sent again as it was, it may well come back the same. A
+	// continued text that comes back with nothing at all, no thinking
+	// either, is the text, whole.
+	empty := strings.TrimSpace(resp.Message.TextContent()) == "" && len(resp.Message.ToolCalls()) == 0
 	thinking := thought || think != "" || thinkingOnly(resp.Message, resp.Usage.ReasoningTokens)
-	stopped := !truncated(resp) && empty && (prefill == nil && thinking || prefill != nil && partial == "")
+	stopped := !truncated(resp) && empty && (thinking || prefill != nil && partial == "")
 	if truncated(resp) || stopped {
 		// Cut off with nothing in it, or a thought that stops: judged on what
 		// this call produced, not on the prefix it continued, which is not an
@@ -210,9 +213,20 @@ func (e *Env) modelStep(ctx context.Context, t *task.TCB, core int, pending []me
 		if stopped {
 			// Thinking cannot be turned off, or is off and the model thought
 			// anyway: a larger cap would not help a turn that was not cut
-			// off. Asked again as it was, counted as a failed call.
+			// off. Asked again as it was, counted as a failed call. A kept
+			// text the call was continuing is dropped, in the same commit, as
+			// for a continuation the provider answered with nothing (design
+			// §6.4): the redo is a fresh call.
 			t.Retries = retries
-			return e.redoThought(t, c), nil, nil
+			dropped := 0
+			if prefill != nil && partial != "" {
+				dropped, t.Partial = runes(partial), ""
+			}
+			c = e.redoThought(t, c)
+			if dropped > 0 {
+				amendRetry(&c, dropped, 0)
+			}
+			return c, nil, nil
 		}
 		return e.redoTruncated(g, t, c), nil, nil
 	}

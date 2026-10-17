@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	"github.com/liliang-cn/neumann/internal/group"
@@ -234,7 +235,7 @@ func prefixRefused(class model.ErrClass, err error) bool {
 // truncated reports a turn cut off by its output cap before it produced
 // anything: no text, no tool call (design §13).
 func truncated(resp model.Response) bool {
-	return resp.FinishReason == "length" && resp.Message.TextContent() == "" && len(resp.Message.ToolCalls()) == 0
+	return resp.FinishReason == "length" && strings.TrimSpace(resp.Message.TextContent()) == "" && len(resp.Message.ToolCalls()) == 0
 }
 
 // redoTruncated asks again with a fourfold output cap, at most
@@ -280,12 +281,14 @@ func (e *Env) redoWithoutThinking(g *Group, t *task.TCB, c mem.CommitSet, stoppe
 		sent = e.maxOut(t)
 	}
 	t.NoThink = true
-	class, text := "truncated", fmt.Sprintf("cut off at %d output tokens with nothing but thinking", sent)
+	// attempt counts what the class counts: the raises for a truncation,
+	// Retries (0: this answered call reset it) for a thought.
+	class, attempt, text := "truncated", t.Truncations, fmt.Sprintf("cut off at %d output tokens with nothing but thinking", sent)
 	if stopped {
-		class, text = classThought, errThought
+		class, attempt, text = classThought, t.Retries, errThought
 	}
 	c.Events = append(c.Events, proto.NewEvent(proto.EvModelRetry, t.ID, map[string]any{
-		"class": class, "attempt": t.Truncations, "delay_ms": 0, "wait": "none", "max_out": sent, "no_think": true,
+		"class": class, "attempt": attempt, "delay_ms": 0, "wait": "none", "max_out": sent, "no_think": true,
 		"error": text,
 	}))
 	e.ready(t, task.StepModel)

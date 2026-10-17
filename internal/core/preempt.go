@@ -330,7 +330,7 @@ func continued(prefix string, msg task.Message) task.Message {
 // part, or reasoning tokens reported, and no text or tool call. A backend
 // that reports neither (Ollama) is judged by the reasoning it streamed.
 func thinkingOnly(msg task.Message, reasoningTokens int) bool {
-	if msg.TextContent() != "" || len(msg.ToolCalls()) > 0 {
+	if strings.TrimSpace(msg.TextContent()) != "" || len(msg.ToolCalls()) > 0 {
 		return false
 	}
 	for _, p := range msg.Parts {

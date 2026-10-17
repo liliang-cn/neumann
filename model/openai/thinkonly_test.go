@@ -62,6 +62,15 @@ func TestAFreshThoughtThatStops(t *testing.T) {
 				`data: {"choices":[{"delta":{"content":" 2. date</thi"}}]}`,
 				`data: {"choices":[{"delta":{"content":"nk>\n\n"},"finish_reason":"stop"}]}`},
 			"\nThey are: 1. order_id 2. date", "stop"},
+		{"white space after the reasoning field",
+			`{"choices":[{"message":{"content":"\n\n","reasoning":"They are: 1. order_id 2. date"},"finish_reason":"stop"}]}`,
+			[]string{`data: {"choices":[{"delta":{"reasoning":"They are: 1. order_id 2. date"}}]}`,
+				`data: {"choices":[{"delta":{"content":"\n\n"},"finish_reason":"stop"}]}`},
+			"They are: 1. order_id 2. date", "stop"},
+		{"white space after the think tags",
+			`{"choices":[{"message":{"content":"<think>They are: 1. order_id 2. date</think> \n"},"finish_reason":"stop"}]}`,
+			[]string{`data: {"choices":[{"delta":{"content":"<think>They are: 1. order_id 2. date</think> \n"},"finish_reason":"stop"}]}`},
+			"They are: 1. order_id 2. date", "stop"},
 		{"cut off while thinking",
 			`{"choices":[{"message":{"content":"","reasoning":"They are: 1. order_id 2. date"},"finish_reason":"length"}]}`,
 			[]string{`data: {"choices":[{"delta":{"reasoning":"They are: 1. order_id 2. date"}}]}`,
@@ -80,7 +89,7 @@ func TestAFreshThoughtThatStops(t *testing.T) {
 					t.Fatalf("%s: %+v, %v", r.how, r.resp, r.err)
 				}
 			}
-			if think != c.want || text != "" {
+			if think != c.want || strings.TrimSpace(text) != "" {
 				t.Fatalf("streamed reasoning %q, text %q", think, text)
 			}
 		})
@@ -138,16 +147,19 @@ func TestAFreshAnswerLeavesItsThinkingOut(t *testing.T) {
 }
 
 // A turn with nothing at all, no thinking either, is still a Transient
-// error, whole or streamed (design §11). One that reports reasoning tokens
+// error, whole or streamed (design §11); white space alone is nothing. One that reports reasoning tokens
 // and no reasoning text (OpenAI's reasoning models) did think: it is
 // returned, empty, with its usage, for the machine to judge.
 func TestAnEmptyTurn(t *testing.T) {
 	_, _, callErr, streamErr, _, _ := wholeAndStreamed(t,
 		`{"choices":[{"message":{"content":""},"finish_reason":"stop"}]}`,
 		[]string{`data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}`}, hi)
-	for _, err := range []error{callErr, streamErr} {
+	_, _, wsCallErr, wsStreamErr, _, _ := wholeAndStreamed(t,
+		`{"choices":[{"message":{"content":" \n\n"},"finish_reason":"stop"}]}`,
+		[]string{`data: {"choices":[{"delta":{"content":" \n"}}]}`, `data: {"choices":[{"delta":{"content":"\n"},"finish_reason":"stop"}]}`}, hi)
+	for _, err := range []error{callErr, streamErr, wsCallErr, wsStreamErr} {
 		var me *model.Error
-		if !errors.As(err, &me) || me.Class != model.Transient || !strings.Contains(me.Msg, "neither text nor tool calls") {
+		if !errors.As(err, &me) || me.Class != model.Transient || !strings.Contains(me.Msg, "neither text nor tool calls") || !errors.Is(err, model.ErrEmptyResponse) {
 			t.Fatalf("an empty turn: %v", err)
 		}
 	}

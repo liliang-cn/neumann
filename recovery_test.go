@@ -487,6 +487,18 @@ var (
 		{name: "group", model: quotaModel, retries: "quota_exhausted", suspendOn: "group", was: "group",
 			maxPays: 1, parked: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}},
 	}
+	// After the payment, the model thinks and stops without an answer
+	// (design §6.4). With ThinkOff, the turn is redone with thinking off, the
+	// switch committed with the redo, and answers: a restart before that
+	// commit thinks again and gets there the same way. Without ThinkOff, the
+	// first answer after the payment is a thought (once, across processes),
+	// asked again as it was and counted in Retries.
+	thoughtScenarios = []crashScenario{
+		{name: "thought", model: fixed(thoughtModel), caps: &model.Caps{Tools: true, ThinkOff: true}, maxPays: 1, retries: "thought",
+			ends: map[task.State]string{task.Done: "end_turn"}},
+		{name: "thought_without_think_off", model: thoughtOnceModel, maxPays: 1, retries: "thought",
+			ends: map[task.State]string{task.Done: "end_turn"}},
+	}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
 	}, maxPays: 1, retries: "quota_exhausted", class: "little", moved: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
@@ -574,6 +586,32 @@ func quotaModel(w *world) modelFn {
 		}
 		if w.fails.Add(1) == 1 {
 			return model.Response{}, sim.QuotaExhausted()
+		}
+		return sim.Reply("done"), nil
+	}
+}
+
+// thoughtModel pays, then thinks and stops without an answer until it is
+// asked with thinking off, and answers "done".
+func thoughtModel(req model.Request) (model.Response, error) {
+	if sim.ToolRounds(req) == 0 {
+		return sim.CallTools("dev_pay", "dev_look"), nil
+	}
+	if !req.NoThink {
+		return thoughtOnly("The bill is paid, so I can say so."), nil
+	}
+	return sim.Reply("done"), nil
+}
+
+// thoughtOnceModel pays, then thinks and stops without an answer once
+// (across processes), and answers "done" after that.
+func thoughtOnceModel(w *world) modelFn {
+	return func(req model.Request) (model.Response, error) {
+		if sim.ToolRounds(req) == 0 {
+			return sim.CallTools("dev_pay", "dev_look"), nil
+		}
+		if w.fails.Add(1) == 1 {
+			return thoughtOnly("The bill is paid, so I can say so."), nil
 		}
 		return sim.Reply("done"), nil
 	}
@@ -1300,6 +1338,19 @@ func TestCrashAtEveryCommitPointWithModelFailures(t *testing.T) {
 		t.Fatal("no crash point left the payment's outcome unknown")
 	}
 	t.Logf("%d crash points; the operator was needed at %d of them", points, held)
+}
+
+// The same sweep with the model thinking and stopping without an answer
+// after the payment, with and without a way to turn thinking off: a crash
+// at every commit of the redo, before and after it lands, still finishes
+// the task once, paying once.
+func TestCrashAtEveryCommitPointWithAThoughtThatStops(t *testing.T) {
+	for _, sc := range thoughtScenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			points, held, _ := sweep(t, sc)
+			t.Logf("%d crash points; the operator was needed at %d of them", points, held)
+		})
+	}
 }
 
 // The same sweep with the quota running out after the payment: the first

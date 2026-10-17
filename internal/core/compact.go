@@ -375,7 +375,9 @@ func (e *Env) windowFor(t *task.TCB, g *Group, a model.Adapter, must bool, extra
 // does that.
 func (e *Env) execCompact(ctx context.Context, t *task.TCB, core int, g *Group, a model.Adapter, d decision) (mem.CommitSet, []Send, error) {
 	chunk := task.CloneMessages(t.Regs[d.from:d.to])
-	req := model.Request{System: task.CompactSystem, Messages: task.CompactMessages(chunk), MaxOut: d.sz.out}
+	// A summary gains nothing from thinking: a model that can turn it off is
+	// asked with it off (design §5.3, §6.4).
+	req := model.Request{System: task.CompactSystem, Messages: task.CompactMessages(chunk), MaxOut: d.sz.out, NoThink: capsOf(a).ThinkOff}
 	resp, c, _, out := e.modelCall(ctx, t, core, g, a, task.StepCompact, req, false, nil)
 	if out != nil {
 		return out.c, out.batch, out.err

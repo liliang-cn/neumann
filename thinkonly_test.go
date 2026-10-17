@@ -185,12 +185,15 @@ func TestAFreshThoughtThatStopsIsRedoneWithoutThinking(t *testing.T) {
 	for _, c := range []struct {
 		name   string
 		tags   bool
+		after  string // content after the thought: white space is no answer
 		finish string
 		class  string
 	}{
-		{"reasoning field", false, "stop", "thought"},
-		{"think tags", true, "stop", "thought"},
-		{"cut off while thinking", false, "length", "truncated"},
+		{"reasoning field", false, "", "stop", "thought"},
+		{"think tags", true, "", "stop", "thought"},
+		{"white space after the reasoning field", false, "\n\n", "stop", "thought"},
+		{"white space after the think tags", true, " \n", "stop", "thought"},
+		{"cut off while thinking", false, "", "length", "truncated"},
 	} {
 		for _, streaming := range []bool{true, false} {
 			name := c.name + "/call"
@@ -203,7 +206,7 @@ func TestAFreshThoughtThatStopsIsRedoneWithoutThinking(t *testing.T) {
 					case body["reasoning_effort"] == "none":
 						return turn{content: csvAnswer, finish: "stop"}
 					case hasToolResult(body):
-						return turn{reasoning: csvThought, tags: c.tags, finish: c.finish}
+						return turn{reasoning: csvThought, content: c.after, tags: c.tags, finish: c.finish}
 					}
 					return turn{reasoning: "I should read the file.", call: true, finish: "tool_calls"}
 				})
@@ -415,5 +418,93 @@ func TestAThoughtForASummaryIsBounded(t *testing.T) {
 	rs := retries(t, m, id)
 	if len(rs) != 2 || rs[0].Attempt != 1 || rs[1].Attempt != 2 {
 		t.Fatalf("model_retry %+v", rs)
+	}
+}
+
+// A continued text answered with thinking alone is a thought that stops
+// too (design §6.4), not the end of the answer: the cut-off prefix is not
+// taken for the whole of it. The turn is asked again with thinking off,
+// still continuing the kept text; answered, the task ends with the prefix
+// and its continuation. Coming back as a thought again, the redo drops the
+// kept text in its commit (model_retry says how much), as a continuation
+// the provider answered with nothing does, and the next call is fresh.
+func TestAContinuedTextAnsweredWithThinkingOnly(t *testing.T) {
+	kept := "Once upon a time"
+	for _, c := range []struct {
+		name, answer string
+		thoughtAgain bool
+	}{
+		{"continued with thinking off", "Once upon a time it ended.", false},
+		{"a thought again", "A whole story.", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var calls atomic.Int32
+			sm := &sim.Model{Info: &model.Caps{Tools: true, Prefill: true, ThinkOff: true}, Fn: func(req model.Request) (model.Response, error) {
+				switch {
+				case sim.Prefill(req) != "" && req.NoThink && !c.thoughtAgain:
+					return sim.Continue(req, "Once upon a time it ended."), nil
+				case sim.Prefill(req) != "":
+					return thoughtOnly("the story should go on"), nil
+				case calls.Add(1) == 1:
+					return sim.Reply(kept), sim.Lost()
+				}
+				return sim.Reply("A whole story."), nil
+			}}
+			clk := sim.NewClock(clock0)
+			m := clockMachine(t, neumann.Config{}, sm, clk)
+			id := submit(t, m, proto.Instruction{Input: "tell"})
+			waitRetries(t, m, id, 1)
+			clk.Advance(time.Second)
+			got := waitDone(t, m, id)
+			if got.State != task.Done || got.LastAnswer() != c.answer || got.Partial != "" || got.NoThink || got.Retries != 0 {
+				t.Fatalf("ended %s %q: %+v", got.State, got.LastAnswer(), got)
+			}
+			reqs := sm.Requests()
+			want := 3
+			if c.thoughtAgain {
+				want = 4
+			}
+			if len(reqs) != want || sim.Prefill(reqs[1]) != kept || reqs[1].NoThink || sim.Prefill(reqs[2]) != kept || !reqs[2].NoThink {
+				t.Fatalf("%d requests", len(reqs))
+			}
+			rs := eventData(t, m, id, proto.EvModelRetry)
+			if len(rs) != want-1 || rs[1]["class"] != "thought" || rs[1]["no_think"] != true {
+				t.Fatalf("model_retry %v", rs)
+			}
+			if c.thoughtAgain {
+				if sim.Prefill(reqs[3]) != "" || rs[2]["class"] != "thought" || rs[2]["dropped"] != float64(len(kept)) || rs[2]["attempt"] != float64(1) {
+					t.Fatalf("the second thought: last request continues %q; model_retry %v", sim.Prefill(reqs[3]), rs[2])
+				}
+			}
+		})
+	}
+}
+
+// A summary gains nothing from thinking: on a model that can turn it off,
+// every compaction request goes out with thinking off, and the model steps
+// around them with thinking on.
+func TestCompactionTurnsThinkingOff(t *testing.T) {
+	caps := smallWindow
+	caps.ThinkOff = true
+	r := &rounder{rounds: 20, size: 400}
+	sm := &sim.Model{Info: &caps, Fn: r.fn}
+	m := startWith(t, neumann.Config{Model: sm, Devices: []bus.Device{echoDev()}})
+	id := submit(t, m, proto.Instruction{Input: "go"})
+	if got := waitDone(t, m, id); got.State != task.Done || got.LastAnswer() != "done after 20" {
+		t.Fatalf("ended %s %q", got.State, got.LastAnswer())
+	}
+	steps, compact := r.requests()
+	if len(compact) == 0 {
+		t.Fatal("no compaction")
+	}
+	for _, req := range compact {
+		if !req.NoThink {
+			t.Fatal("a compaction went out with thinking on")
+		}
+	}
+	for _, req := range steps {
+		if req.NoThink {
+			t.Fatal("a model step went out with thinking off")
+		}
 	}
 }

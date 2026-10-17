@@ -254,7 +254,8 @@ func main() {
 	// A model-step event is one call attempt; Used.Steps counts only the
 	// answered ones. Each failed attempt is a model_retry (other than a
 	// truncation redo or a thought that stopped without an answer, whose
-	// call was answered) or a model_error failure.
+	// call was answered) or a model_error failure (other than one for a
+	// thought that stopped once too often: that call was answered too).
 	modelSteps, failedCalls, dropped := 0, 0, 0
 	steerSeen := false
 	for _, ev := range events {
@@ -262,7 +263,7 @@ func main() {
 			modelSteps++
 		}
 		if (ev.Kind == proto.EvModelRetry && !strings.Contains(string(ev.Data), `"class":"truncated"`) && !strings.Contains(string(ev.Data), `"class":"thought"`)) ||
-			(ev.Kind == proto.EvFailed && strings.Contains(string(ev.Data), `"stop_reason":"model_error"`)) {
+			(ev.Kind == proto.EvFailed && strings.Contains(string(ev.Data), `"stop_reason":"model_error"`) && !strings.Contains(string(ev.Data), "stopped after thinking")) {
 			failedCalls++
 		}
 		if ev.Kind == proto.EvSteerDropped {

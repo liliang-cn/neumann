@@ -322,13 +322,17 @@ func (a *Adapter) opensThought(content string) (string, bool) {
 // replay) and the usage. The thinking of a call that continued no thought
 // is not part of an answer; it is kept only when the turn has nothing else,
 // so that the machine can tell a thought that stopped without an answer from
-// an empty turn (design §6.4). A turn with nothing at all, no thinking
-// either (no reasoning text, no reasoning tokens), is a Transient error
-// unless it was cut off.
+// an empty turn (design §6.4). White space alone is no text: dropped, so
+// that "</think>\n\n" after a thought is not taken for an answer. A turn
+// with nothing at all, no thinking either (no reasoning text, no reasoning
+// tokens), is a Transient error unless it was cut off.
 func (a *Adapter) response(text, reasoning, fresh string, calls []json.RawMessage, finish string, u task.Usage) (model.Response, error) {
 	msg := task.Message{Role: task.RoleAssistant}
-	if text == "" && reasoning == "" && len(calls) == 0 {
-		reasoning = fresh
+	if strings.TrimSpace(text) == "" && len(calls) == 0 {
+		text = ""
+		if reasoning == "" {
+			reasoning = fresh
+		}
 	}
 	if text == "" && reasoning == "" && len(calls) == 0 && finish != "length" && u.ReasoningTokens == 0 {
 		return model.Response{}, &model.Error{Class: model.Transient, Provider: a.Provider(), Msg: "response has neither text nor tool calls", Err: model.ErrEmptyResponse}
