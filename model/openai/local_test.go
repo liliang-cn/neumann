@@ -275,6 +275,32 @@ func TestStreamReportsOllamaReasoning(t *testing.T) {
 	}
 }
 
+// On a text prefill the adapter does not split a thought, so a backend that
+// streams native reasoning and then nothing reports the reasoning as deltas
+// and the turn as empty (ErrEmptyResponse): the machine must not take the
+// reasoning for text continuing the prefix (design §6.4).
+func TestTextPrefillThatOnlyThinksIsEmpty(t *testing.T) {
+	ts, _ := sseServer(t,
+		`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"","reasoning":"hmm, where was I"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}]}`,
+		`data: [DONE]`,
+	)
+	a := New(ts.URL+"/v1", "k", "m")
+	a.Prefill = true
+	a.ThinkTags = [2]string{"<think>", "</think>"}
+	var deltas []model.Delta
+	_, err := a.Stream(context.Background(), model.Request{Messages: []task.Message{
+		task.Text(task.RoleUser, "Tell a story."),
+		task.Text(task.RoleAssistant, "Once upon"),
+	}}, func(d model.Delta) { deltas = append(deltas, d) })
+	if !errors.Is(err, model.ErrEmptyResponse) {
+		t.Fatalf("err %v", err)
+	}
+	if len(deltas) != 1 || deltas[0].Reasoning != "hmm, where was I" || deltas[0].Text != "" {
+		t.Fatalf("deltas %+v", deltas)
+	}
+}
+
 // thinking is a request that asks the model to go on thinking: it ends with
 // an assistant message holding only reasoning.
 var thinking = model.Request{Messages: []task.Message{

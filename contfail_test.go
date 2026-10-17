@@ -34,10 +34,18 @@ func clockMachine(t *testing.T, cfg neumann.Config, sm model.Adapter, clk *sim.C
 func waitRetries(t *testing.T, m *neumann.Machine, id string, n int) *task.TCB {
 	t.Helper()
 	var tc *task.TCB
-	waitFor(t, func() bool {
+	waitForLong(t, 30*time.Second, func() bool {
 		tc = loadTask(t, m, id)
 		return tc.State == task.Waiting && tc.Wait == task.WaitBackoff && tc.Retries == n
 	})
+	return tc
+}
+
+// waitEnded waits, more patiently than waitDone, until id has ended.
+func waitEnded(t *testing.T, m *neumann.Machine, id string) *task.TCB {
+	t.Helper()
+	var tc *task.TCB
+	waitForLong(t, 30*time.Second, func() bool { tc = loadTask(t, m, id); return tc.State.Terminal() })
 	return tc
 }
 
@@ -406,7 +414,7 @@ func TestRejectedContinuationIsRetriedFresh(t *testing.T) {
 			t.Fatalf("model_retry %v", d)
 		}
 		clk.Advance(2 * time.Second)
-		got := waitDone(t, m, id)
+		got := waitEnded(t, m, id)
 		if freshRejected {
 			if got.State != task.Failed || got.StopReason != "model_error" {
 				t.Fatalf("a rejected fresh call: the task ended %s %s", got.State, got.StopReason)
@@ -418,6 +426,45 @@ func TestRejectedContinuationIsRetriedFresh(t *testing.T) {
 		}
 		if reqs := sm.Requests(); len(reqs) != 3 || sim.Prefill(reqs[2]) != "" {
 			t.Fatalf("%d requests", len(reqs))
+		}
+	}
+}
+
+// Reasoning never extends a text prefix: a text continuation whose backend
+// streams some thinking and then comes back empty (the OpenAI-compatible
+// adapter reports native reasoning deltas on a text prefill without putting
+// them in the answer) streamed nothing for the prefix, and drops it like any
+// other empty answer (design §6.4). So does a lost stream that carried only
+// thinking.
+func TestTextContinuationThatOnlyThinksStartsOver(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		var calls atomic.Int32
+		sm := &sim.Model{Info: &model.Caps{Tools: true, Prefill: true, ThinkPrefill: true, ThinkOff: true}, Fn: func(req model.Request) (model.Response, error) {
+			if sim.Prefill(req) != "" {
+				if lost {
+					return sim.Think("hmm, where was I", ""), sim.Lost()
+				}
+				return sim.Think("hmm, where was I", ""), emptyContinuation()
+			}
+			if calls.Add(1) == 1 {
+				return sim.Reply("Once upon"), sim.Lost()
+			}
+			return sim.Reply("A whole story."), nil
+		}}
+		clk := sim.NewClock(clock0)
+		m := clockMachine(t, neumann.Config{}, sm, clk)
+		id := submit(t, m, proto.Instruction{Input: "tell"})
+		waitRetries(t, m, id, 1)
+		clk.Advance(time.Second)
+		if tc := waitRetries(t, m, id, 2); tc.Partial != "" || tc.PartialThink != "" {
+			t.Fatalf("lost %v: the text continuation only thought; its prefix stays: %q / %q", lost, tc.Partial, tc.PartialThink)
+		}
+		if d := eventData(t, m, id, proto.EvModelRetry); d[1]["dropped"] != float64(len("Once upon")) {
+			t.Fatalf("lost %v: model_retry %v", lost, d)
+		}
+		clk.Advance(2 * time.Second)
+		if got := waitEnded(t, m, id); got.LastAnswer() != "A whole story." {
+			t.Fatalf("lost %v: ended %s %q", lost, got.State, got.LastAnswer())
 		}
 	}
 }

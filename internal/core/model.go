@@ -568,9 +568,14 @@ func (e *Env) modelCall(ctx context.Context, t *task.TCB, core int, g *Group, a 
 		if class == model.ContextLength && !panicked {
 			return end(e.contextRejected(t, c, g, a, req, err), nil)
 		}
-		if cont && !panicked && tctx.Err() == nil && got.Len()+gotThink.Len() == 0 && prefixRefused(class, err) {
+		// What the call streamed that would extend its prefix: text extends
+		// either kind, reasoning only a thought (a text Partial is past its
+		// thinking, and a backend may still stream some before it fails).
+		streamed := got.Len() > 0 || (partial0 == "" && gotThink.Len() > 0)
+		if cont && !panicked && tctx.Err() == nil && !streamed && prefixRefused(class, err) {
 			// The provider answered the continued request, streamed
-			// nothing, and the answer is of no use (design §6.4): sent
+			// nothing to extend it, and the answer is of no use (design
+			// §6.4): sent
 			// again, the same request is likely to fare the same (a backend
 			// that answers a continued thought with nothing). The prefix
 			// goes in the commit that records the failure, so neither the
