@@ -382,7 +382,9 @@ func TestSuspendWhileWaitingForRoom(t *testing.T) {
 	a := submit(t, m, proto.Instruction{Input: "a"})
 	waitDone(t, m, a)
 	b := submit(t, m, proto.Instruction{Input: "b"})
-	waitFor(t, func() bool { st := m.Status(); return st.Held == 1 && st.Ready == 0 })
+	// Queued in the limiter, not merely held: a vCore holds the task before
+	// its step reads the interrupts, and a suspend landing then is "ready".
+	waitFor(t, func() bool { st := m.Status(); return st.Held == 1 && st.Limiters[0].Waiting == 1 })
 	suspend(t, m, b)
 	waitSuspended(t, m, b)
 	suspendedWas(t, m, b, "model", 0, 0)
