@@ -86,7 +86,6 @@ func (r *Report) classes() {
 	var routeMS []float64
 	picks, byHow := map[string]int{}, map[string]int{}
 	migrations := 0
-	cloudPassed := 0
 	for _, x := range r.Results {
 		if x.Class != "" {
 			c := get(x.Class)
@@ -116,9 +115,6 @@ func (r *Report) classes() {
 		}
 		if x.Route.By == app.RouteDecide || x.Route.By == "default" && x.Route.Took > 0 {
 			routeMS = append(routeMS, x.RouteMS)
-		}
-		if x.Pass && r.Classes[x.FinalClass].Kind == "cloud" {
-			cloudPassed++
 		}
 	}
 	var cloud ClassSummary
@@ -304,7 +300,7 @@ func (r *Report) Print(w io.Writer) {
 		if f, ok := v.(float64); ok {
 			v = fmt.Sprintf("%.1f", f)
 		}
-		fmt.Fprintf(w, "  %-28s %v\n", k, v)
+		fmt.Fprintf(w, "  %-38s %v\n", k, v)
 	}
 	if cs, ok := r.Summary["classes"].(map[string]*ClassSummary); ok {
 		names := make([]string, 0, len(cs))
