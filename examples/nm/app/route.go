@@ -15,8 +15,10 @@ import (
 // group's model answers short lookups well (the bench's quick probes and
 // repo questions) and fails long analyses (a 4k-line log, a 3k-row CSV, a
 // changelog over many commits); the strong group's does both, billed.
+// They describe kinds of work, not the suite's tasks: tuning them to the
+// suite would measure the tuning.
 const (
-	FastRoute   = "short lookups, one or two files, quick questions, a small focused fix or review"
+	FastRoute   = "short lookups, one or two files, quick questions"
 	StrongRoute = "reading large data, counting, multi-step analysis, writing summaries of many items"
 )
 
@@ -81,6 +83,7 @@ func newRouter(ctx context.Context, cfg Config, engine decide.Engine) (*router, 
 		},
 		Default: ClassStrong,
 		Timeout: cfg.RouteTimeout,
+		Floor:   cfg.RouteFloor,
 	})
 	if err != nil {
 		return nil, err

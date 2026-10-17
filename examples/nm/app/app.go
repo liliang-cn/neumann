@@ -87,6 +87,7 @@ type Config struct {
 	RouterURL     string // decide: the System One server
 	RouterModel   string // decide: the decision model
 	RouteTimeout  time.Duration
+	RouteFloor    float64 // decide: the confidence a pick needs (0: the router's default; negative: any)
 
 	ObserveAddr string
 	OTLP        bool
@@ -117,6 +118,7 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&c.RouterURL, "router-url", decide.DefaultURL, "-route decide: the Ollama server with the System One API")
 	fs.StringVar(&c.RouterModel, "router-model", decide.DefaultModel, "-route decide: the decision model")
 	fs.DurationVar(&c.RouteTimeout, "route-timeout", 0, "-route decide: how long one routing decision may take before the task goes to strong (0: the router's default, 3s)")
+	fs.Float64Var(&c.RouteFloor, "route-floor", 0, "-route decide: the confidence a pick needs, below which the task goes to strong (0: the router's default, 0.2; negative: take every pick)")
 	fs.StringVar(&c.ObserveAddr, "observe-addr", "", "serve the observe HTTP view (/status, /queue, /tasks/{id}, /events, /metrics) here, e.g. 127.0.0.1:43562; empty: off")
 	fs.BoolVar(&c.OTLP, "otlp", false, "export traces and metrics over OTLP/HTTP as the standard OTEL_EXPORTER_OTLP_* variables say")
 }
@@ -273,7 +275,7 @@ func (c *Config) BackendArgs() []string {
 		"-fast-model", c.FastModel, "-fast-base-url", c.FastBaseURL, "-fast-cores", strconv.Itoa(c.FastCores),
 		"-strong-model", c.StrongModel, "-strong-base-url", c.StrongBaseURL, "-strong-cores", strconv.Itoa(c.StrongCores),
 		"-fallback=" + strconv.FormatBool(c.Fallback), "-route", c.Route, "-router-url", c.RouterURL, "-router-model", c.RouterModel,
-		"-route-timeout", c.RouteTimeout.String()}
+		"-route-timeout", c.RouteTimeout.String(), "-route-floor", strconv.FormatFloat(c.RouteFloor, 'g', -1, 64)}
 }
 
 // Adapter builds the side's model adapter, wrapped to record call times.
