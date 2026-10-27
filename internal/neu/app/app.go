@@ -195,7 +195,7 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.IntVar(&c.Parallel, "parallel", 1, "local, and hybrid's fast group: requests the backend serves at once (Ollama's MLX runner serves one; a GGUF model, OLLAMA_NUM_PARALLEL)")
 	fs.StringVar(&c.Store, "store", "", "SQLite file holding the machine's state; default <root>/.neu/state.db")
 	fs.StringVar(&c.Root, "root", ".", "workspace root; every tool is confined to it")
-	fs.StringVar(&c.Writable, "writable", "out", "comma-separated directories under the root where fs_write may write")
+	fs.StringVar(&c.Writable, "writable", "out", "comma-separated directories under the root where fs_write (and neu's fs_edit, fs_delete) change files without asking")
 	fs.IntVar(&c.MaxSteps, "max-steps", 40, "model calls a task may make")
 	fs.IntVar(&c.ContextWindow, "context-window", 0, "the model's context window in tokens; a task is compacted once its request and output reserve pass 80% of it. 0: "+windowDefaults)
 	fs.StringVar(&c.FastModel, "fast-model", "", "hybrid: the fast group's local model; default "+modelDef(d.FastModel))

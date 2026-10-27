@@ -218,7 +218,7 @@ func (t *Tools) preview(tool string, raw []byte) string {
 		if err != nil {
 			return err.Error()
 		}
-		return "edit " + rel + "\n" + Diff(rel, string(cur), after, 24)
+		return Diff(rel, string(cur), after, 24)
 	case "fs_delete":
 		var in struct{ Path string }
 		if decode(raw, &in) != nil {

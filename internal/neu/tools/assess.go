@@ -69,11 +69,11 @@ func (t *Tools) Preview(tool string, args []byte) string {
 			return strings.TrimRight(p, "\n")
 		}
 	case "sh_run":
-		in, _, show, err := t.shCommand(args)
+		in, _, _, err := t.shCommand(args)
 		if err != nil {
 			return err.Error()
 		}
-		return fmt.Sprintf("$ %s\n  in %s/", show, orDot(in.Dir))
+		return fmt.Sprintf("in %s/ of the workspace, without input; env without the API keys", orDot(in.Dir))
 	}
 	var v any
 	if json.Unmarshal(args, &v) == nil {

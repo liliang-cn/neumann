@@ -1,11 +1,14 @@
 # neu
 
-`neu` is an assistant for the files of a local workspace, built on
-[neumann](../../README.md). Ask it one question, or open a REPL and run
-several tasks at once: each line is a task, with priorities, suspend,
-resume, steer and cancel. Its tools are confined to the workspace, and
-every task is kept in a SQLite store, so an interrupted task continues the
-next time you start `neu` there.
+`neu` is an assistant for the files of a local workspace, and a coding
+assistant: it reads, edits, deletes, runs commands and fetches web pages,
+built on [neumann](../../README.md). Ask it one question, or open a REPL
+and run several tasks at once: each line is a task, with priorities,
+suspend, resume, steer and cancel. Its file tools are confined to the
+workspace, anything with a side effect outside `-writable` waits for your
+approval (see [Approvals](#approvals)), and every task is kept in a SQLite
+store, so an interrupted task continues the next time you start `neu`
+there.
 
 ## Install
 
@@ -55,9 +58,13 @@ model    = "some-model"
 key_env  = "GATEWAY_KEY"              # the variable holding the key, never the key
 cores    = 8                          # tasks running model calls at once
 parallel = 1                          # local: requests the server serves at once
-writable = ["out", "docs"]            # where fs_write may write
+writable = ["out", "docs"]            # changed without asking, whatever -approve says
 max_steps = 40                        # model calls per task
 context_window = 32768                # tokens; see "Context window" below
+approve  = "ask"                      # ask, auto or never; see "Approvals"
+sh_timeout = "10m"                    # the longest one sh_run call may run
+sh_shell = true                       # sh_run may run bash -lc scripts
+sh_deny_env = ["AWS_*", "GH_TOKEN"]   # never passed to sh_run's commands
 
 [hybrid]                              # -backend hybrid
 fast_model    = "qwen3.5:4b"
@@ -207,9 +214,10 @@ neu -backend hybrid -route decide "How many lines does data/sales.csv have?"
 
 Every path is relative to the workspace root (`-root`, default `.`);
 anything that leaves it, through `..`, an absolute path or a symlink, is
-refused.
+refused. No tool writes into `.neu/` or `.git/` (at any depth), the store,
+or the change ledger.
 
-| tool | | |
+| tool | effect | |
 |---|---|---|
 | `fs_list` | read-only | a tree with sizes |
 | `fs_read` | read-only | numbered lines, up to 400 per call |
@@ -217,11 +225,101 @@ refused.
 | `git_run` | read-only | `log show diff status blame rev-parse ls-files`, no shell |
 | `go_test` | idempotent | `go test -count=1 ./...` with a timeout |
 | `calc_eval` | read-only | exact arithmetic, `sum avg min max abs round` |
-| `fs_write` | side effect | only under the writable directories; each write is recorded in a ledger and applied once |
+| `fs_write` | side effect | create or replace a file; returns a diff against what it replaced |
+| `fs_edit` | side effect | replace exact text in a file: `old_string` must match exactly and once (or `replace_all`); "not found" and "matches N times" come back as errors with a hint; returns a compact unified diff |
+| `fs_delete` | side effect | delete a file (not a directory, not through a symlink) |
+| `sh_run` | side effect | run a command in a workspace directory: `args` (no shell) or `script` (`bash -lc`); exit status, output capped to its start and end, timeout 2m by default |
+| `web_fetch` | read-only | GET an http(s) URL, HTML as readable text with links as `text (url)`, the final URL after at most 5 redirects |
 
-By default neu may write only under `out/` (created on start). Allow more
-with `-writable out,docs` or `writable = [...]` in the config file;
-`-writable .` allows the whole workspace.
+`fs_write`, `fs_edit` and `fs_delete` change files under `-writable`
+(default `out/`, created on start) without asking, and anywhere else in the
+workspace when the approval mode lets them (`-approve never`: only under
+`-writable`, as before). Each change is recorded in a ledger
+(`out/.ledger`, or `.neu/.ledger` without a writable directory) by its
+call: an intent line with the file's hash before and after, then an
+applied line. A call sent again after a crash, under the same key or as a
+new attempt, is recognised and not applied twice, even when the crash fell
+between the change and its applied line; neu resends such calls itself
+when it restarts, so the task does not wait for an operator.
+
+### sh_run
+
+`args` runs a program directly: `{"args": ["go", "test", "./..."], "dir":
+"parser"}`. `script` runs a bash command line with `bash -lc`, for pipes
+and `&&` (`-sh-shell=false` or `sh_shell = false` turns it off). The
+command gets no input, runs in its own process group (a timeout kills its
+children too), and its output is kept to the first 8 KiB and the last
+16 KiB. A call may ask for `timeout_sec` up to `-sh-timeout` (default 10m).
+Its environment is neu's, minus the backends' key variables
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `NEU_API_KEY`, `CPA_API_KEY` and
+any configured `key_env`) and whatever `-sh-deny-env` / `sh_deny_env`
+names (`NAME` or `PREFIX*`).
+
+A short list of read-only commands runs without asking in ask mode: `ls
+cat head tail wc grep rg find pwd stat du tree which`, `go build vet test
+list env version doc`, read-only `git` (`status log show diff blame
+rev-parse ls-files grep describe shortlog cat-file ls-tree rev-list
+reflog`) and `make -n`, each with the arguments that would write, delete
+or run something else refused (`find -delete/-exec`, `go build -o`, `go
+test -exec/-coverprofile`, `git -c ...`, `git diff --output`, `rg --pre`,
+...). Everything else, and every `script`, needs approval.
+
+**sh_run is not a sandbox.** An approved command runs with your user's
+rights, on your whole machine, not just the workspace; the read-only list
+only spares you prompts for commands that look harmless (`go test` runs the
+package's test code, for one). You are the security boundary: read what
+you approve, and use `-approve auto` only in a workspace you can throw
+away or restore (a git checkout).
+
+### web_fetch
+
+`web_fetch` takes `url` and `max_bytes` (default 20 KB of text, at most
+48 KB). It follows at most 5 redirects, honours `HTTPS_PROXY` /
+`HTTP_PROXY` / `NO_PROXY`, times out after 30s, reads at most 4 MiB, and
+returns text only (HTML, plain text, JSON, XML). It refuses `localhost`,
+loopback, private, link-local and CGNAT addresses (checked for every
+redirect, and for the address a direct connection lands on) unless
+`-web-allow-private`.
+
+## Approvals
+
+Every tool call goes through neu's tool policy before it runs (neumann's
+`ToolPolicy`; a held call waits in `Waiting(Approval)` and is answered with
+`Machine.Approve`, design §9.7). A call that only reads, or changes a file
+under `-writable`, always runs. For everything else `-approve` decides:
+
+| `-approve` | side effects outside `-writable` |
+|---|---|
+| `ask` (default) | held until you answer on the terminal |
+| `auto` | run |
+| `never` (also `read-only`) | refused: the model gets an error saying so |
+
+This covers every device, not only neu's own tools: a tool whose effect is
+read-only or idempotent runs (skills, `tasks_list`, `tasks_send`, an MCP
+tool declared `read_only` or `idempotent`); an MCP tool with a side effect
+(the default for MCP) is held in ask mode, runs in auto, and is refused in
+never.
+
+In ask mode a held call is shown on stderr with what it would do: the
+path and a diff for `fs_edit` / `fs_write`, the command and its directory
+for `sh_run`, the arguments for anything else. Answer with
+
+| answer | |
+|---|---|
+| `y` | run it |
+| `n`, or `n <reason>` | refuse it; the model gets an error result (with your reason) and adjusts |
+| `a` | run it, and every later call of that tool this session without asking |
+
+Calls held at the same time (a round with several calls, or several REPL
+tasks) are asked one at a time, and while a prompt waits nothing else is
+printed; streamed text and progress lines that arrived meanwhile follow
+once you answer. In the REPL the line you type after a prompt is its
+answer, not a task. A call still held when neu stops is asked again on the
+next start (or run with `-approve auto`, refused with `never`).
+
+A one-shot run whose stdin is not a terminal (a pipe, CI) has nobody to
+ask: in ask mode a call that would be held is refused, with a message that
+`-approve auto` allows it.
 
 ## MCP servers
 
@@ -350,5 +448,7 @@ machine's own lines on stderr.
 neu "Summarise the last ten commits"
 neu "Run the tests in ./parser and tell me which fail and why"
 neu -writable out "Write a CHANGELOG since v0.3.0 to out/CHANGELOG.md"
+neu "The tests in ./parser fail; fix the code and rerun them"   # asks before each edit
+neu -approve auto "Rename Foo to Bar across the module and run go vet"
 neu                                    # then: /bg review the diff of HEAD~1 for locking bugs
 ```
