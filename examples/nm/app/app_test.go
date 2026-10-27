@@ -78,3 +78,41 @@ func TestAnthropicBackendSettings(t *testing.T) {
 		t.Fatal("no key, no error")
 	}
 }
+
+// Each protocol takes its endpoint, model and key variable from the flags.
+func TestCustomEndpointModelAndKey(t *testing.T) {
+	t.Setenv("MY_KEY", "secret")
+	for _, tc := range []struct{ backend, api string }{{"openai", "openai"}, {"cloud", "openai"}, {"anthropic", "anthropic"}} {
+		var c Config
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		c.Flags(fs)
+		if err := fs.Parse([]string{"-backend", tc.backend, "-base-url", "https://gw.example/v1", "-model", "m1", "-key-env", "MY_KEY"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Resolve(); err != nil {
+			t.Fatalf("%s: %v", tc.backend, err)
+		}
+		s := c.Sides()[0]
+		if s.API != tc.api || s.BaseURL != "https://gw.example/v1" || s.Model != "m1" || s.KeyEnv != "MY_KEY" {
+			t.Fatalf("%s: side %+v", tc.backend, s)
+		}
+		switch a := s.Adapter().Adapter.(type) {
+		case *openai.Adapter:
+			if tc.api != "openai" || a.APIKey != "secret" || a.Model != "m1" || a.BaseURL != "https://gw.example/v1" {
+				t.Fatalf("%s: openai adapter %+v", tc.backend, a)
+			}
+		case *anthropic.Adapter:
+			if tc.api != "anthropic" || a.APIKey != "secret" || a.Model != "m1" || a.BaseURL != "https://gw.example/v1" {
+				t.Fatalf("%s: anthropic adapter %+v", tc.backend, a)
+			}
+		}
+	}
+	t.Setenv("MY_KEY", "")
+	var c Config
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	c.Flags(fs)
+	fs.Parse([]string{"-backend", "anthropic", "-key-env", "MY_KEY"})
+	if err := c.Resolve(); err == nil {
+		t.Fatal("an empty key variable is not an error")
+	}
+}

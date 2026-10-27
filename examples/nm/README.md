@@ -14,14 +14,23 @@ go build -o nm ./examples/nm
 
 | flag | what it uses |
 |---|---|
-| `-backend cloud` (default) | `CPA_BASE_URL`, `CPA_API_KEY`, `CPA_MODEL`; 8 vCores |
+| `-backend openai` (default; also `cloud`) | any OpenAI-compatible endpoint; defaults `CPA_BASE_URL`, `CPA_MODEL`, key in `$CPA_API_KEY`; 8 vCores |
+| `-backend anthropic` | Anthropic's Messages API; defaults `https://api.anthropic.com/v1`, `claude-sonnet-5-5`, key in `$ANTHROPIC_API_KEY`; 8 vCores |
 | `-backend local` | Ollama at `http://127.0.0.1:11434/v1`, `qwen3.5:9b-mlx`, configured like `cmd/neumann -local`: one request at a time and as many vCores (`-parallel N` for a backend that serves more, e.g. a GGUF model with `OLLAMA_NUM_PARALLEL`), preemption, continuation of a cut-off answer or thought, `reasoning_effort: "none"` to turn thinking off, 10 min to the first byte, 2 min between chunks, no total limit, 8192 output tokens |
-| `-backend hybrid` | both, as two execution groups: `fast` is the local backend on `qwen3.5:4b` (configured exactly like `-backend local`, `-parallel` vCores, preemption on) and `strong` is the cloud backend (8 vCores, no preemption); `-route` picks each task's group |
+| `-backend hybrid` | two execution groups: `fast` is the local backend on `qwen3.5:4b` (configured exactly like `-backend local`, `-parallel` vCores, preemption on) and `strong` is an openai or anthropic backend (`-strong-api`, 8 vCores, no preemption); `-route` picks each task's group |
 
-`-backend anthropic` talks to Anthropic's Messages API (`claude-sonnet-5-5` by default, `ANTHROPIC_API_KEY`; set `HTTPS_PROXY` to reach it through a proxy).
+Every backend takes its endpoint, model and key from flags: `-base-url`, `-model`
+and `-key-env`, the name of the environment variable holding the key (the key itself
+is never a flag, so it stays out of `ps` and shell history; local's default is
+`NM_API_KEY`, unset: `ollama`). `NM_BASE_URL`, `NM_MODEL` and `NM_KEY_ENV` set the
+same. Hybrid's strong group has `-strong-api`, `-strong-base-url`, `-strong-model` and
+`-strong-key-env`. `-parallel` and `-cores` override the rest. `HTTPS_PROXY` is honoured.
 
-`-model`, `-base-url`, `-parallel` and `-cores` override. The key is read from the
-environment only (`NM_API_KEY` for local, default `ollama`) and never printed.
+```
+nm -backend openai -base-url https://gw.example/v1 -model some-model -key-env GW_KEY "..."
+HTTPS_PROXY=http://127.0.0.1:7890 nm -backend anthropic -model claude-haiku-5-5 "..."
+nm -backend hybrid -strong-api anthropic -route static "..."
+```
 
 ### Hybrid: a fast local group and a strong cloud group
 

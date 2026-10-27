@@ -65,9 +65,10 @@ const System = `You are nm, a careful assistant that works on the files of a loc
 
 // Config is what the flags set.
 type Config struct {
-	Backend  string // local, cloud, anthropic or hybrid
+	Backend  string // local, openai (alias cloud), anthropic or hybrid
 	Model    string
 	BaseURL  string
+	KeyEnv   string // the environment variable holding the API key
 	Cores    int
 	Parallel int // requests a local backend serves at once
 	Store    string
@@ -83,6 +84,8 @@ type Config struct {
 	StrongModel   string
 	StrongBaseURL string
 	StrongCores   int
+	StrongAPI     string // openai or anthropic
+	StrongKeyEnv  string
 	Fallback      bool   // fast's tasks move to strong while fast is down
 	Route         string // static, decide, fast or strong
 	RouterURL     string // decide: the System One server
@@ -99,10 +102,11 @@ type Config struct {
 
 // Flags registers the shared flags on fs.
 func (c *Config) Flags(fs *flag.FlagSet) {
-	fs.StringVar(&c.Backend, "backend", envOr("NM_BACKEND", "cloud"), "local (Ollama "+LocalModel+"), cloud (CPA_BASE_URL, CPA_API_KEY, CPA_MODEL) , anthropic (ANTHROPIC_API_KEY; HTTPS_PROXY is honoured) or hybrid (a fast local group and a strong cloud group) [NM_BACKEND]")
-	fs.StringVar(&c.Model, "model", "", "model name; default: "+LocalModel+" (local), $CPA_MODEL (cloud) or "+AnthropicModel+" (anthropic)")
-	fs.StringVar(&c.BaseURL, "base-url", "", "endpoint up to and including /v1; default: "+LocalBaseURL+" (local), $CPA_BASE_URL (cloud) or "+AnthropicBaseURL+" (anthropic)")
-	fs.IntVar(&c.Cores, "cores", 0, "vCores; default -parallel (local) or 8 (cloud, anthropic)")
+	fs.StringVar(&c.Backend, "backend", envOr("NM_BACKEND", "openai"), "local (Ollama "+LocalModel+"), openai (any OpenAI-compatible endpoint; also called cloud), anthropic (the Messages API) or hybrid (a fast local group and a strong group) [NM_BACKEND]. HTTPS_PROXY is honoured")
+	fs.StringVar(&c.Model, "model", os.Getenv("NM_MODEL"), "model name; default: "+LocalModel+" (local), $CPA_MODEL (openai) or "+AnthropicModel+" (anthropic) [NM_MODEL]")
+	fs.StringVar(&c.BaseURL, "base-url", os.Getenv("NM_BASE_URL"), "endpoint up to and including /v1; default: "+LocalBaseURL+" (local), $CPA_BASE_URL (openai) or "+AnthropicBaseURL+" (anthropic) [NM_BASE_URL]")
+	fs.StringVar(&c.KeyEnv, "key-env", os.Getenv("NM_KEY_ENV"), "name of the environment variable holding the API key (the key itself is never a flag); default: NM_API_KEY (local, unset: \"ollama\"), CPA_API_KEY (openai) or ANTHROPIC_API_KEY (anthropic) [NM_KEY_ENV]")
+	fs.IntVar(&c.Cores, "cores", 0, "vCores; default -parallel (local) or 8 (openai, anthropic)")
 	fs.IntVar(&c.Parallel, "parallel", 1, "local, and hybrid's fast group: requests the backend serves at once (Ollama's MLX runner serves one; a GGUF model, OLLAMA_NUM_PARALLEL)")
 	fs.StringVar(&c.Store, "store", filepath.Join(".nm", "state.db"), "SQLite file holding the machine's state")
 	fs.StringVar(&c.Root, "root", ".", "workspace root; every tool is confined to it")
@@ -111,8 +115,10 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&c.FastModel, "fast-model", "", "hybrid: the fast group's local model; default "+HybridFastModel)
 	fs.StringVar(&c.FastBaseURL, "fast-base-url", "", "hybrid: the fast group's endpoint; default "+LocalBaseURL)
 	fs.IntVar(&c.FastCores, "fast-cores", 0, "hybrid: the fast group's vCores; default -parallel")
-	fs.StringVar(&c.StrongModel, "strong-model", "", "hybrid: the strong group's cloud model; default $CPA_MODEL")
-	fs.StringVar(&c.StrongBaseURL, "strong-base-url", "", "hybrid: the strong group's endpoint; default $CPA_BASE_URL")
+	fs.StringVar(&c.StrongAPI, "strong-api", "openai", "hybrid: the strong group's protocol: openai or anthropic")
+	fs.StringVar(&c.StrongModel, "strong-model", "", "hybrid: the strong group's model; default $CPA_MODEL (openai) or "+AnthropicModel+" (anthropic)")
+	fs.StringVar(&c.StrongBaseURL, "strong-base-url", "", "hybrid: the strong group's endpoint; default $CPA_BASE_URL (openai) or "+AnthropicBaseURL+" (anthropic)")
+	fs.StringVar(&c.StrongKeyEnv, "strong-key-env", "", "hybrid: the environment variable holding the strong group's key; default CPA_API_KEY (openai) or ANTHROPIC_API_KEY (anthropic)")
 	fs.IntVar(&c.StrongCores, "strong-cores", 0, "hybrid: the strong group's vCores; default 8")
 	fs.BoolVar(&c.Fallback, "fallback", true, "hybrid: while the fast group is down (its breaker open), its tasks move to the strong group")
 	fs.StringVar(&c.Route, "route", RouteStatic, "hybrid: how a task picks its group: static (by kind; the REPL's default is fast, /strong overrides), decide (a decision model reads the request), fast or strong (everything to one group)")
@@ -145,6 +151,9 @@ func (c *Config) Resolve() error { return c.resolve(true) }
 // resolve is Resolve; without needKeys (scripted adapters) a missing cloud
 // endpoint, model or key is not an error.
 func (c *Config) resolve(needKeys bool) error {
+	if c.Backend == "openai" {
+		c.Backend = "cloud"
+	}
 	switch c.Backend {
 	case "local":
 		if c.Model == "" {
@@ -159,6 +168,9 @@ func (c *Config) resolve(needKeys bool) error {
 		if c.Cores == 0 {
 			c.Cores = c.Parallel
 		}
+		if c.KeyEnv == "" {
+			c.KeyEnv = "NM_API_KEY"
+		}
 	case "cloud":
 		if c.Model == "" {
 			c.Model = os.Getenv("CPA_MODEL")
@@ -169,8 +181,11 @@ func (c *Config) resolve(needKeys bool) error {
 		if c.Cores == 0 {
 			c.Cores = 8
 		}
-		if needKeys && (c.Model == "" || c.BaseURL == "" || cloudKey() == "") {
-			return errors.New("cloud backend needs CPA_BASE_URL, CPA_API_KEY and CPA_MODEL (or -base-url and -model)")
+		if c.KeyEnv == "" {
+			c.KeyEnv = "CPA_API_KEY"
+		}
+		if needKeys && (c.Model == "" || c.BaseURL == "" || os.Getenv(c.KeyEnv) == "") {
+			return fmt.Errorf("openai backend needs -base-url, -model and the key in $%s (defaults: CPA_BASE_URL, CPA_MODEL)", c.KeyEnv)
 		}
 	case "anthropic":
 		if c.Model == "" {
@@ -182,11 +197,14 @@ func (c *Config) resolve(needKeys bool) error {
 		if c.Cores == 0 {
 			c.Cores = 8
 		}
-		if needKeys && os.Getenv("ANTHROPIC_API_KEY") == "" {
-			return errors.New("anthropic backend needs ANTHROPIC_API_KEY")
+		if c.KeyEnv == "" {
+			c.KeyEnv = "ANTHROPIC_API_KEY"
+		}
+		if needKeys && os.Getenv(c.KeyEnv) == "" {
+			return fmt.Errorf("anthropic backend needs the key in $%s", c.KeyEnv)
 		}
 	case "hybrid":
-		for _, f := range []string{"model", "base-url", "cores"} {
+		for _, f := range []string{"model", "base-url", "cores", "key-env"} {
 			if c.set[f] {
 				return fmt.Errorf("-%s does not apply to -backend hybrid: use -fast-%s and -strong-%s", f, f, f)
 			}
@@ -203,17 +221,24 @@ func (c *Config) resolve(needKeys bool) error {
 		if c.FastCores == 0 {
 			c.FastCores = c.Parallel
 		}
-		if c.StrongModel == "" {
-			c.StrongModel = os.Getenv("CPA_MODEL")
-		}
-		if c.StrongBaseURL == "" {
-			c.StrongBaseURL = os.Getenv("CPA_BASE_URL")
+		switch c.StrongAPI {
+		case "", "openai", "cloud":
+			c.StrongAPI = "openai"
+			c.StrongModel = or(c.StrongModel, os.Getenv("CPA_MODEL"))
+			c.StrongBaseURL = or(c.StrongBaseURL, os.Getenv("CPA_BASE_URL"))
+			c.StrongKeyEnv = or(c.StrongKeyEnv, "CPA_API_KEY")
+		case "anthropic":
+			c.StrongModel = or(c.StrongModel, AnthropicModel)
+			c.StrongBaseURL = or(c.StrongBaseURL, AnthropicBaseURL)
+			c.StrongKeyEnv = or(c.StrongKeyEnv, "ANTHROPIC_API_KEY")
+		default:
+			return fmt.Errorf("unknown -strong-api %q: want openai or anthropic", c.StrongAPI)
 		}
 		if c.StrongCores == 0 {
 			c.StrongCores = 8
 		}
-		if needKeys && (c.StrongModel == "" || c.StrongBaseURL == "" || cloudKey() == "") {
-			return errors.New("hybrid backend's strong group needs CPA_BASE_URL, CPA_API_KEY and CPA_MODEL (or -strong-base-url and -strong-model)")
+		if needKeys && (c.StrongModel == "" || c.StrongBaseURL == "" || os.Getenv(c.StrongKeyEnv) == "") {
+			return fmt.Errorf("hybrid backend's strong group needs -strong-base-url, -strong-model and the key in $%s", c.StrongKeyEnv)
 		}
 		if c.FastCores < 1 || c.StrongCores < 1 {
 			return errors.New("-fast-cores and -strong-cores must be at least 1")
@@ -227,7 +252,7 @@ func (c *Config) resolve(needKeys bool) error {
 		}
 		c.Model, c.BaseURL, c.Cores = "", "", c.FastCores+c.StrongCores
 	default:
-		return fmt.Errorf("unknown -backend %q: want local, cloud, anthropic or hybrid", c.Backend)
+		return fmt.Errorf("unknown -backend %q: want local, openai, anthropic or hybrid", c.Backend)
 	}
 	if c.Cores < 1 {
 		return errors.New("-cores must be at least 1")
@@ -235,7 +260,12 @@ func (c *Config) resolve(needKeys bool) error {
 	return nil
 }
 
-func cloudKey() string { return os.Getenv("CPA_API_KEY") }
+func or(v, def string) string {
+	if v != "" {
+		return v
+	}
+	return def
+}
 
 // The anthropic backend's defaults.
 const (
@@ -260,7 +290,8 @@ type Side struct {
 	Model    string
 	BaseURL  string
 	Cores    int
-	Parallel int // local: requests the backend serves at once
+	Parallel int    // local: requests the backend serves at once
+	KeyEnv   string // the environment variable holding the key
 }
 
 // Sides are the groups the resolved config describes: one for local and
@@ -269,15 +300,15 @@ func (c *Config) Sides() []Side {
 	switch c.Backend {
 	case "hybrid":
 		return []Side{
-			{Class: ClassFast, Kind: "local", Model: c.FastModel, BaseURL: c.FastBaseURL, Cores: c.FastCores, Parallel: c.Parallel},
-			{Class: ClassStrong, Kind: "cloud", Model: c.StrongModel, BaseURL: c.StrongBaseURL, Cores: c.StrongCores},
+			{Class: ClassFast, Kind: "local", Model: c.FastModel, BaseURL: c.FastBaseURL, Cores: c.FastCores, Parallel: c.Parallel, KeyEnv: "NM_API_KEY"},
+			{Class: ClassStrong, Kind: "cloud", API: c.StrongAPI, Model: c.StrongModel, BaseURL: c.StrongBaseURL, Cores: c.StrongCores, KeyEnv: c.StrongKeyEnv},
 		}
 	case "local":
-		return []Side{{Class: neumann.DefaultClass, Kind: "local", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, Parallel: c.Parallel}}
+		return []Side{{Class: neumann.DefaultClass, Kind: "local", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, Parallel: c.Parallel, KeyEnv: c.KeyEnv}}
 	case "anthropic":
-		return []Side{{Class: neumann.DefaultClass, Kind: "cloud", API: "anthropic", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores}}
+		return []Side{{Class: neumann.DefaultClass, Kind: "cloud", API: "anthropic", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, KeyEnv: c.KeyEnv}}
 	}
-	return []Side{{Class: neumann.DefaultClass, Kind: "cloud", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores}}
+	return []Side{{Class: neumann.DefaultClass, Kind: "cloud", API: "openai", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, KeyEnv: c.KeyEnv}}
 }
 
 // Describe is the backend in one line, for logs and reports.
@@ -301,11 +332,11 @@ func (c *Config) Describe() string {
 // (the crash scenario's child).
 func (c *Config) BackendArgs() []string {
 	if c.Backend != "hybrid" {
-		return []string{"-backend", c.Backend, "-model", c.Model, "-base-url", c.BaseURL, "-cores", strconv.Itoa(c.Cores), "-parallel", strconv.Itoa(c.Parallel)}
+		return []string{"-backend", c.Backend, "-model", c.Model, "-base-url", c.BaseURL, "-cores", strconv.Itoa(c.Cores), "-parallel", strconv.Itoa(c.Parallel), "-key-env", c.KeyEnv}
 	}
 	return []string{"-backend", "hybrid", "-parallel", strconv.Itoa(c.Parallel),
 		"-fast-model", c.FastModel, "-fast-base-url", c.FastBaseURL, "-fast-cores", strconv.Itoa(c.FastCores),
-		"-strong-model", c.StrongModel, "-strong-base-url", c.StrongBaseURL, "-strong-cores", strconv.Itoa(c.StrongCores),
+		"-strong-api", c.StrongAPI, "-strong-key-env", c.StrongKeyEnv, "-strong-model", c.StrongModel, "-strong-base-url", c.StrongBaseURL, "-strong-cores", strconv.Itoa(c.StrongCores),
 		"-fallback=" + strconv.FormatBool(c.Fallback), "-route", c.Route, "-router-url", c.RouterURL, "-router-model", c.RouterModel,
 		"-route-timeout", c.RouteTimeout.String(), "-route-floor", strconv.FormatFloat(c.RouteFloor, 'g', -1, 64)}
 }
@@ -314,14 +345,14 @@ func (c *Config) BackendArgs() []string {
 // A local side is configured as cmd/neumann -local configures one; a cloud
 // side keeps the adapter's defaults.
 func (s Side) Adapter() *Timed {
+	key := os.Getenv(s.KeyEnv)
 	if s.API == "anthropic" {
-		a := anthropic.New(s.BaseURL, os.Getenv("ANTHROPIC_API_KEY"), s.Model)
+		a := anthropic.New(s.BaseURL, key, s.Model)
 		a.ThinkOff = anthropicThinkOff[s.Model]
 		return &Timed{Adapter: a, Class: s.Class}
 	}
-	key := cloudKey()
-	if s.Kind == "local" {
-		key = envOr("NM_API_KEY", "ollama")
+	if s.Kind == "local" && key == "" {
+		key = "ollama"
 	}
 	a := openai.New(s.BaseURL, key, s.Model)
 	if s.Kind == "local" {
