@@ -61,6 +61,7 @@ func setup(t *testing.T, env Env, args ...string) (app.Config, string, error) {
 	cfg := app.Config{Def: app.UserDefaults()}
 	fs := flag.NewFlagSet("t", flag.ContinueOnError)
 	cfg.Flags(fs)
+	cfg.CodingFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		t.Fatal(err)
 	}
@@ -383,4 +384,40 @@ context_window = 100000
 			t.Fatalf("hybrid flags: fast %d strong %d", cfg.FastContextWindow, cfg.StrongContextWindow)
 		}
 	})
+}
+
+// approve, sh_timeout, sh_shell, sh_deny_env and writable come from the
+// file; a flag wins.
+func TestCodingKeys(t *testing.T) {
+	clean(t)
+	t.Setenv("ANTHROPIC_API_KEY", "k")
+	cfgFile := writeFile(t, `backend = "anthropic"
+model = "m"
+approve = "auto"
+sh_timeout = "30s"
+sh_shell = false
+sh_deny_env = ["AWS_*", "GH_TOKEN"]
+writable = ["out", "docs"]
+`)
+	cfg, _, err := setup(t, Env{ConfigPath: cfgFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := cfg.Coding
+	if !k.On || k.Approve != "auto" || k.ShTimeout != 30*time.Second || k.ShScript || strings.Join(k.ShDenyEnv, ",") != "AWS_*,GH_TOKEN" || cfg.Writable != "out,docs" {
+		t.Fatalf("coding %+v writable %q", k, cfg.Writable)
+	}
+	cfg, _, err = setup(t, Env{ConfigPath: cfgFile}, "-approve", "never", "-sh-shell=true", "-sh-timeout", "1m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k := cfg.Coding; k.Approve != "never" || !k.ShScript || k.ShTimeout != time.Minute {
+		t.Fatalf("flags lost to the file: %+v", k)
+	}
+	if _, _, err := setup(t, Env{ConfigPath: writeFile(t, "approve = \"sometimes\"\nbackend = \"anthropic\"\nmodel = \"m\"\n")}); err == nil || !strings.Contains(err.Error(), "-approve") {
+		t.Fatalf("bad approve: %v", err)
+	}
+	if _, err := LoadFile(writeFile(t, `sh_timeout = "soon"`)); err == nil {
+		t.Fatal("bad sh_timeout accepted")
+	}
 }
