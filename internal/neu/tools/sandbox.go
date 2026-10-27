@@ -121,9 +121,13 @@ func (s *Sandbox) Rel(p string) string {
 	return filepath.ToSlash(r)
 }
 
+// reservedDirs are directories under the root that are never writable,
+// even with the whole root writable: neu's store and git's.
+var reservedDirs = []string{".neu", ".git"}
+
 // Writable resolves p and checks that a write there is allowed: under one
-// of the writable directories, and not a hidden file of nm's own (the
-// ledger).
+// of the writable directories, not a hidden file of neu's own (the
+// ledger), and not in a reserved directory.
 func (s *Sandbox) Writable(p string) (string, error) {
 	rp, err := s.Resolve(p)
 	if err != nil {
@@ -131,6 +135,11 @@ func (s *Sandbox) Writable(p string) (string, error) {
 	}
 	if filepath.Base(rp) == ledgerName {
 		return "", errors.New("that file is reserved")
+	}
+	for _, d := range reservedDirs {
+		if within(filepath.Join(s.root, d), rp) {
+			return "", fmt.Errorf("%s/ is reserved", d)
+		}
 	}
 	for _, w := range s.writable {
 		if rp != w && within(w, rp) {

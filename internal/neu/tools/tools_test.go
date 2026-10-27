@@ -249,3 +249,23 @@ func TestCalc(t *testing.T) {
 		}
 	}
 }
+
+// With the whole root writable, the store's and git's directories stay
+// closed.
+func TestWholeRootWritableKeepsReservedDirs(t *testing.T) {
+	root := t.TempDir()
+	box, err := NewSandbox(root, []string{"."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{".neu/state.db", ".git/config", ".neu"} {
+		if _, err := box.Writable(p); err == nil {
+			t.Errorf("%s writable", p)
+		}
+	}
+	for _, p := range []string{"notes.md", "docs/a.md", ".neutral/x"} {
+		if _, err := box.Writable(p); err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+}

@@ -1,20 +1,21 @@
-# nm
+# bench
 
-`nm` is a small assistant for a local workspace, built on neumann: one
-process, one machine with a SQLite store, and tools confined to a workspace
-root. It is also the test vehicle for measuring neumann on realistic work:
-`nm bench` runs a suite of auto-checked tasks in several scenarios and
-reports what the machine did, from its committed event stream.
+`acceptance/bench` measures neumann on realistic work. It builds the same
+machine as [`neu`](../../cmd/neu/README.md) (backend, SQLite store, the
+sandboxed workspace tools) and runs a suite of auto-checked tasks in several
+scenarios, then reports what the machine did, from its committed event
+stream. It is a development tool and is not part of the `neu` binary.
 
 ```
-go build -o nm ./examples/nm
+go run ./acceptance/bench -help                 # flags and task ids
+go build -o bench ./acceptance/bench            # or build it once
 ```
 
 ## Backends
 
 | flag | what it uses |
 |---|---|
-| `-backend openai` (default; also `cloud`) | any OpenAI-compatible endpoint; defaults `CPA_BASE_URL`, `CPA_MODEL`, key in `$CPA_API_KEY`; 8 vCores |
+| `-backend openai` (default; also `cloud`) | any OpenAI-compatible endpoint; defaults `CPA_BASE_URL`, `CPA_MODEL`, key in `$CPA_API_KEY` (the bench's defaults, unlike neu's); 8 vCores |
 | `-backend anthropic` | Anthropic's Messages API; defaults `https://api.anthropic.com/v1`, `claude-sonnet-5-5`, key in `$ANTHROPIC_API_KEY`; 8 vCores |
 | `-backend local` | Ollama at `http://127.0.0.1:11434/v1`, `qwen3.5:9b-mlx`, configured like `cmd/neumann -local`: one request at a time and as many vCores (`-parallel N` for a backend that serves more, e.g. a GGUF model with `OLLAMA_NUM_PARALLEL`), preemption, continuation of a cut-off answer or thought, `reasoning_effort: "none"` to turn thinking off, 10 min to the first byte, 2 min between chunks, no total limit, 8192 output tokens |
 | `-backend hybrid` | two execution groups: `fast` is the local backend on `qwen3.5:4b` (configured exactly like `-backend local`, `-parallel` vCores, preemption on) and `strong` is an openai or anthropic backend (`-strong-api`, 8 vCores, no preemption); `-route` picks each task's group |
@@ -22,22 +23,19 @@ go build -o nm ./examples/nm
 Every backend takes its endpoint, model and key from flags: `-base-url`, `-model`
 and `-key-env`, the name of the environment variable holding the key (the key itself
 is never a flag, so it stays out of `ps` and shell history; local's default is
-`NM_API_KEY`, unset: `ollama`). `NM_BASE_URL`, `NM_MODEL` and `NM_KEY_ENV` set the
-same. Hybrid's strong group has `-strong-api`, `-strong-base-url`, `-strong-model` and
+`NEU_API_KEY`, unset: `ollama`). Hybrid's strong group has `-strong-api`, `-strong-base-url`, `-strong-model` and
 `-strong-key-env`. `-parallel` and `-cores` override the rest. `HTTPS_PROXY` is honoured.
 
 ```
-nm -backend openai -base-url https://gw.example/v1 -model some-model -key-env GW_KEY "..."
-HTTPS_PROXY=http://127.0.0.1:7890 nm -backend anthropic -model claude-haiku-5-5 "..."
-nm -backend hybrid -strong-api anthropic -route static "..."
+go run ./acceptance/bench -backend openai -base-url https://gw.example/v1 -model some-model -key-env GW_KEY -tasks quick
+HTTPS_PROXY=http://127.0.0.1:7890 go run ./acceptance/bench -backend anthropic -model claude-haiku-5-5 -tasks quick
+go run ./acceptance/bench -backend hybrid -strong-api anthropic -route static
 ```
 
 ### Hybrid: a fast local group and a strong cloud group
 
 ```
-nm -backend hybrid                                 # REPL; a line goes to fast, /strong <text> to the cloud
-nm -backend hybrid -route decide "How many lines does data/sales.csv have?"
-nm bench -backend hybrid -route static -out hybrid-static-solo.json
+go run ./acceptance/bench -backend hybrid -route static -out hybrid-static-solo.json
 ```
 
 | flag | default | |
@@ -53,7 +51,7 @@ Each group's window is pinned at its vCores once the machine starts, as
 the one-group backends pin theirs; `-model`, `-base-url` and `-cores` are
 refused with `-backend hybrid`.
 
-**Routing.** The router runs in nm, before `Submit`: the task's class is
+**Routing.** The router runs in the program, before `Submit`: the task's class is
 set on the instruction, and the `accepted` event records it.
 
 - `static`: the bench routes by task kind, from what the 4B model was
@@ -88,7 +86,7 @@ connection refused, a stream that breaks), its tasks that are not
 `PinClass` move to `strong` with a `migrated` event (`reason:
 group_down`), keep their place in the queue, and their next model step
 runs on the cloud. The capability checks of design §6.3 pass: the cloud
-adapter takes tools (nm has 7, under its limit of 128) and reports no
+adapter takes tools (neu has 7, under its limit of 128) and reports no
 context window, so no context check can refuse. A continuation prefix the
 local model left (after a preemption or a broken stream) is dropped: the
 cloud adapter does not continue an assistant message, so that step starts
@@ -99,53 +97,26 @@ breaker and moves nothing.
 
 ## Tools
 
-All paths are relative to `-root` (default `.`); anything that leaves it,
-through `..`, an absolute path or a symlink, is refused.
-
-| tool | effect | |
-|---|---|---|
-| `fs_list {path, depth}` | read-only | a tree with sizes |
-| `fs_read {path, offset_line, limit_lines}` | read-only | numbered lines, at most 400 per call, says how many the file has |
-| `fs_grep {pattern, path, glob, ignore_case, count_only}` | read-only | `file:line: text` for up to 100 matches, always the total |
-| `git_run {dir, args}` | read-only | `log show diff status blame rev-parse ls-files`, no shell, no `--output`/`--no-index`/`--ext-diff`, no repository above the root |
-| `go_test {dir, run}` | idempotent | `go test -count=1 ./...` with a timeout |
-| `calc_eval {expr}` | read-only | exact arithmetic, `sum avg min max abs round` |
-| `fs_write {path, content}` | side effect | only under `-writable` (default `out`); idempotent by the call's key, every write recorded in `out/.ledger` |
-
-## Modes
-
-```
-nm "Which files mention preemption?"     # one question; tool calls stream on stderr, the answer on stdout
-nm                                       # REPL: each line is a task at priority 0
-```
-
-REPL commands: `/bg <text>` (priority 2), `/pri <id> <n>`, `/suspend <id>`,
-`/resume <id>`, `/steer <id> <text>`, `/cancel <id>`, `/status`, `/tasks`,
-`/wait <id>`, `/quit`. Answers print as tasks finish, prefixed by their id.
-The store is `./.nm/state.db` (`-store`): an interrupted task continues on
-the next start.
-
-`-observe-addr 127.0.0.1:43562` serves the observe view (`/status`,
-`/queue`, `/tasks/{id}`, `/events`, `/metrics`); `-otlp` exports traces and
-metrics over OTLP/HTTP as the standard `OTEL_EXPORTER_OTLP_*` variables say.
+The tasks run with neu's tools; see [neu's README](../../cmd/neu/README.md#tools).
+The bench's workspace allows writes under `out` and `fixbug`.
 
 ## Bench
 
 ```
-nm bench -scenario solo  -backend cloud -out solo-cloud.json
-nm bench -scenario solo  -backend local -tasks repo-qa,quick,fix-bug -out solo-local.json
-nm bench -scenario mixed -backend local -bg repo-qa.cores,code-review -probes 3 -every 60s -baseline solo-local.json -out mixed-local.json
-nm bench -scenario ops   -backend cloud -out ops.json
-nm bench -scenario crash -backend cloud -seed 3 -out crash.json
-nm bench -scenario crash -backend cloud -kill-on fs_write -out crash-write.json
-nm bench -scenario burst -backend cloud -k 30 -out burst.json
-nm bench -rejudge solo-local.json            # run the checkers again on a report's answers and files
+go run ./acceptance/bench -scenario solo  -backend cloud -out solo-cloud.json
+go run ./acceptance/bench -scenario solo  -backend local -tasks repo-qa,quick,fix-bug -out solo-local.json
+go run ./acceptance/bench -scenario mixed -backend local -bg repo-qa.cores,code-review -probes 3 -every 60s -baseline solo-local.json -out mixed-local.json
+go run ./acceptance/bench -scenario ops   -backend cloud -out ops.json
+go run ./acceptance/bench -scenario crash -backend cloud -seed 3 -out crash.json
+go run ./acceptance/bench -scenario crash -backend cloud -kill-on fs_write -out crash-write.json
+go run ./acceptance/bench -scenario burst -backend cloud -k 30 -out burst.json
+go run ./acceptance/bench -rejudge solo-local.json            # run the checkers again on a report's answers and files
 ```
 
 Run it from the repository root (or pass `-repo`): the workspace gets a
 `git archive` of tag `v0.3.0`. Everything else is generated or copied from
 `testdata/` into `-work` (default: a new directory under `$TMPDIR`), with
-the store in `<work>/.nm/<scenario>.db`. `nm bench -help` lists the tasks.
+the store in `<work>/.neu/<scenario>.db`. `-help` lists the tasks.
 
 ### Tasks
 
@@ -174,7 +145,8 @@ the store in `<work>/.nm/<scenario>.db`. `nm bench -help` lists the tasks.
   `changelog` is cancelled at its first tool call. Each must end as asked:
   passed with no model call while suspended, the extra question answered,
   cancelled with no tool call or write after.
-- `crash`: the batch runs in a child process that is killed with SIGKILL
+- `crash`: the batch runs in a child process (the bench binary itself, `go run`'s
+  build included) that is killed with SIGKILL
   after `-kill-after` tool results (default 3–10 from `-seed`), or as soon as
   a call of the `-kill-on` tool is dispatched, then started
   again on the same store. Calls of `fs_write` whose outcome is unknown are
