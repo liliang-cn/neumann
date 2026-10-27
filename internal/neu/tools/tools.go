@@ -54,20 +54,26 @@ type Tools struct {
 	OnCall func(CallStat)
 	// GoTestTimeout bounds go_test; 0 is GoTestTimeout.
 	GoTestTimeout time.Duration
+
+	// Coding adds neu's coding tools: fs_edit, fs_delete, sh_run and
+	// web_fetch. Set the fields below before Devices.
+	Coding bool
+	// WriteAnywhere lets fs_write, fs_edit and fs_delete change any file
+	// under the root but .neu/, .git/ and reserved files; otherwise they
+	// change files under the writable directories only.
+	WriteAnywhere bool
+	Sh            Shell
+	Web           Web
 }
 
-// New returns the tools on box; the write ledger lives in the first
-// writable directory, out/ by convention.
+// New returns the tools on box. The change ledger lives in the first
+// writable directory (out/.ledger by convention), else in .neu/.
 func New(box *Sandbox) (*Tools, error) {
-	t := &Tools{Box: box}
-	if len(box.writable) > 0 {
-		l, err := OpenLedger(filepath.Join(box.writable[0], ledgerName))
-		if err != nil {
-			return nil, err
-		}
-		t.Ledger = l
+	l, err := OpenLedger(ledgerPath(box))
+	if err != nil {
+		return nil, err
 	}
-	return t, nil
+	return &Tools{Box: box, Ledger: l}, nil
 }
 
 type fn func(ctx context.Context, call bus.DeviceCall) (string, error)
@@ -86,7 +92,8 @@ func (t *Tools) wrap(full string, f fn) builtin.Func {
 func schema(s string) json.RawMessage { return json.RawMessage(s) }
 
 // Devices returns the devices: fs (list, read, grep, write), git (run), go
-// (test) and calc (eval). Without a writable directory there is no
+// (test) and calc (eval); with Coding also fs (edit, delete), sh (run) and
+// web (fetch). Without a writable directory or WriteAnywhere there is no
 // fs_write.
 func (t *Tools) Devices() []bus.Device {
 	fsd := builtin.New("fs").
@@ -108,14 +115,30 @@ func (t *Tools) Devices() []bus.Device {
 			Schema:      schema(`{"type":"object","properties":{"pattern":{"type":"string","description":"RE2 regular expression"},"path":{"type":"string","description":"file or directory to search; default ."},"glob":{"type":"string","description":"only files whose name (or path relative to path) matches this glob, e.g. *.go"},"ignore_case":{"type":"boolean"},"count_only":{"type":"boolean"}},"required":["pattern"]}`),
 			Effect:      bus.ReadOnly,
 		}, t.wrap("fs_grep", t.grep))
-	if t.Ledger != nil {
+	if len(t.Box.writable) > 0 || t.WriteAnywhere {
 		fsd.Add(bus.ToolDef{
 			Name:        "write",
-			Description: "Create or replace a text file with the given content. Allowed only under " + t.writableNames() + ". Returns the number of bytes written.",
+			Description: t.writeDescription(),
 			Schema:      schema(`{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}`),
 			Effect:      bus.SideEffect,
 			Timeout:     30 * time.Second,
 		}, t.wrap("fs_write", t.write))
+		if t.Coding {
+			fsd.Add(bus.ToolDef{
+				Name:        "edit",
+				Description: "Replace exact text in an existing file: old_string must match the file exactly (whitespace and line breaks included) and only once, unless replace_all. Read the file first and copy old_string from it, with enough surrounding lines to be unique. " + t.whereWritable() + " Returns a diff of the change.",
+				Schema:      schema(`{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string","description":"the exact text to replace"},"new_string":{"type":"string","description":"the text to put in its place"},"replace_all":{"type":"boolean","description":"replace every occurrence; default false"}},"required":["path","old_string","new_string"]}`),
+				Effect:      bus.SideEffect,
+				Timeout:     30 * time.Second,
+			}, t.wrap("fs_edit", t.edit)).
+				Add(bus.ToolDef{
+					Name:        "delete",
+					Description: "Delete a file (not a directory). " + t.whereWritable(),
+					Schema:      schema(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}`),
+					Effect:      bus.SideEffect,
+					Timeout:     30 * time.Second,
+				}, t.wrap("fs_delete", t.remove))
+		}
 	}
 	git := builtin.New("git").Add(bus.ToolDef{
 		Name:        "run",
@@ -143,7 +166,52 @@ func (t *Tools) Devices() []bus.Device {
 		}
 		return Calc(in.Expr)
 	}))
-	return []bus.Device{fsd, git, gotest, calc}
+	devs := []bus.Device{fsd, git, gotest, calc}
+	if t.Coding {
+		devs = append(devs, t.codingDevices()...)
+	}
+	return devs
+}
+
+func (t *Tools) codingDevices() []bus.Device {
+	script := ""
+	props := `"args":{"type":"array","items":{"type":"string"},"description":"the program and its arguments, run without a shell"}`
+	if t.Sh.Script {
+		script = " Or give script, a bash command line (pipes, &&, redirections), run with bash -lc."
+		props += `,"script":{"type":"string","description":"a bash command line, instead of args"}`
+	}
+	sh := builtin.New("sh").Add(bus.ToolDef{
+		Name: "run",
+		Description: fmt.Sprintf("Run a command in a directory of the workspace and return its output (the start and the end when long) and exit status. args is the program and its arguments, run without a shell.%s "+
+			"Default timeout %s, timeout_sec up to %s. No input; nothing interactive. Read-only commands (ls, cat, grep, rg, find, go build/vet/test/list, git status/log/diff/show, ...) run at once; others may need the user's approval.",
+			script, min(ShDefaultTimeout, t.Sh.maxTimeout()), t.Sh.maxTimeout()),
+		Schema:        schema(`{"type":"object","properties":{` + props + `,"dir":{"type":"string","description":"working directory, relative to the workspace root; default ."},"timeout_sec":{"type":"integer"}}}`),
+		Effect:        bus.SideEffect,
+		ReportUnknown: true,
+		Timeout:       t.Sh.maxTimeout() + 15*time.Second,
+	}, t.wrap("sh_run", t.shRun))
+	web := builtin.New("web").Add(bus.ToolDef{
+		Name:        "fetch",
+		Description: fmt.Sprintf("Fetch a public http or https URL and return its text (an HTML page as readable text, links as text (url)) and the final URL after redirects. At most max_bytes of text (default %d, up to %d).", WebDefBytes, WebMaxBytes),
+		Schema:      schema(`{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["url"]}`),
+		Effect:      bus.ReadOnly,
+		Timeout:     WebTimeout + 5*time.Second,
+	}, t.wrap("web_fetch", t.webFetch))
+	return []bus.Device{sh, web}
+}
+
+func (t *Tools) writeDescription() string {
+	if !t.Coding {
+		return "Create or replace a text file with the given content. Allowed only under " + t.writableNames() + ". Returns the number of bytes written."
+	}
+	return "Create or replace a text file with the given content. " + t.whereWritable() + " Returns what changed. To change part of an existing file prefer fs_edit."
+}
+
+func (t *Tools) whereWritable() string {
+	if t.WriteAnywhere {
+		return "Any file of the workspace but .neu/ and .git/; outside " + or(t.writableNames(), "(none)") + " the user may be asked to approve."
+	}
+	return "Allowed only under " + t.writableNames() + "."
 }
 
 func (t *Tools) goTestTimeout() time.Duration {
@@ -477,27 +545,6 @@ func (t *Tools) grep(ctx context.Context, c bus.DeviceCall) (string, error) {
 		summary += fmt.Sprintf(" (showing the first %d; narrow the pattern or path, or use count_only)", nshown)
 	}
 	return shown.String() + summary + "\n", nil
-}
-
-func (t *Tools) write(_ context.Context, c bus.DeviceCall) (string, error) {
-	var in struct {
-		Path    string
-		Content *string
-	}
-	if err := decode(c.Args, &in); err != nil {
-		return "", err
-	}
-	if in.Path == "" || in.Content == nil {
-		return "", errors.New("path and content are required")
-	}
-	if len(*in.Content) > 1<<20 {
-		return "", errors.New("content over 1 MiB")
-	}
-	rp, err := t.Box.Writable(in.Path)
-	if err != nil {
-		return "", err
-	}
-	return t.Ledger.Write(c.Key, c.Task, t.Box.Rel(rp), rp, []byte(*in.Content))
 }
 
 var gitAllowed = []string{"log", "show", "diff", "status", "blame", "rev-parse", "ls-files"}

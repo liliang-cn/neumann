@@ -131,7 +131,7 @@ func TestOneShotCompactsOnASmallWindow(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	con := newConsole(&stdout, &stderr, false)
 	con.watch(ctx, a.M) // the answer streams, and is not printed again at the end
-	if code := oneShot(ctx, a, tr, con, "How many lines does big.log have?", &stdout, &stderr); code != 0 {
+	if code := oneShot(ctx, a, tr, con, "How many lines does big.log have?", newApprover(a, con, nil), &stdout, &stderr); code != 0 {
 		t.Fatalf("exit %d\nstdout %s\nstderr %s", code, stdout.String(), stderr.String())
 	}
 	if n := strings.Count(stdout.String(), "400 lines"); n != 1 {

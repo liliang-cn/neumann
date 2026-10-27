@@ -1,8 +1,11 @@
-// Command neu is a workspace assistant built on neumann: one process, one
-// machine with a SQLite store, and tools confined to a workspace root
-// (fs_list, fs_read, fs_grep, fs_write, git_run, go_test, calc_eval),
-// plus the config file's MCP servers ([[mcp]]), skills (<root>/.neu/skills,
-// ~/.config/neu/skills) and messages between tasks (tasks_send, tasks_list).
+// Command neu is a workspace and coding assistant built on neumann: one
+// process, one machine with a SQLite store, and tools confined to a
+// workspace root (fs_list, fs_read, fs_grep, fs_write, fs_edit, fs_delete,
+// git_run, go_test, sh_run, web_fetch, calc_eval), plus the config file's
+// MCP servers ([[mcp]]), skills (<root>/.neu/skills, ~/.config/neu/skills)
+// and messages between tasks (tasks_send, tasks_list). Side effects outside
+// -writable wait for the user's approval (-approve ask), run (auto) or are
+// refused (never).
 //
 //	neu "Which files mention preemption?"    one question, then exit
 //	neu                                       REPL: each line is a task
@@ -77,6 +80,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	fs := flag.NewFlagSet("neu", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfg.Flags(fs)
+	cfg.CodingFlags(fs)
 	verbose := fs.Bool("v", false, "log the machine's own lines on stderr")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	noStream := fs.Bool("no-stream", false, "print each answer when its task ends instead of as the model writes it")
@@ -111,8 +115,12 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintf(stderr, "neu: %v\n", err)
 		return 1
 	}
+	q := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if q != "" && cfg.Coding.Approve == app.ApproveAsk && !stdinIsTerminal(stdin) {
+		cfg.Coding.NoPrompt = noPrompt
+	}
 	cfg.DetectWindows(ctx, func(s string) { fmt.Fprintf(stderr, "neu: %s\n", s) })
-	fmt.Fprintf(stderr, "neu: %s [%s]\n", cfg.Describe(), src)
+	fmt.Fprintf(stderr, "neu: %s; approve %s [%s]\n", cfg.Describe(), cfg.Coding.Approve, src)
 	file, err := LoadFile(*cfgPath) // Setup read it already: no error now
 	if err != nil {
 		fmt.Fprintf(stderr, "neu: %v\n", err)
@@ -144,15 +152,23 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if !*noStream {
 		con.watch(ctx, a.M)
 	}
-	if q := strings.TrimSpace(strings.Join(fs.Args(), " ")); q != "" {
-		return oneShot(ctx, a, tr, con, q, stdout, stderr)
+	a.Reconcile(ctx, tr, func(s string) { con.line(stderr, s) })
+	if q != "" {
+		var read readFunc
+		if cfg.Coding.NoPrompt == "" {
+			read = readerLines(stdin)
+		}
+		return oneShot(ctx, a, tr, con, q, newApprover(a, con, read), stdout, stderr)
 	}
-	return repl(ctx, a, tr, con, stdin, stdout)
+	in := readLines(stdin)
+	newApprover(a, con, in.answer).start(ctx, tr, nil)
+	return repl(ctx, a, tr, con, in, stdout)
 }
 
-func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, con *console, q string, stdout, stderr io.Writer) int {
+func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, con *console, q string, appr *approver, stdout, stderr io.Writer) int {
 	id := newID()
 	con.setFocus(id)
+	appr.start(ctx, tr, func(task string) bool { return task == id })
 	tr.Subscribe(func(ev proto.Event) {
 		if ev.TaskID == id || ev.TaskID == "" {
 			con.event(ev)
@@ -213,6 +229,12 @@ func progress(ev proto.Event) string {
 		tool, _ := app.Field[string](ev, "tool")
 		args, _ := app.Field[string](ev, "args")
 		return fmt.Sprintf("%s → %s %s", tag, tool, clip(args, 90))
+	case proto.EvToolDenied:
+		tool, _ := app.Field[string](ev, "tool")
+		reason, _ := app.Field[string](ev, "reason")
+		if by, _ := app.Field[string](ev, "by"); by == "policy" {
+			return fmt.Sprintf("%s ✗ %s refused: %s", tag, tool, clip(reason, 160))
+		}
 	case proto.EvToolResult:
 		if isErr, _ := app.Field[bool](ev, "is_error"); isErr {
 			id, _ := app.Field[string](ev, "call_id")

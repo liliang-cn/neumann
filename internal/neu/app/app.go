@@ -163,6 +163,10 @@ type Config struct {
 	OTLP        bool
 	Quiet       bool // no machine log lines on stderr
 
+	// Coding is neu's coding tools and approval policy (CodingFlags); off
+	// for the bench.
+	Coding Coding
+
 	set map[string]bool
 }
 
@@ -359,7 +363,7 @@ func (c *Config) resolve(needKeys bool) error {
 	if c.ContextWindow < 0 {
 		return errors.New("-context-window must not be negative")
 	}
-	return nil
+	return c.Coding.check()
 }
 
 func or(v, def string) string {
@@ -503,6 +507,7 @@ type App struct {
 	obs      *observing
 	logw     *log.Logger
 	ext      extras // MCP servers, skills, messages (extras.go)
+	always   always // tools allowed for the session (coding.go)
 }
 
 // Options for Build beyond the flags.
@@ -550,7 +555,11 @@ func Build(ctx context.Context, cfg Config, opt Options) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	if st, err := filepath.Abs(cfg.Store); err == nil {
+		box.Reserve(st, st+"-wal", st+"-shm", st+"-journal")
+	}
 	a := &App{Cfg: cfg, Tools: tl, Models: map[string]model.Adapter{}}
+	policy := a.setupCoding()
 	sides := cfg.Sides()
 	for _, s := range sides {
 		m := opt.adapterFor(s.Class)
@@ -600,10 +609,14 @@ func Build(ctx context.Context, cfg Config, opt Options) (*App, error) {
 		return nil, err
 	}
 	mc := neumann.Config{
-		Devices: devs,
-		Store:   st,
-		System:  System + sys,
-		Logf:    logf,
+		Devices:    devs,
+		Store:      st,
+		System:     System + sys,
+		Logf:       logf,
+		ToolPolicy: policy,
+	}
+	if cfg.Coding.On {
+		mc.System = CodingSystem + sys
 	}
 	if cfg.Backend == "hybrid" {
 		mc.Groups, mc.Default = a.groups(sides), ClassFast

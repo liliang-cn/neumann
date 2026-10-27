@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -36,7 +35,7 @@ const replHelp = `Each line is a task at priority 0 (interactive). Commands:
 
 // repl reads one line at a time. Answers are printed as their tasks end,
 // from the event stream, prefixed by the task id.
-func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, stdin io.Reader, stdout io.Writer) int {
+func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, src *lineSource, stdout io.Writer) int {
 	say := func(format string, args ...any) { con.line(stdout, fmt.Sprintf(format, args...)) }
 	waiting := map[string]bool{} // answered by /wait: not printed twice
 	var wmu sync.Mutex
@@ -58,15 +57,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, stdin 
 		}
 	})
 	say("neu %s, workspace %s. /help for commands.", Version(), a.Tools.Box.Root())
-	lines := make(chan string)
-	go func() {
-		defer close(lines)
-		sc := bufio.NewScanner(stdin)
-		sc.Buffer(make([]byte, 64<<10), 1<<20)
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
-	}()
+	lines := src.lines
 	submitTo := func(text string, prio int, pick app.Pick) {
 		id := newID()
 		_, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: text, Class: pick.Class, Priority: prio, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}})

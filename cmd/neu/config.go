@@ -42,6 +42,13 @@ type File struct {
 	// model, so it applies only to the file's backend.
 	ContextWindow int `toml:"context_window"`
 
+	// The coding tools and their approvals: -approve, -sh-timeout,
+	// -sh-shell, -sh-deny-env.
+	Approve   string   `toml:"approve"`
+	ShTimeout string   `toml:"sh_timeout"`
+	ShShell   *bool    `toml:"sh_shell"`
+	ShDenyEnv []string `toml:"sh_deny_env"`
+
 	Hybrid struct {
 		FastModel    string   `toml:"fast_model"`
 		FastBaseURL  string   `toml:"fast_base_url"`
@@ -105,6 +112,11 @@ func LoadFile(path string) (*File, error) {
 	}
 	if err := f.BusFile.check(path); err != nil {
 		return nil, err
+	}
+	if f.ShTimeout != "" {
+		if _, err := time.ParseDuration(f.ShTimeout); err != nil {
+			return nil, fmt.Errorf("%s: sh_timeout: %w", path, err)
+		}
 	}
 	if f.Hybrid.RouteTimeout != "" {
 		if _, err := time.ParseDuration(f.Hybrid.RouteTimeout); err != nil {
@@ -189,6 +201,7 @@ func (f *File) apply(cfg *app.Config, set map[string]bool) {
 	if len(f.Writable) > 0 {
 		str("writable", &cfg.Writable, strings.Join(f.Writable, ","))
 	}
+	f.applyCoding(&cfg.Coding, set)
 	h := f.Hybrid
 	str("fast-model", &cfg.FastModel, h.FastModel)
 	str("fast-base-url", &cfg.FastBaseURL, h.FastBaseURL)
@@ -245,4 +258,20 @@ func noBackend(configPath string) error {
   - Ollama running at %s, with -model: local
   - flags: -backend local|openai|anthropic|hybrid, with -base-url, -model and -key-env as needed`,
 		configPath, app.OpenAIKeyEnv, OllamaURL)
+}
+
+// applyCoding copies the coding keys into k where no flag set them.
+func (f *File) applyCoding(k *app.Coding, set map[string]bool) {
+	if f.Approve != "" && !set["approve"] {
+		k.Approve = f.Approve
+	}
+	if d, err := time.ParseDuration(f.ShTimeout); err == nil && !set["sh-timeout"] {
+		k.ShTimeout = d
+	}
+	if f.ShShell != nil && !set["sh-shell"] {
+		k.ShScript = *f.ShShell
+	}
+	if len(f.ShDenyEnv) > 0 && !set["sh-deny-env"] {
+		k.ShDenyEnv = f.ShDenyEnv
+	}
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -24,6 +23,16 @@ type console struct {
 	midline bool   // the last thing printed was streamed text without a newline
 	thought bool   // reasoning is being streamed and its line is open
 	streams map[string]*streamed
+
+	// While an approval prompt waits for its answer (hold), everything
+	// else is kept in pending and printed when it is answered.
+	paused  bool
+	pending []pend
+}
+
+type pend struct {
+	w io.Writer
+	s string
 }
 
 // streamed is what a task's model has streamed since its last tool round:
@@ -68,22 +77,22 @@ func (c *console) delta(d proto.Delta) {
 	if d.Reasoning != "" && c.think {
 		if !c.thought {
 			c.breakLine()
-			fmt.Fprint(c.err, "  … ")
+			c.write(c.err, "  … ")
 			c.thought = true
 		}
-		fmt.Fprint(c.err, strings.ReplaceAll(d.Reasoning, "\n", "\n    "))
+		c.write(c.err, strings.ReplaceAll(d.Reasoning, "\n", "\n    "))
 		c.midline = true
 	}
 	if d.Text == "" {
 		return
 	}
 	if c.thought {
-		fmt.Fprintln(c.err)
+		c.write(c.err, "\n")
 		c.thought, c.midline = false, false
 	}
 	s.any = true
 	s.text.WriteString(d.Text)
-	fmt.Fprint(c.out, d.Text)
+	c.write(c.out, d.Text)
 	c.midline = !strings.HasSuffix(d.Text, "\n")
 }
 
@@ -103,7 +112,7 @@ func (c *console) event(ev proto.Event) {
 	case proto.EvModelRetry:
 		if s.text.Len() > 0 {
 			c.breakLine()
-			fmt.Fprintln(c.err, "  (the model call is retried; the answer starts again)")
+			c.write(c.err, "  (the model call is retried; the answer starts again)\n")
 		}
 		s.text.Reset()
 	}
@@ -114,7 +123,7 @@ func (c *console) line(w io.Writer, s string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.breakLine()
-	fmt.Fprintln(w, s)
+	c.write(w, s+"\n")
 }
 
 // answer reports whether the task's answer was already streamed in full,
@@ -139,11 +148,47 @@ func (c *console) answer(id, final string) (shown bool) {
 func (c *console) breakLine() {
 	if c.midline {
 		if c.thought {
-			fmt.Fprintln(c.err)
+			c.write(c.err, "\n")
 			c.thought = false
 		} else {
-			fmt.Fprintln(c.out)
+			c.write(c.out, "\n")
 		}
 		c.midline = false
 	}
+}
+
+// write prints s on w, or keeps it while a prompt is open. Callers hold mu.
+func (c *console) write(w io.Writer, s string) {
+	if c.paused {
+		c.pending = append(c.pending, pend{w, s})
+		return
+	}
+	io.WriteString(w, s)
+}
+
+// hold opens a prompt: the open streamed line is ended, and until release
+// nothing else is printed (it is kept, in order, and printed then), so the
+// prompt and the answer typed after it stay on their own lines. One prompt
+// is open at a time.
+func (c *console) hold() (release func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.breakLine()
+	c.paused = true
+	return func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.paused = false
+		for _, p := range c.pending {
+			io.WriteString(p.w, p.s)
+		}
+		c.pending = nil
+	}
+}
+
+// prompt prints s on err while a prompt is open (hold), past the pause.
+func (c *console) prompt(s string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	io.WriteString(c.err, s)
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -17,6 +18,7 @@ import (
 type Sandbox struct {
 	root     string   // absolute, symlinks resolved
 	writable []string // absolute, symlinks resolved; each inside root
+	reserved []string // files never written: the store and its journals
 }
 
 // NewSandbox returns a sandbox on root. writable are directories (relative
@@ -88,6 +90,19 @@ func (s *Sandbox) Resolve(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	out, err := realPath(full)
+	if err != nil {
+		return "", err
+	}
+	if !within(s.root, out) {
+		return "", errEscape
+	}
+	return out, nil
+}
+
+// realPath is the clean absolute path full with every symlink of its
+// deepest existing ancestor resolved.
+func realPath(full string) (string, error) {
 	existing, rest := full, ""
 	for {
 		if _, err := os.Lstat(existing); err == nil {
@@ -104,11 +119,7 @@ func (s *Sandbox) Resolve(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	out := filepath.Join(real, rest)
-	if !within(s.root, out) {
-		return "", errEscape
-	}
-	return out, nil
+	return filepath.Join(real, rest), nil
 }
 
 // Rel is p (a real path inside the root) relative to the root, with forward
@@ -121,30 +132,56 @@ func (s *Sandbox) Rel(p string) string {
 	return filepath.ToSlash(r)
 }
 
-// reservedDirs are directories under the root that are never writable,
-// even with the whole root writable: neu's store and git's.
+// reservedDirs are directories that are never writable, even with the
+// whole root writable: neu's store and git's, at any depth (a nested
+// repository's .git too).
 var reservedDirs = []string{".neu", ".git"}
 
-// Writable resolves p and checks that a write there is allowed: under one
-// of the writable directories, not a hidden file of neu's own (the
-// ledger), and not in a reserved directory.
-func (s *Sandbox) Writable(p string) (string, error) {
+// Reserve marks files (absolute or relative to the root) that no tool may
+// write or delete, such as a store outside .neu/.
+func (s *Sandbox) Reserve(paths ...string) {
+	for _, p := range paths {
+		if abs, err := filepath.Abs(p); err == nil {
+			if rp, err := realPath(abs); err == nil && within(s.root, rp) {
+				s.reserved = append(s.reserved, rp)
+			}
+		}
+	}
+}
+
+// changeable resolves p and refuses what no tool may change: the ledger,
+// a reserved file, anything in a reserved directory, and the root itself.
+func (s *Sandbox) changeable(p string) (string, error) {
 	rp, err := s.Resolve(p)
 	if err != nil {
 		return "", err
 	}
-	if filepath.Base(rp) == ledgerName {
+	if rp == s.root {
+		return "", errors.New("that is the workspace root")
+	}
+	if filepath.Base(rp) == ledgerName || slices.Contains(s.reserved, rp) {
 		return "", errors.New("that file is reserved")
 	}
-	for _, d := range reservedDirs {
-		if within(filepath.Join(s.root, d), rp) {
-			return "", fmt.Errorf("%s/ is reserved", d)
+	for _, part := range strings.Split(s.Rel(rp), "/") {
+		if slices.Contains(reservedDirs, part) {
+			return "", fmt.Errorf("%s/ is reserved", part)
 		}
 	}
-	for _, w := range s.writable {
-		if rp != w && within(w, rp) {
-			return rp, nil
-		}
+	return rp, nil
+}
+
+// Writable resolves p and checks that a write there is allowed without
+// asking: under one of the writable directories, and changeable.
+func (s *Sandbox) Writable(p string) (string, error) {
+	rp, err := s.changeable(p)
+	if err != nil {
+		return "", err
+	}
+	if s.InWritable(rp) {
+		return rp, nil
+	}
+	if len(s.writable) == 0 {
+		return "", errors.New("no directory is writable")
 	}
 	var names []string
 	for _, w := range s.writable {
@@ -152,6 +189,21 @@ func (s *Sandbox) Writable(p string) (string, error) {
 	}
 	return "", fmt.Errorf("writes are allowed only under %s", strings.Join(names, ", "))
 }
+
+// InWritable reports whether rp, a resolved path, is inside one of the
+// writable directories (not the directory itself).
+func (s *Sandbox) InWritable(rp string) bool {
+	for _, w := range s.writable {
+		if rp != w && within(w, rp) {
+			return true
+		}
+	}
+	return false
+}
+
+// Mutable resolves p for a change anywhere under the root: everything but
+// the ledger, reserved files and reserved directories.
+func (s *Sandbox) Mutable(p string) (string, error) { return s.changeable(p) }
 
 // within reports whether p is dir or inside it; both are clean absolute paths.
 func within(dir, p string) bool {
