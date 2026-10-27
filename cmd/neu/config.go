@@ -38,11 +38,15 @@ type File struct {
 	Parallel int      `toml:"parallel"`
 	Writable []string `toml:"writable"`
 	MaxSteps int      `toml:"max_steps"`
+	// ContextWindow is the model's context window in tokens; it goes with
+	// model, so it applies only to the file's backend.
+	ContextWindow int `toml:"context_window"`
 
 	Hybrid struct {
 		FastModel    string   `toml:"fast_model"`
 		FastBaseURL  string   `toml:"fast_base_url"`
 		FastCores    int      `toml:"fast_cores"`
+		FastWindow   int      `toml:"fast_context_window"`
 		Route        string   `toml:"route"`
 		RouterURL    string   `toml:"router_url"`
 		RouterModel  string   `toml:"router_model"`
@@ -57,6 +61,7 @@ type File struct {
 		BaseURL string `toml:"base_url"`
 		KeyEnv  string `toml:"key_env"`
 		Cores   int    `toml:"cores"`
+		Window  int    `toml:"context_window"`
 	} `toml:"strong"`
 }
 
@@ -171,6 +176,7 @@ func (f *File) apply(cfg *app.Config, set map[string]bool) {
 		str("key-env", &cfg.KeyEnv, f.KeyEnv)
 		if cfg.Backend != "hybrid" {
 			num("cores", &cfg.Cores, f.Cores)
+			num("context-window", &cfg.ContextWindow, f.ContextWindow)
 		}
 	}
 	num("parallel", &cfg.Parallel, f.Parallel)
@@ -182,6 +188,7 @@ func (f *File) apply(cfg *app.Config, set map[string]bool) {
 	str("fast-model", &cfg.FastModel, h.FastModel)
 	str("fast-base-url", &cfg.FastBaseURL, h.FastBaseURL)
 	num("fast-cores", &cfg.FastCores, h.FastCores)
+	num("fast-context-window", &cfg.FastContextWindow, h.FastWindow)
 	str("route", &cfg.Route, h.Route)
 	str("router-url", &cfg.RouterURL, h.RouterURL)
 	str("router-model", &cfg.RouterModel, h.RouterModel)
@@ -200,6 +207,7 @@ func (f *File) apply(cfg *app.Config, set map[string]bool) {
 	str("strong-base-url", &cfg.StrongBaseURL, s.BaseURL)
 	str("strong-key-env", &cfg.StrongKeyEnv, s.KeyEnv)
 	num("strong-cores", &cfg.StrongCores, s.Cores)
+	num("strong-context-window", &cfg.StrongContextWindow, s.Window)
 }
 
 // ollamaUp reports whether an Ollama server answers GET /api/tags at base

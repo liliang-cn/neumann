@@ -132,6 +132,11 @@ type Config struct {
 	Root     string
 	Writable string // comma-separated, relative to Root
 	MaxSteps int
+	// ContextWindow is the model's context window in tokens (input and
+	// output together), which compaction sizes by (design §5.3); 0: the
+	// adapter's own (anthropic 200000, openai unknown), or for local what
+	// DetectWindows reads from Ollama.
+	ContextWindow int
 
 	// -backend hybrid: two execution groups, fast on a local model and
 	// strong on the cloud endpoint, and how tasks are routed between them.
@@ -143,12 +148,16 @@ type Config struct {
 	StrongCores   int
 	StrongAPI     string // openai or anthropic
 	StrongKeyEnv  string
-	Fallback      bool   // fast's tasks move to strong while fast is down
-	Route         string // static, decide, fast or strong
-	RouterURL     string // decide: the System One server
-	RouterModel   string // decide: the decision model
-	RouteTimeout  time.Duration
-	RouteFloor    float64 // decide: the confidence a pick needs (0: the router's default; negative: any)
+	// The groups' context windows, as ContextWindow is the one-group
+	// backends'.
+	FastContextWindow   int
+	StrongContextWindow int
+	Fallback            bool   // fast's tasks move to strong while fast is down
+	Route               string // static, decide, fast or strong
+	RouterURL           string // decide: the System One server
+	RouterModel         string // decide: the decision model
+	RouteTimeout        time.Duration
+	RouteFloor          float64 // decide: the confidence a pick needs (0: the router's default; negative: any)
 
 	ObserveAddr string
 	OTLP        bool
@@ -184,14 +193,17 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&c.Root, "root", ".", "workspace root; every tool is confined to it")
 	fs.StringVar(&c.Writable, "writable", "out", "comma-separated directories under the root where fs_write may write")
 	fs.IntVar(&c.MaxSteps, "max-steps", 40, "model calls a task may make")
+	fs.IntVar(&c.ContextWindow, "context-window", 0, "the model's context window in tokens; a task is compacted once its request and output reserve pass 80% of it. 0: "+windowDefaults)
 	fs.StringVar(&c.FastModel, "fast-model", "", "hybrid: the fast group's local model; default "+modelDef(d.FastModel))
 	fs.StringVar(&c.FastBaseURL, "fast-base-url", "", "hybrid: the fast group's endpoint; default "+LocalBaseURL)
 	fs.IntVar(&c.FastCores, "fast-cores", 0, "hybrid: the fast group's vCores; default -parallel")
+	fs.IntVar(&c.FastContextWindow, "fast-context-window", 0, "hybrid: the fast group's context window in tokens; 0: read from Ollama")
 	fs.StringVar(&c.StrongAPI, "strong-api", "openai", "hybrid: the strong group's protocol: openai or anthropic")
 	fs.StringVar(&c.StrongModel, "strong-model", "", "hybrid: the strong group's model; default "+modelDef(d.OpenAIModel)+" (openai), "+modelDef(d.AnthropicModel)+" (anthropic)")
 	fs.StringVar(&c.StrongBaseURL, "strong-base-url", "", "hybrid: the strong group's endpoint; default "+openaiURL+" (openai) or "+AnthropicBaseURL+" (anthropic)")
 	fs.StringVar(&c.StrongKeyEnv, "strong-key-env", "", "hybrid: the environment variable holding the strong group's key; default "+d.OpenAIKeyEnv+" (openai) or ANTHROPIC_API_KEY (anthropic)")
 	fs.IntVar(&c.StrongCores, "strong-cores", 0, "hybrid: the strong group's vCores; default 8")
+	fs.IntVar(&c.StrongContextWindow, "strong-context-window", 0, "hybrid: the strong group's context window in tokens; 0: 200000 (anthropic) or unknown (openai)")
 	fs.BoolVar(&c.Fallback, "fallback", true, "hybrid: while the fast group is down (its breaker open), its tasks move to the strong group")
 	fs.StringVar(&c.Route, "route", RouteStatic, "hybrid: how a task picks its group: static (by kind; the REPL's default is fast, /strong overrides), decide (a decision model reads the request), fast or strong (everything to one group)")
 	fs.StringVar(&c.RouterURL, "router-url", decide.DefaultURL, "-route decide: the Ollama server with the System One API")
@@ -282,7 +294,7 @@ func (c *Config) resolve(needKeys bool) error {
 			return fmt.Errorf("anthropic backend needs the key in $%s", c.KeyEnv)
 		}
 	case "hybrid":
-		for _, f := range []string{"model", "base-url", "cores", "key-env"} {
+		for _, f := range []string{"model", "base-url", "cores", "key-env", "context-window"} {
 			if c.set[f] {
 				return fmt.Errorf("-%s does not apply to -backend hybrid: use -fast-%s and -strong-%s", f, f, f)
 			}
@@ -325,6 +337,9 @@ func (c *Config) resolve(needKeys bool) error {
 		if c.FastCores < 1 || c.StrongCores < 1 {
 			return errors.New("-fast-cores and -strong-cores must be at least 1")
 		}
+		if c.FastContextWindow < 0 || c.StrongContextWindow < 0 {
+			return errors.New("-fast-context-window and -strong-context-window must not be negative")
+		}
 		switch c.Route {
 		case "":
 			c.Route = RouteStatic
@@ -340,6 +355,9 @@ func (c *Config) resolve(needKeys bool) error {
 	}
 	if c.Cores < 1 {
 		return errors.New("-cores must be at least 1")
+	}
+	if c.ContextWindow < 0 {
+		return errors.New("-context-window must not be negative")
 	}
 	return nil
 }
@@ -377,6 +395,7 @@ type Side struct {
 	Cores    int
 	Parallel int    // local: requests the backend serves at once
 	KeyEnv   string // the environment variable holding the key
+	Window   int    // context window in tokens; 0: the adapter's default
 }
 
 // Sides are the groups the resolved config describes: one for local and
@@ -385,15 +404,15 @@ func (c *Config) Sides() []Side {
 	switch c.Backend {
 	case "hybrid":
 		return []Side{
-			{Class: ClassFast, Kind: "local", Model: c.FastModel, BaseURL: c.FastBaseURL, Cores: c.FastCores, Parallel: c.Parallel, KeyEnv: LocalKeyEnv},
-			{Class: ClassStrong, Kind: "cloud", API: c.StrongAPI, Model: c.StrongModel, BaseURL: c.StrongBaseURL, Cores: c.StrongCores, KeyEnv: c.StrongKeyEnv},
+			{Class: ClassFast, Kind: "local", Model: c.FastModel, BaseURL: c.FastBaseURL, Cores: c.FastCores, Parallel: c.Parallel, KeyEnv: LocalKeyEnv, Window: c.FastContextWindow},
+			{Class: ClassStrong, Kind: "cloud", API: c.StrongAPI, Model: c.StrongModel, BaseURL: c.StrongBaseURL, Cores: c.StrongCores, KeyEnv: c.StrongKeyEnv, Window: c.StrongContextWindow},
 		}
 	case "local":
-		return []Side{{Class: neumann.DefaultClass, Kind: "local", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, Parallel: c.Parallel, KeyEnv: c.KeyEnv}}
+		return []Side{{Class: neumann.DefaultClass, Kind: "local", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, Parallel: c.Parallel, KeyEnv: c.KeyEnv, Window: c.ContextWindow}}
 	case "anthropic":
-		return []Side{{Class: neumann.DefaultClass, Kind: "cloud", API: "anthropic", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, KeyEnv: c.KeyEnv}}
+		return []Side{{Class: neumann.DefaultClass, Kind: "cloud", API: "anthropic", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, KeyEnv: c.KeyEnv, Window: c.ContextWindow}}
 	}
-	return []Side{{Class: neumann.DefaultClass, Kind: "cloud", API: "openai", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, KeyEnv: c.KeyEnv}}
+	return []Side{{Class: neumann.DefaultClass, Kind: "cloud", API: "openai", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, KeyEnv: c.KeyEnv, Window: c.ContextWindow}}
 }
 
 // Describe is the backend in one line, for logs and reports.
@@ -403,7 +422,7 @@ func (c *Config) Describe() string {
 		if b == "cloud" {
 			b = "openai"
 		}
-		return fmt.Sprintf("%s (%s at %s), %d vCore(s)", b, c.Model, c.BaseURL, c.Cores)
+		return fmt.Sprintf("%s (%s at %s), %d vCore(s), %s", b, c.Model, c.BaseURL, c.Cores, c.Sides()[0].WindowDesc())
 	}
 	fb := "no fallback"
 	if c.Fallback {
@@ -413,43 +432,55 @@ func (c *Config) Describe() string {
 	if route == RouteDecide {
 		route += " (" + c.RouterModel + ")"
 	}
-	return fmt.Sprintf("hybrid: fast %s at %s, %d vCore(s); strong %s at %s, %d vCore(s); route %s; %s",
-		c.FastModel, c.FastBaseURL, c.FastCores, c.StrongModel, c.StrongBaseURL, c.StrongCores, route, fb)
+	sides := c.Sides()
+	return fmt.Sprintf("hybrid: fast %s at %s, %d vCore(s), %s; strong %s at %s, %d vCore(s), %s; route %s; %s",
+		c.FastModel, c.FastBaseURL, c.FastCores, sides[0].WindowDesc(), c.StrongModel, c.StrongBaseURL, c.StrongCores, sides[1].WindowDesc(), route, fb)
 }
 
 // BackendArgs are the flags that rebuild this backend in another process
 // (the crash scenario's child).
 func (c *Config) BackendArgs() []string {
 	if c.Backend != "hybrid" {
-		return []string{"-backend", c.Backend, "-model", c.Model, "-base-url", c.BaseURL, "-cores", strconv.Itoa(c.Cores), "-parallel", strconv.Itoa(c.Parallel), "-key-env", c.KeyEnv}
+		return []string{"-backend", c.Backend, "-model", c.Model, "-base-url", c.BaseURL, "-cores", strconv.Itoa(c.Cores), "-parallel", strconv.Itoa(c.Parallel), "-key-env", c.KeyEnv,
+			"-context-window", strconv.Itoa(c.ContextWindow)}
 	}
 	return []string{"-backend", "hybrid", "-parallel", strconv.Itoa(c.Parallel),
 		"-fast-model", c.FastModel, "-fast-base-url", c.FastBaseURL, "-fast-cores", strconv.Itoa(c.FastCores),
 		"-strong-api", c.StrongAPI, "-strong-key-env", c.StrongKeyEnv, "-strong-model", c.StrongModel, "-strong-base-url", c.StrongBaseURL, "-strong-cores", strconv.Itoa(c.StrongCores),
+		"-fast-context-window", strconv.Itoa(c.FastContextWindow), "-strong-context-window", strconv.Itoa(c.StrongContextWindow),
 		"-fallback=" + strconv.FormatBool(c.Fallback), "-route", c.Route, "-router-url", c.RouterURL, "-router-model", c.RouterModel,
 		"-route-timeout", c.RouteTimeout.String(), "-route-floor", strconv.FormatFloat(c.RouteFloor, 'g', -1, 64)}
 }
 
 // Adapter builds the side's model adapter, wrapped to record call times.
 // A local side is configured as cmd/neumann -local configures one; a cloud
-// side keeps the adapter's defaults.
+// side keeps the adapter's defaults. Window, when set, is the adapter's
+// ContextWindow. A local side with a known window reserves at most a
+// quarter of it for the answer: Ollama's context holds the prompt and the
+// answer together, and compaction keeps the request below 80% of the
+// window minus that reserve.
 func (s Side) Adapter() *Timed {
 	key := os.Getenv(s.KeyEnv)
 	if s.API == "anthropic" {
 		a := anthropic.New(s.BaseURL, key, s.Model)
 		a.ThinkOff = anthropicThinkOff[s.Model]
+		a.ContextWindow = s.Window
 		return &Timed{Adapter: a, Class: s.Class}
 	}
 	if s.Kind == "local" && key == "" {
 		key = "ollama"
 	}
 	a := openai.New(s.BaseURL, key, s.Model)
+	a.ContextWindow = s.Window
 	if s.Kind == "local" {
 		a.Parallel = s.Parallel
 		a.Prefill, a.ThinkOff = true, localThinkOff
 		a.ThinkTags = [2]string{"<think>", "</think>"}
 		a.Timeout, a.FirstByteTimeout, a.IdleTimeout = 0, localFirstByte, localIdle
 		a.MaxTokens = localMaxTokens
+		if s.Window > 0 {
+			a.MaxTokens = min(localMaxTokens, s.Window/4)
+		}
 	}
 	return &Timed{Adapter: a, Class: s.Class}
 }

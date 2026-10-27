@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -291,4 +293,94 @@ func TestVersionFlag(t *testing.T) {
 	if Version() != "v9.9.9" {
 		t.Fatal(Version())
 	}
+}
+
+// ollamaWith is an Ollama that loads any model with context length n and
+// counts the loads.
+func ollamaWith(t *testing.T, n int, loads *int) string {
+	t.Helper()
+	var loaded string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/generate":
+			var req struct{ Model string }
+			json.NewDecoder(r.Body).Decode(&req)
+			loaded = req.Model
+			*loads++
+			w.Write([]byte(`{"done":true}`))
+		case "/api/ps":
+			fmt.Fprintf(w, `{"models":[{"name":%q,"model":%q,"context_length":%d}]}`, loaded, loaded, n)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// The context window: a flag wins over the file, the file over what
+// Ollama reports; the file's top-level context_window goes with its
+// backend, [hybrid] fast_context_window and [strong] context_window with
+// the groups.
+func TestContextWindowPrecedence(t *testing.T) {
+	clean(t)
+	t.Setenv("ANTHROPIC_API_KEY", "a")
+	var loads int
+	base := ollamaWith(t, 32768, &loads) + "/v1"
+	file := writeFile(t, `
+backend = "local"
+model = "qwen3.5:4b"
+context_window = 16384
+
+[hybrid]
+fast_model = "qwen3.5:4b"
+fast_context_window = 8192
+
+[strong]
+api = "anthropic"
+model = "claude-haiku-5-5"
+context_window = 100000
+`)
+	noWindow := writeFile(t, "backend = \"local\"\nmodel = \"qwen3.5:4b\"\n")
+	for _, tc := range []struct {
+		name         string
+		file         string
+		args         []string
+		window, load int
+	}{
+		{"file", file, []string{"-base-url", base}, 16384, 0},
+		{"flag over file", file, []string{"-base-url", base, "-context-window", "12000"}, 12000, 0},
+		{"Ollama", noWindow, []string{"-base-url", base}, 32768, 1},
+		{"file's window stays with its backend", file, []string{"-backend", "anthropic", "-model", "claude-x"}, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loads = 0
+			cfg, _, err := setup(t, Env{ConfigPath: tc.file}, tc.args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var warns []string
+			cfg.DetectWindows(context.Background(), func(s string) { warns = append(warns, s) })
+			if cfg.ContextWindow != tc.window || loads != tc.load || len(warns) != 0 {
+				t.Fatalf("window %d, %d loads, warnings %q; want %d, %d loads", cfg.ContextWindow, loads, warns, tc.window, tc.load)
+			}
+		})
+	}
+	t.Run("hybrid", func(t *testing.T) {
+		cfg, _, err := setup(t, Env{ConfigPath: file}, "-backend", "hybrid", "-fast-base-url", base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.DetectWindows(context.Background(), func(string) {})
+		if cfg.FastContextWindow != 8192 || cfg.StrongContextWindow != 100000 || cfg.ContextWindow != 0 {
+			t.Fatalf("hybrid: fast %d strong %d", cfg.FastContextWindow, cfg.StrongContextWindow)
+		}
+		cfg, _, err = setup(t, Env{ConfigPath: file}, "-backend", "hybrid", "-fast-base-url", base, "-fast-context-window", "4096", "-strong-context-window", "50000")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.FastContextWindow != 4096 || cfg.StrongContextWindow != 50000 {
+			t.Fatalf("hybrid flags: fast %d strong %d", cfg.FastContextWindow, cfg.StrongContextWindow)
+		}
+	})
 }
