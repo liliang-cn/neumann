@@ -29,6 +29,8 @@ const replHelp = `Each line is a task at priority 0 (interactive). Commands:
   /status             vCores, queues, groups, and the session's usage
   /usage              the session's model calls and tokens
   /tasks              unfinished tasks
+  /tools              every tool, its effect and its device (MCP servers included)
+  /skills             the skills found, and those skipped
   /wait <id>          block until a task ends and print its answer
   /quit               stop (unfinished tasks continue on the next start)`
 
@@ -158,6 +160,12 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, stdin 
 			for _, t := range infos {
 				say("  %-10s %-9s %-10s %s", t.ID, t.State, t.Wait, t.Title)
 			}
+		case "/tools":
+			say("%s", toolsText(a))
+			continue
+		case "/skills":
+			say("%s", skillsText(a))
+			continue
 		case "/wait":
 			wmu.Lock()
 			waiting[id] = true

@@ -502,6 +502,7 @@ type App struct {
 	trackers []*Tracker
 	obs      *observing
 	logw     *log.Logger
+	ext      extras // MCP servers, skills, messages (extras.go)
 }
 
 // Options for Build beyond the flags.
@@ -523,6 +524,8 @@ type Options struct {
 	// Tune, if set, may change the machine's config just before it is
 	// built (tests shorten backoffs and breakers).
 	Tune func(*neumann.Config)
+	// Extras are the tool sources besides the workspace tools.
+	Extras Extras
 }
 
 func (o Options) adapterFor(class string) model.Adapter {
@@ -591,10 +594,15 @@ func Build(ctx context.Context, cfg Config, opt Options) (*App, error) {
 			logf = a.logw.Printf
 		}
 	}
+	devs, sys, err := a.attach(ctx, tl.Devices(), opt.Extras)
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
 	mc := neumann.Config{
-		Devices: tl.Devices(),
+		Devices: devs,
 		Store:   st,
-		System:  System,
+		System:  System + sys,
 		Logf:    logf,
 	}
 	if cfg.Backend == "hybrid" {
@@ -607,9 +615,11 @@ func Build(ctx context.Context, cfg Config, opt Options) (*App, error) {
 	}
 	m, err := neumann.New(mc)
 	if err != nil {
+		a.closeExtras()
 		st.Close()
 		return nil, err
 	}
+	a.bind(m)
 	a.M = m
 	return a, nil
 }

@@ -63,6 +63,8 @@ type File struct {
 		Cores   int    `toml:"cores"`
 		Window  int    `toml:"context_window"`
 	} `toml:"strong"`
+
+	BusFile // [[mcp]] and skills_dir (bus.go)
 }
 
 // DefaultConfigPath is $XDG_CONFIG_HOME/neu/config.toml, or
@@ -100,6 +102,9 @@ func LoadFile(path string) (*File, error) {
 		}
 		sort.Strings(keys)
 		return nil, fmt.Errorf("%s: unknown key(s) %s", path, strings.Join(keys, ", "))
+	}
+	if err := f.BusFile.check(path); err != nil {
+		return nil, err
 	}
 	if f.Hybrid.RouteTimeout != "" {
 		if _, err := time.ParseDuration(f.Hybrid.RouteTimeout); err != nil {

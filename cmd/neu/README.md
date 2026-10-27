@@ -78,6 +78,9 @@ cores    = 8
 context_window = 200000
 ```
 
+`[[mcp]]` entries and `skills_dir` are described under
+[MCP servers](#mcp-servers) and [Skills](#skills).
+
 ### Flags and proxies
 
 `-backend`, `-model`, `-base-url` and `-key-env` choose the backend
@@ -170,6 +173,8 @@ line.
 | `/status` | vCores, queues, groups and breakers, and the session's usage |
 | `/usage` | the session's model calls and tokens, running tasks included |
 | `/tasks` | unfinished tasks |
+| `/tools` | every tool the model can call, its effect and its device |
+| `/skills` | the skills found, and those skipped and why |
 | `/wait <id>` | block until a task ends and print its answer |
 | `/fast <text>`, `/strong <text>` | hybrid: send a task to one group |
 | `/quit` | stop; unfinished tasks continue on the next start |
@@ -217,6 +222,114 @@ refused.
 By default neu may write only under `out/` (created on start). Allow more
 with `-writable out,docs` or `writable = [...]` in the config file;
 `-writable .` allows the whole workspace.
+
+## MCP servers
+
+Each `[[mcp]]` entry of the config file is a Model Context Protocol server,
+started with neu and stopped when it exits. Its tools appear as
+`<name>_<tool>` (`time_get_current_time`). A server that does not start
+within `startup_timeout` (default 30s), or whose tool names collide with
+another device's, is left out with one warning and neu goes on. `-no-mcp`
+starts none of them; `/tools` lists what is attached. An MCP tool is not
+confined to the workspace: it does whatever its server does.
+
+```toml
+[[mcp]]                                   # over stdio
+name    = "time"                          # letters, digits, '-'
+command = "uvx"
+args    = ["mcp-server-time", "--local-timezone", "Europe/Vienna"]
+env     = { TZ = "Europe/Vienna" }        # $VAR / ${VAR} are expanded from neu's environment
+read_only = ["get_current_time", "convert_time"]
+
+[[mcp]]                                   # over streamable HTTP
+name    = "docs"
+url     = "https://mcp.example/mcp"
+headers = { Authorization = "Bearer ${DOCS_TOKEN}" }
+effect  = "annotations"                   # trust the server's readOnlyHint / idempotentHint
+side_effect = ["publish"]
+enabled = false                           # keep the entry, do not start it
+startup_timeout = "1m"
+```
+
+**Effects.** A tool's effect decides whether a call is sent again after a
+crash, and how an approval policy treats it. It is the list that names the
+tool (`read_only`, `idempotent`, `side_effect`), else the entry's `effect`:
+`side_effect` (the default), `idempotent`, `read_only`, or `annotations`,
+which takes the server's own hints. So an MCP tool is a side effect unless
+the entry says otherwise: the hints come from the server and are not
+trusted by default. A name in a list that the server does not have is a
+warning.
+
+**Environment.** A stdio server gets neu's environment except the backend's
+keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `NEU_API_KEY` and the
+configured `key_env` variables are set empty for it, unless its `env` names
+them (`env = { OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). Its stderr goes to
+`mcp-<name>.log` next to the store, which the warning names when it fails.
+
+## Skills
+
+A skill is a directory with a `SKILL.md`: YAML frontmatter (`name`,
+`description`, optionally `when_to_use`) and markdown instructions, plus
+any files they refer to. neu reads them from `<root>/.neu/skills` and
+`~/.config/neu/skills` (`$XDG_CONFIG_HOME/neu/skills`), those that exist,
+the workspace's winning a name; `-skills dir1,dir2` or `skills_dir = "dir"`
+(or a list) in the config file replaces those. A relative directory is
+relative to the workspace root, and `~` is the home directory.
+
+The catalogue of names and descriptions goes into the system prompt; the
+model loads a skill's instructions when a task calls for one (`skills_load`)
+and reads its files only when the instructions point to them
+(`skills_read`); all three tools are read-only and execute nothing. `/skills`
+lists the skills, and those skipped (a bad frontmatter, a duplicate name)
+with the reason.
+
+```
+$ cat .neu/skills/word-count/SKILL.md
+---
+name: word-count
+description: Count the words of a file of the workspace and report it in the house format.
+---
+1. Read the file with fs_read.
+2. Answer exactly: `WC[<file>] = <n> words`.
+$ neu "Use the word-count skill on notes.txt."
+neu: 1 skill
+[teef16] → skills_load {"name": "word-count"}
+[teef16] → fs_read {"path": "notes.txt"}
+WC[notes.txt] = 7 words
+```
+
+## Task messages
+
+The tasks of one neu process can message each other: `tasks_list` shows
+the other unfinished tasks (id, state, the start of the request), and
+`tasks_send {task_id, text}` delivers a message to one at its next model
+step, marked as coming from `task:<sender>` and not from the user. A task
+sees the tasks of its own execution group (with `-backend hybrid`, fast
+and strong tasks do not see each other). A message can reach only a task
+that is still working; the REPL shows each delivery:
+
+```
+> Find every Go file under bus/ whose text mentions SideEffect, and say what each uses it for. If another task sends you a message while you work, quote it at the end of your answer.
+[tf5dbb] submitted (priority 0)
+> /bg Use tasks_list to find the other task. Count the files directly under bus/tasks with fs_list and send that count to that task with tasks_send. Then answer 'reported'.
+[tf5dc0] submitted (priority 2)
+[tf5dc0] → tasks_list {}
+[tf5dc0] → fs_list {"depth": 1,"path": "bus/tasks"}
+[tf5dbb] → fs_grep {"glob": "*.go","pattern": "SideEffect","path": "bus"}
+[tf5dc0] → tasks_send {"task_id": "tf5dbb","text": "3"}
+[tf5dc0] done:
+reported
+[tf5dbb] message from task:tf5dc0 delivered
+[tf5dbb] → fs_read {"limit_lines": 50,"path": "bus/bus.go","offset_line": 15}
+...
+[tf5dbb] done:
+The following 8 Go files under `bus/` mention `SideEffect`: ...
+Message received from task `tf5dc0` during execution:
+> 3
+```
+
+`tasks_send` is idempotent (a call sent again after a restart is not
+delivered twice), and one task may send at most 32 messages.
 
 ## State
 

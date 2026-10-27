@@ -1,6 +1,8 @@
 // Command neu is a workspace assistant built on neumann: one process, one
 // machine with a SQLite store, and tools confined to a workspace root
-// (fs_list, fs_read, fs_grep, fs_write, git_run, go_test, calc_eval).
+// (fs_list, fs_read, fs_grep, fs_write, git_run, go_test, calc_eval),
+// plus the config file's MCP servers ([[mcp]]), skills (<root>/.neu/skills,
+// ~/.config/neu/skills) and messages between tasks (tasks_send, tasks_list).
 //
 //	neu "Which files mention preemption?"    one question, then exit
 //	neu                                       REPL: each line is a task
@@ -80,6 +82,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	noStream := fs.Bool("no-stream", false, "print each answer when its task ends instead of as the model writes it")
 	think := fs.Bool("think", false, "also stream the model's reasoning (on stderr)")
 	cfgPath := fs.String("config", DefaultConfigPath(), "config file (TOML); a missing file is not an error")
+	var bf busFlags
+	bf.register(fs)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, usageHead, DefaultConfigPath(), app.AnthropicBaseURL, app.OpenAIBaseURL, OllamaURL)
 		fs.PrintDefaults()
@@ -109,10 +113,20 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	cfg.DetectWindows(ctx, func(s string) { fmt.Fprintf(stderr, "neu: %s\n", s) })
 	fmt.Fprintf(stderr, "neu: %s [%s]\n", cfg.Describe(), src)
-	a, err := app.Build(ctx, cfg, app.Options{})
+	file, err := LoadFile(*cfgPath) // Setup read it already: no error now
 	if err != nil {
 		fmt.Fprintf(stderr, "neu: %v\n", err)
 		return 1
+	}
+	ex := bf.extras(file, cfg.Root)
+	ex.Warnf = func(f string, args ...any) { fmt.Fprintf(stderr, "neu: "+f+"\n", args...) }
+	a, err := app.Build(ctx, cfg, app.Options{Extras: ex})
+	if err != nil {
+		fmt.Fprintf(stderr, "neu: %v\n", err)
+		return 1
+	}
+	if line := busLine(a); line != "" {
+		fmt.Fprintf(stderr, "neu: %s\n", line)
 	}
 	if err := a.Start(ctx); err != nil {
 		fmt.Fprintf(stderr, "neu: start: %v\n", err)
@@ -218,7 +232,14 @@ func progress(ev proto.Event) string {
 		tool, _ := app.Field[string](ev, "tool")
 		return fmt.Sprintf("%s %s has an unknown outcome after a restart; it waits for an operator", tag, tool)
 	case proto.EvSteerDelivered:
+		if from, _ := app.Field[string](ev, "from"); from != "" {
+			return fmt.Sprintf("%s message from %s delivered", tag, from)
+		}
 		return tag + " steer delivered"
+	case proto.EvSteerDropped:
+		if from, _ := app.Field[string](ev, "from"); from != "" {
+			return fmt.Sprintf("%s message from %s dropped: the task ended first", tag, from)
+		}
 	case proto.EvCompacted:
 		rounds, _ := app.Field[int](ev, "rounds")
 		before, _ := app.Field[int](ev, "tokens_before_est")
