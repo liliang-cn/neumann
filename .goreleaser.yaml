@@ -1,0 +1,78 @@
+# Release builds of neu (the workspace assistant) and neumann (the stdio
+# frontend). The release workflow runs this on a v* tag; locally:
+#   goreleaser check
+#   goreleaser build --snapshot --clean --single-target
+version: 2
+
+project_name: neumann
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: neu
+    main: ./cmd/neu
+    binary: neu
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+  - id: neumann
+    main: ./cmd/neumann
+    binary: neumann
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+
+archives:
+  - id: neu
+    ids: [neu]
+    name_template: "neu_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - src: cmd/neu/README.md
+        dst: README-neu.md
+  - id: neumann
+    ids: [neumann]
+    name_template: "neumann_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  disable: true
+
+release:
+  github:
+    owner: liliang-cn
+    name: neumann
+  # A release made by hand (gh release create, with its notes) keeps its
+  # title and notes; the archives are added to it.
+  mode: keep-existing
