@@ -137,9 +137,21 @@ N×` counts compaction calls.
 neu "Which files mention preemption?"
 ```
 
-Tool calls stream on stderr, the answer is printed on stdout, the usage
-line follows on stderr, and the exit status is 0 when the task finished. Ctrl-C leaves the task in the store; it
-continues the next time neu starts in that workspace.
+Tool calls show on stderr as they happen, the answer streams on stdout as the
+model writes it, the usage line follows on stderr, and the exit status is 0 when
+the task finished. Ctrl-C leaves the task in the store; it continues the next
+time neu starts in that workspace.
+
+`-no-stream` prints the answer only when the task ends; `-think` also streams
+the model's reasoning on stderr (when the provider sends it: Anthropic's
+current models send a summary or nothing). In the REPL the newest interactive
+task streams; `/bg` tasks and older ones print when they end. If a model call
+is retried, neu says so and the answer starts again.
+
+How smooth the stream is depends on the provider. Anthropic's API, measured
+from this side with plain curl, sends the text of a turn that follows a tool
+result in one burst at the end, while a turn without tool results streams
+token by token; OpenAI-compatible endpoints and Ollama stream either way.
 
 ## REPL
 

@@ -77,6 +77,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	cfg.Flags(fs)
 	verbose := fs.Bool("v", false, "log the machine's own lines on stderr")
 	showVersion := fs.Bool("version", false, "print the version and exit")
+	noStream := fs.Bool("no-stream", false, "print each answer when its task ends instead of as the model writes it")
+	think := fs.Bool("think", false, "also stream the model's reasoning (on stderr)")
 	cfgPath := fs.String("config", DefaultConfigPath(), "config file (TOML); a missing file is not an error")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, usageHead, DefaultConfigPath(), app.AnthropicBaseURL, app.OpenAIBaseURL, OllamaURL)
@@ -124,18 +126,24 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return 1
 	}
 	tr := a.Track(ctx, head)
-	if q := strings.TrimSpace(strings.Join(fs.Args(), " ")); q != "" {
-		return oneShot(ctx, a, tr, q, stdout, stderr)
+	con := newConsole(stdout, stderr, *think)
+	if !*noStream {
+		con.watch(ctx, a.M)
 	}
-	return repl(ctx, a, tr, stdin, stdout)
+	if q := strings.TrimSpace(strings.Join(fs.Args(), " ")); q != "" {
+		return oneShot(ctx, a, tr, con, q, stdout, stderr)
+	}
+	return repl(ctx, a, tr, con, stdin, stdout)
 }
 
-func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, q string, stdout, stderr io.Writer) int {
+func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, con *console, q string, stdout, stderr io.Writer) int {
 	id := newID()
+	con.setFocus(id)
 	tr.Subscribe(func(ev proto.Event) {
 		if ev.TaskID == id || ev.TaskID == "" {
+			con.event(ev)
 			if line := progress(ev); line != "" {
-				fmt.Fprintln(stderr, line)
+				con.line(stderr, line)
 			}
 		}
 	})
@@ -157,7 +165,9 @@ func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, q string, stdout,
 		fmt.Fprintf(stderr, "neu: %v\n", err)
 		return 1
 	}
-	fmt.Fprintln(stdout, t.LastAnswer())
+	if !con.answer(id, t.LastAnswer()) {
+		fmt.Fprintln(stdout, t.LastAnswer())
+	}
 	fmt.Fprintln(stderr, taskUsage(tr, t, ev))
 	if ev.Kind != proto.EvDone {
 		fmt.Fprintf(stderr, "neu: task %s ended %s %s\n", id, ev.Kind, string(ev.Data))

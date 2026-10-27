@@ -129,11 +129,13 @@ func TestOneShotCompactsOnASmallWindow(t *testing.T) {
 	}
 	tr := a.Track(ctx, head)
 	var stdout, stderr bytes.Buffer
-	if code := oneShot(ctx, a, tr, "How many lines does big.log have?", &stdout, &stderr); code != 0 {
+	con := newConsole(&stdout, &stderr, false)
+	con.watch(ctx, a.M) // the answer streams, and is not printed again at the end
+	if code := oneShot(ctx, a, tr, con, "How many lines does big.log have?", &stdout, &stderr); code != 0 {
 		t.Fatalf("exit %d\nstdout %s\nstderr %s", code, stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "400 lines") {
-		t.Fatalf("answer %q", stdout.String())
+	if n := strings.Count(stdout.String(), "400 lines"); n != 1 {
+		t.Fatalf("answer printed %d times: %q", n, stdout.String())
 	}
 	if maxEst > window {
 		t.Errorf("a request of ~%d tokens went to a %d-token window", maxEst, window)

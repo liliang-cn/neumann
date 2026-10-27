@@ -34,18 +34,14 @@ const replHelp = `Each line is a task at priority 0 (interactive). Commands:
 
 // repl reads one line at a time. Answers are printed as their tasks end,
 // from the event stream, prefixed by the task id.
-func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, stdout io.Writer) int {
-	var mu sync.Mutex
-	say := func(format string, args ...any) {
-		mu.Lock()
-		defer mu.Unlock()
-		fmt.Fprintf(stdout, format+"\n", args...)
-	}
+func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, stdin io.Reader, stdout io.Writer) int {
+	say := func(format string, args ...any) { con.line(stdout, fmt.Sprintf(format, args...)) }
 	waiting := map[string]bool{} // answered by /wait: not printed twice
 	var wmu sync.Mutex
 	usage := newTally()
 	tr.Subscribe(func(ev proto.Event) {
 		usage.add(ev)
+		con.event(ev)
 		if line := progress(ev); line != "" {
 			say("%s", line)
 		}
@@ -56,7 +52,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 		w := waiting[ev.TaskID]
 		wmu.Unlock()
 		if !w {
-			go func() { say("%s", outcome(context.WithoutCancel(ctx), a, tr, ev)) }()
+			go func() { say("%s", outcome(context.WithoutCancel(ctx), a, tr, con, ev)) }()
 		}
 	})
 	say("neu %s, workspace %s. /help for commands.", Version(), a.Tools.Box.Root())
@@ -75,6 +71,9 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 		if err != nil {
 			say("error: %v", err)
 			return
+		}
+		if prio == 0 {
+			con.setFocus(id) // the newest interactive task streams its answer
 		}
 		if pick.Class != "" {
 			say("[%s] submitted (priority %d) → %s", id, prio, pick)
@@ -168,7 +167,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 				err = werr
 				break
 			}
-			say("%s", outcome(ctx, a, tr, ev))
+			say("%s", outcome(ctx, a, tr, con, ev))
 		default:
 			say("unknown command %s; /help lists them", cmd)
 			continue
@@ -200,7 +199,7 @@ func retryBusy(ctx context.Context, f func() error) error {
 
 // outcome is what the REPL prints when a task ends: how it ended, its
 // answer, and its usage line.
-func outcome(ctx context.Context, a *app.App, tr *app.Tracker, ev proto.Event) string {
+func outcome(ctx context.Context, a *app.App, tr *app.Tracker, con *console, ev proto.Event) string {
 	t, err := a.M.Load(ctx, ev.TaskID)
 	if err != nil {
 		return fmt.Sprintf("[%s] %s (%v)", ev.TaskID, ev.Kind, err)
@@ -213,7 +212,7 @@ func outcome(ctx context.Context, a *app.App, tr *app.Tracker, ev proto.Event) s
 	if ev.Kind != proto.EvDone {
 		head += " " + string(ev.Data)
 	}
-	if ans := t.LastAnswer(); ans != "" {
+	if ans := t.LastAnswer(); ans != "" && !con.answer(ev.TaskID, ans) {
 		head += ":\n" + ans
 	}
 	return head + "\n" + taskUsage(tr, t, ev)
