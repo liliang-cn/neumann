@@ -16,7 +16,10 @@ import (
 	"github.com/liliang-cn/neumann/task"
 )
 
-const replHelp = `Each line is a task at priority 0 (interactive). Commands:
+const replHelp = `Each line is a task at priority 0 (interactive). Interactive tasks share one
+conversation: each is sent with the questions and answers before it (kept in
+.neu/session.json across restarts). Commands:
+  /new                start a new conversation
   /bg <text>          submit at priority 2 (background)
   /fast <text>        hybrid: submit to the fast (local) group, whatever -route says
   /strong <text>      hybrid: submit to the strong (cloud) group
@@ -36,6 +39,10 @@ const replHelp = `Each line is a task at priority 0 (interactive). Commands:
 // repl reads one line at a time. Answers are printed as their tasks end,
 // from the event stream, prefixed by the task id.
 func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, src *lineSource, stdout io.Writer) int {
+	sess := openSession(a.Cfg.Store)
+	if n := sess.len(); n > 0 {
+		con.line(stdout, fmt.Sprintf("continuing the conversation of %d earlier turn%s (/new starts over)", n, plural(n)))
+	}
 	say := func(format string, args ...any) { con.line(stdout, fmt.Sprintf(format, args...)) }
 	waiting := map[string]bool{} // answered by /wait: not printed twice
 	var wmu sync.Mutex
@@ -53,17 +60,24 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, src *l
 		w := waiting[ev.TaskID]
 		wmu.Unlock()
 		if !w {
-			go func() { say("%s", outcome(context.WithoutCancel(ctx), a, tr, con, ev)) }()
+			go func() { say("%s", outcome(context.WithoutCancel(ctx), a, tr, con, sess, ev)) }()
 		}
 	})
 	say("neu %s, workspace %s. /help for commands.", Version(), a.Tools.Box.Root())
 	lines := src.lines
 	submitTo := func(text string, prio int, pick app.Pick) {
 		id := newID()
-		_, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: text, Class: pick.Class, Priority: prio, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}})
+		input := text
+		if prio == 0 {
+			input = sess.input(text) // the conversation so far, then the question
+		}
+		_, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: input, Class: pick.Class, Priority: prio, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}})
 		if err != nil {
 			say("error: %v", err)
 			return
+		}
+		if prio == 0 {
+			sess.asked(id, text)
 		}
 		if prio == 0 {
 			con.setFocus(id) // the newest interactive task streams its answer
@@ -100,6 +114,10 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, src *l
 		arg = strings.TrimSpace(arg)
 		var err error
 		switch cmd {
+		case "/new":
+			sess.reset()
+			say("new conversation")
+			continue
 		case "/help":
 			say("%s", replHelp)
 		case "/quit", "/exit":
@@ -166,7 +184,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, src *l
 				err = werr
 				break
 			}
-			say("%s", outcome(ctx, a, tr, con, ev))
+			say("%s", outcome(ctx, a, tr, con, sess, ev))
 		default:
 			say("unknown command %s; /help lists them", cmd)
 			continue
@@ -198,11 +216,12 @@ func retryBusy(ctx context.Context, f func() error) error {
 
 // outcome is what the REPL prints when a task ends: how it ended, its
 // answer, and its usage line.
-func outcome(ctx context.Context, a *app.App, tr *app.Tracker, con *console, ev proto.Event) string {
+func outcome(ctx context.Context, a *app.App, tr *app.Tracker, con *console, sess *session, ev proto.Event) string {
 	t, err := a.M.Load(ctx, ev.TaskID)
 	if err != nil {
 		return fmt.Sprintf("[%s] %s (%v)", ev.TaskID, ev.Kind, err)
 	}
+	sess.answered(ev.TaskID, t.LastAnswer())
 	on := ""
 	if a.Hybrid() {
 		on = " on " + t.Class

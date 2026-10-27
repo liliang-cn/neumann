@@ -114,7 +114,7 @@ func TestAskFlowYesNoAlways(t *testing.T) {
 	con := newConsole(&out, &errw, false)
 	appr := newApprover(a, con, readerLines(strings.NewReader("y\nmaybe\nn not that file\na\n")))
 	ctx := context.Background()
-	if code := oneShot(ctx, a, tr, con, "change things", appr, &out, &errw); code != 0 {
+	if code := oneShot(ctx, a, tr, con, nil, "change things", appr, &out, &errw); code != 0 {
 		t.Fatalf("exit %d\n%s", code, errw.String())
 	}
 	if b, _ := os.ReadFile(filepath.Join(root, "a.txt")); string(b) != "bye a.txt\n" {
@@ -159,7 +159,7 @@ func TestOneShotWithoutTerminalDenies(t *testing.T) {
 	a, tr, root := startCoding(t, app.ApproveAsk, m, func(c *app.Config) { c.Coding.NoPrompt = noPrompt })
 	var out, errw syncBuf
 	con := newConsole(&out, &errw, false)
-	if code := oneShot(context.Background(), a, tr, con, "delete a.txt", newApprover(a, con, nil), &out, &errw); code != 0 {
+	if code := oneShot(context.Background(), a, tr, con, nil, "delete a.txt", newApprover(a, con, nil), &out, &errw); code != 0 {
 		t.Fatalf("exit %d", code)
 	}
 	if _, err := os.Stat(filepath.Join(root, "a.txt")); err != nil {

@@ -169,6 +169,13 @@ token by token; OpenAI-compatible endpoints and Ollama stream either way.
 its task finishes, prefixed by the task's id and followed by its usage
 line.
 
+Interactive lines are one conversation: each is sent with the questions and
+answers before it (the newest first, up to about 24 KB), so "is it fixed?"
+knows what "fix the bug" did. The conversation is kept in `.neu/session.json`
+and picked up when neu starts again in that workspace; `/new` starts over.
+`/bg` tasks run outside it. `neu -c "question"` asks one question inside the
+conversation and adds the turn to it.
+
 | command | |
 |---|---|
 | `<text>` | a task at priority 0 (interactive) |

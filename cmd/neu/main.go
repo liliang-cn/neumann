@@ -85,6 +85,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	noStream := fs.Bool("no-stream", false, "print each answer when its task ends instead of as the model writes it")
 	think := fs.Bool("think", false, "also stream the model's reasoning (on stderr)")
+	cont := fs.Bool("c", false, "one question: continue the REPL's conversation (.neu/session.json) and add this turn to it")
 	cfgPath := fs.String("config", DefaultConfigPath(), "config file (TOML); a missing file is not an error")
 	var bf busFlags
 	bf.register(fs)
@@ -158,14 +159,18 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		if cfg.Coding.NoPrompt == "" {
 			read = readerLines(stdin)
 		}
-		return oneShot(ctx, a, tr, con, q, newApprover(a, con, read), stdout, stderr)
+		var sess *session
+		if *cont {
+			sess = openSession(a.Cfg.Store)
+		}
+		return oneShot(ctx, a, tr, con, sess, q, newApprover(a, con, read), stdout, stderr)
 	}
 	in := readLines(stdin)
 	newApprover(a, con, in.answer).start(ctx, tr, nil)
 	return repl(ctx, a, tr, con, in, stdout)
 }
 
-func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, con *console, q string, appr *approver, stdout, stderr io.Writer) int {
+func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, con *console, sess *session, q string, appr *approver, stdout, stderr io.Writer) int {
 	id := newID()
 	con.setFocus(id)
 	appr.start(ctx, tr, func(task string) bool { return task == id })
@@ -178,9 +183,16 @@ func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, con *console, q s
 		}
 	})
 	pick := a.Route(ctx, q, "")
-	if _, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: q, Class: pick.Class, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}}); err != nil {
+	input := q
+	if sess != nil {
+		input = sess.input(q)
+	}
+	if _, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: input, Class: pick.Class, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}}); err != nil {
 		fmt.Fprintf(stderr, "neu: submit: %v\n", err)
 		return 1
+	}
+	if sess != nil {
+		sess.asked(id, q)
 	}
 	if pick.Class != "" {
 		fmt.Fprintf(stderr, "[%s] → %s\n", id, pick)
@@ -194,6 +206,9 @@ func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, con *console, q s
 	if err != nil {
 		fmt.Fprintf(stderr, "neu: %v\n", err)
 		return 1
+	}
+	if sess != nil {
+		sess.answered(id, t.LastAnswer())
 	}
 	if !con.answer(id, t.LastAnswer()) {
 		fmt.Fprintln(stdout, t.LastAnswer())
