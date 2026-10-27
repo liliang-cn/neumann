@@ -105,6 +105,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintf(stderr, "neu: %v\n", err)
 		return 1
 	}
+	cfg.DetectWindows(ctx, func(s string) { fmt.Fprintf(stderr, "neu: %s\n", s) })
 	fmt.Fprintf(stderr, "neu: %s [%s]\n", cfg.Describe(), src)
 	a, err := app.Build(ctx, cfg, app.Options{})
 	if err != nil {
@@ -157,6 +158,7 @@ func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, q string, stdout,
 		return 1
 	}
 	fmt.Fprintln(stdout, t.LastAnswer())
+	fmt.Fprintln(stderr, taskUsage(tr, t, ev))
 	if ev.Kind != proto.EvDone {
 		fmt.Fprintf(stderr, "neu: task %s ended %s %s\n", id, ev.Kind, string(ev.Data))
 		return 1
@@ -207,6 +209,11 @@ func progress(ev proto.Event) string {
 		return fmt.Sprintf("%s %s has an unknown outcome after a restart; it waits for an operator", tag, tool)
 	case proto.EvSteerDelivered:
 		return tag + " steer delivered"
+	case proto.EvCompacted:
+		rounds, _ := app.Field[int](ev, "rounds")
+		before, _ := app.Field[int](ev, "tokens_before_est")
+		after, _ := app.Field[int](ev, "tokens_after_est")
+		return fmt.Sprintf("%s compacted %d round%s: ~%s → ~%s tokens", tag, rounds, plural(rounds), tokens(before), tokens(after))
 	}
 	return ""
 }

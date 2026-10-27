@@ -37,7 +37,7 @@ Without one neu exits and says how to give it.
 
 ```
 $ ANTHROPIC_MODEL=claude-sonnet-5-5 neu "How many lines does go.mod have?"
-neu: anthropic (claude-sonnet-5-5 at https://api.anthropic.com/v1), 8 vCore(s) [ANTHROPIC_API_KEY is set]
+neu: anthropic (claude-sonnet-5-5 at https://api.anthropic.com/v1), 8 vCore(s), window 200000 [ANTHROPIC_API_KEY is set]
 ...
 ```
 
@@ -57,11 +57,13 @@ cores    = 8                          # tasks running model calls at once
 parallel = 1                          # local: requests the server serves at once
 writable = ["out", "docs"]            # where fs_write may write
 max_steps = 40                        # model calls per task
+context_window = 32768                # tokens; see "Context window" below
 
 [hybrid]                              # -backend hybrid
 fast_model    = "qwen3.5:4b"
 fast_base_url = "http://127.0.0.1:11434/v1"
 fast_cores    = 1
+fast_context_window = 32768
 route         = "static"              # static, decide, fast or strong
 router_model  = "tev1:4b"             # route = "decide"
 route_timeout = "3s"
@@ -73,6 +75,7 @@ api      = "anthropic"                # openai or anthropic
 model    = "claude-sonnet-5-5"
 key_env  = "ANTHROPIC_API_KEY"
 cores    = 8
+context_window = 200000
 ```
 
 ### Flags and proxies
@@ -90,20 +93,59 @@ HTTPS_PROXY=http://127.0.0.1:7890 neu -backend anthropic -model claude-haiku-5-5
 Cloud calls honour `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`; the local
 Ollama on the loopback address is never proxied.
 
+### Context window, compaction and caching
+
+neu compacts a task when its next request plus the answer's reserve would
+pass 80% of the model's context window: the oldest tool rounds are
+replaced by a summary (the originals stay in the store). For that it has to
+know the window. `-context-window N` (tokens; `context_window` in the file,
+`-fast-context-window` / `fast_context_window` and `-strong-context-window`
+/ `[strong] context_window` for hybrid's groups) sets it; otherwise:
+
+| backend | window |
+|---|---|
+| `anthropic` | 200000 |
+| `local` | read from Ollama: neu loads the model with the server's defaults (as the first request would) and reads the `context_length` it runs with from `/api/ps`; that is the runtime `num_ctx`, not the model's training maximum (`qwen3.5:4b`: 262144 in `/api/show`, 32768 loaded on a Mac without `OLLAMA_CONTEXT_LENGTH`). When it cannot be read, 4096 (Ollama's smallest default) and a warning |
+| `openai` | unknown: compaction waits until the provider rejects a request as too long, and neu says so on start |
+
+The startup line shows the window in use. This matters most for Ollama: it
+never rejects a long prompt, it silently drops its start once the prompt
+passes `num_ctx`, so a task neu does not compact loses context without any
+error. The OpenAI-compatible endpoint cannot set `num_ctx` per request; set
+it on the server (`OLLAMA_CONTEXT_LENGTH`) or in a Modelfile (`PARAMETER
+num_ctx`), and neu reads whatever results. With a known local window the
+answer's reserve is at most a quarter of it (8192 tokens at 32768).
+
+Prompt caching needs nothing from you: the Anthropic adapter places
+`cache_control` breakpoints itself, OpenAI-compatible providers and Ollama
+cache by prefix, and a task's requests share their prefix from one call
+to the next (until a compaction rewrites it). After each task neu prints
+one line with what it used, with the cache hit rate when the provider
+reports one:
+
+```
+[t1a2b3] 7 calls, 41.2k in (83% cached), 1.1k out, 12.3s, compacted 1×
+```
+
+`in` counts every prompt token (cached ones included), `out` every output
+token (reasoning, shown in brackets when reported, included); `compacted
+N×` counts compaction calls.
+
 ## One question
 
 ```
 neu "Which files mention preemption?"
 ```
 
-Tool calls stream on stderr, the answer is printed on stdout, and the exit
-status is 0 when the task finished. Ctrl-C leaves the task in the store; it
+Tool calls stream on stderr, the answer is printed on stdout, the usage
+line follows on stderr, and the exit status is 0 when the task finished. Ctrl-C leaves the task in the store; it
 continues the next time neu starts in that workspace.
 
 ## REPL
 
 `neu` with no question reads one task per line and prints each answer as
-its task finishes, prefixed by the task's id.
+its task finishes, prefixed by the task's id and followed by its usage
+line.
 
 | command | |
 |---|---|
@@ -113,7 +155,8 @@ its task finishes, prefixed by the task's id.
 | `/suspend <id>`, `/resume <id>` | take a task off the machine, put it back |
 | `/steer <id> <text>` | add a message to a running task |
 | `/cancel <id>` | cancel a task |
-| `/status` | vCores, queues, groups and breakers |
+| `/status` | vCores, queues, groups and breakers, and the session's usage |
+| `/usage` | the session's model calls and tokens, running tasks included |
 | `/tasks` | unfinished tasks |
 | `/wait <id>` | block until a task ends and print its answer |
 | `/fast <text>`, `/strong <text>` | hybrid: send a task to one group |

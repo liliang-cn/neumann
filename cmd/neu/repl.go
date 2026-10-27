@@ -26,7 +26,8 @@ const replHelp = `Each line is a task at priority 0 (interactive). Commands:
   /resume <id>        put it back
   /steer <id> <text>  add a message to a running task
   /cancel <id>        cancel a task
-  /status             vCores, queues, groups
+  /status             vCores, queues, groups, and the session's usage
+  /usage              the session's model calls and tokens
   /tasks              unfinished tasks
   /wait <id>          block until a task ends and print its answer
   /quit               stop (unfinished tasks continue on the next start)`
@@ -42,7 +43,9 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 	}
 	waiting := map[string]bool{} // answered by /wait: not printed twice
 	var wmu sync.Mutex
+	usage := newTally()
 	tr.Subscribe(func(ev proto.Event) {
+		usage.add(ev)
 		if line := progress(ev); line != "" {
 			say("%s", line)
 		}
@@ -53,7 +56,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 		w := waiting[ev.TaskID]
 		wmu.Unlock()
 		if !w {
-			go func() { say("%s", outcome(context.WithoutCancel(ctx), a, ev)) }()
+			go func() { say("%s", outcome(context.WithoutCancel(ctx), a, tr, ev)) }()
 		}
 	})
 	say("neu %s, workspace %s. /help for commands.", Version(), a.Tools.Box.Root())
@@ -145,7 +148,9 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 		case "/cancel":
 			err = a.M.Cancel(ctx, id)
 		case "/status":
-			say("%s", statusText(a, a.M.Status()))
+			say("%s\n%s", statusText(a, a.M.Status()), usage)
+		case "/usage":
+			say("%s", usage)
 		case "/tasks":
 			infos := a.M.Tasks()
 			if len(infos) == 0 {
@@ -163,14 +168,14 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 				err = werr
 				break
 			}
-			say("%s", outcome(ctx, a, ev))
+			say("%s", outcome(ctx, a, tr, ev))
 		default:
 			say("unknown command %s; /help lists them", cmd)
 			continue
 		}
 		if err != nil {
 			say("error: %v", err)
-		} else if cmd != "/help" && cmd != "/status" && cmd != "/tasks" && cmd != "/wait" && cmd != "/bg" {
+		} else if cmd != "/help" && cmd != "/status" && cmd != "/usage" && cmd != "/tasks" && cmd != "/wait" && cmd != "/bg" {
 			say("ok")
 		}
 	}
@@ -193,7 +198,9 @@ func retryBusy(ctx context.Context, f func() error) error {
 	}
 }
 
-func outcome(ctx context.Context, a *app.App, ev proto.Event) string {
+// outcome is what the REPL prints when a task ends: how it ended, its
+// answer, and its usage line.
+func outcome(ctx context.Context, a *app.App, tr *app.Tracker, ev proto.Event) string {
 	t, err := a.M.Load(ctx, ev.TaskID)
 	if err != nil {
 		return fmt.Sprintf("[%s] %s (%v)", ev.TaskID, ev.Kind, err)
@@ -202,14 +209,14 @@ func outcome(ctx context.Context, a *app.App, ev proto.Event) string {
 	if a.Hybrid() {
 		on = " on " + t.Class
 	}
-	head := fmt.Sprintf("[%s] %s%s after %d model calls", ev.TaskID, ev.Kind, on, t.Used.Steps)
+	head := fmt.Sprintf("[%s] %s%s", ev.TaskID, ev.Kind, on)
 	if ev.Kind != proto.EvDone {
 		head += " " + string(ev.Data)
 	}
 	if ans := t.LastAnswer(); ans != "" {
-		return head + ":\n" + ans
+		head += ":\n" + ans
 	}
-	return head
+	return head + "\n" + taskUsage(tr, t, ev)
 }
 
 func statusText(a *app.App, s neumann.Status) string {
