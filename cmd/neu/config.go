@@ -223,13 +223,13 @@ func ollamaUp(ctx context.Context, base string) bool {
 }
 
 func noBackend(configPath string) error {
-	return fmt.Errorf(`no backend configured; any one of these works:
+	return fmt.Errorf(`no backend configured; any one of these works (a model must always be given):
   - a config file at %s, e.g.
         backend = "anthropic"
-        model = "%s"
-  - ANTHROPIC_API_KEY in the environment (anthropic, %s)
-  - %s in the environment (openai; OPENAI_BASE_URL and OPENAI_MODEL for another endpoint or model)
-  - Ollama running at %s (local, %s)
+        model = "<model name>"
+  - ANTHROPIC_API_KEY (and ANTHROPIC_MODEL or -model) in the environment: anthropic
+  - %s (and OPENAI_MODEL or -model) in the environment: openai; OPENAI_BASE_URL for another endpoint
+  - Ollama running at %s, with -model: local
   - flags: -backend local|openai|anthropic|hybrid, with -base-url, -model and -key-env as needed`,
-		configPath, app.AnthropicModel, app.AnthropicModel, app.OpenAIKeyEnv, OllamaURL, app.HybridFastModel)
+		configPath, app.OpenAIKeyEnv, OllamaURL)
 }

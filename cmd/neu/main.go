@@ -61,11 +61,12 @@ stdout). Without: a REPL, one task per line (/help lists its commands).
 
 Backend, when -backend is not given, the first that applies:
   1. the config file %s (-config), key "backend"
-  2. ANTHROPIC_API_KEY set: anthropic, %s at %s
-  3. OPENAI_API_KEY set: openai, OPENAI_BASE_URL or %s,
-     OPENAI_MODEL or %s
-  4. Ollama answering at %s: local, %s
-Flags override the config file. HTTPS_PROXY is honoured.
+  2. ANTHROPIC_API_KEY set: anthropic at %s
+  3. OPENAI_API_KEY set: openai at OPENAI_BASE_URL or %s
+  4. Ollama answering at %s: local
+There is no default model: give it with -model, model in the config file,
+or OPENAI_MODEL / ANTHROPIC_MODEL. Flags override the config file.
+HTTPS_PROXY is honoured.
 
 `
 
@@ -78,8 +79,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	cfgPath := fs.String("config", DefaultConfigPath(), "config file (TOML); a missing file is not an error")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, usageHead, DefaultConfigPath(), app.AnthropicModel, app.AnthropicBaseURL,
-			app.OpenAIBaseURL, app.OpenAIModel, OllamaURL, app.HybridFastModel)
+		fmt.Fprintf(stderr, usageHead, DefaultConfigPath(), app.AnthropicBaseURL, app.OpenAIBaseURL, OllamaURL)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {

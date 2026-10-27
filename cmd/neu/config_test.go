@@ -17,7 +17,7 @@ import (
 // clean empties every variable the resolution reads.
 func clean(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"} {
+	for _, k := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"} {
 		t.Setenv(k, "")
 	}
 }
@@ -81,18 +81,21 @@ func TestResolutionOrder(t *testing.T) {
 		anthropic, openai  string
 		file, ollama       string
 		backend, model, by string
+		args               []string
 	}{
-		{"file wins over keys", "a", "o", file, up, "local", "from-file", file},
-		{"anthropic key", "a", "o", "", up, "anthropic", app.AnthropicModel, "ANTHROPIC_API_KEY"},
-		{"openai key", "", "o", "", up, "cloud", app.OpenAIModel, "OPENAI_API_KEY"},
-		{"ollama", "", "", "", up, "local", app.HybridFastModel, "Ollama"},
-		{"missing file falls through", "", "", filepath.Join(t.TempDir(), "none.toml"), up, "local", app.HybridFastModel, "Ollama"},
+		{"file wins over keys", "a", "o", file, up, "local", "from-file", file, nil},
+		{"anthropic key", "a", "o", "", up, "anthropic", "claude-from-env", "ANTHROPIC_API_KEY", nil},
+		{"openai key", "", "o", "", up, "cloud", "gpt-from-env", "OPENAI_API_KEY", nil},
+		{"ollama", "", "", "", up, "local", "qwen-flag", "Ollama", []string{"-model", "qwen-flag"}},
+		{"missing file falls through", "", "", filepath.Join(t.TempDir(), "none.toml"), up, "local", "qwen-flag", "Ollama", []string{"-model", "qwen-flag"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clean(t)
 			t.Setenv("ANTHROPIC_API_KEY", tc.anthropic)
+			t.Setenv("ANTHROPIC_MODEL", "claude-from-env")
 			t.Setenv("OPENAI_API_KEY", tc.openai)
-			cfg, src, err := setup(t, Env{ConfigPath: tc.file, OllamaURL: tc.ollama})
+			t.Setenv("OPENAI_MODEL", "gpt-from-env")
+			cfg, src, err := setup(t, Env{ConfigPath: tc.file, OllamaURL: tc.ollama}, tc.args...)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -146,13 +149,38 @@ func TestOpenAIEnvDefaults(t *testing.T) {
 		t.Fatalf("side %+v", s)
 	}
 	t.Setenv("OPENAI_BASE_URL", "")
-	t.Setenv("OPENAI_MODEL", "")
 	cfg, _, err = setup(t, Env{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.BaseURL != app.OpenAIBaseURL || cfg.Model != app.OpenAIModel {
+	if cfg.BaseURL != app.OpenAIBaseURL || cfg.Model != "m2" {
 		t.Fatalf("defaults %q %q", cfg.BaseURL, cfg.Model)
+	}
+}
+
+// neu has no default model: every backend refuses to start without one.
+func TestModelIsRequired(t *testing.T) {
+	up := ollama(t)
+	for _, tc := range []struct {
+		name, anthropic, openai string
+		args                    []string
+		want                    string
+	}{
+		{"anthropic", "a", "", nil, "ANTHROPIC_MODEL"},
+		{"openai", "", "o", nil, "OPENAI_MODEL"},
+		{"local", "", "", nil, "-model"},
+		{"hybrid fast", "", "o", []string{"-backend", "hybrid", "-strong-model", "s"}, "-fast-model"},
+		{"hybrid strong", "", "o", []string{"-backend", "hybrid", "-fast-model", "f"}, "-strong-model"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clean(t)
+			t.Setenv("ANTHROPIC_API_KEY", tc.anthropic)
+			t.Setenv("OPENAI_API_KEY", tc.openai)
+			_, _, err := setup(t, Env{ConfigPath: filepath.Join(t.TempDir(), "none.toml"), OllamaURL: up}, tc.args...)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err %v, want one naming %s", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -207,11 +235,11 @@ cores = 4
 
 	// Another backend on the command line does not inherit the file's
 	// model, endpoint or key variable; the rest still applies.
-	cfg, _, err = setup(t, Env{ConfigPath: file}, "-backend", "local")
+	cfg, _, err = setup(t, Env{ConfigPath: file}, "-backend", "local", "-model", "qwen-flag")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Model != app.HybridFastModel || cfg.BaseURL != app.LocalBaseURL || cfg.KeyEnv != app.LocalKeyEnv || cfg.Parallel != 2 || cfg.Cores != 2 || cfg.Writable != "out,docs" {
+	if cfg.Model != "qwen-flag" || cfg.BaseURL != app.LocalBaseURL || cfg.KeyEnv != app.LocalKeyEnv || cfg.Parallel != 2 || cfg.Cores != 2 || cfg.Writable != "out,docs" {
 		t.Fatalf("-backend local with an openai file: %+v", cfg)
 	}
 

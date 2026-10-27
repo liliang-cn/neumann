@@ -65,24 +65,27 @@ const System = `You are neu, a careful assistant that works on the files of a lo
 - You can only write files where fs_write allows it. Never edit tests to make them pass.
 - Finish with a short, direct answer that gives the exact values, names and file:line locations asked for.`
 
-// The openai backend's defaults for neu (UserDefaults), overridden by
-// OPENAI_BASE_URL and OPENAI_MODEL, then by -base-url and -model.
+// The openai backend's endpoint and key variable for neu (UserDefaults),
+// overridden by OPENAI_BASE_URL, then by -base-url. neu has no default
+// model for any backend: it must be given (-model, the config file, or
+// OPENAI_MODEL / ANTHROPIC_MODEL).
 const (
 	OpenAIBaseURL = "https://api.openai.com/v1"
-	OpenAIModel   = "gpt-5"
 	OpenAIKeyEnv  = "OPENAI_API_KEY"
 )
 
 // Defaults are what a program fills in when the flags leave a backend's
 // model, endpoint or key variable empty. The bench and neu differ: the
 // bench measures against a fixed gateway (CPA_*) and the 9B local model;
-// neu talks to OpenAI by default and uses the 4B model locally.
+// neu has no default model at all: an empty model is an error.
 type Defaults struct {
-	Backend       string // used when -backend is empty; "": none
-	LocalModel    string
-	OpenAIBaseURL string
-	OpenAIModel   string
-	OpenAIKeyEnv  string
+	Backend        string // used when -backend is empty; "": none
+	LocalModel     string
+	FastModel      string // hybrid's fast group
+	OpenAIBaseURL  string
+	OpenAIModel    string
+	OpenAIKeyEnv   string
+	AnthropicModel string
 }
 
 // BenchDefaults are the bench's defaults, and those of a Config whose Def
@@ -90,23 +93,26 @@ type Defaults struct {
 // LocalModel for -backend local.
 func BenchDefaults() Defaults {
 	return Defaults{
-		Backend:       "openai",
-		LocalModel:    LocalModel,
-		OpenAIBaseURL: os.Getenv("CPA_BASE_URL"),
-		OpenAIModel:   os.Getenv("CPA_MODEL"),
-		OpenAIKeyEnv:  "CPA_API_KEY",
+		Backend:        "openai",
+		LocalModel:     LocalModel,
+		FastModel:      HybridFastModel,
+		OpenAIBaseURL:  os.Getenv("CPA_BASE_URL"),
+		OpenAIModel:    os.Getenv("CPA_MODEL"),
+		OpenAIKeyEnv:   "CPA_API_KEY",
+		AnthropicModel: AnthropicModel,
 	}
 }
 
-// UserDefaults are neu's: no backend (the CLI picks one), the 4B model
-// locally, and OpenAI (OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_API_KEY) for
+// UserDefaults are neu's: no backend (the CLI picks one), no model (it
+// must be given explicitly; OPENAI_MODEL and ANTHROPIC_MODEL count as
+// given), and OpenAI's endpoint (OPENAI_BASE_URL) and key variable for
 // -backend openai and hybrid's strong group.
 func UserDefaults() Defaults {
 	return Defaults{
-		LocalModel:    HybridFastModel,
-		OpenAIBaseURL: envOr("OPENAI_BASE_URL", OpenAIBaseURL),
-		OpenAIModel:   envOr("OPENAI_MODEL", OpenAIModel),
-		OpenAIKeyEnv:  OpenAIKeyEnv,
+		OpenAIBaseURL:  envOr("OPENAI_BASE_URL", OpenAIBaseURL),
+		OpenAIModel:    os.Getenv("OPENAI_MODEL"),
+		OpenAIKeyEnv:   OpenAIKeyEnv,
+		AnthropicModel: os.Getenv("ANTHROPIC_MODEL"),
 	}
 }
 
@@ -166,9 +172,10 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	if d.Backend == "" {
 		backendDef = "default: see above"
 	}
-	openaiModel, openaiURL := or(d.OpenAIModel, "(none)"), or(d.OpenAIBaseURL, "(none)")
+	openaiURL := or(d.OpenAIBaseURL, "(none)")
+	modelDef := func(m string) string { return or(m, "none, required") }
 	fs.StringVar(&c.Backend, "backend", "", "local (Ollama), openai (any OpenAI-compatible endpoint; also called cloud), anthropic (the Messages API) or hybrid (a fast local group and a strong group); "+backendDef+". HTTPS_PROXY is honoured")
-	fs.StringVar(&c.Model, "model", "", "model name; default: "+d.LocalModel+" (local), "+openaiModel+" (openai) or "+AnthropicModel+" (anthropic)")
+	fs.StringVar(&c.Model, "model", "", "model name; default: "+modelDef(d.LocalModel)+" (local), "+modelDef(d.OpenAIModel)+" (openai), "+modelDef(d.AnthropicModel)+" (anthropic)")
 	fs.StringVar(&c.BaseURL, "base-url", "", "endpoint up to and including /v1; default: "+LocalBaseURL+" (local), "+openaiURL+" (openai) or "+AnthropicBaseURL+" (anthropic)")
 	fs.StringVar(&c.KeyEnv, "key-env", "", "name of the environment variable holding the API key (the key itself is never a flag); default: "+LocalKeyEnv+" (local, unset: \"ollama\"), "+d.OpenAIKeyEnv+" (openai) or ANTHROPIC_API_KEY (anthropic)")
 	fs.IntVar(&c.Cores, "cores", 0, "vCores; default -parallel (local) or 8 (openai, anthropic)")
@@ -177,11 +184,11 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&c.Root, "root", ".", "workspace root; every tool is confined to it")
 	fs.StringVar(&c.Writable, "writable", "out", "comma-separated directories under the root where fs_write may write")
 	fs.IntVar(&c.MaxSteps, "max-steps", 40, "model calls a task may make")
-	fs.StringVar(&c.FastModel, "fast-model", "", "hybrid: the fast group's local model; default "+HybridFastModel)
+	fs.StringVar(&c.FastModel, "fast-model", "", "hybrid: the fast group's local model; default "+modelDef(d.FastModel))
 	fs.StringVar(&c.FastBaseURL, "fast-base-url", "", "hybrid: the fast group's endpoint; default "+LocalBaseURL)
 	fs.IntVar(&c.FastCores, "fast-cores", 0, "hybrid: the fast group's vCores; default -parallel")
 	fs.StringVar(&c.StrongAPI, "strong-api", "openai", "hybrid: the strong group's protocol: openai or anthropic")
-	fs.StringVar(&c.StrongModel, "strong-model", "", "hybrid: the strong group's model; default "+openaiModel+" (openai) or "+AnthropicModel+" (anthropic)")
+	fs.StringVar(&c.StrongModel, "strong-model", "", "hybrid: the strong group's model; default "+modelDef(d.OpenAIModel)+" (openai), "+modelDef(d.AnthropicModel)+" (anthropic)")
 	fs.StringVar(&c.StrongBaseURL, "strong-base-url", "", "hybrid: the strong group's endpoint; default "+openaiURL+" (openai) or "+AnthropicBaseURL+" (anthropic)")
 	fs.StringVar(&c.StrongKeyEnv, "strong-key-env", "", "hybrid: the environment variable holding the strong group's key; default "+d.OpenAIKeyEnv+" (openai) or ANTHROPIC_API_KEY (anthropic)")
 	fs.IntVar(&c.StrongCores, "strong-cores", 0, "hybrid: the strong group's vCores; default 8")
@@ -228,8 +235,9 @@ func (c *Config) resolve(needKeys bool) error {
 	}
 	switch c.Backend {
 	case "local":
+		c.Model = or(c.Model, d.LocalModel)
 		if c.Model == "" {
-			c.Model = or(d.LocalModel, LocalModel)
+			return errors.New("local backend needs a model: -model (e.g. an Ollama model name) or model in the config file")
 		}
 		if c.BaseURL == "" {
 			c.BaseURL = LocalBaseURL
@@ -250,12 +258,16 @@ func (c *Config) resolve(needKeys bool) error {
 			c.Cores = 8
 		}
 		c.KeyEnv = or(c.KeyEnv, d.OpenAIKeyEnv)
-		if needKeys && (c.Model == "" || c.BaseURL == "" || os.Getenv(c.KeyEnv) == "") {
-			return fmt.Errorf("openai backend needs -base-url, -model and the key in $%s", c.KeyEnv)
+		if c.Model == "" {
+			return errors.New("openai backend needs a model: -model, OPENAI_MODEL, or model in the config file")
+		}
+		if needKeys && (c.BaseURL == "" || os.Getenv(c.KeyEnv) == "") {
+			return fmt.Errorf("openai backend needs -base-url and the key in $%s", c.KeyEnv)
 		}
 	case "anthropic":
+		c.Model = or(c.Model, d.AnthropicModel)
 		if c.Model == "" {
-			c.Model = AnthropicModel
+			return errors.New("anthropic backend needs a model: -model, ANTHROPIC_MODEL, or model in the config file")
 		}
 		if c.BaseURL == "" {
 			c.BaseURL = AnthropicBaseURL
@@ -278,8 +290,9 @@ func (c *Config) resolve(needKeys bool) error {
 		if c.Parallel < 1 {
 			return errors.New("-parallel must be at least 1")
 		}
+		c.FastModel = or(c.FastModel, d.FastModel)
 		if c.FastModel == "" {
-			c.FastModel = HybridFastModel
+			return errors.New("hybrid backend needs the fast group's model: -fast-model or fast_model in the config file")
 		}
 		if c.FastBaseURL == "" {
 			c.FastBaseURL = LocalBaseURL
@@ -294,7 +307,7 @@ func (c *Config) resolve(needKeys bool) error {
 			c.StrongBaseURL = or(c.StrongBaseURL, d.OpenAIBaseURL)
 			c.StrongKeyEnv = or(c.StrongKeyEnv, d.OpenAIKeyEnv)
 		case "anthropic":
-			c.StrongModel = or(c.StrongModel, AnthropicModel)
+			c.StrongModel = or(c.StrongModel, d.AnthropicModel)
 			c.StrongBaseURL = or(c.StrongBaseURL, AnthropicBaseURL)
 			c.StrongKeyEnv = or(c.StrongKeyEnv, "ANTHROPIC_API_KEY")
 		default:
@@ -303,7 +316,10 @@ func (c *Config) resolve(needKeys bool) error {
 		if c.StrongCores == 0 {
 			c.StrongCores = 8
 		}
-		if needKeys && (c.StrongModel == "" || c.StrongBaseURL == "" || os.Getenv(c.StrongKeyEnv) == "") {
+		if c.StrongModel == "" {
+			return errors.New("hybrid backend needs the strong group's model: -strong-model, OPENAI_MODEL / ANTHROPIC_MODEL, or [strong] model in the config file")
+		}
+		if needKeys && (c.StrongBaseURL == "" || os.Getenv(c.StrongKeyEnv) == "") {
 			return fmt.Errorf("hybrid backend's strong group needs -strong-base-url, -strong-model and the key in $%s", c.StrongKeyEnv)
 		}
 		if c.FastCores < 1 || c.StrongCores < 1 {
@@ -335,7 +351,8 @@ func or(v, def string) string {
 	return def
 }
 
-// The anthropic backend's defaults.
+// The anthropic backend's endpoint, and the bench's Anthropic model (neu
+// has no default model).
 const (
 	AnthropicModel   = "claude-sonnet-5-5"
 	AnthropicBaseURL = "https://api.anthropic.com/v1"

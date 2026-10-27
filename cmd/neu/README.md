@@ -24,16 +24,19 @@ its choice on stderr (never the key):
 
 1. the config file `~/.config/neu/config.toml` (`$XDG_CONFIG_HOME/neu/config.toml`
    when that is set; `-config` names another), if it sets `backend`;
-2. `ANTHROPIC_API_KEY` set: Anthropic, `claude-sonnet-5-5` at `https://api.anthropic.com/v1`;
-3. `OPENAI_API_KEY` set: OpenAI, `gpt-5` at `https://api.openai.com/v1`;
-   `OPENAI_BASE_URL` and `OPENAI_MODEL` point it at another endpoint or model
-   (any OpenAI-compatible server works);
-4. Ollama answering at `127.0.0.1:11434`: the local backend with `qwen3.5:4b`.
+2. `ANTHROPIC_API_KEY` set: Anthropic at `https://api.anthropic.com/v1`;
+3. `OPENAI_API_KEY` set: OpenAI at `https://api.openai.com/v1`, or at
+   `OPENAI_BASE_URL` (any OpenAI-compatible server works);
+4. Ollama answering at `127.0.0.1:11434`: the local backend.
 
 Otherwise it exits and lists these options.
 
+**There is no default model.** Name it every time, one of: `-model`, `model`
+in the config file, or `ANTHROPIC_MODEL` / `OPENAI_MODEL` in the environment.
+Without one neu exits and says how to give it.
+
 ```
-$ neu "How many lines does go.mod have?"
+$ ANTHROPIC_MODEL=claude-sonnet-5-5 neu "How many lines does go.mod have?"
 neu: anthropic (claude-sonnet-5-5 at https://api.anthropic.com/v1), 8 vCore(s) [ANTHROPIC_API_KEY is set]
 ...
 ```
@@ -122,7 +125,7 @@ its task finishes, prefixed by the task's id.
 |---|---|
 | `anthropic` | the Messages API; 8 vCores |
 | `openai` | any OpenAI-compatible endpoint; 8 vCores |
-| `local` | Ollama at `http://127.0.0.1:11434/v1`, `qwen3.5:4b`: one request at a time (`-parallel N` for a server that serves more), preemption of background work by interactive tasks, continuation of a cut-off answer, thinking off |
+| `local` | Ollama at `http://127.0.0.1:11434/v1` (`-model` names the Ollama model): one request at a time (`-parallel N` for a server that serves more), preemption of background work by interactive tasks, continuation of a cut-off answer, thinking off |
 | `hybrid` | two execution groups: `fast` on the local model and `strong` on a cloud model (`-strong-api openai` or `anthropic`); `-route` picks each task's group |
 
 **Hybrid.** `-route static` sends REPL and one-shot requests to `fast`
