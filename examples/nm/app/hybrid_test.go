@@ -13,6 +13,7 @@ import (
 	"github.com/liliang-cn/neumann/decide"
 	"github.com/liliang-cn/neumann/decide/decidetest"
 	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/model/openai"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/sim"
 )
@@ -60,7 +61,7 @@ func TestHybridConfig(t *testing.T) {
 	if c.Route != RouteStatic || !c.Fallback || c.Cores != 4 {
 		t.Errorf("route %q fallback %v cores %d", c.Route, c.Fallback, c.Cores)
 	}
-	fa, sa := fast.Adapter().Adapter, strong.Adapter().Adapter
+	fa, sa := fast.Adapter().Adapter.(*openai.Adapter), strong.Adapter().Adapter.(*openai.Adapter)
 	if fa.Parallel != 1 || !fa.Prefill || fa.ThinkOff != "none" || fa.ThinkTags != [2]string{"<think>", "</think>"} ||
 		fa.Timeout != 0 || fa.FirstByteTimeout != localFirstByte || fa.IdleTimeout != localIdle || fa.MaxTokens != localMaxTokens {
 		t.Errorf("fast adapter %+v", fa)

@@ -22,6 +22,7 @@ import (
 	"github.com/liliang-cn/neumann/examples/nm/tools"
 	"github.com/liliang-cn/neumann/mem/sqlite"
 	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/model/anthropic"
 	"github.com/liliang-cn/neumann/model/openai"
 )
 
@@ -64,7 +65,7 @@ const System = `You are nm, a careful assistant that works on the files of a loc
 
 // Config is what the flags set.
 type Config struct {
-	Backend  string // local, cloud or hybrid
+	Backend  string // local, cloud, anthropic or hybrid
 	Model    string
 	BaseURL  string
 	Cores    int
@@ -98,10 +99,10 @@ type Config struct {
 
 // Flags registers the shared flags on fs.
 func (c *Config) Flags(fs *flag.FlagSet) {
-	fs.StringVar(&c.Backend, "backend", envOr("NM_BACKEND", "cloud"), "local (Ollama "+LocalModel+"), cloud (CPA_BASE_URL, CPA_API_KEY, CPA_MODEL) or hybrid (a fast local group and a strong cloud group) [NM_BACKEND]")
-	fs.StringVar(&c.Model, "model", "", "model name; default: "+LocalModel+" (local) or $CPA_MODEL (cloud)")
-	fs.StringVar(&c.BaseURL, "base-url", "", "endpoint up to and including /v1; default: "+LocalBaseURL+" (local) or $CPA_BASE_URL (cloud)")
-	fs.IntVar(&c.Cores, "cores", 0, "vCores; default -parallel (local) or 8 (cloud)")
+	fs.StringVar(&c.Backend, "backend", envOr("NM_BACKEND", "cloud"), "local (Ollama "+LocalModel+"), cloud (CPA_BASE_URL, CPA_API_KEY, CPA_MODEL) , anthropic (ANTHROPIC_API_KEY; HTTPS_PROXY is honoured) or hybrid (a fast local group and a strong cloud group) [NM_BACKEND]")
+	fs.StringVar(&c.Model, "model", "", "model name; default: "+LocalModel+" (local), $CPA_MODEL (cloud) or "+AnthropicModel+" (anthropic)")
+	fs.StringVar(&c.BaseURL, "base-url", "", "endpoint up to and including /v1; default: "+LocalBaseURL+" (local), $CPA_BASE_URL (cloud) or "+AnthropicBaseURL+" (anthropic)")
+	fs.IntVar(&c.Cores, "cores", 0, "vCores; default -parallel (local) or 8 (cloud, anthropic)")
 	fs.IntVar(&c.Parallel, "parallel", 1, "local, and hybrid's fast group: requests the backend serves at once (Ollama's MLX runner serves one; a GGUF model, OLLAMA_NUM_PARALLEL)")
 	fs.StringVar(&c.Store, "store", filepath.Join(".nm", "state.db"), "SQLite file holding the machine's state")
 	fs.StringVar(&c.Root, "root", ".", "workspace root; every tool is confined to it")
@@ -171,6 +172,19 @@ func (c *Config) resolve(needKeys bool) error {
 		if needKeys && (c.Model == "" || c.BaseURL == "" || cloudKey() == "") {
 			return errors.New("cloud backend needs CPA_BASE_URL, CPA_API_KEY and CPA_MODEL (or -base-url and -model)")
 		}
+	case "anthropic":
+		if c.Model == "" {
+			c.Model = AnthropicModel
+		}
+		if c.BaseURL == "" {
+			c.BaseURL = AnthropicBaseURL
+		}
+		if c.Cores == 0 {
+			c.Cores = 8
+		}
+		if needKeys && os.Getenv("ANTHROPIC_API_KEY") == "" {
+			return errors.New("anthropic backend needs ANTHROPIC_API_KEY")
+		}
 	case "hybrid":
 		for _, f := range []string{"model", "base-url", "cores"} {
 			if c.set[f] {
@@ -213,7 +227,7 @@ func (c *Config) resolve(needKeys bool) error {
 		}
 		c.Model, c.BaseURL, c.Cores = "", "", c.FastCores+c.StrongCores
 	default:
-		return fmt.Errorf("unknown -backend %q: want local, cloud or hybrid", c.Backend)
+		return fmt.Errorf("unknown -backend %q: want local, cloud, anthropic or hybrid", c.Backend)
 	}
 	if c.Cores < 1 {
 		return errors.New("-cores must be at least 1")
@@ -223,10 +237,26 @@ func (c *Config) resolve(needKeys bool) error {
 
 func cloudKey() string { return os.Getenv("CPA_API_KEY") }
 
+// The anthropic backend's defaults.
+const (
+	AnthropicModel   = "claude-sonnet-5-5"
+	AnthropicBaseURL = "https://api.anthropic.com/v1"
+)
+
+// anthropicThinkOff is the thinking type that turns thinking off, for the
+// models that can (anthropic.Adapter.ThinkOff); a model not listed keeps
+// its thinking on a NoThink redo.
+var anthropicThinkOff = map[string]string{
+	"claude-sonnet-5-5": "between_tools",
+	"claude-sonnet-5":   "disabled",
+	"claude-haiku-5-5":  "disabled",
+}
+
 // Side is one model backend of the machine: an execution group.
 type Side struct {
 	Class    string // the group's class: neumann.DefaultClass for local and cloud, fast or strong for hybrid
 	Kind     string // local or cloud
+	API      string // the cloud side's protocol: openai (default) or anthropic
 	Model    string
 	BaseURL  string
 	Cores    int
@@ -244,6 +274,8 @@ func (c *Config) Sides() []Side {
 		}
 	case "local":
 		return []Side{{Class: neumann.DefaultClass, Kind: "local", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores, Parallel: c.Parallel}}
+	case "anthropic":
+		return []Side{{Class: neumann.DefaultClass, Kind: "cloud", API: "anthropic", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores}}
 	}
 	return []Side{{Class: neumann.DefaultClass, Kind: "cloud", Model: c.Model, BaseURL: c.BaseURL, Cores: c.Cores}}
 }
@@ -282,6 +314,11 @@ func (c *Config) BackendArgs() []string {
 // A local side is configured as cmd/neumann -local configures one; a cloud
 // side keeps the adapter's defaults.
 func (s Side) Adapter() *Timed {
+	if s.API == "anthropic" {
+		a := anthropic.New(s.BaseURL, os.Getenv("ANTHROPIC_API_KEY"), s.Model)
+		a.ThinkOff = anthropicThinkOff[s.Model]
+		return &Timed{Adapter: a, Class: s.Class}
+	}
 	key := cloudKey()
 	if s.Kind == "local" {
 		key = envOr("NM_API_KEY", "ollama")

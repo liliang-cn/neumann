@@ -18,6 +18,8 @@ go build -o nm ./examples/nm
 | `-backend local` | Ollama at `http://127.0.0.1:11434/v1`, `qwen3.5:9b-mlx`, configured like `cmd/neumann -local`: one request at a time and as many vCores (`-parallel N` for a backend that serves more, e.g. a GGUF model with `OLLAMA_NUM_PARALLEL`), preemption, continuation of a cut-off answer or thought, `reasoning_effort: "none"` to turn thinking off, 10 min to the first byte, 2 min between chunks, no total limit, 8192 output tokens |
 | `-backend hybrid` | both, as two execution groups: `fast` is the local backend on `qwen3.5:4b` (configured exactly like `-backend local`, `-parallel` vCores, preemption on) and `strong` is the cloud backend (8 vCores, no preemption); `-route` picks each task's group |
 
+`-backend anthropic` talks to Anthropic's Messages API (`claude-sonnet-5-5` by default, `ANTHROPIC_API_KEY`; set `HTTPS_PROXY` to reach it through a proxy).
+
 `-model`, `-base-url`, `-parallel` and `-cores` override. The key is read from the
 environment only (`NM_API_KEY` for local, default `ollama`) and never printed.
 

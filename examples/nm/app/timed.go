@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/liliang-cn/neumann/model"
+	"github.com/liliang-cn/neumann/model/anthropic"
 	"github.com/liliang-cn/neumann/model/openai"
 	"github.com/liliang-cn/neumann/task"
 )
@@ -23,13 +24,29 @@ type CallRecord struct {
 	Err         string
 }
 
-// Timed wraps the OpenAI-compatible adapter and records every call. It
-// forwards each optional interface that adapter implements (OutputCap,
-// CapsReporter, Warmer, Streamer, RateReporter); it implements no others,
-// so the machine sees exactly what it would see without the wrapper.
+// Backend is what both the OpenAI-compatible and the Anthropic adapter
+// implement: the adapter and every optional interface Timed forwards.
+type Backend interface {
+	model.Adapter
+	model.Streamer
+	model.CapsReporter
+	model.OutputCap
+	model.Warmer
+	model.RateReporter
+}
+
+var (
+	_ Backend = (*openai.Adapter)(nil)
+	_ Backend = (*anthropic.Adapter)(nil)
+)
+
+// Timed wraps an adapter and records every call. It forwards each optional
+// interface the adapters implement (OutputCap, CapsReporter, Warmer,
+// Streamer, RateReporter); it implements no others, so the machine sees
+// exactly what it would see without the wrapper.
 type Timed struct {
-	*openai.Adapter
-	Class string // the execution group it serves, for records
+	Adapter Backend
+	Class   string // the execution group it serves, for records
 
 	mu      sync.Mutex
 	records []CallRecord
@@ -77,6 +94,16 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func (t *Timed) Provider() string { return t.Adapter.Provider() }
+func (t *Timed) Caps() model.Caps { return t.Adapter.Caps() }
+func (t *Timed) MaxOut() int      { return t.Adapter.MaxOut() }
+func (t *Timed) Warm(ctx context.Context) error {
+	return t.Adapter.Warm(ctx)
+}
+func (t *Timed) RateInfo(resp *model.Response, err error) *model.RateInfo {
+	return t.Adapter.RateInfo(resp, err)
 }
 
 func (t *Timed) Call(ctx context.Context, req model.Request) (model.Response, error) {
