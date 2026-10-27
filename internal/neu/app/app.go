@@ -1,7 +1,8 @@
-// Package app builds nm's machine: the backend (a local Ollama, a cloud
-// OpenAI-compatible endpoint, or both as two execution groups with a
-// router between them), the SQLite store, the workspace tools and the
-// optional observe endpoints. The CLI and the bench harness share it.
+// Package app builds neu's machine: the backend (a local Ollama, a cloud
+// OpenAI-compatible or Anthropic endpoint, or a local and a cloud one as
+// two execution groups with a router between them), the SQLite store, the
+// workspace tools and the optional observe endpoints. The neu CLI
+// (cmd/neu) and the bench harness (acceptance/bench) share it.
 package app
 
 import (
@@ -19,7 +20,7 @@ import (
 
 	"github.com/liliang-cn/neumann"
 	"github.com/liliang-cn/neumann/decide"
-	"github.com/liliang-cn/neumann/examples/nm/tools"
+	"github.com/liliang-cn/neumann/internal/neu/tools"
 	"github.com/liliang-cn/neumann/mem/sqlite"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/model/anthropic"
@@ -46,25 +47,75 @@ const (
 // generous first-byte limit, a short idle limit and no total limit.
 const (
 	LocalBaseURL   = "http://127.0.0.1:11434/v1"
-	LocalModel     = "qwen3.5:9b-mlx"
+	LocalModel     = "qwen3.5:9b-mlx" // the bench's local model
+	LocalKeyEnv    = "NEU_API_KEY"    // a local backend's key; unset: "ollama"
 	localThinkOff  = "none"
 	localFirstByte = 10 * time.Minute
 	localIdle      = 2 * time.Minute
 	localMaxTokens = 8192
 )
 
-// System is nm's system prompt. It is generic on purpose: the bench
+// System is neu's system prompt. It is generic on purpose: the bench
 // measures the framework and the model on ordinary requests, not prompts
 // tuned per task.
-const System = `You are nm, a careful assistant that works on the files of a local workspace through tools.
+const System = `You are neu, a careful assistant that works on the files of a local workspace through tools.
 - Every path is relative to the workspace root. Look at files with the tools instead of guessing; quote what you found.
 - Prefer fs_grep to find things and fs_read to read the parts you need; read big files in pages.
 - Use calc_eval for any arithmetic over more than two numbers; never add up long columns in your head.
 - You can only write files where fs_write allows it. Never edit tests to make them pass.
 - Finish with a short, direct answer that gives the exact values, names and file:line locations asked for.`
 
+// The openai backend's defaults for neu (UserDefaults), overridden by
+// OPENAI_BASE_URL and OPENAI_MODEL, then by -base-url and -model.
+const (
+	OpenAIBaseURL = "https://api.openai.com/v1"
+	OpenAIModel   = "gpt-5"
+	OpenAIKeyEnv  = "OPENAI_API_KEY"
+)
+
+// Defaults are what a program fills in when the flags leave a backend's
+// model, endpoint or key variable empty. The bench and neu differ: the
+// bench measures against a fixed gateway (CPA_*) and the 9B local model;
+// neu talks to OpenAI by default and uses the 4B model locally.
+type Defaults struct {
+	Backend       string // used when -backend is empty; "": none
+	LocalModel    string
+	OpenAIBaseURL string
+	OpenAIModel   string
+	OpenAIKeyEnv  string
+}
+
+// BenchDefaults are the bench's defaults, and those of a Config whose Def
+// is zero: -backend openai on CPA_BASE_URL, CPA_MODEL and CPA_API_KEY, and
+// LocalModel for -backend local.
+func BenchDefaults() Defaults {
+	return Defaults{
+		Backend:       "openai",
+		LocalModel:    LocalModel,
+		OpenAIBaseURL: os.Getenv("CPA_BASE_URL"),
+		OpenAIModel:   os.Getenv("CPA_MODEL"),
+		OpenAIKeyEnv:  "CPA_API_KEY",
+	}
+}
+
+// UserDefaults are neu's: no backend (the CLI picks one), the 4B model
+// locally, and OpenAI (OPENAI_BASE_URL, OPENAI_MODEL, OPENAI_API_KEY) for
+// -backend openai and hybrid's strong group.
+func UserDefaults() Defaults {
+	return Defaults{
+		LocalModel:    HybridFastModel,
+		OpenAIBaseURL: envOr("OPENAI_BASE_URL", OpenAIBaseURL),
+		OpenAIModel:   envOr("OPENAI_MODEL", OpenAIModel),
+		OpenAIKeyEnv:  OpenAIKeyEnv,
+	}
+}
+
 // Config is what the flags set.
 type Config struct {
+	// Def are the program's defaults; zero: BenchDefaults. Set it before
+	// Flags, whose help shows them.
+	Def Defaults
+
 	Backend  string // local, openai (alias cloud), anthropic or hybrid
 	Model    string
 	BaseURL  string
@@ -100,15 +151,29 @@ type Config struct {
 	set map[string]bool
 }
 
+// defaults are c.Def, or BenchDefaults when it is zero.
+func (c *Config) defaults() Defaults {
+	if c.Def == (Defaults{}) {
+		return BenchDefaults()
+	}
+	return c.Def
+}
+
 // Flags registers the shared flags on fs.
 func (c *Config) Flags(fs *flag.FlagSet) {
-	fs.StringVar(&c.Backend, "backend", envOr("NM_BACKEND", "openai"), "local (Ollama "+LocalModel+"), openai (any OpenAI-compatible endpoint; also called cloud), anthropic (the Messages API) or hybrid (a fast local group and a strong group) [NM_BACKEND]. HTTPS_PROXY is honoured")
-	fs.StringVar(&c.Model, "model", os.Getenv("NM_MODEL"), "model name; default: "+LocalModel+" (local), $CPA_MODEL (openai) or "+AnthropicModel+" (anthropic) [NM_MODEL]")
-	fs.StringVar(&c.BaseURL, "base-url", os.Getenv("NM_BASE_URL"), "endpoint up to and including /v1; default: "+LocalBaseURL+" (local), $CPA_BASE_URL (openai) or "+AnthropicBaseURL+" (anthropic) [NM_BASE_URL]")
-	fs.StringVar(&c.KeyEnv, "key-env", os.Getenv("NM_KEY_ENV"), "name of the environment variable holding the API key (the key itself is never a flag); default: NM_API_KEY (local, unset: \"ollama\"), CPA_API_KEY (openai) or ANTHROPIC_API_KEY (anthropic) [NM_KEY_ENV]")
+	d := c.defaults()
+	backendDef := "default " + d.Backend
+	if d.Backend == "" {
+		backendDef = "default: see above"
+	}
+	openaiModel, openaiURL := or(d.OpenAIModel, "(none)"), or(d.OpenAIBaseURL, "(none)")
+	fs.StringVar(&c.Backend, "backend", "", "local (Ollama), openai (any OpenAI-compatible endpoint; also called cloud), anthropic (the Messages API) or hybrid (a fast local group and a strong group); "+backendDef+". HTTPS_PROXY is honoured")
+	fs.StringVar(&c.Model, "model", "", "model name; default: "+d.LocalModel+" (local), "+openaiModel+" (openai) or "+AnthropicModel+" (anthropic)")
+	fs.StringVar(&c.BaseURL, "base-url", "", "endpoint up to and including /v1; default: "+LocalBaseURL+" (local), "+openaiURL+" (openai) or "+AnthropicBaseURL+" (anthropic)")
+	fs.StringVar(&c.KeyEnv, "key-env", "", "name of the environment variable holding the API key (the key itself is never a flag); default: "+LocalKeyEnv+" (local, unset: \"ollama\"), "+d.OpenAIKeyEnv+" (openai) or ANTHROPIC_API_KEY (anthropic)")
 	fs.IntVar(&c.Cores, "cores", 0, "vCores; default -parallel (local) or 8 (openai, anthropic)")
 	fs.IntVar(&c.Parallel, "parallel", 1, "local, and hybrid's fast group: requests the backend serves at once (Ollama's MLX runner serves one; a GGUF model, OLLAMA_NUM_PARALLEL)")
-	fs.StringVar(&c.Store, "store", filepath.Join(".nm", "state.db"), "SQLite file holding the machine's state")
+	fs.StringVar(&c.Store, "store", "", "SQLite file holding the machine's state; default <root>/.neu/state.db")
 	fs.StringVar(&c.Root, "root", ".", "workspace root; every tool is confined to it")
 	fs.StringVar(&c.Writable, "writable", "out", "comma-separated directories under the root where fs_write may write")
 	fs.IntVar(&c.MaxSteps, "max-steps", 40, "model calls a task may make")
@@ -116,9 +181,9 @@ func (c *Config) Flags(fs *flag.FlagSet) {
 	fs.StringVar(&c.FastBaseURL, "fast-base-url", "", "hybrid: the fast group's endpoint; default "+LocalBaseURL)
 	fs.IntVar(&c.FastCores, "fast-cores", 0, "hybrid: the fast group's vCores; default -parallel")
 	fs.StringVar(&c.StrongAPI, "strong-api", "openai", "hybrid: the strong group's protocol: openai or anthropic")
-	fs.StringVar(&c.StrongModel, "strong-model", "", "hybrid: the strong group's model; default $CPA_MODEL (openai) or "+AnthropicModel+" (anthropic)")
-	fs.StringVar(&c.StrongBaseURL, "strong-base-url", "", "hybrid: the strong group's endpoint; default $CPA_BASE_URL (openai) or "+AnthropicBaseURL+" (anthropic)")
-	fs.StringVar(&c.StrongKeyEnv, "strong-key-env", "", "hybrid: the environment variable holding the strong group's key; default CPA_API_KEY (openai) or ANTHROPIC_API_KEY (anthropic)")
+	fs.StringVar(&c.StrongModel, "strong-model", "", "hybrid: the strong group's model; default "+openaiModel+" (openai) or "+AnthropicModel+" (anthropic)")
+	fs.StringVar(&c.StrongBaseURL, "strong-base-url", "", "hybrid: the strong group's endpoint; default "+openaiURL+" (openai) or "+AnthropicBaseURL+" (anthropic)")
+	fs.StringVar(&c.StrongKeyEnv, "strong-key-env", "", "hybrid: the environment variable holding the strong group's key; default "+d.OpenAIKeyEnv+" (openai) or ANTHROPIC_API_KEY (anthropic)")
 	fs.IntVar(&c.StrongCores, "strong-cores", 0, "hybrid: the strong group's vCores; default 8")
 	fs.BoolVar(&c.Fallback, "fallback", true, "hybrid: while the fast group is down (its breaker open), its tasks move to the strong group")
 	fs.StringVar(&c.Route, "route", RouteStatic, "hybrid: how a task picks its group: static (by kind; the REPL's default is fast, /strong overrides), decide (a decision model reads the request), fast or strong (everything to one group)")
@@ -151,13 +216,20 @@ func (c *Config) Resolve() error { return c.resolve(true) }
 // resolve is Resolve; without needKeys (scripted adapters) a missing cloud
 // endpoint, model or key is not an error.
 func (c *Config) resolve(needKeys bool) error {
+	d := c.defaults()
+	if c.Backend == "" {
+		c.Backend = d.Backend
+	}
+	if c.Store == "" {
+		c.Store = filepath.Join(c.Root, ".neu", "state.db")
+	}
 	if c.Backend == "openai" {
 		c.Backend = "cloud"
 	}
 	switch c.Backend {
 	case "local":
 		if c.Model == "" {
-			c.Model = LocalModel
+			c.Model = or(d.LocalModel, LocalModel)
 		}
 		if c.BaseURL == "" {
 			c.BaseURL = LocalBaseURL
@@ -169,23 +241,17 @@ func (c *Config) resolve(needKeys bool) error {
 			c.Cores = c.Parallel
 		}
 		if c.KeyEnv == "" {
-			c.KeyEnv = "NM_API_KEY"
+			c.KeyEnv = LocalKeyEnv
 		}
 	case "cloud":
-		if c.Model == "" {
-			c.Model = os.Getenv("CPA_MODEL")
-		}
-		if c.BaseURL == "" {
-			c.BaseURL = os.Getenv("CPA_BASE_URL")
-		}
+		c.Model = or(c.Model, d.OpenAIModel)
+		c.BaseURL = or(c.BaseURL, d.OpenAIBaseURL)
 		if c.Cores == 0 {
 			c.Cores = 8
 		}
-		if c.KeyEnv == "" {
-			c.KeyEnv = "CPA_API_KEY"
-		}
+		c.KeyEnv = or(c.KeyEnv, d.OpenAIKeyEnv)
 		if needKeys && (c.Model == "" || c.BaseURL == "" || os.Getenv(c.KeyEnv) == "") {
-			return fmt.Errorf("openai backend needs -base-url, -model and the key in $%s (defaults: CPA_BASE_URL, CPA_MODEL)", c.KeyEnv)
+			return fmt.Errorf("openai backend needs -base-url, -model and the key in $%s", c.KeyEnv)
 		}
 	case "anthropic":
 		if c.Model == "" {
@@ -224,9 +290,9 @@ func (c *Config) resolve(needKeys bool) error {
 		switch c.StrongAPI {
 		case "", "openai", "cloud":
 			c.StrongAPI = "openai"
-			c.StrongModel = or(c.StrongModel, os.Getenv("CPA_MODEL"))
-			c.StrongBaseURL = or(c.StrongBaseURL, os.Getenv("CPA_BASE_URL"))
-			c.StrongKeyEnv = or(c.StrongKeyEnv, "CPA_API_KEY")
+			c.StrongModel = or(c.StrongModel, d.OpenAIModel)
+			c.StrongBaseURL = or(c.StrongBaseURL, d.OpenAIBaseURL)
+			c.StrongKeyEnv = or(c.StrongKeyEnv, d.OpenAIKeyEnv)
 		case "anthropic":
 			c.StrongModel = or(c.StrongModel, AnthropicModel)
 			c.StrongBaseURL = or(c.StrongBaseURL, AnthropicBaseURL)
@@ -251,6 +317,8 @@ func (c *Config) resolve(needKeys bool) error {
 			return fmt.Errorf("unknown -route %q: want static, decide, fast or strong", c.Route)
 		}
 		c.Model, c.BaseURL, c.Cores = "", "", c.FastCores+c.StrongCores
+	case "":
+		return errors.New("no backend: pass -backend local, openai, anthropic or hybrid")
 	default:
 		return fmt.Errorf("unknown -backend %q: want local, openai, anthropic or hybrid", c.Backend)
 	}
@@ -300,7 +368,7 @@ func (c *Config) Sides() []Side {
 	switch c.Backend {
 	case "hybrid":
 		return []Side{
-			{Class: ClassFast, Kind: "local", Model: c.FastModel, BaseURL: c.FastBaseURL, Cores: c.FastCores, Parallel: c.Parallel, KeyEnv: "NM_API_KEY"},
+			{Class: ClassFast, Kind: "local", Model: c.FastModel, BaseURL: c.FastBaseURL, Cores: c.FastCores, Parallel: c.Parallel, KeyEnv: LocalKeyEnv},
 			{Class: ClassStrong, Kind: "cloud", API: c.StrongAPI, Model: c.StrongModel, BaseURL: c.StrongBaseURL, Cores: c.StrongCores, KeyEnv: c.StrongKeyEnv},
 		}
 	case "local":
@@ -314,7 +382,11 @@ func (c *Config) Sides() []Side {
 // Describe is the backend in one line, for logs and reports.
 func (c *Config) Describe() string {
 	if c.Backend != "hybrid" {
-		return fmt.Sprintf("%s (%s at %s), %d vCore(s)", c.Backend, c.Model, c.BaseURL, c.Cores)
+		b := c.Backend
+		if b == "cloud" {
+			b = "openai"
+		}
+		return fmt.Sprintf("%s (%s at %s), %d vCore(s)", b, c.Model, c.BaseURL, c.Cores)
 	}
 	fb := "no fallback"
 	if c.Fallback {
@@ -467,7 +539,7 @@ func Build(ctx context.Context, cfg Config, opt Options) (*App, error) {
 		if cfg.Quiet {
 			logf = func(string, ...any) {}
 		} else {
-			a.logw = log.New(os.Stderr, "nm: ", log.Ltime)
+			a.logw = log.New(os.Stderr, "neu: ", log.Ltime)
 			logf = a.logw.Printf
 		}
 	}
@@ -532,7 +604,7 @@ func (a *App) Start(ctx context.Context) error {
 			}
 		}
 	}
-	obs, err := startObserving(ctx, a.Cfg, a.M, func(f string, args ...any) { fmt.Fprintf(os.Stderr, "nm: "+f+"\n", args...) })
+	obs, err := startObserving(ctx, a.Cfg, a.M, func(f string, args ...any) { fmt.Fprintf(os.Stderr, "neu: "+f+"\n", args...) })
 	if err != nil {
 		return err
 	}

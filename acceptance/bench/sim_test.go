@@ -1,4 +1,4 @@
-package bench
+package main
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/liliang-cn/neumann/examples/nm/app"
+	"github.com/liliang-cn/neumann/internal/neu/app"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/sim"
 	"github.com/liliang-cn/neumann/task"
@@ -81,14 +81,14 @@ func TestSoloOnAScriptedModel(t *testing.T) {
 	simRoot = dir
 	work := filepath.Dir(dir)
 	b := &Bench{
-		Cfg:      app.Config{Backend: "local", Model: "sim", Cores: 2, MaxSteps: 10, Root: dir, Writable: "out,fixbug", Store: filepath.Join(work, ".nm", "sim.db"), Quiet: true},
+		Cfg:      app.Config{Backend: "local", Model: "sim", Cores: 2, MaxSteps: 10, Root: dir, Writable: "out,fixbug", Store: filepath.Join(work, ".neu", "sim.db"), Quiet: true},
 		Opt:      Options{Scenario: "solo", RunID: fmt.Sprintf("s%d", time.Now().UnixNano()%1e6), Work: work, Timeout: time.Minute},
 		Testdata: testdata,
 		out:      io.Discard,
 		errw:     io.Discard,
 		adapter:  &sim.Model{Name: "scripted", Fn: script},
 	}
-	b.Facts, _ = Setup(dir, "../../..", testdata)
+	b.Facts, _ = Setup(dir, "../..", testdata)
 	var err error
 	if b.tasks, err = Select("quick.lines,fix-bug"); err != nil {
 		t.Fatal(err)
@@ -110,7 +110,7 @@ func TestSoloOnAScriptedModel(t *testing.T) {
 			t.Errorf("%s metrics: %+v", r.ID, r.Metrics)
 		}
 	}
-	if os.Getenv("NM_DUMP") != "" {
+	if os.Getenv("BENCH_DUMP") != "" {
 		for _, ev := range b.lastSession.Tr.Events(rep.Results[1].ID) {
 			t.Logf("%d %s %s %s", ev.Seq, ev.Time.Format("05.000000"), ev.Kind, ev.Data)
 		}
@@ -143,7 +143,7 @@ func TestHybridSoloAccountsPerClass(t *testing.T) {
 	t.Setenv("CPA_MODEL", "cloud-model")
 	t.Setenv("CPA_API_KEY", "k")
 	cfg := app.Config{Backend: "hybrid", Parallel: 1, Route: app.RouteStatic, Fallback: true, MaxSteps: 10, Root: dir, Writable: "out,fixbug",
-		Store: filepath.Join(work, ".nm", "hybrid.db"), Quiet: true}
+		Store: filepath.Join(work, ".neu", "hybrid.db"), Quiet: true}
 	if err := cfg.Resolve(); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestHybridSoloAccountsPerClass(t *testing.T) {
 		errw:     io.Discard,
 		adapters: map[string]model.Adapter{app.ClassFast: &sim.Model{Name: "sim:fast", Fn: script}, app.ClassStrong: strong},
 	}
-	b.Facts, _ = Setup(dir, "../../..", testdata)
+	b.Facts, _ = Setup(dir, "../..", testdata)
 	var err error
 	if b.tasks, err = Select("quick.lines,csv-stats"); err != nil {
 		t.Fatal(err)

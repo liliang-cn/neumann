@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/liliang-cn/neumann"
-	"github.com/liliang-cn/neumann/examples/nm/app"
+	"github.com/liliang-cn/neumann/internal/neu/app"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
 )
@@ -56,7 +56,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, stdin io.Reader, std
 			go func() { say("%s", outcome(context.WithoutCancel(ctx), a, ev)) }()
 		}
 	})
-	say("nm: %s, workspace %s. /help for commands.", a.Cfg.Describe(), a.Tools.Box.Root())
+	say("neu %s, workspace %s. /help for commands.", Version(), a.Tools.Box.Root())
 	lines := make(chan string)
 	go func() {
 		defer close(lines)

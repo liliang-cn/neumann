@@ -1,4 +1,4 @@
-package bench
+package main
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liliang-cn/neumann/examples/nm/app"
+	"github.com/liliang-cn/neumann/internal/neu/app"
 	"github.com/liliang-cn/neumann/proto"
 )
 

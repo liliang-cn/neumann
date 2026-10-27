@@ -1,4 +1,4 @@
-package bench
+package main
 
 import (
 	"archive/tar"
@@ -58,7 +58,7 @@ type Commit struct {
 }
 
 const (
-	factsFile   = ".nm-facts.json"
+	factsFile   = ".bench-facts.json"
 	fixturesVer = "nm-fixtures-3"
 	repoTag     = "v0.3.0"
 )

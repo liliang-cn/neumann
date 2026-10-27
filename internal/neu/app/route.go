@@ -72,7 +72,7 @@ func newRouter(ctx context.Context, cfg Config, engine decide.Engine) (*router, 
 		}
 		cancel()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "nm: router %s: %v; tasks go to %s until it answers\n", so.Name(), err, ClassStrong)
+			fmt.Fprintf(os.Stderr, "neu: router %s: %v; tasks go to %s until it answers\n", so.Name(), err, ClassStrong)
 		}
 		engine = so
 	}

@@ -1,4 +1,4 @@
-package bench
+package main
 
 import (
 	"bufio"
@@ -13,8 +13,6 @@ import (
 	"testing"
 )
 
-var testdata = os.DirFS("..")
-
 var (
 	setupOnce sync.Once
 	setupDir  string
@@ -26,13 +24,13 @@ var (
 func workspace(t *testing.T) (string, *Facts) {
 	t.Helper()
 	setupOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "nm-bench-test-")
+		dir, err := os.MkdirTemp("", "neu-bench-test-")
 		if err != nil {
 			setupErr = err
 			return
 		}
 		setupDir = filepath.Join(dir, "ws")
-		setupF, setupErr = Setup(setupDir, "../../..", testdata)
+		setupF, setupErr = Setup(setupDir, "../..", testdata)
 	})
 	if setupErr != nil {
 		t.Skipf("fixtures need git and the v0.3.0 tag: %v", setupErr)
@@ -157,7 +155,7 @@ func TestSetupBuildsTheWorkspace(t *testing.T) {
 		t.Fatalf("changelog commits: %d", len(f.Changelog))
 	}
 	// Setup again is a no-op that returns the same facts.
-	again, err := Setup(dir, "../../..", testdata)
+	again, err := Setup(dir, "../..", testdata)
 	if err != nil || again.Log.Failed != f.Log.Failed || again.Sales != f.Sales {
 		t.Fatalf("second Setup: %v %+v", err, again)
 	}

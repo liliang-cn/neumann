@@ -107,7 +107,7 @@ func (l *Ledger) Write(key, task, rel, abs string, data []byte) (string, error) 
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(abs), ".nm-write-*")
+	tmp, err := os.CreateTemp(filepath.Dir(abs), ".neu-write-*")
 	if err != nil {
 		return "", err
 	}

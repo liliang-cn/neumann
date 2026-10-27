@@ -1,4 +1,4 @@
-package bench
+package main
 
 import (
 	"bufio"
@@ -17,14 +17,14 @@ import (
 	"time"
 
 	"github.com/liliang-cn/neumann"
-	"github.com/liliang-cn/neumann/examples/nm/app"
-	"github.com/liliang-cn/neumann/examples/nm/tools"
+	"github.com/liliang-cn/neumann/internal/neu/app"
+	"github.com/liliang-cn/neumann/internal/neu/tools"
 	"github.com/liliang-cn/neumann/proto"
 )
 
 const crashResults = "crash-results.json"
 
-// crash runs the batch in a child process (`nm bench -scenario
+// crash runs the batch in a child process (this binary with `-scenario
 // crash-child`), kills it with SIGKILL after some tool results, starts it
 // again on the same store and workspace, and lets it finish. Then every
 // task must have finished, and no fs_write may have been applied twice
@@ -43,7 +43,7 @@ func (b *Bench) crash(ctx context.Context, rep *Report) error {
 	for _, t := range b.tasks {
 		ids = append(ids, t.ID)
 	}
-	args := []string{"bench", "-scenario", "crash-child", "-work", b.Opt.Work, "-run-id", b.Opt.RunID}
+	args := []string{"-scenario", "crash-child", "-work", b.Opt.Work, "-run-id", b.Opt.RunID}
 	args = append(args, b.Cfg.BackendArgs()...)
 	args = append(args, "-max-steps", strconv.Itoa(b.Cfg.MaxSteps), "-tasks", strings.Join(ids, ","), "-store", b.Cfg.Store, "-repo", b.Opt.Repo)
 	if b.Opt.Verbose {

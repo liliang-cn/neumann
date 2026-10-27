@@ -31,7 +31,7 @@ func hybridFlags(t *testing.T, args ...string) Config {
 	}
 	c.MarkSet(fs)
 	dir := t.TempDir()
-	c.Root, c.Writable, c.Store, c.Quiet = dir, "out", filepath.Join(dir, ".nm", "state.db"), true
+	c.Root, c.Writable, c.Store, c.Quiet = dir, "out", filepath.Join(dir, ".neu", "state.db"), true
 	return c
 }
 
@@ -52,7 +52,7 @@ func TestHybridConfig(t *testing.T) {
 		t.Fatalf("sides %+v", sides)
 	}
 	fast, strong := sides[0], sides[1]
-	if fast != (Side{Class: ClassFast, Kind: "local", Model: "small:4b", BaseURL: LocalBaseURL, Cores: 1, Parallel: 1, KeyEnv: "NM_API_KEY"}) {
+	if fast != (Side{Class: ClassFast, Kind: "local", Model: "small:4b", BaseURL: LocalBaseURL, Cores: 1, Parallel: 1, KeyEnv: LocalKeyEnv}) {
 		t.Errorf("fast %+v", fast)
 	}
 	if strong != (Side{Class: ClassStrong, Kind: "cloud", API: "openai", Model: "cloud-model", BaseURL: "https://cloud.example/v1", Cores: 3, KeyEnv: "CPA_API_KEY"}) {

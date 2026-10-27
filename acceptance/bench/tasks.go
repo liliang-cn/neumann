@@ -1,4 +1,4 @@
-package bench
+package main
 
 import (
 	"context"
@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/liliang-cn/neumann/examples/nm/app"
-	"github.com/liliang-cn/neumann/examples/nm/tools"
+	"github.com/liliang-cn/neumann/internal/neu/app"
+	"github.com/liliang-cn/neumann/internal/neu/tools"
 )
 
 // Task is one kind of request a user makes, with a checker that judges

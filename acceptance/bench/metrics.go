@@ -1,12 +1,12 @@
-package bench
+package main
 
 import (
 	"encoding/json"
 	"strings"
 	"time"
 
-	"github.com/liliang-cn/neumann/examples/nm/app"
-	"github.com/liliang-cn/neumann/examples/nm/tools"
+	"github.com/liliang-cn/neumann/internal/neu/app"
+	"github.com/liliang-cn/neumann/internal/neu/tools"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
 )

@@ -1,4 +1,4 @@
-package bench
+package main
 
 import (
 	"encoding/json"
@@ -11,7 +11,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/liliang-cn/neumann/examples/nm/app"
+	"github.com/liliang-cn/neumann/internal/neu/app"
 )
 
 // Report is what a bench run writes.

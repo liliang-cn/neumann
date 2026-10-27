@@ -34,7 +34,7 @@ func startObserving(ctx context.Context, c Config, m *neumann.Machine, logf func
 		return o, nil
 	}
 	res, err := resource.New(ctx,
-		resource.WithAttributes(attribute.String("service.name", "nm")),
+		resource.WithAttributes(attribute.String("service.name", "neu")),
 		resource.WithFromEnv(), resource.WithTelemetrySDK())
 	if err != nil {
 		return nil, err

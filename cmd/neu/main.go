@@ -1,66 +1,85 @@
-// Command nm is a small coding and data assistant on top of neumann: one
-// process, one machine with a SQLite store, and workspace tools confined to
-// a root directory (fs_list, fs_read, fs_grep, fs_write, git_run, go_test,
-// calc_eval). It doubles as a test vehicle: `nm bench` runs a suite of
-// realistic, auto-checked tasks in several scenarios and reports what the
-// framework did.
+// Command neu is a workspace assistant built on neumann: one process, one
+// machine with a SQLite store, and tools confined to a workspace root
+// (fs_list, fs_read, fs_grep, fs_write, git_run, go_test, calc_eval).
 //
-//	nm "Which files mention preemption?"          one question, then exit
-//	nm                                             REPL: each line is a task
-//	nm bench -scenario solo -out report.json       the harness
+//	neu "Which files mention preemption?"    one question, then exit
+//	neu                                       REPL: each line is a task
 //
-// -backend local uses Ollama (qwen3.5:9b-mlx, one request at a time,
-// preemption on); -backend cloud uses CPA_BASE_URL, CPA_API_KEY and
-// CPA_MODEL; -backend hybrid runs both as two execution groups, fast
-// (Ollama, qwen3.5:4b) and strong (the cloud model), and -route picks the
-// group of each task. Keys come from the environment only and are never printed.
-// Unfinished tasks continue after a restart (the store is ./.nm/state.db
-// unless -store says otherwise).
+// Without -backend, the backend comes from the config file
+// ($XDG_CONFIG_HOME/neu/config.toml or ~/.config/neu/config.toml), else
+// ANTHROPIC_API_KEY, else OPENAI_API_KEY, else a local Ollama. Keys come
+// from the environment only and are never printed. Unfinished tasks
+// continue after a restart (the store is <root>/.neu/state.db).
 package main
 
 import (
 	"context"
-	"embed"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/liliang-cn/neumann/examples/nm/app"
-	"github.com/liliang-cn/neumann/examples/nm/bench"
+	"github.com/liliang-cn/neumann/internal/neu/app"
 	"github.com/liliang-cn/neumann/observe"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
 )
 
-// testdata is the bench's committed fixtures.
-//
-//go:embed testdata
-var testdata embed.FS
+// version is set at build time (-ldflags "-X main.version=v0.3.2"); empty:
+// the module version from the build info.
+var version string
 
 func main() {
 	signal.Ignore(syscall.SIGPIPE)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if len(os.Args) > 1 && os.Args[1] == "bench" {
-		os.Exit(bench.Main(ctx, os.Args[2:], testdata, os.Stdout, os.Stderr))
-	}
 	os.Exit(run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
+// Version is neu's version: the -ldflags one, else the module's (go
+// install ...@v0.3.2), else "devel".
+func Version() string {
+	if version != "" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return "devel"
+}
+
+const usageHead = `usage: neu [flags] [question]
+
+With a question: answer it and exit (tool calls on stderr, the answer on
+stdout). Without: a REPL, one task per line (/help lists its commands).
+
+Backend, when -backend is not given, the first that applies:
+  1. the config file %s (-config), key "backend"
+  2. ANTHROPIC_API_KEY set: anthropic, %s at %s
+  3. OPENAI_API_KEY set: openai, OPENAI_BASE_URL or %s,
+     OPENAI_MODEL or %s
+  4. Ollama answering at %s: local, %s
+Flags override the config file. HTTPS_PROXY is honoured.
+
+`
+
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	var cfg app.Config
-	fs := flag.NewFlagSet("nm", flag.ContinueOnError)
+	cfg := app.Config{Def: app.UserDefaults()}
+	fs := flag.NewFlagSet("neu", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfg.Flags(fs)
 	verbose := fs.Bool("v", false, "log the machine's own lines on stderr")
+	showVersion := fs.Bool("version", false, "print the version and exit")
+	cfgPath := fs.String("config", DefaultConfigPath(), "config file (TOML); a missing file is not an error")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: nm [flags] [question]\n       nm bench [flags]   (nm bench -help)\n\nWith a question: answer it and exit. Without: a REPL, one task per line (/help).\n\n")
+		fmt.Fprintf(stderr, usageHead, DefaultConfigPath(), app.AnthropicModel, app.AnthropicBaseURL,
+			app.OpenAIBaseURL, app.OpenAIModel, OllamaURL, app.HybridFastModel)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -69,22 +88,38 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		}
 		return 2
 	}
+	if *showVersion {
+		fmt.Fprintf(stdout, "neu %s\n", Version())
+		return 0
+	}
 	cfg.MarkSet(fs)
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	src, err := Setup(ctx, &cfg, set, Env{ConfigPath: *cfgPath, OllamaURL: OllamaURL})
+	if err != nil {
+		fmt.Fprintf(stderr, "neu: %v\n", err)
+		return 1
+	}
 	cfg.Quiet = !*verbose
+	if err := cfg.Resolve(); err != nil {
+		fmt.Fprintf(stderr, "neu: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stderr, "neu: %s [%s]\n", cfg.Describe(), src)
 	a, err := app.Build(ctx, cfg, app.Options{})
 	if err != nil {
-		fmt.Fprintf(stderr, "nm: %v\n", err)
+		fmt.Fprintf(stderr, "neu: %v\n", err)
 		return 1
 	}
 	if err := a.Start(ctx); err != nil {
-		fmt.Fprintf(stderr, "nm: start: %v\n", err)
+		fmt.Fprintf(stderr, "neu: start: %v\n", err)
 		a.Close(5 * time.Second)
 		return 1
 	}
 	defer a.Close(10 * time.Second)
 	head, err := observe.Head(ctx, a.M)
 	if err != nil {
-		fmt.Fprintf(stderr, "nm: %v\n", err)
+		fmt.Fprintf(stderr, "neu: %v\n", err)
 		return 1
 	}
 	tr := a.Track(ctx, head)
@@ -105,7 +140,7 @@ func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, q string, stdout,
 	})
 	pick := a.Route(ctx, q, "")
 	if _, err := a.M.Submit(ctx, proto.Instruction{TaskID: id, Input: q, Class: pick.Class, Budget: &task.Budget{MaxSteps: a.Cfg.MaxSteps}}); err != nil {
-		fmt.Fprintf(stderr, "nm: submit: %v\n", err)
+		fmt.Fprintf(stderr, "neu: submit: %v\n", err)
 		return 1
 	}
 	if pick.Class != "" {
@@ -113,17 +148,17 @@ func oneShot(ctx context.Context, a *app.App, tr *app.Tracker, q string, stdout,
 	}
 	ev, err := tr.Wait(ctx, id)
 	if err != nil {
-		fmt.Fprintf(stderr, "nm: interrupted; task %s continues on the next start with the same -store\n", id)
+		fmt.Fprintf(stderr, "neu: interrupted; task %s continues on the next start with the same -store\n", id)
 		return 130
 	}
 	t, err := a.M.Load(context.WithoutCancel(ctx), id)
 	if err != nil {
-		fmt.Fprintf(stderr, "nm: %v\n", err)
+		fmt.Fprintf(stderr, "neu: %v\n", err)
 		return 1
 	}
 	fmt.Fprintln(stdout, t.LastAnswer())
 	if ev.Kind != proto.EvDone {
-		fmt.Fprintf(stderr, "nm: task %s ended %s %s\n", id, ev.Kind, string(ev.Data))
+		fmt.Fprintf(stderr, "neu: task %s ended %s %s\n", id, ev.Kind, string(ev.Data))
 		return 1
 	}
 	return 0

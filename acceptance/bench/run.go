@@ -1,7 +1,4 @@
-// Package bench is nm's harness: a suite of realistic tasks with objective
-// checkers, run against a real backend in several scenarios, measured from
-// the machine's committed event stream.
-package bench
+package main
 
 import (
 	"context"
@@ -20,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/liliang-cn/neumann/examples/nm/app"
-	"github.com/liliang-cn/neumann/examples/nm/tools"
+	"github.com/liliang-cn/neumann/internal/neu/app"
+	"github.com/liliang-cn/neumann/internal/neu/tools"
 	"github.com/liliang-cn/neumann/model"
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
@@ -59,11 +56,11 @@ type Suite struct {
 	BG     []string `json:"background"`
 }
 
-// Main is `nm bench`; testdata holds the committed fixtures.
+// Main is the bench; testdata holds the committed fixtures.
 func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.Writer) int {
-	var cfg app.Config
+	cfg := app.Config{Def: app.BenchDefaults()}
 	var o Options
-	fset := flag.NewFlagSet("nm bench", flag.ContinueOnError)
+	fset := flag.NewFlagSet("bench", flag.ContinueOnError)
 	fset.SetOutput(stderr)
 	cfg.Flags(fset)
 	fset.StringVar(&o.Scenario, "scenario", "solo", "solo, mixed, ops, crash or burst")
@@ -87,7 +84,7 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 	fset.DurationVar(&o.Timeout, "timeout", 3*time.Hour, "give up on the whole run after this long")
 	fset.BoolVar(&o.Verbose, "v", false, "log the machine's own lines and every tool call")
 	fset.Usage = func() {
-		fmt.Fprintf(stderr, "usage: nm bench [flags]\n\nRuns the task suite in a scenario and reports what happened. Task ids:\n")
+		fmt.Fprintf(stderr, "usage: go run ./acceptance/bench [flags]\n\nRuns the task suite in a scenario and reports what happened. Task ids:\n")
 		for _, t := range Tasks() {
 			fmt.Fprintf(stderr, "  %-18s %s\n", t.ID, clip(t.Prompt, 90))
 		}
@@ -107,9 +104,9 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 	defer cancel()
 
 	if o.Work == "" {
-		d, err := os.MkdirTemp("", "nm-bench-")
+		d, err := os.MkdirTemp("", "neu-bench-")
 		if err != nil {
-			fmt.Fprintf(stderr, "nm bench: %v\n", err)
+			fmt.Fprintf(stderr, "bench: %v\n", err)
 			return 1
 		}
 		o.Work = d
@@ -121,20 +118,20 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 		o.RunID = fmt.Sprintf("r%s", time.Now().Format("0102-150405"))
 	}
 	if !storeSet {
-		cfg.Store = filepath.Join(o.Work, ".nm", o.Scenario+".db")
+		cfg.Store = filepath.Join(o.Work, ".neu", o.Scenario+".db")
 		if o.Scenario == "crash-child" {
-			cfg.Store = filepath.Join(o.Work, ".nm", "crash.db")
+			cfg.Store = filepath.Join(o.Work, ".neu", "crash.db")
 		}
 	}
 	cfg.Root, cfg.Writable = filepath.Join(o.Work, "ws"), "out,fixbug"
 	cfg.Quiet = !o.Verbose
 	if err := cfg.Resolve(); err != nil {
-		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		fmt.Fprintf(stderr, "bench: %v\n", err)
 		return 1
 	}
 	b := &Bench{Cfg: cfg, Opt: o, Testdata: testdata, out: stdout, errw: stderr}
 	if err := b.loadSuite(); err != nil {
-		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		fmt.Fprintf(stderr, "bench: %v\n", err)
 		return 2
 	}
 	if o.Scenario == "crash-child" {
@@ -143,10 +140,10 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 	if o.Rejudge != "" {
 		return b.rejudge(stdout, stderr)
 	}
-	b.logf("nm bench: scenario %s, backend %s, workspace %s", o.Scenario, cfg.Describe(), o.Work)
+	b.logf("bench: scenario %s, backend %s, workspace %s", o.Scenario, cfg.Describe(), o.Work)
 	facts, err := Setup(cfg.Root, o.Repo, testdata)
 	if err != nil {
-		fmt.Fprintf(stderr, "nm bench: fixtures: %v\n", err)
+		fmt.Fprintf(stderr, "bench: fixtures: %v\n", err)
 		return 1
 	}
 	b.Facts = facts
@@ -170,12 +167,12 @@ func Main(ctx context.Context, args []string, testdata fs.FS, stdout, stderr io.
 	rep.WallS = rep.Finished.Sub(rep.Started).Seconds()
 	if err != nil {
 		rep.Notes = append(rep.Notes, "error: "+err.Error())
-		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		fmt.Fprintf(stderr, "bench: %v\n", err)
 	}
 	rep.Print(stdout)
 	if o.Out != "" {
 		if werr := rep.Write(o.Out); werr != nil {
-			fmt.Fprintf(stderr, "nm bench: %v\n", werr)
+			fmt.Fprintf(stderr, "bench: %v\n", werr)
 			return 1
 		}
 		fmt.Fprintf(stdout, "report: %s\n", o.Out)
@@ -500,18 +497,18 @@ func percentile(xs []float64, p float64) float64 {
 func (b *Bench) rejudge(stdout, stderr io.Writer) int {
 	data, err := os.ReadFile(b.Opt.Rejudge)
 	if err != nil {
-		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		fmt.Fprintf(stderr, "bench: %v\n", err)
 		return 1
 	}
 	var rep Report
 	if err := json.Unmarshal(data, &rep); err != nil {
-		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		fmt.Fprintf(stderr, "bench: %v\n", err)
 		return 1
 	}
 	root := filepath.Join(rep.Work, "ws")
 	facts, err := Setup(root, b.Opt.Repo, b.Testdata)
 	if err != nil {
-		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		fmt.Fprintf(stderr, "bench: %v\n", err)
 		return 1
 	}
 	ledger, _ := tools.ReadLedger(filepath.Join(root, "out", ".ledger"))
@@ -547,7 +544,7 @@ func (b *Bench) rejudge(stdout, stderr io.Writer) int {
 		out = b.Opt.Rejudge
 	}
 	if err := rep.Write(out); err != nil {
-		fmt.Fprintf(stderr, "nm bench: %v\n", err)
+		fmt.Fprintf(stderr, "bench: %v\n", err)
 		return 1
 	}
 	fmt.Fprintf(stdout, "report: %s\n", out)

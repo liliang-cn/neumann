@@ -96,6 +96,23 @@ t, _ := m.Load(ctx, id)
 fmt.Println(t.LastAnswer())
 ```
 
+## neu: a workspace assistant
+
+[`neu`](cmd/neu/README.md) is a command-line assistant built on neumann: ask
+a question about the files in a directory, or open a REPL and run several
+tasks at once with priorities, suspend, resume, steer and cancel. Its tools
+(read, grep, git, `go test`, a calculator, writes under `out/`) are confined
+to the workspace, and unfinished tasks continue after a restart.
+
+```
+go install github.com/liliang-cn/neumann/cmd/neu@latest
+neu "How many lines does go.mod have?"
+```
+
+It picks a backend from `~/.config/neu/config.toml`, `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY` or a local Ollama, in that order. Release archives for
+macOS, Linux and Windows are attached to each GitHub release.
+
 ## With a real model
 
 Two adapters ship with neumann: `model/openai` for any OpenAI-compatible
@@ -816,6 +833,14 @@ NEUMANN_ACCEPT_LIVE=1 OPENAI_BASE_URL=... OPENAI_API_KEY=... OPENAI_MODEL=... \
   go test -v -count=1 -timeout 40m ./acceptance/load       # 200 tasks on one autoscaling group
 ```
 
+`acceptance/bench` measures neumann through `neu`'s machine on realistic,
+auto-checked tasks (solo, mixed, ops, crash and burst scenarios); see its
+[README](acceptance/bench/README.md):
+
+```
+go run ./acceptance/bench -scenario solo -tasks quick -out solo.json
+```
+
 `decide`'s live test asks a real System One server and is skipped unless
 `NEUMANN_DECIDE_LIVE=1` (`NEUMANN_DECIDE_URL`, `NEUMANN_DECIDE_MODEL` and
 `NEUMANN_DECIDE_KEY` point it elsewhere than tev1:4b on the local Ollama):
@@ -832,6 +857,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how changes are reviewed.
 - [docs/design.md](docs/design.md): the full design, section by section (Chinese).
 - [docs/architecture.html](docs/architecture.html): an illustrated architecture page (Chinese; open it in a browser).
 - [examples/](examples/README.md): runnable programs.
+- [cmd/neu](cmd/neu/README.md): the neu assistant.
 - `go doc github.com/liliang-cn/neumann` and each package's documentation.
 
 ## License
