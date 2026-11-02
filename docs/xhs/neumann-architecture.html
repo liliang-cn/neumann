@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>neumann 架构一图</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
+<style>
+/* One 1080x1440 card, fitted to the screen. Control on the left and top (program, scheduler, vCores),
+   the outside world on the right (providers), devices and the persistent store along the bottom.
+   One worked example plays through it: a multi-step tool task that moves from one model to another. */
+:root {
+  --page: #E6ECF2; --paper: #EEF2F6; --card: #FFFFFF; --ink: #0F1C27; --muted: #5A6976; --line: #A9B6C2;
+  --blue: #2350E3; --blue-soft: #DEE6FF;
+  --amber: #DB8E00; --amber-soft: #FFF0C9;
+  --violet: #7A4FD6; --violet-soft: #ECE4FF;
+  --red: #D23A3A; --red-soft: #FBDCDC;
+  --green: #13865A; --green-soft: #D5F0E3;
+  --sans: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--page); display: grid; place-items: center; overflow: hidden; font-family: var(--sans); }
+.frame { position: relative; overflow: hidden; border-radius: 12px; box-shadow: 0 6px 30px rgba(30,50,70,.16); }
+.card { position: absolute; left: 0; top: 0; width: 1080px; height: 1440px; transform-origin: 0 0; background: var(--paper); color: var(--ink); }
+.kick { position: absolute; left: 56px; top: 44px; font: 700 30px var(--mono); color: var(--blue); }
+.ttl { position: absolute; left: 56px; right: 56px; top: 90px; margin: 0; font: 900 56px/1.15 var(--sans); }
+.ask { position: absolute; left: 56px; right: 56px; top: 160px; font: 500 28px var(--sans); color: var(--muted); }
+svg.stage { position: absolute; inset: 0; width: 1080px; height: 1440px; overflow: visible; }
+.say { position: absolute; left: 40px; right: 40px; top: 1180px; height: 176px; background: var(--card); border-radius: 24px; padding: 12px 30px; display: flex; align-items: center; gap: 22px; }
+.say .n { flex: 0 0 auto; width: 76px; height: 76px; border-radius: 50%; background: var(--blue); color: #FFF; font: 700 34px var(--mono); display: grid; place-items: center; }
+.say .n.bad { background: var(--red); } .say .n.good { background: var(--green); } .say .n.t2 { background: var(--violet); } .say .n.t3 { background: var(--amber); }
+.say .t { font: 500 36px/1.38 var(--sans); transition: opacity .3s; }
+.foot { position: absolute; left: 56px; right: 56px; top: 1376px; display: flex; justify-content: space-between; align-items: center; font: 500 24px var(--sans); color: var(--muted); }
+.legend { display: flex; gap: 22px; align-items: center; }
+.legend i { display: inline-block; width: 20px; height: 20px; border-radius: 6px; margin-right: 8px; vertical-align: -3px; }
+.stamp { position: absolute; left: 50%; top: 700px; transform: translate(-50%,-50%) rotate(-7deg); font: 900 150px var(--mono); color: var(--red); border: 12px solid var(--red); border-radius: 26px; padding: 4px 40px; white-space: nowrap; background: rgba(255,255,255,.82); opacity: 0; transition: opacity .25s; pointer-events: none; }
+.stamp.on { opacity: 1; }
+
+.box rect.b { fill: var(--card); stroke: var(--ink); stroke-width: 3; transition: fill .35s, stroke .35s, stroke-width .25s; }
+.box.ext rect.b { stroke-dasharray: 12 8; }
+.box.core rect.b { fill: var(--blue-soft); stroke: var(--blue); }
+.box.dev rect.b { fill: var(--amber-soft); stroke: #8A6200; }
+.box.cop rect.b { fill: var(--violet-soft); stroke: var(--violet); }
+.box.store rect.b { fill: #E2E9F0; }
+.box.lane rect.b { fill: #F6F8FA; stroke: #B8C4CE; stroke-width: 2.5; }
+.box.group rect.b { fill: #F3F6FF; stroke: #9DB0E8; stroke-width: 2.5; }
+.box.on rect.b { stroke: var(--blue); stroke-width: 7; }
+.box.flash rect.b { stroke: var(--green); stroke-width: 7; fill: var(--green-soft); }
+.box.down rect.b { stroke: var(--red); stroke-width: 6; fill: var(--red-soft); }
+.box.idle { opacity: .3; }
+.box.busy1 rect.b { fill: #C9D6FF; } .box.busy2 rect.b { fill: #DCCDFF; } .box.busy3 rect.b { fill: #FFE6A6; }
+.box text.t { font: 700 32px var(--sans); fill: var(--ink); }
+.box text.s { font: 400 24px var(--sans); fill: var(--muted); }
+.box text.l { font: 700 26px var(--sans); fill: var(--muted); }
+.box text.m { font: 700 26px var(--mono); fill: var(--blue); }
+.conn { fill: none; stroke: var(--line); stroke-width: 3; stroke-dasharray: 2 9; stroke-linecap: round; }
+.trail { fill: none; stroke-width: 4; stroke-linecap: round; opacity: .55; transition: opacity .6s; }
+.pk { stroke: #FFF; stroke-width: 3; }
+.tok { transition: transform .9s cubic-bezier(.6,.05,.3,1), opacity .5s; }
+.tok text { font: 700 28px var(--mono); fill: #FFF; }
+.bub { transition: opacity .45s; }
+.bub rect { fill: var(--ink); }
+.bub text { font: 500 25px var(--sans); fill: #FFF; }
+.bub.red rect { fill: var(--red); } .bub.green rect { fill: var(--green); }
+.dead { filter: grayscale(1); opacity: .45; transition: filter .3s, opacity .3s; }
+.alive { transition: filter .8s, opacity .8s; }
+
+/* observability panel: a trace waterfall rebuilt from events, plus metrics */
+.obs { position: absolute; left: 40px; right: 40px; top: 206px; height: 960px; background: var(--card); border-radius: 24px; padding: 28px 32px; opacity: 0; transform: translateY(16px); transition: opacity .5s, transform .5s; pointer-events: none; box-shadow: 0 6px 24px rgba(30,50,70,.12); }
+.obs.on { opacity: 1; transform: none; }
+.obs h2 { margin: 0 0 4px; font: 900 34px var(--sans); }
+.obs .sub { font: 400 22px var(--sans); color: var(--muted); margin-bottom: 18px; }
+.wf { display: grid; grid-template-columns: 330px 1fr; row-gap: 8px; column-gap: 16px; align-items: center; }
+.wf .nm { font: 500 22px var(--mono); color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wf .nm.c { padding-left: 22px; color: var(--muted); }
+.wf .tr { position: relative; height: 34px; background: #F1F4F8; border-radius: 6px; }
+.wf .bar { position: absolute; top: 4px; height: 26px; border-radius: 5px; width: 0; transition: width .55s ease; }
+.wf .bar.root { background: #B9C8F5; } .wf .bar.m { background: var(--blue); } .wf .bar.t { background: var(--amber); }
+.wf .bar.x { background: var(--red); } .wf .bar.c2 { background: var(--violet); }
+.wf .ev { position: absolute; top: -3px; width: 4px; height: 40px; background: var(--ink); border-radius: 2px; opacity: 0; transition: opacity .4s; }
+.wf .ev.on { opacity: 1; }
+.wf .evl { position: absolute; top: 5px; font: 700 19px var(--sans); color: var(--ink); white-space: nowrap; opacity: 0; transition: opacity .4s; background: rgba(255,255,255,.88); padding: 0 6px; border-radius: 4px; }
+.wf .evl.on { opacity: 1; }
+.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 22px; opacity: 0; transition: opacity .5s; }
+.tiles.on { opacity: 1; }
+.tile { background: #F4F7FA; border-radius: 14px; padding: 12px 16px; }
+.tile b { display: block; font: 700 34px var(--mono); color: var(--ink); }
+.tile span { font: 500 17px var(--mono); color: var(--muted); }
+.ends { margin-top: 16px; font: 500 22px var(--mono); color: var(--blue); opacity: 0; transition: opacity .5s; }
+.ends.on { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .tok, .box rect.b, .trail { transition: none; } }
+</style>
+</head>
+<body>
+<div class="frame" id="frame">
+  <div class="card" id="card">
+    <div class="kick">neumann · 架构一图 · 跟着一个例子走</div>
+    <h1 class="ttl">规划成都周末一日游</h1>
+    <div class="ask">两个任务互发消息、两个模型接力、答案校验、一次 kill -9</div>
+    <svg class="stage" id="stage" viewBox="0 0 1080 1440" aria-label="neumann 架构动图：决策协处理器 tev 把任务 1 和任务 2 路由到 Gemini 执行组；任务 1 并行调用只读工具时进程被杀后恢复；任务 1 用 tasks_send 给任务 2 发消息，任务 2 收到标明来自另一个任务的消息后回复；Gemini 熔断后任务 1 迁到 Claude，第一个答案只是计划，被答案校验打回，随后调用 notes_write 并通过校验完成。"></svg>
+    <div class="say"><div class="n" id="num">1</div><div class="t" id="say"></div></div>
+    <div class="foot">
+      <span class="legend"><span><i style="background:var(--blue)"></i>#1 规划行程</span><span><i style="background:var(--violet)"></i>#2 限行查询</span></span>
+      <span>先提交，后动作</span>
+    </div>
+    <div class="stamp" id="stamp">kill -9</div>
+    <div class="obs" id="obs"><h2>trace · 任务 #1</h2><div class="sub">从已提交的事件重建：一个任务一棵树，起止用事件的提交时间</div><div class="wf" id="wf"></div><div class="tiles" id="tiles"></div><div class="ends" id="ends">observe.NewHandler → /events（SSE，按 seq 续读）· /status · /metrics · pprof · OTLP 导出</div></div>
+  </div>
+</div>
+<script>
+(() => {
+'use strict';
+const NS = 'http://www.w3.org/2000/svg';
+const $ = s => document.querySelector(s);
+const svg = $('#stage'), card = $('#card');
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const mk = (tag, a = {}, p = svg) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); p.appendChild(e); return e; };
+
+// ------------------------------------------------------------------ the picture
+const B = {};
+const layer = {};
+layer.conn = mk('g'); layer.boxes = mk('g'); layer.trails = mk('g'); layer.toks = mk('g'); layer.pks = mk('g'); layer.bubs = mk('g');
+
+function box(id, x, y, w, h, t, s = '', cls = '', o = {}) {
+  const g = mk('g', { class: 'box ' + cls }, layer.boxes);
+  mk('rect', { class: 'b', x, y, width: w, height: h, rx: 18 }, g);
+  if (o.label) {
+    const l = mk('text', { class: 'l', x: x + 20, y: y + 38 }, g); l.textContent = t;
+    if (s) { const st = mk('text', { class: 's', x: x + 20, y: y + 70 }, g); st.style.fontSize = '22px'; st.textContent = s; }
+  } else {
+    const lines = s ? s.split('\n') : [];
+    const ts = o.ts || 32, ss = o.ss || 24;
+    const total = ts * 1.2 + (lines.length ? 8 + lines.length * ss * 1.35 : 0);
+    let y0 = y + h / 2 - total / 2 + ts * .95;
+    const t1 = mk('text', { class: 't', x: x + w / 2, y: y0, 'text-anchor': 'middle' }, g); t1.textContent = t; t1.style.fontSize = ts + 'px';
+    y0 += 8;
+    for (const line of lines) { y0 += ss * 1.35; const t2 = mk('text', { class: 's', x: x + w / 2, y: y0 - ss * .3, 'text-anchor': 'middle' }, g); t2.textContent = line; t2.style.fontSize = ss + 'px'; }
+  }
+  B[id] = { g, x, y, w, h, cx: x + w / 2, cy: y + h / 2 };
+}
+
+box('prog', 40, 220, 480, 104, '你的程序', 'Submit · Steer · Cancel · Approve', 'ext', { ss: 22 });
+box('events', 560, 220, 480, 104, '事件流', 'answer · tool_call · migrated …', 'ext', { ss: 22 });
+box('sched', 40, 370, 1000, 190, '调度器', '', 'group', { label: true });
+box('ready', 60, 418, 470, 124, '就绪队列', '', 'lane', { label: true });
+box('wait', 550, 418, 470, 124, '等待集合', 'IO · 退避 · 等组 · 等批准', 'lane', { label: true });
+box('gA', 40, 600, 400, 186, '执行组 A · Gemini', '', 'group', { label: true });
+box('A1', 60, 668, 110, 96, 'vCore', '', 'core', { ts: 26 });
+box('A2', 185, 668, 110, 96, 'vCore', '', 'core', { ts: 26 });
+box('A3', 310, 668, 110, 96, 'vCore', '', 'core', { ts: 26 });
+box('gB', 40, 806, 400, 120, '执行组 B · Claude', '', 'group', { label: true });
+box('B1', 310, 818, 110, 96, 'vCore', '', 'core', { ts: 26 });
+box('lim', 480, 620, 200, 166, '限流器', 'RPM · TPM\n预占 · 结算', '', { ss: 22 });
+box('dec', 480, 806, 200, 120, '协处理器', 'tev1:4b · 决策', 'cop', { ts: 28, ss: 20 });
+box('pA', 720, 620, 320, 124, 'Gemini', '模型服务商', 'ext');
+box('pB', 720, 796, 320, 124, 'Claude', '模型服务商', 'ext');
+box('bus', 40, 968, 480, 100, '总线', '页表 · L2 缓存 · 设备队列', '', { ss: 22 });
+box('d1', 40, 1088, 150, 80, 'builtin', 'notes_write', 'dev', { ts: 24, ss: 17 });
+box('d2', 205, 1088, 150, 80, 'MCP', '天气 · 地图 · 交通', 'dev', { ts: 24, ss: 16 });
+box('d3', 370, 1088, 150, 80, 'tasks', 'send · list', 'dev', { ts: 24, ss: 17 });
+box('store', 560, 968, 480, 200, '持久化存储', 'TCB · 调用记录 · 中断\n事件 · 归档\n一次提交 = 一个事务', 'store', { ss: 23 });
+
+const wText = mk('text', { class: 'm', x: 420, y: 638, 'text-anchor': 'end' }, B.gA.g);
+const commitText = mk('text', { class: 'm', x: 1020, y: 1158, 'text-anchor': 'end' }, B.store.g); commitText.style.fontSize = '22px'; commitText.style.fill = 'var(--green)';
+const seqText = mk('text', { class: 'm', x: 1036, y: 208, 'text-anchor': 'end' }, B.events.g); seqText.style.fontSize = '22px';
+
+const conn = d => mk('path', { class: 'conn', d }, layer.conn);
+conn('M280 324 L280 418'); conn('M240 542 L240 668');
+conn('M440 700 L480 700'); conn('M440 866 L480 866');
+conn('M680 690 L720 690'); conn('M680 740 C700 740, 700 858, 720 858');
+conn('M120 786 C10 830, 10 930, 120 968');
+conn('M115 1068 L115 1088'); conn('M280 1068 L280 1088'); conn('M445 1068 L445 1088');
+conn('M1040 1060 C1076 1000, 1076 300, 1040 272');
+
+// ------------------------------------------------------------------ motion primitives
+let speed = +new URLSearchParams(location.search).get('speed') || 1, paused = false, gateWaiters = [];
+const gate = () => paused ? new Promise(r => gateWaiters.push(r)) : Promise.resolve();
+const sleep = async ms => { await new Promise(r => setTimeout(r, ms / speed)); await gate(); };
+const C = { 1: 'var(--blue)', 2: 'var(--violet)', 3: 'var(--amber)', g: 'var(--green)', r: 'var(--red)' };
+const pt = id => Array.isArray(id) ? id : [B[id].cx, B[id].cy];
+
+function packet(from, to, color, bend = .18) {
+  const a = pt(from), b = pt(to);
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const c = [(a[0] + b[0]) / 2 - dy * bend, (a[1] + b[1]) / 2 + dx * bend];
+  const p = mk('path', { class: 'trail', d: `M${a[0]} ${a[1]} Q${c[0]} ${c[1]} ${b[0]} ${b[1]}`, stroke: color }, layer.trails);
+  const len = p.getTotalLength();
+  p.style.strokeDasharray = len; p.style.strokeDashoffset = len;
+  const dot = mk('circle', { class: 'pk', r: 13, fill: color, cx: a[0], cy: a[1] }, layer.pks);
+  const dur = (reduce ? 1 : Math.min(1300, Math.max(600, len * 1.5))) / speed;
+  return new Promise(res => {
+    let t0 = null;
+    const step = now => {
+      t0 = t0 ?? now;
+      const k = Math.min(1, (now - t0) / dur), e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+      const q = p.getPointAtLength(e * len);
+      dot.setAttribute('cx', q.x); dot.setAttribute('cy', q.y);
+      p.style.strokeDashoffset = len * (1 - e);
+      if (k < 1) requestAnimationFrame(step);
+      else { dot.remove(); p.style.opacity = 0; setTimeout(() => p.remove(), 700); res(); }
+    };
+    requestAnimationFrame(step);
+  });
+}
+function token(id) {
+  const g = mk('g', { class: 'tok' }, layer.toks);
+  mk('rect', { x: -40, y: -24, width: 80, height: 48, rx: 24, fill: C[id] }, g);
+  const t = mk('text', { y: 10, 'text-anchor': 'middle' }, g); t.textContent = '#' + id;
+  g.style.opacity = 0;
+  return g;
+}
+const place = (tok, [x, y]) => { tok.style.transform = `translate(${x}px, ${y}px)`; tok.style.opacity = 1; };
+async function move(tok, p) { place(tok, p); await sleep(950); }
+function flash(id, ms = 700) { const g = B[id].g; g.classList.add('flash'); setTimeout(() => g.classList.remove('flash'), ms); }
+// a speech bubble near a box: what the model said, what a tool returned
+function bubble(text, x, y, cls = '', ms = 3200, anchor = 'middle') {
+  const g = mk('g', { class: 'bub ' + cls }, layer.bubs);
+  const r = mk('rect', { rx: 14, height: 48 }, g);
+  const t = mk('text', { y: y + 8 }, g); t.textContent = text;
+  const w = t.getComputedTextLength() + 36;
+  const left = anchor === 'middle' ? x - w / 2 : anchor === 'end' ? x - w : x;
+  r.setAttribute('x', left); r.setAttribute('y', y - 24); r.setAttribute('width', w);
+  t.setAttribute('x', left + 18);
+  setTimeout(() => { g.style.opacity = 0; setTimeout(() => g.remove(), 500); }, ms / speed);
+}
+
+let commits = 0, seq = 0, W = 2;
+function commit() { commits++; commitText.textContent = `已提交 ${commits} 次`; flash('store'); }
+function emit(n = 1) { seq += n; seqText.textContent = `seq ${seq}`; flash('events', 500); }
+function showW() {
+  wText.textContent = `W ${W.toFixed(1)}`;
+  ['A1', 'A2', 'A3'].forEach((id, i) => B[id].g.classList.toggle('idle', i >= Math.floor(W)));
+}
+const grow = () => { W += 1 / W; showW(); };
+
+function fitSay() {
+  const t = $('#say'), box = t.parentElement;
+  let fs = 36; t.style.fontSize = fs + 'px';
+  while (t.scrollHeight > box.clientHeight - 20 && fs > 26) { fs -= 1; t.style.fontSize = fs + 'px'; }
+}
+async function say(n, text, cls = '', ms) {
+  const t = $('#say'), num = $('#num');
+  t.style.opacity = 0;
+  await new Promise(r => setTimeout(r, 160));
+  t.textContent = text; num.textContent = n; num.className = 'n ' + cls; fitSay(); t.style.opacity = 1;
+}
+function hl(ids) { Object.values(B).forEach(b => b.g.classList.remove('on')); ids.forEach(id => B[id].g.classList.add('on')); }
+const readMs = text => Math.min(6500, Math.max(2600, text.length * 95));
+async function beat(n, text, ids, cls = '') { hl(ids); await say(n, text, cls); return () => sleep(readMs(text)); }
+
+async function crash(recoverText) {
+  await say('!', 'kill -9：进程在工具执行中被杀。没有清理，在途的请求全断了。', 'bad');
+  hl([]);
+  svg.classList.add('dead');
+  $('#stamp').classList.add('on');
+  await new Promise(r => setTimeout(r, 2800 / speed));
+  $('#stamp').classList.remove('on');
+  svg.classList.remove('dead');
+  await say('↻', recoverText, 'good');
+  hl(['store', 'wait']);
+  W = 2; showW();
+}
+
+// ------------------------------------------------------------------ the worked example
+const R = { ready: [180, 517], ready2: [330, 517], wait: [690, 517], wait2: [870, 517], ev1: [720, 347], ev2: [880, 347], prog1: [150, 347], prog2: [300, 347] };
+const at = id => [B[id].cx, B[id].cy + 4];
+const V = 'var(--violet)';
+const tev = (from, text, ms = 2600) => (async () => {
+  await packet(from, 'dec', V, .25);
+  bubble(text, 580, 790, '', ms);
+  await packet('dec', from, V, .25);
+})();
+const call = async (core, prov, color) => { await packet(core, 'lim', color, .1); await packet('lim', prov, color, .1); };
+
+
+// ------------------------------------------------------------------ observability: the trace this run leaves
+const SPANS = [
+  // [name, child?, kind, start%, end%, events [[at%, label]]]
+  ['task #1', false, 'root', 0, 100, [[22, 'recovered'], [52, ''], [58, 'migrated'], [74, '']]],
+  ['model · gemini', true, 'm', 2, 12, []],
+  ['tool weather_forecast', true, 't', 13, 26, [[20, 'kill -9 → 重发']]],
+  ['tool maps_search', true, 't', 13, 25, []],
+  ['tool tasks_list', true, 't', 13, 21, []],
+  ['model · gemini', true, 'm', 28, 34, []],
+  ['tool tasks_send', true, 'c2', 35, 38, []],
+  ['model · gemini ×3', true, 'x', 40, 52, [[46, '超时 · 退避']]],
+  ['model · claude', true, 'm', 60, 73, [[61, 'steer_delivered from task:#2']]],
+  ['model · claude', true, 'm', 76, 83, [[75, 'answer_rejected']]],
+  ['tool notes_write', true, 't', 84, 88, []],
+  ['model · claude', true, 'm', 89, 99, [[99, 'done · checked']]]
+];
+const TILES = [
+  ['8', 'neumann.model.calls'], ['6', 'neumann.tool.calls'], ['1 · 1', 'answers.checked 打回·通过'],
+  ['2', 'neumann.steers.delivered'], ['2', 'neumann.tasks.recovered'], ['1', 'group.transitions down']
+];
+async function observability() {
+  const wf = $('#wf'), tiles = $('#tiles');
+  wf.innerHTML = ''; tiles.innerHTML = '';
+  $('#ends').classList.remove('on'); tiles.classList.remove('on');
+  const rows = SPANS.map(([name, child, kind, a, b, evs]) => {
+    const nm = document.createElement('div'); nm.className = 'nm' + (child ? ' c' : ''); nm.textContent = name;
+    const tr = document.createElement('div'); tr.className = 'tr';
+    const bar = document.createElement('div'); bar.className = 'bar ' + kind; bar.style.left = a + '%';
+    tr.appendChild(bar);
+    const marks = evs.map(([at, label]) => {
+      const ev = document.createElement('div'); ev.className = 'ev'; ev.style.left = at + '%';
+      const l = document.createElement('div'); l.className = 'evl'; l.textContent = label; if (!label) l.style.display = 'none';
+      if (at > 70) { l.style.right = (100 - at) + '%'; l.style.marginRight = '8px'; } else { l.style.left = at + '%'; l.style.marginLeft = '8px'; }
+      tr.appendChild(ev); tr.appendChild(l);
+      return [ev, l];
+    });
+    wf.appendChild(nm); wf.appendChild(tr);
+    return { bar, w: b - a, marks };
+  });
+  for (const [v, k] of TILES) {
+    const t = document.createElement('div'); t.className = 'tile';
+    t.innerHTML = '<b></b><span></span>'; t.firstChild.textContent = v; t.lastChild.textContent = k;
+    tiles.appendChild(t);
+  }
+  $('#obs').classList.add('on');
+  hl([]);
+  let w = await beat('◎', '可观测性：每次提交都带事件，事件有序号。observe 的 Tracer 从事件重建 trace，一个任务一棵树：模型调用、工具调用是子 span。', [], '');
+  for (const r of rows) { r.bar.style.width = r.w + '%'; await sleep(260); }
+  await w();
+  w = await beat('◎', '重试、熔断、迁移、插话送达、答案打回，都是 span 上的事件。起止用事件的提交时间，所以 kill -9 之后从 seq 0 重放日志，导出的 span 和在线时一样。', [], '');
+  for (const r of rows) for (const [ev, l] of r.marks) { ev.classList.add('on'); l.classList.add('on'); await sleep(320); }
+  await w();
+  w = await beat('◎', '指标走 OpenTelemetry，名字都以 neumann. 开头；一个 observe.NewHandler 挂上 /events、/status、/metrics 和 pprof，也能用 OTLP 导出到任何后端。', [], '');
+  tiles.classList.add('on'); await sleep(600); $('#ends').classList.add('on');
+  await w();
+  $('#obs').classList.remove('on');
+  await sleep(600);
+}
+
+async function story() {
+  const t1 = token(1), t2 = token(2);
+  let w;
+  // 1 route and submit #1
+  place(t1, R.prog1);
+  w = await beat(1, '提交前，你的程序先问决策协处理器 tev：“这个请求交给哪个执行组？”它一次前向就答：多步、要调工具，交给执行组 A。', ['prog', 'dec']);
+  await tev(R.prog1, 'tev → 执行组 A');
+  await w();
+  w = await beat(1, '你的程序带着 Class 提交任务 #1：“规划成都周末一日游，存进笔记”。TCB 先提交，Submit 才返回。', ['prog', 'store']);
+  await packet(R.prog1, 'store', C[1], .25); commit(); emit();
+  await move(t1, R.ready); await w();
+
+  // 2 first model call; #2 arrives meanwhile
+  w = await beat(2, '空闲的 vCore 取走 #1。一条指令就是一次模型调用：先在限流器预占额度，提交 Running，再请求 Gemini。', ['A1', 'lim', 'pA']);
+  B.A1.g.classList.add('busy1');
+  await move(t1, at('A1'));
+  await call('A1', 'pA', C[1]);
+  bubble('规划中……', 880, 590, '', 2400);
+  await w();
+  w = await beat('+', 'Gemini 还在规划 #1，另一个用户的任务 #2 进来了：“明天成都限行尾号？”。tev 也把它交给执行组 A，另一个 vCore 取走它，和 #1 并行。', ['prog', 'dec', 'A2'], 't2');
+  const second = (async () => {
+    place(t2, R.prog2);
+    bubble('明天成都限行尾号？', 300, 205, '', 2600);
+    await tev(R.prog2, 'tev → 执行组 A', 2000);
+    await packet(R.prog2, 'store', C[2], .25); commit(); emit();
+    await move(t2, R.ready2);
+    B.A2.g.classList.add('busy2');
+    await move(t2, at('A2'));
+    await call('A2', 'pA', C[2]);
+    bubble('调 traffic_rules', 880, 760, '', 2200);
+    await packet('pA', 'A2', C[2], -.12); grow();
+    await packet('A2', 'store', C[2], .15); commit(); emit();
+    B.A2.g.classList.remove('busy2');
+    await move(t2, R.wait2);
+    await packet('A2', 'bus', C[2], .25); await packet('bus', 'd2', C[2], -.12);
+  })();
+  await sleep(1600);
+  bubble('先查天气、景点，再看看有没有相关任务', 880, 590, '', 3400);
+  await packet('pA', 'A1', C[1], -.12); grow();
+  await Promise.all([second, w()]);
+  await (await beat('+', '#2 要查交通规则（只读工具），调用记录写成 dispatched，转等待 IO。它的 vCore 空出来了，工具在 MCP 设备上慢慢跑。', ['wait', 'd2'], 't2'))();
+
+  // 3 three read-only tools
+  w = await beat(3, 'Gemini 要 #1 并行调三个只读工具：weather_forecast、maps_search 和 tasks_list。只读不用问协处理器，三条调用记录一次提交成 dispatched。', ['store', 'wait']);
+  await packet('A1', 'store', C[1], .15); commit(); emit(3);
+  B.A1.g.classList.remove('busy1');
+  await move(t1, R.wait); await w();
+
+  // 4 dispatch, kill -9, recovery
+  w = await beat(4, '工具经总线派发：查页表、L2 缓存，再进设备队列。weather 和 maps 去 MCP，tasks_list 去 tasks 设备。', ['bus', 'd2', 'd3']);
+  await packet('A1', 'bus', C[1], .25);
+  await Promise.all([packet('bus', 'd2', C[1], .12), packet('bus', 'd2', C[1], -.12), packet('bus', 'd3', C[1], -.1)]);
+  await w();
+  await crash('重启：Start 从持久化存储读回两个任务和它们的调用记录。都是只读工具，用同一个幂等键再发一次。');
+  await packet('store', 'bus', C.g, .15);
+  await Promise.all([packet('bus', 'd2', C[1], .12), packet('bus', 'd2', C[1], -.12), packet('bus', 'd3', C[1], -.1), packet('bus', 'd2', C[2], .2)]);
+  await sleep(2200);
+
+  // 5 results
+  w = await beat(5, '三个结果各自提交。tasks_list 看见同组还有一个 #2 在查限行。最后一个完成时像中断，#1 回到就绪队列。', ['store', 'ready']);
+  bubble('周六小雨 · 周日晴', 280, 946, 'green', 3400);
+  await packet('d2', 'store', C.g, -.15); commit(); emit();
+  bubble('博物馆 · 大熊猫基地', 280, 1010, 'green', 3400);
+  await packet('d2', 'store', C.g, -.15); commit(); emit();
+  bubble('#2 · 明天成都限行尾号？ · 等 IO', 445, 1060, 'green', 3600, 'end');
+  await packet('d3', 'store', C.g, -.2); commit(); emit();
+  await packet('store', R.wait, C.g, .12);
+  await move(t1, R.ready); await w();
+
+  // 6 tasks_send, gated by the policy
+  w = await beat(6, 'Gemini 让 #1 给 #2 发消息：tasks_send(#2, “查到周六限不限行告诉我”)。它不是只读工具，派发前 ToolPolicy 问 tev：普通消息，放行。', ['A1', 'dec']);
+  B.A1.g.classList.add('busy1');
+  await move(t1, at('A1'));
+  await call('A1', 'pA', C[1]);
+  await packet('pA', 'A1', C[1], -.12); grow();
+  await tev('A1', 'tev：普通消息 · 放行');
+  await packet('A1', 'store', C[1], .15); commit(); emit();
+  B.A1.g.classList.remove('busy1');
+  await move(t1, R.wait); await w();
+  w = await beat(7, 'tasks_send 走总线到 tasks 设备。设备带着这次调用的幂等键，把消息作为“来自 task:#1”的插话提交进 #2 的中断表。重启重发也只送达一次。', ['bus', 'd3', 'store']);
+  await packet('A1', 'bus', C[1], .2); await packet('bus', 'd3', C[1], .1);
+  await packet('d3', 'store', C[1], -.2); commit();
+  bubble('#2 的中断表：来自 task:#1', 800, 950, '', 3000);
+  await packet('d3', 'store', C.g, -.25); commit(); emit();
+  await move(t1, R.ready); await w();
+
+  // 8 #2 gets the message, framed as not from its user, and replies
+  w = await beat('+', '#2 的交通规则查回来了。下一条指令开头送达 #1 的消息：明确标着来自另一个任务、不是 #2 的用户，只当参考。steer_delivered 和这一步一起提交。', ['d2', 'A2', 'store'], 't2');
+  await packet('d2', 'store', C.g, -.15); commit(); emit();
+  await move(t2, R.ready2);
+  B.A2.g.classList.add('busy2');
+  await move(t2, at('A2'));
+  bubble('[来自 task:#1，不是你的用户] > 查到周六…', 60, 600, '', 3600, 'start');
+  await call('A2', 'pA', C[2]);
+  await packet('pA', 'A2', C[2], -.12); grow(); emit();
+  await w();
+  w = await beat('+', 'Gemini 让 #2 用 tasks_send 回复 #1：“周六尾号 3 和 8”，同样先问 tev、先提交再派发；然后回答自己的用户。#2 完成。', ['A2', 'd3', 'events'], 't2');
+  await tev('A2', 'tev：普通消息 · 放行', 2000);
+  await packet('A2', 'store', C[2], .15); commit(); emit();
+  await packet('A2', 'bus', C[2], .2); await packet('bus', 'd3', C[2], .1);
+  await packet('d3', 'store', C[2], -.2); commit(); emit();
+  await call('A2', 'pA', C[2]);
+  bubble('尾号 3 和 8', 880, 760, 'green', 2400);
+  await packet('pA', 'A2', C[2], -.12); grow();
+  await packet('A2', 'store', C[2], .15); commit();
+  B.A2.g.classList.remove('busy2');
+  await packet('store', 'events', C.g, -.2); emit(2);
+  await move(t2, R.ev2); t2.style.opacity = 0;
+  await w();
+
+  // 9 Gemini times out, breaker opens, #1 migrates to Claude
+  w = await beat(8, '#1 下一条指令再请求 Gemini，可它一直超时，每次失败都退避等待。连续 5 次临时失败，执行组 A 熔断打开。', ['A1', 'pA', 'gA'], 'bad');
+  B.A1.g.classList.add('busy1');
+  await move(t1, at('A1'));
+  for (let i = 0; i < 3; i++) {
+    await packet('A1', 'pA', C[1], .1);
+    bubble('超时', 880, 600, 'red', 1200);
+    await packet('pA', 'A1', C.r, -.12);
+    if (i === 0) { B.A1.g.classList.remove('busy1'); await move(t1, R.wait); }
+  }
+  B.gA.g.classList.add('down');
+  bubble('熔断 · 30 秒后探测', 240, 598, 'red', 4000);
+  await w();
+  w = await beat(9, '#1 没有钉住执行组，沿 Fallback 链迁到执行组 B：Claude 支持工具、工具数量够、上下文放得下。新 Class 和 migrated 事件一次提交。', ['gB', 'store']);
+  await move(t1, R.ready);
+  await packet(R.ready, 'store', C[1], .2); commit(); emit();
+  B.B1.g.classList.add('busy1');
+  await move(t1, at('B1')); await w();
+
+  // 10 Claude receives #2's reply, answers with only a plan; the answer check rejects it
+  w = await beat(10, 'Claude 接着同一份寄存器做，去掉了 Gemini 的推理块；#2 的回复也在这一步送达。它的第一个答案只是计划：“我会把行程整理好存进笔记……”', ['B1', 'pB']);
+  bubble('[来自 task:#2] > 周六尾号 3 和 8', 240, 800, '', 3200);
+  await call('B1', 'pB', C[1]);
+  bubble('我会把行程整理好存进笔记……', 880, 772, '', 3200);
+  await packet('pB', 'B1', C[1], -.12); emit();
+  await w();
+  w = await beat(11, '答案校验：任务完成前，Config.AnswerCheck 问 tev“这是不是只有计划？”是，打回。答案、反馈和 answer_rejected 一次提交，#1 回就绪队列再来一步。', ['B1', 'dec', 'store'], 'bad');
+  await tev('B1', 'tev：只有计划 · 打回', 2800);
+  await packet('B1', 'store', C[1], .15); commit(); emit();
+  B.B1.g.classList.remove('busy1');
+  await move(t1, R.ready); await w();
+
+  // 11 notes_write gated, then the real answer passes
+  w = await beat(12, '看到反馈，Claude 真去做：调 notes_write。派发前 ToolPolicy 问 tev：可撤销，放行；结论跟 dispatched 一起提交，再派发到 builtin。', ['B1', 'dec', 'd1']);
+  B.B1.g.classList.add('busy1');
+  await move(t1, at('B1'));
+  await call('B1', 'pB', C[1]);
+  await packet('pB', 'B1', C[1], -.12);
+  await tev('B1', 'tev：可撤销 · 放行');
+  await packet('B1', 'store', C[1], .15); commit(); emit();
+  B.B1.g.classList.remove('busy1');
+  await move(t1, R.wait);
+  await packet('B1', 'bus', C[1], .2); await packet('bus', 'd1', C[1], .1);
+  bubble('已保存 note-42', 115, 1060, 'green', 2800);
+  await packet('d1', 'store', C.g, -.2); commit(); emit();
+  await move(t1, R.ready); await w();
+  w = await beat(13, 'Claude 给出最终答案，答案校验再问一次 tev：通过。answer、done（checked）和终态一次提交，事件流回你的程序。', ['B1', 'dec', 'events'], 'good');
+  B.B1.g.classList.add('busy1');
+  await move(t1, at('B1'));
+  await call('B1', 'pB', C[1]);
+  bubble('行程已存进笔记：周六尾号 3、8 限行……', 880, 772, 'green', 3000);
+  await packet('pB', 'B1', C[1], -.12);
+  await tev('B1', 'tev：通过', 2000);
+  await packet('B1', 'store', C[1], .15); commit();
+  B.B1.g.classList.remove('busy1');
+  await packet('store', 'events', C.g, -.2); emit(2);
+  await move(t1, R.ev1); t1.style.opacity = 0;
+  await w();
+
+  await observability();
+  w = await beat('✓', '回顾：两个任务互发消息、两个模型接力、协处理器管路由、把关和答案校验，中间还挨了一次 kill -9。每一步都先提交再动作，也都留在事件和 trace 里。', [], 'good');
+  B.gA.g.classList.remove('down');
+  await w();
+  await sleep(1500);
+  t1.remove(); t2.remove();
+}
+
+// ------------------------------------------------------------------ layout & loop
+function layout() {
+  const s = Math.min(window.innerWidth / 1080, window.innerHeight / 1440) * (window.innerWidth > 700 ? .96 : 1);
+  const f = $('#frame');
+  f.style.width = 1080 * s + 'px'; f.style.height = 1440 * s + 'px';
+  card.style.transform = `scale(${s})`;
+}
+window.addEventListener('resize', layout);
+layout();
+commitText.textContent = '已提交 0 次'; seqText.textContent = 'seq 0'; showW();
+(document.fonts ? document.fonts.ready : Promise.resolve()).then(async () => {
+  for (;;) {
+    commits = 0; seq = 0; W = 2; showW(); commitText.textContent = '已提交 0 次'; seqText.textContent = 'seq 0';
+    if (new URLSearchParams(location.search).has('obs')) await observability();
+    await story();
+  }
+});
+})();
+</script>
+</body>
+</html>

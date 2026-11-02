@@ -1,0 +1,1387 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>neumann 拆解</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
+<style>
+/* A teaching card series: every slide is a 1080x1440 (3:4) card for Xiaohongshu.
+   One light look everywhere: a pale blue-grey studio around white panels, so the page and the recordings match. */
+:root {
+  --studio: #E6ECF2; --panel: #FFFFFF; --panel-line: #D3DCE5; --studio-ink: #13212D; --studio-muted: #5F6F7C;
+  --paper: #EDF1F5; --card: #FFFFFF; --ink: #0F1C27; --muted: #5A6976;
+  --blue: #2350E3; --blue-soft: #DEE6FF;
+  --amber: #E09200; --amber-soft: #FFF0C9;
+  --red: #D23A3A; --red-soft: #FBDCDC;
+  --green: #13865A; --green-soft: #D5F0E3;
+  --code: #142230; --code-ink: #DCE6EF;
+  --sans: "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--studio); color: var(--studio-ink); font-family: var(--sans); font-size: 14px; }
+button { font-family: inherit; }
+button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+.app { display: grid; grid-template-columns: 250px minmax(0, 1fr) 360px; height: 100%; }
+.side, .copy { background: var(--panel); border-color: var(--panel-line); overflow-y: auto; padding: 20px 16px; }
+.side { border-right: 1px solid var(--panel-line); }
+.copy { border-left: 1px solid var(--panel-line); display: grid; align-content: start; gap: 14px; }
+.brand { font: 900 20px var(--sans); margin: 0 0 4px; }
+.brand-sub { color: var(--studio-muted); font-size: 12px; margin: 0 0 18px; line-height: 1.5; }
+.eps { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.eps button { width: 100%; text-align: left; background: transparent; border: 0; color: var(--studio-muted); padding: 8px 10px; border-radius: 8px; cursor: pointer; display: grid; grid-template-columns: 28px 1fr; gap: 6px; font-size: 14px; line-height: 1.4; }
+.eps button:hover { color: var(--studio-ink); background: #EEF2F6; }
+.eps button[aria-current="true"] { color: var(--blue); background: var(--blue-soft); font-weight: 700; }
+.eps .no { font: 700 12px var(--mono); padding-top: 2px; }
+
+.main { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-width: 0; min-height: 0; padding: 16px; gap: 12px; }
+.stagewrap { min-height: 0; display: grid; place-items: center; }
+.frame { position: relative; overflow: hidden; border-radius: 10px; box-shadow: 0 6px 30px rgba(30,50,70,.16); }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; align-items: center; }
+.ctl { background: var(--panel); color: var(--studio-ink); border: 1px solid var(--panel-line); border-radius: 10px; padding: 8px 14px; font-size: 14px; cursor: pointer; min-height: 40px; }
+.ctl:hover { border-color: var(--studio-muted); }
+.ctl.primary { background: var(--blue); border-color: var(--blue); color: #FFFFFF; }
+.where { color: var(--studio-muted); font: 500 12px var(--mono); min-width: 110px; text-align: center; }
+
+.copy h2 { font: 700 15px var(--sans); margin: 0; }
+.copy .hint { color: var(--studio-muted); font-size: 12px; line-height: 1.6; margin: 0; }
+.field { display: grid; gap: 6px; }
+.field .lab { display: flex; justify-content: space-between; align-items: center; color: var(--studio-muted); font-size: 12px; }
+.field pre { margin: 0; white-space: pre-wrap; word-break: break-word; background: #F4F7FA; border: 1px solid var(--panel-line); border-radius: 8px; padding: 10px 12px; font: 14px/1.7 var(--sans); color: var(--studio-ink); }
+.mini { background: var(--panel); min-height: 30px; border: 1px solid var(--panel-line); color: var(--studio-ink); border-radius: 6px; font-size: 12px; padding: 2px 8px; cursor: pointer; }
+.cmd { font: 12px/1.6 var(--mono); color: var(--studio-muted); background: #F4F7FA; white-space: pre-wrap; border: 1px dashed var(--panel-line); border-radius: 8px; padding: 8px 10px; word-break: break-all; }
+
+/* ---------- the card: 1080 x 1440 ---------- */
+.card { position: absolute; left: 0; top: 0; width: 1080px; height: 1440px; transform-origin: 0 0; background: var(--paper); color: var(--ink); font-family: var(--sans); overflow: hidden; }
+.card .kick { position: absolute; left: 64px; top: 50px; font: 700 34px var(--mono); color: var(--blue); letter-spacing: .02em; }
+.card .ttl { position: absolute; left: 56px; right: 56px; top: 100px; margin: 0; font: 900 64px/1.14 var(--sans); letter-spacing: -.01em; text-wrap: balance; }
+.card svg.stage { position: absolute; left: 0; top: 270px; width: 1080px; height: 870px; overflow: visible; }
+.card .say { position: absolute; left: 40px; right: 40px; top: 1150px; height: 210px; background: var(--card); border-radius: 26px; padding: 20px 34px; font: 500 43px/1.42 var(--sans); overflow: hidden; display: flex; align-items: center; }
+.card .say span { display: block; transition: opacity .35s; }
+.card .foot { position: absolute; left: 64px; right: 64px; top: 1376px; display: flex; justify-content: space-between; align-items: center; font: 500 24px var(--mono); color: var(--muted); }
+.card .dots { display: flex; gap: 8px; }
+.card .dots i { width: 34px; height: 8px; border-radius: 4px; background: #C9D3DC; }
+.card .dots i.on { background: var(--blue); }
+.card .stamp { position: absolute; left: 50%; top: 640px; transform: translate(-50%, -50%) rotate(-7deg) scale(.6); font: 900 150px var(--mono); color: var(--red); border: 12px solid var(--red); border-radius: 26px; padding: 6px 40px; opacity: 0; pointer-events: none; background: rgba(255,255,255,.75); }
+.card .stamp.go { animation: stamp 1.9s ease-out forwards; }
+@keyframes stamp { 0% { opacity: 0; transform: translate(-50%,-50%) rotate(-7deg) scale(1.6); } 15% { opacity: 1; transform: translate(-50%,-50%) rotate(-7deg) scale(1); } 70% { opacity: 1; } 100% { opacity: 0; } }
+
+/* svg primitives */
+.box rect.body { fill: var(--card); stroke: var(--ink); stroke-width: 3; transition: fill .4s, stroke .4s, stroke-width .3s; }
+.box text.t { font: 700 34px var(--sans); fill: var(--ink); }
+.box text.s { font: 400 23px var(--sans); fill: var(--muted); }
+.box.k-core rect.body { fill: var(--blue-soft); stroke: var(--blue); }
+.box.k-store rect.body { fill: #E3EAF1; }
+.box.k-store line.lid { stroke: var(--ink); stroke-width: 2; opacity: .5; }
+.box.k-ext rect.body { stroke-dasharray: 12 8; }
+.box.k-dev rect.body { fill: var(--amber-soft); stroke: #8A6200; }
+.box.k-good rect.body { fill: var(--green-soft); stroke: var(--green); }
+.box.k-bad rect.body { fill: var(--red-soft); stroke: var(--red); }
+.box.k-plain rect.body { fill: #E2E8EE; stroke: #9AA8B4; }
+.box.k-note rect.body { fill: transparent; stroke: none; }
+.box.k-note text.t { font-weight: 900; }
+.box.k-code rect.body { fill: var(--code); stroke: none; }
+.box.k-code text.t { font: 500 30px var(--mono); fill: var(--code-ink); }
+.box.k-code text.s { font: 500 22px var(--mono); fill: #8EA2B5; }
+.box.mono text.t { font-family: var(--mono); font-weight: 700; }
+.box.on rect.body { stroke: var(--blue); stroke-width: 7; }
+.box.on.k-code rect.body { fill: #1F3A5C; stroke: none; }
+.box.hot rect.body { fill: var(--amber-soft); stroke: var(--amber); stroke-width: 7; }
+.box.hot.k-code rect.body { fill: #4A3A10; }
+.box.sgood rect.body { fill: var(--green-soft); stroke: var(--green); stroke-width: 7; }
+.box.sbad rect.body { fill: var(--red-soft); stroke: var(--red); stroke-width: 7; }
+.el { transition: opacity .5s; }
+.el.gone { opacity: 0; }
+.el.dim { opacity: .18; }
+.edge { fill: none; stroke: #8796A3; stroke-width: 3.5; transition: stroke .3s; }
+.edge.dash { stroke-dasharray: 10 8; }
+.edge.hot { stroke: var(--blue); }
+.ah { fill: #8796A3; }
+.elab { font: 500 27px var(--sans); fill: var(--muted); paint-order: stroke; stroke: var(--paper); stroke-width: 8px; stroke-linejoin: round; }
+.pk { fill: var(--blue); }
+.pk.c-hot { fill: var(--amber); } .pk.c-bad { fill: var(--red); } .pk.c-good { fill: var(--green); }
+.pkh { fill: var(--blue); opacity: .25; }
+.pkh.c-hot { fill: var(--amber); } .pkh.c-bad { fill: var(--red); } .pkh.c-good { fill: var(--green); }
+.tok { transition: transform .95s cubic-bezier(.6,.05,.3,1); }
+.tok rect { fill: var(--ink); }
+.tok text { font: 700 31px var(--mono); fill: #FFFFFF; }
+.txt { font: 500 26px var(--sans); fill: var(--muted); }
+.plot .axis { stroke: var(--ink); stroke-width: 3; fill: none; }
+.plot .grid { stroke: #CDD6DE; stroke-width: 1.5; }
+.plot .line { stroke: var(--blue); stroke-width: 6; fill: none; stroke-linejoin: round; stroke-linecap: round; transition: stroke-dashoffset 1.3s ease; }
+.plot .lab { font: 500 29px var(--mono); fill: var(--muted); }
+.instant, .instant * { transition: none !important; }
+
+/* record / still: only the card, fitted to the window */
+body.rec .app { grid-template-columns: 1fr; }
+body.rec .side, body.rec .copy, body.rec .controls { display: none; }
+body.rec .main { padding: 0; grid-template-rows: 1fr; height: 100vh; height: 100dvh; }
+body.rec .app { height: 100vh; height: 100dvh; }
+body.rec { background: var(--paper); }
+body.rec .frame { border-radius: 0; box-shadow: none; }
+
+/* default continuous mode: card + table of contents */
+.tocbtn { display: none; }
+.slides { list-style: none; margin: 2px 0 8px 34px; padding: 0; display: grid; gap: 1px; }
+.slides button { width: 100%; text-align: left; background: transparent; border: 0; color: var(--studio-muted); padding: 5px 8px; border-radius: 6px; cursor: pointer; font-size: 13px; line-height: 1.45; display: grid; grid-template-columns: 22px 1fr; }
+.slides button:hover { color: var(--studio-ink); background: #EEF2F6; }
+.slides button[aria-current="true"] { color: var(--ink); background: var(--amber-soft); font-weight: 700; }
+.slides .sn { font: 500 11px var(--mono); padding-top: 2px; }
+body.loop { background: var(--studio); }
+body.loop .app { grid-template-columns: 300px minmax(0, 1fr); height: 100vh; height: 100dvh; }
+body.loop .copy, body.loop .controls { display: none; }
+body.loop .main { grid-template-rows: 1fr; padding: 16px; height: 100vh; height: 100dvh; }
+body.loop .side { height: 100vh; height: 100dvh; }
+@media (max-width: 900px) {
+  body.loop .app { grid-template-columns: minmax(0, 1fr); }
+  body.loop .main { padding: 8px; }
+  body.loop .side { position: fixed; inset: 0 auto 0 0; width: min(86vw, 340px); z-index: 20; transform: translateX(-102%); transition: transform .3s ease; box-shadow: 0 0 40px rgba(20,40,60,.25); padding-top: calc(66px + env(safe-area-inset-top, 0px)); }
+  body.loop.tocopen .side { transform: none; }
+  body.loop .tocbtn { display: block; position: fixed; z-index: 30; top: calc(10px + env(safe-area-inset-top, 0px)); left: 10px; background: var(--panel); color: var(--studio-ink); border: 1px solid var(--panel-line); border-radius: 22px; padding: 9px 16px; font-size: 15px; font-weight: 700; box-shadow: 0 4px 16px rgba(20,40,60,.15); min-height: 44px; }
+  body.loop .scrim { position: fixed; inset: 0; background: rgba(20,35,50,.28); z-index: 15; }
+}
+
+@media (max-width: 1180px) {
+  .app { grid-template-columns: minmax(0, 1fr); height: auto; }
+  .side { border: 0; border-bottom: 1px solid var(--panel-line); padding: 12px 16px; position: sticky; top: 0; z-index: 5; }
+  .brand-sub { display: none; }
+  .brand { font-size: 17px; margin-bottom: 8px; }
+  .eps { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  .eps::-webkit-scrollbar { display: none; }
+  body.loop .eps { display: grid; overflow: visible; }
+  body.loop .eps button { white-space: normal; border: 0; grid-template-columns: 28px 1fr; }
+  .eps li { flex: 0 0 auto; }
+  .eps button { grid-template-columns: auto auto; white-space: nowrap; border: 1px solid var(--panel-line); padding: 8px 12px; min-height: 40px; }
+  .main { grid-template-rows: auto auto; padding: 12px 16px; }
+  .controls { position: sticky; bottom: 0; z-index: 5; background: rgba(230,236,242,.94); backdrop-filter: blur(8px); padding: 10px 0 calc(10px + env(safe-area-inset-bottom, 0px)); }
+  .where { order: -1; width: 100%; }
+  .copy { border: 0; border-top: 1px solid var(--panel-line); padding: 18px 16px 32px; }
+}
+@media (max-width: 520px) {
+  .ctl { padding: 8px 10px; font-size: 13px; }
+  #rec, #speed { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .tok, .plot .line, .el, .box rect.body { transition: none; }
+}
+</style>
+</head>
+<body>
+<button class="tocbtn" id="tocbtn" aria-expanded="false" aria-controls="side">目录</button>
+<div class="scrim" id="scrim" hidden></div>
+<div class="app">
+  <nav class="side" id="side" aria-label="目录">
+    <p class="brand">neumann 拆解</p>
+    <p class="brand-sub">一个按冯·诺依曼计算机组织的 Go Agent 运行时。每页是一张 1080×1440 的卡片。手机上左右滑动翻页。</p>
+    <ol class="eps" id="eps"></ol>
+  </nav>
+
+  <main class="main">
+    <div class="stagewrap" id="stagewrap">
+      <div class="frame" id="frame">
+        <div class="card" id="card">
+          <div class="kick" id="kick"></div>
+          <h1 class="ttl" id="ttl"></h1>
+          <svg class="stage" id="stage" viewBox="0 0 1080 870" aria-hidden="true"></svg>
+          <div class="say"><span id="say"></span></div>
+          <div class="foot"><span>neumann · Go 写的 Agent 运行时</span><span class="dots" id="dots"></span><span id="page"></span></div>
+          <div class="stamp" id="stamp"></div>
+        </div>
+      </div>
+    </div>
+    <div class="controls">
+      <button class="ctl" id="prev">上一页</button>
+      <button class="ctl primary" id="play">暂停</button>
+      <button class="ctl" id="next">下一页</button>
+      <span class="where" id="where"></span>
+      <button class="ctl" id="still" title="跳到这一页的最终状态，用来截图做图文">定格</button>
+      <button class="ctl" id="replay">重放本页</button>
+      <button class="ctl" id="speed">1×</button>
+      <button class="ctl" id="rec" title="只留卡片，从第一页自动播完整集，用来录屏">录制模式</button>
+    </div>
+  </main>
+
+  <aside class="copy" aria-label="笔记文案">
+    <h2>这一集的笔记文案</h2>
+    <p class="hint">正文里不放链接。话题在小红书里逐个输入：每个 # 前先打空格，等联想出来再回车。</p>
+    <div class="field"><div class="lab"><span>标题</span><button class="mini" data-copy="c-title">复制</button></div><pre id="c-title"></pre></div>
+    <div class="field"><div class="lab"><span>正文</span><button class="mini" data-copy="c-body">复制</button></div><pre id="c-body"></pre></div>
+    <div class="field"><div class="lab"><span>话题</span><button class="mini" data-copy="c-tags">复制</button></div><pre id="c-tags"></pre></div>
+    <div class="field"><div class="lab"><span>录屏 / 截图用的地址参数</span></div><div class="cmd" id="c-urls"></div></div>
+  </aside>
+</div>
+
+<script>
+(() => {
+'use strict';
+// ------------------------------------------------------------------ authoring helpers
+const B = (id, x, y, w, h, t, s = '', k = '', o = {}) => ({ type: 'box', id, x, y, w, h, t, s, k, ...o });
+const E = (id, a, b, o = {}) => ({ type: 'edge', id, a, b, ...o });
+const T = (id, at, label, o = {}) => ({ type: 'token', id, at, label, ...o });
+const X = (id, x, y, t, o = {}) => ({ type: 'text', id, x, y, t, ...o });
+const P = (id, x, y, w, h, vals, max, o = {}) => ({ type: 'plot', id, x, y, w, h, vals, max, ...o });
+const range = (p, a, b) => Array.from({ length: b - a + 1 }, (_, i) => p + (a + i));
+
+// a two-column table: left term -> right meaning
+function table(items, o = {}) {
+  const y0 = o.y0 ?? 10, h = o.h ?? 70, gap = o.gap ?? 8, lw = o.lw ?? 330, lx = 40, rx = lx + lw + 40, rw = 1040 - rx;
+  const els = [];
+  items.forEach(([l, r, rs = ''], i) => {
+    const y = y0 + i * (h + gap);
+    els.push(B('l' + (i + 1), lx, y, lw, h, l, '', o.lk ?? 'plain', { hidden: !o.shown, ts: o.lts ?? 30 }));
+    els.push(B('r' + (i + 1), rx, y, rw, h, r, rs, o.rk ?? 'core', { hidden: !o.shown, ts: o.rts ?? 30, ss: o.rss ?? 22 }));
+    els.push(E('a' + (i + 1), 'l' + (i + 1), 'r' + (i + 1), { hidden: !o.shown }));
+  });
+  return els;
+}
+const both = (...ns) => ns.flatMap(n => ['l' + n, 'r' + n, 'a' + n]);
+// a vertical list of full-width rows
+function rows(items, o = {}) {
+  const y0 = o.y0 ?? 10, h = o.h ?? 100, gap = o.gap ?? 18, x = o.x ?? 40, w = o.w ?? 1000;
+  const els = items.map(([t, s, k = '', extra = {}], i) =>
+    B('r' + (i + 1), x, y0 + i * (h + gap), w, h, t, s, k, { hidden: !!o.hidden, ...extra }));
+  if (o.edges) for (let i = 1; i < items.length; i++) els.push(E('e' + i, 'r' + i, 'r' + (i + 1), { hidden: !!o.hidden }));
+  return els;
+}
+
+// ------------------------------------------------------------------ the series
+const EP = [
+// ============================================================ 01
+{ title: '把 Agent 做成一台计算机',
+  copy: {
+    title: '把 Agent 做成一台计算机',
+    body: `我用 Go 写了一个常驻的 Agent 运行时，叫 neumann。结构照着冯·诺依曼计算机来：
+
+· vCore 是核心，一条指令就是一次模型调用
+· 每个任务有一个 TCB，发给模型的消息就是寄存器
+· 工具挂在总线上，异步执行，做完发中断
+· 所有状态提交进持久化存储：先提交，后动作
+
+这个系列一集拆一块，每一集都对着源码讲。第一集先看整台机器长什么样、一个任务怎么从提交走到完成。`,
+    tags: '#Go语言 #AIAgent #大模型应用 #后端开发 #程序员 #系统设计 #计算机组成原理'
+  },
+  slides: [
+  { title: '一个按计算机组织的 Agent 运行时',
+    scene: [
+      B('io', 40, 10, 1000, 100, '协议端口', 'Instruction 进 · Event 出', 'ext'),
+      B('sched', 40, 180, 290, 150, '调度器', '就绪队列\n等待集合'),
+      B('v1', 370, 180, 210, 150, 'vCore 1', '取指·执行·提交', 'core', { ts: 32, ss: 21 }),
+      B('v2', 600, 180, 210, 150, 'vCore 2', '取指·执行·提交', 'core', { ts: 32, ss: 21 }),
+      B('v3', 830, 180, 210, 150, 'vCore 3', '取指·执行·提交', 'core', { ts: 32, ss: 21 }),
+      B('model', 40, 410, 480, 120, '模型服务商', 'OpenAI 兼容 · Anthropic', 'ext'),
+      B('bus', 560, 410, 480, 120, '总线', '页表 · 仲裁 · L2 缓存'),
+      B('d1', 560, 590, 150, 90, 'builtin', '', 'dev', { ts: 28 }),
+      B('d2', 725, 590, 150, 90, 'MCP', '', 'dev', { ts: 28 }),
+      B('d3', 890, 590, 150, 90, 'skills', '', 'dev', { ts: 28 }),
+      B('mem', 40, 750, 1000, 100, '持久化存储', 'TCB · 调用记录 · 中断 · 事件，同一个事务', 'store'),
+      E('in', 'io', 'sched'), E('s1', 'sched', 'v1'), E('vm', 'v1', 'model'), E('vb', 'v3', 'bus'),
+      E('b1', 'bus', 'd1'), E('b2', 'bus', 'd2'), E('b3', 'bus', 'd3'),
+      E('mm', 'model', 'mem'), E('dm', 'd2', 'mem'),
+      E('out', 'mem', 'io', { d: 'M40 800 C6 800, 6 60, 40 60' })
+    ],
+    beats: [
+      { on: ['io'], send: ['in'], say: 'neumann 是一个用 Go 写的常驻 Agent 运行时。外部只用两种结构和它交换：Instruction 进，Event 出。' },
+      { on: ['sched', 'v1', 'v2', 'v3'], send: ['s1'], say: '调度器管排队，vCore 干活。vCore 是一个 goroutine，不停地取指、执行、提交。' },
+      { on: ['v1', 'model'], send: ['vm', { e: 'vm', rev: true, delay: 900 }], say: '一条指令就是一次模型调用。每个服务商是一个执行组，组里的 vCore 数随负载伸缩。' },
+      { on: ['bus', 'd1', 'd2', 'd3'], send: ['vb', { e: 'b1', delay: 800 }, { e: 'b2', delay: 800 }], say: '工具像外设，挂在总线上。工具调用异步执行，做完用中断唤醒任务，慢工具不占核心。' },
+      { on: ['mem'], send: ['mm', 'dm'], say: '所有状态提交进持久化存储：任务、调用记录、中断、事件，放在同一个事务里。' },
+      { hot: ['mem'], send: [{ e: 'out', c: 'hot' }], say: '先提交，后动作。所以进程被 kill -9 之后，重启就能接着跑。' }
+    ] },
+  { title: '计算机里的部件，这里都能对上',
+    scene: table([
+      ['核心', 'vCore：无状态的 goroutine'],
+      ['指令', '一次模型调用，或一批工具派发'],
+      ['进程 PCB', '任务 TCB'],
+      ['寄存器', '发给模型的那串消息'],
+      ['调度器', '就绪队列 + 等待集合 + 定时器'],
+      ['总线 / 外设', 'Bus / builtin · MCP · skills'],
+      ['DMA + 中断', '异步工具调用，完成发中断'],
+      ['预写日志', '工具调用记录'],
+      ['L1 / L2 缓存', 'prompt cache / 只读工具结果缓存'],
+      ['主存', '持久化存储'],
+      ['MMU', '每个任务的工具权限表']
+    ]),
+    beats: [
+      { show: both(1, 2), on: ['r1', 'r2'], say: '核心对应 vCore，指令对应一次模型调用。一个任务走了多少步，就是执行了多少条指令。' },
+      { show: both(3, 4, 5), on: ['r3', 'r4', 'r5'], say: '进程对应任务。TCB 记着状态、程序计数器和寄存器，寄存器就是要发给模型的消息。' },
+      { show: both(6, 7, 8), on: ['r6', 'r7', 'r8'], say: '工具是外设。派发像 DMA，完成发中断；每次派发之前先写一条预写日志。' },
+      { show: both(9, 10, 11), on: ['r9', 'r10', 'r11'], say: '缓存、主存、MMU 也都对得上。这张表用来理解结构，可靠性靠的是提交和恢复的规则。' }
+    ] },
+  { title: '一个任务的一生',
+    scene: [
+      B('submit', 40, 20, 300, 120, 'Submit', '先提交，再返回'),
+      B('model', 390, 20, 300, 120, '模型', '一次调用', 'ext'),
+      B('mem', 740, 20, 300, 120, '持久化存储', '每一步都提交', 'store'),
+      B('queue', 40, 300, 300, 150, '就绪队列', '按优先级排'),
+      B('core', 390, 300, 300, 150, 'vCore', '执行一条指令', 'core'),
+      B('wait', 740, 300, 300, 150, '等待集合', 'Waiting(IO)'),
+      B('done', 40, 620, 300, 150, '完成', 'answer · done'),
+      B('dev', 740, 620, 300, 150, '设备', 'builtin · MCP', 'dev'),
+      E('cm', 'core', 'model'), E('cs', 'core', 'mem'), E('wd', 'wait', 'dev'),
+      E('dm', 'dev', 'mem', { d: 'M1040 695 C1076 695, 1076 80, 1040 80' }),
+      E('cd', 'core', 'done'),
+      T('tcb', 'submit', '任务 #7')
+    ],
+    beats: [
+      { on: ['submit'], say: 'Submit 一个任务：TCB 先提交进持久化存储，然后才返回成功。' },
+      { move: [['tcb', 'queue']], on: ['queue'], say: '任务进入就绪队列，按优先级和进入队列的时间排。' },
+      { move: [['tcb', 'core']], on: ['core'], say: '空闲的 vCore 取走它。从这一刻起，只有这个 vCore 能改它。' },
+      { on: ['core', 'model'], send: ['cm', { e: 'cm', rev: true, delay: 900 }], say: '执行 StepModel：调一次模型。模型回答：要调两个工具。' },
+      { on: ['mem', 'wait'], send: ['cs'], move: [['tcb', 'wait']], say: '调用记录写成 dispatched，任务转 Waiting(IO)，一次提交。提交成功后才派发。' },
+      { on: ['dev'], send: ['wd'], say: 'vCore 把任务交还，马上去执行别的任务。两个工具在设备上并发地跑。' },
+      { on: ['mem', 'queue'], send: [{ e: 'dm', c: 'good' }], move: [['tcb', 'queue']], say: '工具都做完，结果提交，任务被唤醒，回到就绪队列。' },
+      { on: ['core', 'model'], move: [['tcb', 'core']], send: [{ e: 'cm', delay: 700 }, { e: 'cm', rev: true, delay: 1500 }], say: '下一条指令：模型看到工具结果，给出答案。' },
+      { good: ['done'], send: ['cs'], move: [['tcb', 'done']], say: 'answer 和 done 事件跟任务的终态在同一次提交里。' }
+    ] },
+  { title: '代码在哪里',
+    scene: [
+      B('root', 40, 10, 1000, 120, 'neumann', 'Machine · Config · 公开 API · 启动恢复 · 操作员控制', '', { cls: 'mono' }),
+      B('core', 40, 170, 310, 130, 'internal/core', 'vCore 循环 · 指令', '', { cls: 'mono', ts: 30 }),
+      B('sched', 385, 170, 310, 130, 'internal/sched', '队列 · 等待 · 定时器', '', { cls: 'mono', ts: 30 }),
+      B('group', 730, 170, 310, 130, 'internal/group', '窗口 · 伸缩 · 熔断', '', { cls: 'mono', ts: 30 }),
+      B('task', 40, 340, 310, 130, 'task', 'TCB · 消息 · 估算', '', { cls: 'mono' }),
+      B('mem', 385, 340, 310, 130, 'mem', 'Store · 持久化存储', 'store', { cls: 'mono' }),
+      B('limit', 730, 340, 310, 130, 'limit', '限流器 · 预占', '', { cls: 'mono' }),
+      B('bus', 40, 510, 310, 130, 'bus', 'builtin · mcp · skills', 'dev', { cls: 'mono' }),
+      B('cache', 385, 510, 310, 130, 'cache', 'L2 工具结果缓存', '', { cls: 'mono' }),
+      B('model', 730, 510, 310, 130, 'model', 'openai · anthropic', 'ext', { cls: 'mono' }),
+      B('proto', 40, 680, 310, 130, 'proto', 'JSON Lines 协议', '', { cls: 'mono' }),
+      B('observe', 385, 680, 310, 130, 'observe', '指标 · 追踪 · HTTP', '', { cls: 'mono' }),
+      B('sim', 730, 680, 310, 130, 'sim', '脚本模型 · 假时钟', '', { cls: 'mono' })
+    ],
+    beats: [
+      { on: ['root'], say: '根包就是你用的东西：New、Start、Submit、Steer、Cancel，都是 Machine 上的方法。' },
+      { on: ['core', 'sched', 'group'], say: '三个 internal 包管执行和所有权。放在 internal 里，模块外的代码绕不过所有权规则。' },
+      { on: ['task', 'mem', 'limit'], say: 'task 定义 TCB 和中立的消息格式，mem 负责提交，limit 管额度。' },
+      { on: ['bus', 'cache', 'model'], say: 'bus 挂设备，cache 是 L2，model 是适配器：OpenAI 兼容和 Anthropic 两个。' },
+      { on: ['proto', 'observe', 'sim'], say: 'proto 是 stdio 协议，observe 让它看得见，sim 用脚本模型和假时钟写测试。' }
+    ] },
+  { title: '这个系列讲什么',
+    scene: rows([
+      ['01  把 Agent 做成一台计算机', '', 'core'],
+      ['02  vCore：取指、执行、提交', ''],
+      ['03  先提交，后动作', ''],
+      ['04  工具调用的预写日志', ''],
+      ['05  kill -9 之后', ''],
+      ['06  弹性 vCore 与拥塞窗口', ''],
+      ['07  总线与设备', ''],
+      ['08  插话、压缩、人工批准', ''],
+      ['09  看得见，也验得过', '']
+    ].map(r => [r[0], r[1], r[2], { ts: 34, align: 'left' }]), { h: 82, gap: 12, y0: 8 }),
+    beats: [
+      { on: ['r1'], say: '一集讲一块，每一集都对着源码。下一集：vCore 是怎么取指、执行、提交的。' }
+    ] }
+  ] },
+
+// ============================================================ 02
+{ title: 'vCore：取指、执行、提交',
+  copy: {
+    title: 'vCore 只做四件事',
+    body: `neumann 拆解第 2 集：vCore。
+
+vCore 是一个 goroutine，循环做四件事：从就绪队列取一个任务，执行一条指令，把结果提交，交还任务以后再动作。
+
+指令只有三种：StepModel、StepTools、StepCompact。压缩也是一条指令，所以每一次模型调用调度器都看得见、计量都算得到。
+
+这一集还讲了 StepModel 的七步、TCB 里有哪些字段，以及“同一时刻只有一个所有者”这条规则。`,
+    tags: '#Go语言 #AIAgent #并发编程 #goroutine #系统设计 #程序员'
+  },
+  slides: [
+  { title: 'vCore 只做四件事',
+    scene: [
+      B('f', 340, 30, 400, 130, '① 取指', 'Sched.Next 取一个任务', 'core'),
+      B('x', 650, 340, 390, 130, '② 执行', '按 PC 跑一条指令', 'core'),
+      B('c', 340, 650, 400, 130, '③ 提交', 'Store.Commit', 'store'),
+      B('h', 40, 340, 390, 130, '④ 交还，再动作', 'Requeue · 派发 · 通知'),
+      X('lab', 540, 425, 'RunVCore', { size: 44, mono: true, ink: true }),
+      E('fx', 'f', 'x'), E('xc', 'x', 'c'), E('ch', 'c', 'h'), E('hf', 'h', 'f')
+    ],
+    beats: [
+      { on: ['f'], send: ['hf'], say: 'vCore 从自己执行组的就绪队列里取一个任务。' },
+      { on: ['x'], send: ['fx'], say: '看 TCB 里的 PC，执行一条指令：调一次模型，或者派发一批工具。' },
+      { on: ['c'], send: ['xc'], say: '新状态一次提交：TCB、调用记录、事件，同一个事务。' },
+      { on: ['h'], send: ['ch'], say: '提交成功以后，才交还任务、派发工具、通知订阅者。' },
+      { send: ['hf', { e: 'fx', delay: 650 }, { e: 'xc', delay: 1300 }, { e: 'ch', delay: 1950 }], say: '然后回到第一步。vCore 自己不存任何状态，所以随时可以加一个，或者退役一个。' }
+    ] },
+  { title: '指令只有三种',
+    scene: [
+      B('m', 40, 40, 310, 320, 'StepModel', '调一次模型\n\n回答是答案\n或者工具调用', 'core', { cls: 'mono', ts: 32 }),
+      B('t', 385, 40, 310, 320, 'StepTools', '把 planned 的调用\n写成 dispatched\n再派发', '', { cls: 'mono', ts: 32 }),
+      B('c', 730, 40, 310, 320, 'StepCompact', '调一次模型\n把最早的几轮\n换成一条摘要', '', { cls: 'mono', ts: 32 }),
+      B('note', 40, 430, 1000, 380, '每次模型调用都是一条指令\n调度器看得见\n计量算得到', '', 'note', { ts: 50 })
+    ],
+    beats: [
+      { on: ['m'], say: 'StepModel 最常见：调一次模型。回答是文字就结束，是工具调用就进入等待。' },
+      { on: ['t'], say: 'StepTools 负责派发已经计划好的工具调用。' },
+      { on: ['c'], say: 'StepCompact 也是一次模型调用：上下文快满的时候，把最早的几轮换成摘要。' },
+      { hot: ['note'], say: '压缩也占一条指令，也计用量。没有藏在框架里偷偷发出去的调用。' }
+    ] },
+  { title: 'StepModel 的七步',
+    scene: rows([
+      ['合并插话', '把还没送达的 Steer 放进寄存器'],
+      ['检查预算', '超过 MaxSteps 就以 budget 结束'],
+      ['看执行组', '熔断打开：停在 Waiting(Group)，或迁移'],
+      ['限流器预占', '所有额度一起拿到，或者一个都不拿'],
+      ['提交 Running', '意思是：请求可能已经发出去了'],
+      ['调用适配器', '流式，受这个任务的 context 控制'],
+      ['结算，再提交结果', '工具调用 / 答案 / 按错误类别处理']
+    ], { h: 100, gap: 18, y0: 6, edges: true }),
+    beats: [
+      { on: ['r1', 'r2'], send: ['e1'], say: '先送达插话，再看预算：答过的调用加上没确认的调用，超过 MaxSteps 就结束。' },
+      { on: ['r3', 'r4'], send: ['e2', { e: 'e3', delay: 700 }], say: '执行组的熔断开着就不调；限流器的额度要一起预占，拿不全就等。' },
+      { hot: ['r5'], send: ['e4'], say: '关键是第 5 步：先提交 Running。重启时看到 Running，就记一次 Unconfirmed，重做这一步。' },
+      { on: ['r6', 'r7'], send: ['e5', { e: 'e6', delay: 700 }], say: '调完模型，先结算额度、向执行组报告结果，再把结果一次提交。' }
+    ] },
+  { title: 'TCB：任务的进程控制块',
+    scene: [
+      B('state', 40, 20, 490, 92, 'State', 'Ready · Running · Waiting · Done…', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('pc', 550, 20, 490, 92, 'PC', 'StepModel · StepTools · StepCompact', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('wait', 40, 124, 490, 92, 'Wait', 'IO · Backoff · Reconcile · Group…', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('class', 550, 124, 490, 92, 'Class', '属于哪个执行组，迁移时会变', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('regs', 40, 228, 490, 92, 'Regs', '寄存器：发给模型的消息', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('allow', 550, 228, 490, 92, 'Allow / Deny', '页表：能调哪些工具', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('budget', 40, 332, 490, 92, 'Budget', 'MaxSteps · Deadline · MaxTokens', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('used', 550, 332, 490, 92, 'Used', '已经确认的用量', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('unc', 40, 436, 490, 92, 'Unconfirmed', '发出去、没拿到回答的请求数', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('seq', 550, 436, 490, 92, 'CallSeq', '工具调用 id 只增不减', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('arch', 40, 540, 490, 92, 'Archived', '压缩换出去的消息数', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('ver', 550, 540, 490, 92, 'Version', '每次提交 +1', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('note', 40, 670, 1000, 160, '工具调用的状态在调用记录里\n插话和取消在中断表里', '', 'note', { ts: 38 })
+    ],
+    beats: [
+      { on: ['state', 'pc', 'wait'], say: 'State、PC、Wait 三个字段就是状态机：现在在哪、下一步做什么、在等什么。' },
+      { on: ['regs', 'allow'], say: 'Regs 是寄存器，Allow / Deny 是页表。工具列表在创建任务时就快照下来，之后不变。' },
+      { on: ['budget', 'used', 'unc'], say: '用量分两种：Used 是确认过的，Unconfirmed 是发出去但不知道结果的。预算两者一起算。' },
+      { on: ['ver'], say: 'Version 每次提交恰好加一。对不上说明所有权出了 bug，不当成可以重试的错误。' },
+      { hot: ['note'], say: 'TCB 不装所有东西：工具调用的状态在调用记录里，外部输入在中断表里。' }
+    ] },
+  { title: '同一时刻只有一个所有者',
+    scene: [
+      B('sched', 40, 70, 300, 160, '调度器', '在队列或\n等待集合里'),
+      B('core', 390, 70, 300, 160, 'vCore', '从 Next\n到交还', 'core'),
+      B('batch', 740, 70, 300, 160, '工具批次', '从 Checkout\n到交还', 'dev'),
+      B('ext', 40, 420, 420, 150, 'Steer · Cancel', '外面来的输入', 'ext'),
+      B('irq', 560, 420, 480, 150, '中断表', '先提交，所有者下次提交时消费', 'store'),
+      B('note', 40, 650, 1000, 170, '重复交还、批次找不到自己的任务\n直接 panic：那是所有权 bug', '', 'note', { ts: 36 }),
+      E('sc', 'sched', 'core'), E('cb', 'core', 'batch'),
+      E('bs', 'batch', 'sched', { d: 'M890 70 C890 8, 190 8, 190 70' }),
+      E('ei', 'ext', 'irq'), E('ic', 'irq', 'core'),
+      T('tcb', 'sched', 'TCB')
+    ],
+    beats: [
+      { on: ['sched'], say: 'TCB 任何时刻只有一个所有者，只有所有者能提交它的变化。' },
+      { on: ['core'], send: ['sc'], move: [['tcb', 'core']], say: 'vCore 从 Sched.Next 拿到它，直到交还为止。' },
+      { on: ['batch'], send: ['cb'], move: [['tcb', 'batch']], say: '一轮工具全部做完时，工具批次 Checkout 它，按顺序拼好结果。' },
+      { on: ['sched'], send: ['bs'], move: [['tcb', 'sched']], say: '然后交还调度器。所有权一直是一条线，没有两个人同时改。' },
+      { on: ['ext', 'irq'], send: ['ei', { e: 'ic', delay: 900 }], say: '插话和取消不直接改任务：先写进中断表并提交，由所有者在下一次提交里消费。' },
+      { hot: ['note'], say: '这条规则写进了代码里：违反它就 panic，不会悄悄出错。' }
+    ] }
+  ] },
+
+// ============================================================ 03
+{ title: '先提交，后动作',
+  copy: {
+    title: '先提交，后动作',
+    body: `neumann 拆解第 3 集：整套系统最重要的一条规则。
+
+任何外面看得见的效果：API 返回成功、发出一个事件、派发一个工具，都排在让它可恢复的那次提交之后。
+
+一次提交里装着新的 TCB、调用记录、新中断、已消费的中断和事件，在一个事务里，要么全写进去，要么全没写。
+
+还讲了取消为什么“先提交的总是赢”，以及单写者 + 组提交怎么让多个提交共用一次 fsync。`,
+    tags: '#Go语言 #AIAgent #数据库 #持久化 #事务 #系统设计 #程序员'
+  },
+  slides: [
+  { title: '顺序永远是这三步',
+    scene: [
+      B('a', 40, 40, 300, 170, '① 算出新状态', '只在内存里'),
+      B('b', 390, 40, 300, 170, '② Commit 成功', '一个事务', 'store'),
+      B('c', 740, 40, 300, 170, '③ 才动作', '交还 · 通知\n派发 · 返回成功', 'core'),
+      E('ab', 'a', 'b'), E('bc', 'b', 'c'),
+      B('x1', 40, 310, 480, 210, '崩在 ② 之前', '这次变化没发生过\n从上一次提交继续', 'bad', { hidden: true }),
+      B('x2', 560, 310, 480, 210, '崩在 ② 之后', '变化已经落盘\n重启后补上 ③', 'good', { hidden: true }),
+      B('note', 40, 590, 1000, 230, '外面看得见的效果\n都排在让它可恢复的那次提交之后', '', 'note', { ts: 44 })
+    ],
+    beats: [
+      { on: ['a'], say: '每一次状态变化，先在内存里算出新状态。' },
+      { on: ['b'], send: ['ab'], say: '然后提交。Commit 失败，这次变化就当没发生。' },
+      { on: ['c'], send: ['bc'], say: '提交成功之后才动作：把任务放回队列、唤醒订阅者、派发工具、给调用方返回成功。' },
+      { show: ['x1'], say: '进程如果在提交之前崩了：没有任何东西出去过，重启从上一次提交继续。' },
+      { show: ['x2'], say: '如果在提交之后、动作之前崩了：状态已经落盘，重启时恢复流程把动作补上。' },
+      { hot: ['note'], say: '所以不存在“外面已经看见了，重启后却丢了”的情况。' }
+    ] },
+  { title: '一次提交里装着什么',
+    scene: [
+      B('set', 40, 10, 1000, 110, 'CommitSet', '一次 Store.Commit', 'core', { cls: 'mono' }),
+      B('i1', 40, 200, 180, 150, 'TCB', '新状态', '', { ts: 30 }),
+      B('i2', 245, 200, 180, 150, '调用记录', '工具的日志', '', { ts: 30 }),
+      B('i3', 450, 200, 180, 150, '新中断', '', '', { ts: 30 }),
+      B('i4', 655, 200, 180, 150, '消费的中断', '标记 applied', '', { ts: 30 }),
+      B('i5', 860, 200, 180, 150, '事件', '带序号', '', { ts: 30 }),
+      B('db', 40, 450, 1000, 130, '一个事务', '要么全写进去，要么全没写', 'store'),
+      B('note', 40, 640, 1000, 190, '事件和状态在同一个事务里\nVersion 每次恰好 +1', '', 'note', { ts: 40 }),
+      E('s1', 'set', 'i1'), E('s2', 'set', 'i2'), E('s3', 'set', 'i3'), E('s4', 'set', 'i4'), E('s5', 'set', 'i5'),
+      E('d1', 'i1', 'db'), E('d2', 'i2', 'db'), E('d3', 'i3', 'db'), E('d4', 'i4', 'db'), E('d5', 'i5', 'db')
+    ],
+    beats: [
+      { on: ['set'], say: '每一次状态变化都是一个 CommitSet，交给 Store.Commit。' },
+      { on: ['i1', 'i2', 'i3', 'i4', 'i5'], send: ['s1', 's2', 's3', 's4', 's5'], say: '里面有新的 TCB、它涉及的调用记录、新中断、这次消费掉的中断，还有这次产生的事件。' },
+      { on: ['db'], send: ['d1', 'd2', 'd3', 'd4', 'd5'], say: '五样东西在一个事务里写入持久化存储。' },
+      { hot: ['note'], say: '事件和状态一起提交，客户端看到的事件重启后不会丢。Version 对不上是 bug，不重试。' }
+    ] },
+  { title: '取消：先提交的取消总是赢',
+    scene: [
+      B('cancel', 40, 40, 300, 140, 'Cancel', '提交取消中断', 'ext'),
+      B('store', 390, 40, 300, 140, 'Store', '有未送达的取消', 'store'),
+      B('core', 740, 40, 300, 140, 'vCore', '正持着这个任务', 'core'),
+      B('ctx', 40, 320, 300, 150, 'context 取消', '在途的调用\n马上停'),
+      B('refuse', 390, 320, 650, 150, 'ErrCancelPending', '不许把调用写成 dispatched', 'bad', { hidden: true, cls: 'mono' }),
+      B('final', 390, 580, 650, 150, '就地最终提交', 'Cancelled · 没派发的调用记 cancelled', 'good', { hidden: true }),
+      E('cs', 'cancel', 'store'), E('cc', 'cancel', 'ctx'), E('ks', 'core', 'store'),
+      E('sr', 'store', 'refuse', { hidden: true }), E('rf', 'refuse', 'final', { hidden: true })
+    ],
+    beats: [
+      { on: ['cancel', 'store'], send: ['cs'], say: 'Cancel 先把取消中断提交进 Store。' },
+      { on: ['ctx'], send: ['cc'], say: '然后取消这个任务的 context，正在进行的模型调用或工具调用立刻停下。' },
+      { on: ['core'], send: [{ e: 'ks', c: 'hot' }], say: '持着任务的 vCore 还不知道，照常想把工具调用提交成 dispatched。' },
+      { show: ['refuse', 'sr'], send: [{ e: 'sr', c: 'bad' }], say: 'Store 拒绝：有未送达的取消时，只接受这个任务的最终提交。' },
+      { show: ['final', 'rf'], send: [{ e: 'rf', c: 'good' }], say: '持有方当场做最终提交。所以第一个提交成功的取消一定生效，不管持有方看到了什么。' }
+    ] },
+  { title: '存储：一个写者，组提交',
+    scene: [
+      B('c1', 40, 40, 240, 90, 'Commit A', '', '', { ts: 28, cls: 'mono' }),
+      B('c2', 40, 160, 240, 90, 'Commit B', '', '', { ts: 28, cls: 'mono' }),
+      B('c3', 40, 280, 240, 90, 'Commit C', '', '', { ts: 28, cls: 'mono' }),
+      B('c4', 40, 400, 240, 90, 'Commit D', '', '', { ts: 28, cls: 'mono' }),
+      B('w', 380, 190, 300, 150, '写者', '只有一个 goroutine', 'core'),
+      B('t', 760, 110, 280, 310, '一个事务', 'B · C · D\n各一个 savepoint\n\n一次 fsync', 'store'),
+      B('note', 40, 580, 1000, 240, '负载高时，多个提交共用一次 fsync\n只有一个提交时，也不等别人', '', 'note', { ts: 40 }),
+      E('w1', 'c1', 'w'), E('w2', 'c2', 'w'), E('w3', 'c3', 'w'), E('w4', 'c4', 'w'), E('wt', 'w', 't')
+    ],
+    beats: [
+      { on: ['c1', 'w'], send: ['w1', { e: 'wt', delay: 900 }], say: '持久化存储只有一个写者 goroutine。Commit A 单独来，就单独写。' },
+      { on: ['c2', 'c3', 'c4'], send: ['w2', 'w3', 'w4'], say: '写 A 的时候 B、C、D 到了，它们排进下一个事务。' },
+      { on: ['t'], send: ['wt'], say: '三个提交各占一个 savepoint，失败的单独回滚，成功的一起落盘，共用一次 fsync。' },
+      { hot: ['note'], say: '这样每一步都提交也不慢：负载越高，平均每次提交分到的 fsync 越少。' }
+    ] }
+  ] },
+
+// ============================================================ 04
+{ title: '工具调用的预写日志',
+  copy: {
+    title: '工具调用的预写日志',
+    body: `neumann 拆解第 4 集：Agent 调工具时进程崩了，怎么知道这个工具执行过没有？
+
+做法和数据库一样：派发之前先写日志。每个工具调用一条记录：planned → dispatched → done，重启时看到 dispatched 却没有 done，就按工具声明的 Effect 处理：
+
+· ReadOnly / Idempotent：用同一个幂等键再发一次
+· SideEffect：记成 unknown，停下来等人确认
+
+换来的保证：每个调用恰好得到一个结果，有副作用的调用没有人确认最多执行一次。`,
+    tags: '#Go语言 #AIAgent #预写日志 #幂等 #分布式系统 #后端开发 #程序员'
+  },
+  slides: [
+  { title: '一个工具调用的状态',
+    scene: [
+      B('planned', 40, 50, 280, 130, 'planned', '还没离开进程', '', { cls: 'mono' }),
+      B('disp', 400, 50, 280, 130, 'dispatched', '已经派发', 'core', { cls: 'mono' }),
+      B('done', 760, 50, 280, 130, 'done', '拿到结果', 'good', { cls: 'mono' }),
+      B('cancel', 40, 330, 280, 130, 'cancelled', '取消时没到设备', '', { cls: 'mono' }),
+      B('unk', 400, 330, 280, 130, 'unknown', '重启后不知道结果', '', { cls: 'mono' }),
+      B('late', 760, 330, 280, 130, 'late', '最终提交后才回来', '', { cls: 'mono' }),
+      B('res', 400, 620, 280, 130, 'Resolve', '操作员确认', 'ext', { cls: 'mono' }),
+      E('pd', 'planned', 'disp'), E('dd', 'disp', 'done'), E('du', 'disp', 'unk'),
+      E('ur', 'unk', 'res'), E('rd', 'res', 'done', { d: 'M680 685 C1068 685, 1068 230, 1000 180' }),
+      E('pc', 'planned', 'cancel'), E('dl', 'disp', 'late')
+    ],
+    beats: [
+      { on: ['planned'], say: '工具调用在派发之前，先写一条记录：planned。和数据库的预写日志一个道理。' },
+      { on: ['disp'], send: ['pd'], say: '把它写成 dispatched 的那次提交成功之后，才真正交给设备。' },
+      { good: ['done'], send: ['dd'], say: '设备返回，结果和 tool_result 事件一起提交：done。' },
+      { hot: ['unk'], send: [{ e: 'du', c: 'hot' }], say: '要是进程在这中间崩了，重启时不知道它到底执行没有：unknown。' },
+      { on: ['res', 'done'], send: ['ur', { e: 'rd', delay: 900, c: 'good' }], say: '有副作用的调用停下来，等操作员 Resolve：给出结果，或者重试。' },
+      { on: ['cancel', 'late'], send: ['pc', 'dl'], say: '取消时还没到设备的记 cancelled；最终提交以后才回来的结果记 late，不再给模型看。' }
+    ] },
+  { title: 'Effect 决定重启后怎么办',
+    scene: [
+      B('ro', 40, 40, 310, 260, 'ReadOnly', '只读\n重跑没关系', 'good', { cls: 'mono', ts: 32 }),
+      B('id', 385, 40, 310, 260, 'Idempotent', '幂等\n同一个 key 重发', 'core', { cls: 'mono', ts: 32 }),
+      B('se', 730, 40, 310, 260, 'SideEffect', '有副作用\n最多派发一次', 'bad', { cls: 'mono', ts: 32 }),
+      B('key', 40, 370, 1000, 140, '幂等键', 'task / call / attempt', 'store'),
+      B('note', 40, 570, 1000, 250, '没声明 Effect 的工具，一律当 SideEffect\n宁可停下来核对\n也不重复一个有副作用的操作', '', 'note', { ts: 38 })
+    ],
+    beats: [
+      { on: ['ro'], say: '每个工具挂载时声明 Effect。ReadOnly：只读，重跑一次没有影响。' },
+      { on: ['id'], say: 'Idempotent：幂等，用同一个幂等键重发，结果一样。' },
+      { on: ['se'], say: 'SideEffect：发邮件、扣款、写文件这类，最多派发一次。' },
+      { on: ['key'], say: '每次派发都带一个幂等键：任务 / 调用 / 第几次尝试。设备可以按它去重。' },
+      { hot: ['note'], say: '记录里存的是计划时声明的 Effect，重启后按它判断，不按重启后设备怎么说。' }
+    ] },
+  { title: '重启后，每条记录怎么处理',
+    scene: [
+      ...rows([
+        ['planned', '从没离开进程：正常派发'],
+        ['dispatched · 只读或幂等', '用同一个 key 再发一次'],
+        ['dispatched · 副作用 · 可报告', '记 unknown，给模型一个“结果未知”'],
+        ['dispatched · 副作用', '记 unknown，任务等操作员 Resolve'],
+        ['done', '保留结果']
+      ].map(([t, s], i) => [t, s, i === 3 ? 'bad' : i === 4 ? 'good' : '', { ts: 32, ss: 25 }]), { h: 140, gap: 22, y0: 20, hidden: true })
+    ],
+    beats: [
+      { show: ['r1', 'r2'], on: ['r1', 'r2'], say: 'planned 的从没出过进程，照常派发。只读或幂等的 dispatched，用同一个 key 再发一次。' },
+      { show: ['r3'], on: ['r3'], say: '有副作用、但声明了可以报告未知的：记 unknown，给模型一个“结果未知”的错误结果，让它自己判断。' },
+      { show: ['r4'], hot: ['r4'], say: '其余有副作用的：记 unknown，任务转 Waiting(Reconcile)，发 reconcile_needed，等操作员。' },
+      { show: ['r5'], on: ['r5'], say: '已经 done 的，结果保留，不会再执行。' }
+    ] },
+  { title: '换来的保证',
+    scene: [
+      B('g1', 40, 30, 1000, 170, '每个调用恰好得到一个结果', '', 'good', { hidden: true, ts: 40 }),
+      B('g2', 40, 230, 1000, 170, '只读和幂等的调用可能跑不止一次', '', 'core', { hidden: true, ts: 40 }),
+      B('g3', 40, 430, 1000, 170, '有副作用的调用，没人确认最多派发一次', '', 'bad', { hidden: true, ts: 40 }),
+      B('note', 40, 640, 1000, 190, '外部世界的“恰好一次”\n还需要设备按幂等键去重', '', 'note', { hidden: true, ts: 40 })
+    ],
+    beats: [
+      { show: ['g1'], say: '模型发出的每个调用，都会恰好拿回一个结果，不会有没结果的调用、没调用的结果。' },
+      { show: ['g2'], say: '只读和幂等的调用，崩溃后可能重发，所以可能执行不止一次。' },
+      { show: ['g3'], say: '有副作用的调用，没有操作员确认，最多派发一次。' },
+      { show: ['note'], hot: ['note'], say: '要做到外部世界里恰好一次，设备得按幂等键去重。这一点框架替不了设备。' }
+    ] }
+  ] },
+
+// ============================================================ 05
+{ title: 'kill -9 之后',
+  copy: {
+    title: 'Agent 被 kill -9 之后',
+    body: `neumann 拆解第 5 集：进程被 kill -9，没有清理，没有退出钩子。重启时会发生什么？
+
+Start 先做恢复，再启动任何 vCore：
+1. 载入所有没结束的任务
+2. 执行组被删掉的任务迁走
+3. Running 变回 Ready，记一次“没确认的调用”
+4. 按上一集的表结算工具调用记录
+5. 退避中、等执行组的任务回到队列，保留原来的位置
+6. 重建队列
+
+测试在每一个提交点前后各崩一次。真实模型 + SIGKILL 跑了 3 次，有副作用的工具都只执行了一次。`,
+    tags: '#Go语言 #AIAgent #崩溃恢复 #容错 #系统设计 #程序员'
+  },
+  slides: [
+  { title: 'kill -9 之后，Start 先做恢复',
+    scene: rows([
+      ['载入所有没结束的任务', '连同调用记录和没送达的中断'],
+      ['执行组没了的任务', '迁到默认组，或以 class_removed 失败'],
+      ['Running → Ready', 'Unconfirmed + 1，重做这一步', 'core'],
+      ['结算调用记录', '按 Effect，上一集那张表'],
+      ['Backoff / Group → Ready', '保留原来的排队位置'],
+      ['重建队列', '窗口从 Initial 开始，限流器从空开始']
+    ], { h: 112, gap: 20, y0: 30, edges: true }),
+    beats: [
+      { stamp: 'kill -9', dim: ['r1', 'r2', 'r3', 'r4', 'r5', 'r6', 'e1', 'e2', 'e3', 'e4', 'e5'], say: '进程被 kill -9：没有清理，没有退出钩子，在途的请求全断了。' },
+      { undim: ['r1', 'e1'], on: ['r1'], say: '重启后 Start 先做恢复，再启动任何 vCore。第一步，把没结束的任务全部载入。' },
+      { undim: ['r2', 'e2', 'r3', 'e3'], on: ['r2', 'r3'], send: ['e1', { e: 'e2', delay: 700 }], say: '还在 Running 的任务，请求可能已经发出去了：变回 Ready，记一次 Unconfirmed，重做。' },
+      { undim: ['r4', 'e4'], on: ['r4'], send: ['e3'], say: '工具调用记录按上一集的表结算：重发、标 unknown、或者等人。' },
+      { undim: ['r5', 'e5', 'r6'], on: ['r5', 'r6'], send: ['e4', { e: 'e5', delay: 700 }], say: '定时器和熔断不持久化：退避中、等执行组的任务直接就绪，排在原来的位置。' },
+      { on: ['r1', 'r2', 'r3', 'r4', 'r5', 'r6'], say: '所有恢复决定先提交，再调度。恢复做到一半失败，Start 可以再调一次。' }
+    ] },
+  { title: '每一个提交点都崩一次',
+    scene: [
+      B('p1', 40, 60, 170, 110, 'Submit', '', '', { ts: 26, cls: 'mono' }),
+      B('p2', 247, 60, 170, 110, 'Running', '', '', { ts: 26, cls: 'mono' }),
+      B('p3', 455, 60, 170, 110, 'dispatched', '', '', { ts: 24, cls: 'mono' }),
+      B('p4', 662, 60, 170, 110, 'done', '', '', { ts: 26, cls: 'mono' }),
+      B('p5', 870, 60, 170, 110, 'Done', '', '', { ts: 26, cls: 'mono' }),
+      E('q1', 'p1', 'p2'), E('q2', 'p2', 'p3'), E('q3', 'p3', 'p4'), E('q4', 'p4', 'p5'),
+      B('rs', 40, 320, 1000, 130, '在持久化存储上重启', 'Start → 恢复', 'store'),
+      B('ck', 40, 520, 1000, 140, '检查不变式', '每个调用一个结果 · 副作用最多一次 · 用量对得上', 'good'),
+      B('note', 40, 700, 1000, 130, 'recovery_test.go · TestCrashAtEveryCommitPoint', '', 'note', { ts: 30, cls: 'mono' }),
+      E('x1', 'p1', 'rs'), E('x2', 'p2', 'rs'), E('x3', 'p3', 'rs'), E('x4', 'p4', 'rs'), E('x5', 'p5', 'rs'),
+      E('rk', 'rs', 'ck')
+    ],
+    beats: [
+      { on: ['p1', 'p2', 'p3', 'p4', 'p5'], send: ['q1', { e: 'q2', delay: 500 }, { e: 'q3', delay: 1000 }, { e: 'q4', delay: 1500 }], say: '一个任务从提交到完成，要经过这几个提交点。' },
+      { hot: ['p2', 'p3'], send: [{ e: 'x2', c: 'bad' }, { e: 'x3', c: 'bad' }], say: '测试在每个提交点之前崩一次、之后崩一次。' },
+      { on: ['rs'], send: ['x1', 'x4', 'x5'], say: '每次都在持久化存储上重启，走真实的恢复流程。' },
+      { good: ['ck'], send: [{ e: 'rk', c: 'good' }], say: '然后检查不变式：每个调用恰好一个结果，副作用最多一次，用量账对得上。' },
+      { hot: ['note'], say: '再加上真实模型：acceptance/killnine 中途 SIGKILL，3 次全过，有副作用的工具都只执行了一次。' }
+    ] }
+  ] },
+
+// ============================================================ 06
+{ title: '弹性 vCore 与拥塞窗口',
+  copy: {
+    title: '用 TCP 的办法管大模型并发',
+    body: `neumann 拆解第 6 集：同时给一个模型服务商发几个请求合适？
+
+neumann 借了 TCP 拥塞控制的办法：每个执行组有一个窗口 W。成功一次加 1/W，收到过载信号（529、503 overloaded、裸 429）减半，冷却 10 秒。vCore 的数量跟着 W 走。
+
+服务商挂了有熔断器：连续 5 次临时失败打开，30 秒后放一个探测请求。没钉住组的任务沿 Fallback 链迁到别的组，迁之前检查工具和上下文窗口放不放得下。
+
+限流器和执行组分开建模，因为额度按账号算，模型按组分。`,
+    tags: '#Go语言 #AIAgent #大模型 #并发控制 #TCP #限流 #熔断 #程序员'
+  },
+  slides: [
+  { title: '拥塞窗口：加性增，乘性减',
+    scene: [
+      P('w', 90, 30, 920, 430, [2, 2.5, 2.9, 3.2, 3.5, 3.8, 4.0, 4.3, 4.5, 4.7, 2.35, 2.35, 2.35, 2.35, 2.8, 3.2, 3.5, 3.8, 4.0, 4.3, 4.5, 4.7, 4.9, 5.1], 6,
+        { yl: 'W', xl: '时间 →', marks: [{ i: 10, t: '过载 · 减半', id: 'm1', dx: -20, dy: -26, anchor: 'end' }, { i: 12, t: '冷却 10s', id: 'm2', dx: 10, dy: 50 }] }),
+      B('v1', 40, 540, 170, 100, 'vCore', '', 'core', { ts: 26 }),
+      B('v2', 247, 540, 170, 100, 'vCore', '', 'core', { ts: 26 }),
+      B('v3', 454, 540, 170, 100, 'vCore', '', 'core', { ts: 26 }),
+      B('v4', 661, 540, 170, 100, 'vCore', '', 'core', { ts: 26 }),
+      B('v5', 868, 540, 170, 100, 'vCore', '', 'core', { ts: 26 }),
+      B('note', 40, 680, 1000, 150, 'W 只回答一个问题\n同时给这个服务商发几个请求', '', 'note', { ts: 38 })
+    ],
+    beats: [
+      { plot: ['w', .4], dim: ['v5'], on: ['v1', 'v2', 'v3', 'v4'], say: '每成功一次，W 加 1/W，慢慢往上涨。vCore 的数量跟着 floor(W) 走。' },
+      { plot: ['w', .48], show: ['m1'], dim: ['v3', 'v4', 'v5'], hot: ['v1', 'v2'], say: '收到过载信号：529、503 overloaded、不带说明的 429，W 减半，进入 10 秒冷却。' },
+      { plot: ['w', .58], show: ['m2'], say: '同一批在途请求带回好几个过载，只减半一次：每个请求记着自己发出时的纪元。' },
+      { plot: ['w', 1], undim: ['v3', 'v4', 'v5'], on: ['v1', 'v2', 'v3', 'v4', 'v5'], say: '冷却之后接着慢慢涨。多出来的 vCore 只在两条指令之间退役，不会做到一半被停。' },
+      { hot: ['note'], say: '操作员可以用 SetCores 钉住 W，用 AutoScale 恢复自动调整。' }
+    ] },
+  { title: '熔断器',
+    scene: [
+      B('closed', 40, 60, 300, 160, '闭合', '正常调用', 'good'),
+      B('open', 740, 60, 300, 160, '打开', '任务停在\nWaiting(Group)', 'bad'),
+      B('half', 390, 400, 300, 160, '半开', '放一个探测请求'),
+      B('quota', 740, 650, 300, 160, '额度耗尽', '一直开着\n等 GroupReset', 'bad'),
+      E('co', 'closed', 'open', { label: '连续 5 次临时失败' }),
+      E('oh', 'open', 'half', { label: '30 秒后' }),
+      E('hc', 'half', 'closed', { label: '成功 · group_up' }),
+      E('ho', 'half', 'open', { bend: 120, label: '失败' }),
+      E('qo', 'quota', 'open')
+    ],
+    beats: [
+      { on: ['closed'], say: '执行组的熔断器平时闭合，请求照常发。' },
+      { on: ['open'], send: [{ e: 'co', c: 'bad' }], say: '连续 5 次临时失败（5xx、网络错误、超时）就打开。这个组的任务停在 Waiting(Group)。' },
+      { on: ['half'], send: ['oh'], say: '30 秒后半开：只放一个探测请求出去。' },
+      { on: ['closed'], send: [{ e: 'hc', c: 'good' }], say: '探测成功就闭合，发 group_up 事件，停着的任务继续。失败就再打开。' },
+      { on: ['quota', 'open'], send: [{ e: 'qo', c: 'bad' }], say: '额度耗尽不一样：熔断一直开着，直到操作员调 GroupReset。' }
+    ] },
+  { title: '迁移：顺着 Fallback 链走',
+    scene: [
+      B('a', 40, 60, 300, 150, '组 A', '熔断打开', 'bad'),
+      B('b', 390, 60, 300, 150, '组 B', '等待检查'),
+      B('c', 740, 60, 300, 150, '组 C', '等待检查'),
+      E('ab', 'a', 'b'), E('bc', 'b', 'c'),
+      B('chk', 40, 330, 1000, 200, '迁移前的三项检查', '支持工具调用 · 工具数量 · 上下文放得进目标窗口', 'core'),
+      B('res', 40, 610, 1000, 200, '一次提交', '新 Class · 排队位置不变 · migrated 事件\n发给新服务商时去掉旧服务商的推理块', 'store'),
+      T('tk', 'a', '任务')
+    ],
+    beats: [
+      { on: ['a'], say: '组 A 的熔断打开了。没有钉住执行组的任务，沿着 Fallback 链找下一个能用的组。' },
+      { on: ['chk'], move: [['tk', 'b']], send: ['ab'], set: { b: '工具太多，拒绝' }, bad: ['b'], say: '每到一个组先做三项检查。组 B 的工具数量上限放不下这个任务，跳过。' },
+      { move: [['tk', 'c']], send: ['bc'], set: { c: '检查通过' }, good: ['c'], say: '组 C 支持工具调用、工具数量够、上下文也放得进它的窗口。' },
+      { on: ['res'], say: '迁移就是一次提交：新的 Class，原来的排队位置，一个 migrated 事件。都不行就 migrate_refused。' }
+    ] },
+  { title: '限流器和执行组分开',
+    scene: [
+      B('g1', 40, 60, 320, 140, '组 A', 'flash 模型'),
+      B('g2', 40, 260, 320, 140, '组 B', 'pro 模型'),
+      B('g3', 40, 460, 320, 140, '组 C', '本地模型'),
+      B('l1', 560, 120, 480, 170, '限流器：同一个账号', 'RPM · TPM', 'store'),
+      B('l2', 560, 420, 480, 170, '限流器：本地 GPU', 'RPM', 'store'),
+      E('e1', 'g1', 'l1'), E('e2', 'g2', 'l1'), E('e3', 'g3', 'l2'),
+      B('note', 40, 660, 1000, 170, '一个请求要在它所有的限流器里同时拿到额度\n全拿到，或者一个都不拿，先来先得', '', 'note', { ts: 34 })
+    ],
+    beats: [
+      { on: ['g1', 'g2', 'g3'], say: '执行组按模型分。额度却是按账号算的：同一个账号下的两个模型，共用一份 RPM 和 TPM。' },
+      { on: ['l1'], send: ['e1', 'e2'], say: '所以限流器单独建模，可以被多个执行组共享。' },
+      { hot: ['note'], send: ['e3'], say: '一个请求要在它的所有限流器里同时拿到额度，拿不全就一个都不拿，排队等。' },
+      { on: ['l1', 'l2'], say: '调用之后结算，多退少补；服务商的限流响应头会压低限流器以为还剩的额度。带重试时间的 429 暂停整个限流器。' }
+    ] }
+  ] },
+
+// ============================================================ 07
+{ title: '总线与设备',
+  copy: {
+    title: '工具是挂在总线上的外设',
+    body: `neumann 拆解第 7 集：工具。
+
+在 neumann 里，工具来自设备：builtin、MCP、skills，或者你自己实现的 Device。一次工具调用穿过总线：先查页表（这个任务能不能调），只读调用再查 L2 缓存，没命中就进设备的队列。
+
+工具在自己的 goroutine 里跑，vCore 不等它。每个调用完成单独提交结果；一轮全部完成，任务被唤醒回到队列，像 DMA 加中断。
+
+超时和取消由总线执行，不靠设备配合。写一个自己的设备只要实现四个方法。`,
+    tags: '#Go语言 #AIAgent #MCP #工具调用 #系统设计 #程序员'
+  },
+  slides: [
+  { title: '一次工具调用穿过总线',
+    scene: [
+      B('core', 40, 40, 280, 140, '工具批次', 'mcp_read_file', 'core'),
+      B('pt', 400, 40, 280, 140, '页表', '这个任务能调吗'),
+      B('l2', 760, 40, 280, 140, 'L2 缓存', '只读结果命中吗'),
+      B('deny', 40, 300, 280, 140, '错误结果', '越权，不执行', 'bad', { hidden: true }),
+      B('q', 400, 300, 280, 140, '设备队列', 'MaxConcurrent · FIFO'),
+      B('dev', 760, 300, 280, 140, '设备', 'mcp', 'dev'),
+      B('to', 40, 560, 1000, 150, '超时和取消由总线执行', '设备在单独的 goroutine 里，panic 变成错误结果'),
+      E('cp', 'core', 'pt'), E('pl', 'pt', 'l2'), E('pd', 'pt', 'deny', { hidden: true }),
+      E('lq', 'l2', 'q'), E('qd', 'q', 'dev'),
+      E('hit', 'l2', 'core', { d: 'M900 40 C900 2, 180 2, 180 40', label: '命中：直接返回' })
+    ],
+    beats: [
+      { on: ['core'], say: '模型看到的工具名是“设备名_工具名”，比如 mcp_read_file。' },
+      { on: ['pt'], send: ['cp'], show: ['deny', 'pd'], say: '先查页表：不在 Allow 里，或者在 Deny 里，直接给模型一个错误结果，不执行。' },
+      { bad: ['deny'], send: [{ e: 'pd', c: 'bad' }], say: '派发时再查一次。页表就是这个任务的 MMU。' },
+      { on: ['l2'], send: ['pl', { e: 'hit', delay: 900, c: 'good' }], say: '只读、可缓存的调用先查 L2。命中就直接返回同一个任务里之前那次的真实结果。' },
+      { on: ['q', 'dev'], send: ['lq', { e: 'qd', delay: 900 }], say: '没命中进设备队列。每个设备有自己的并发上限，多出来的先来先排。' },
+      { hot: ['to'], say: '超时和取消由总线强制执行，不依赖设备配合。设备 panic 也只变成一个错误结果。' }
+    ] },
+  { title: '工具在跑，vCore 不等',
+    scene: [
+      B('core', 40, 40, 300, 140, 'vCore', '', 'core'),
+      B('batch', 390, 40, 650, 140, '工具批次', '每个调用一个 goroutine'),
+      B('other', 40, 260, 300, 140, '别的任务', 'vCore 去执行它'),
+      B('c1', 390, 260, 200, 120, 'c-1', 'calc_add', 'dev', { cls: 'mono', ts: 28, ss: 20 }),
+      B('c2', 615, 260, 200, 120, 'c-2', 'calc_multiply', 'dev', { cls: 'mono', ts: 28, ss: 20 }),
+      B('c3', 840, 260, 200, 120, 'c-3', 'notes_write', 'dev', { cls: 'mono', ts: 28, ss: 20 }),
+      B('mem', 390, 470, 650, 130, '持久化存储', '每个调用完成单独提交 · tool_result', 'store'),
+      B('back', 390, 680, 650, 140, '全部完成', '按调用顺序拼成一条 tool 消息\nReady · 回队列', 'good', { hidden: true }),
+      E('cb', 'core', 'batch'), E('co', 'core', 'other'),
+      E('b1', 'batch', 'c1'), E('b2', 'batch', 'c2'), E('b3', 'batch', 'c3'),
+      E('m1', 'c1', 'mem'), E('m2', 'c2', 'mem'), E('m3', 'c3', 'mem'),
+      E('mb', 'mem', 'back', { hidden: true })
+    ],
+    beats: [
+      { on: ['core', 'batch'], send: ['cb'], say: '模型要调三个工具。dispatched 提交之后，vCore 把它们交给总线。' },
+      { on: ['other'], send: ['co'], say: '然后 vCore 立刻去执行别的任务。工具再慢，也不占着核心。' },
+      { on: ['c1', 'c2', 'c3'], send: ['b1', 'b2', 'b3'], say: '三个调用各在自己的 goroutine 里跑，像 DMA。' },
+      { on: ['mem'], send: [{ e: 'm2', delay: 0 }, { e: 'm1', delay: 600 }, { e: 'm3', delay: 1200 }], say: '每个调用做完就单独提交结果，发一个 tool_result 事件，谁先完成谁先提交。' },
+      { show: ['back', 'mb'], good: ['back'], send: [{ e: 'mb', c: 'good' }], say: '最后一个完成时，像中断：批次按调用顺序拼好结果，任务回到就绪队列。' }
+    ] },
+  { title: 'L2：只读工具结果缓存',
+    scene: rows([
+      ['只缓存 ReadOnly 且 Cacheable', '其他 Effect 上的 Cacheable 一律忽略'],
+      ['作用域是一个任务', '键 = 完整工具名 + 规范化的参数'],
+      ['有写操作完成就清空', '非只读调用一返回，清掉这个任务的缓存'],
+      ['有上限', '每个任务 256 条 · 全局 64 MiB · LRU']
+    ].map(([t, s]) => [t, s, '', { ts: 34, ss: 26 }]), { h: 175, gap: 30, y0: 20, hidden: true }),
+    beats: [
+      { show: ['r1'], on: ['r1'], say: '这是 L2。L1 是服务商自己的 prompt cache。只读、并且声明了可缓存的工具结果才进 L2。' },
+      { show: ['r2'], on: ['r2'], say: '缓存只在一个任务内部有效。参数先规范化：键排序、去空白，1 和 1.0 算不同。' },
+      { show: ['r3'], hot: ['r3'], say: '只要有一个非只读调用完成，就清掉这个任务的缓存，免得读到写之前的旧结果。' },
+      { show: ['r4'], on: ['r4'], say: '内存有界，任务结束时缓存一起丢掉。命中的 tool_result 事件带 cached: true。' }
+    ] },
+  { title: '写一个自己的设备',
+    scene: [
+      B('k1', 40, 30, 1000, 74, 'type Device interface {', '', 'code', { align: 'left' }),
+      B('k2', 40, 104, 1000, 74, '    Name() string', '', 'code', { align: 'left' }),
+      B('k3', 40, 178, 1000, 74, '    Tools(ctx) ([]ToolDef, error)', '', 'code', { align: 'left' }),
+      B('k4', 40, 252, 1000, 74, '    Call(ctx, DeviceCall) (ToolResult, error)', '', 'code', { align: 'left' }),
+      B('k5', 40, 326, 1000, 74, '    Close() error', '', 'code', { align: 'left' }),
+      B('k6', 40, 400, 1000, 74, '}', '', 'code', { align: 'left' }),
+      B('d1', 40, 530, 1000, 74, 'ToolDef{ Name, Description, Schema,', '', 'code', { align: 'left' }),
+      B('d2', 40, 604, 1000, 74, '    Effect, Cacheable, CacheTTL,', '', 'code', { align: 'left' }),
+      B('d3', 40, 678, 1000, 74, '    Timeout, OnUnknown }', '', 'code', { align: 'left' })
+    ],
+    beats: [
+      { on: ['k1', 'k6'], say: '设备是一个 Go 接口，四个方法。' },
+      { on: ['k2', 'k3'], say: 'Name 是工具名的前缀。Tools 列出这个设备的工具，每个工具带 Schema 和 Effect。' },
+      { on: ['k4'], say: 'Call 收到的 DeviceCall 里带着幂等键，设备可以按它去重。' },
+      { on: ['d2'], say: 'MCP 工具的 readOnlyHint、idempotentHint 会映射成 Effect；没声明就按 SideEffect。' },
+      { on: ['d3'], say: 'Timeout 默认 120 秒。OnUnknown 决定崩溃后结果未知时，是停下等人还是告诉模型。' }
+    ] }
+  ] },
+
+// ============================================================ 08
+{ title: '插话、压缩、人工批准',
+  copy: {
+    title: '给 Agent 插话、压缩和审批',
+    body: `neumann 拆解第 8 集：任务跑起来以后，人怎么介入。
+
+插话和取消都先写进中断表并提交，任务的所有者在下一次提交里消费。取消还会立刻取消 context，在途的调用马上停。Deadline 就是一个到点触发的取消。
+
+上下文快满时，下一条指令变成 StepCompact：最早的几轮换成一条摘要，原文进归档表，History 还能拿回完整历史。
+
+工具策略可以放行、拒绝、改参数，或者要求人工批准。要批准时整轮都不派发，等 Approve。`,
+    tags: '#Go语言 #AIAgent #上下文压缩 #人工审批 #大模型应用 #程序员'
+  },
+  slides: [
+  { title: '插话和取消都走中断表',
+    scene: [
+      B('you', 40, 40, 300, 150, '你', 'm.Steer(id, "…")', 'ext'),
+      B('irq', 390, 40, 650, 150, '中断表', '先提交，Steer 才返回', 'store'),
+      B('dl', 40, 300, 300, 150, 'Deadline', '到点就是\n一次取消', 'bad'),
+      B('core', 390, 300, 650, 150, '下一条模型指令', '把插话放进寄存器\n同一次提交标记 applied', 'core'),
+      B('regs', 390, 560, 650, 250, '寄存器', 'user · assistant · tool\n……\nuser：你刚插的那句话'),
+      E('yi', 'you', 'irq'), E('di', 'dl', 'irq'), E('ic', 'irq', 'core'), E('cr', 'core', 'regs')
+    ],
+    beats: [
+      { on: ['you', 'irq'], send: ['yi'], say: '任务跑着的时候插一句话：m.Steer 把它写进中断表，提交成功才返回。' },
+      { on: ['core'], send: ['ic'], say: '任务的所有者在下一条模型指令开头取走它，在同一次提交里标记 applied。' },
+      { on: ['regs'], send: ['cr'], say: '插话变成寄存器里的一条 user 消息，模型下一轮就能看到。' },
+      { on: ['dl'], send: [{ e: 'di', c: 'bad' }], say: 'Deadline 就是一个原因为 deadline 的取消，不管任务在什么状态，到点由调度器触发。' }
+    ] },
+  { title: '压缩：把最早的几轮换成摘要',
+    scene: [
+      B('head', 40, 40, 170, 130, '请求', '', 'core', { ts: 30 }),
+      B('u1', 222, 40, 156, 130, '轮 1', '', '', { ts: 28 }),
+      B('u2', 386, 40, 156, 130, '轮 2', '', '', { ts: 28 }),
+      B('u3', 550, 40, 156, 130, '轮 3', '', '', { ts: 28 }),
+      B('u4', 714, 40, 156, 130, '轮 4', '', '', { ts: 28 }),
+      B('u5', 878, 40, 162, 130, '轮 5', '', '', { ts: 28 }),
+      B('sum', 222, 40, 484, 130, '摘要', 'role user · Summary = true', 'good', { hidden: true }),
+      X('thr', 540, 230, '估算 + 输出预留 > 0.8 × 窗口', { size: 30, hidden: true, ink: true }),
+      B('cmp', 40, 290, 1000, 140, 'StepCompact', '一条指令 · 一次模型调用 · 同样的熔断、限流、提交', 'core', { cls: 'mono' }),
+      B('arch', 290, 520, 500, 140, '归档表', '原始消息，同一个事务', 'store'),
+      B('note', 40, 700, 1000, 130, 'm.History(id) 拿回完整历史', '请求 + 归档 + 摘要之后的消息', 'note', { ts: 36 }),
+      E('ua', 'cmp', 'arch', { hidden: true })
+    ],
+    beats: [
+      { on: ['head', 'u1', 'u2', 'u3', 'u4', 'u5'], say: '寄存器里是请求，加上一轮一轮的对话。一轮是模型的工具调用加上它的全部结果，从不拆开。' },
+      { show: ['thr'], hot: ['u1', 'u2', 'u3', 'u4', 'u5'], say: '估算超过窗口的 0.8，下一条指令就换成 StepCompact。' },
+      { on: ['u4', 'u5', 'head'], say: '最新的几轮原样保留，合计不超过窗口的 0.3。头部的请求永远保留。' },
+      { on: ['cmp'], say: '压缩本身是一条普通的模型指令：一样过熔断、一样预占额度、一样先提交 Running。' },
+      { show: ['sum', 'ua'], hide: ['u1', 'u2', 'u3'], on: ['sum', 'arch'], send: [{ e: 'ua', c: 'good' }], say: '最早的几轮换成一条摘要，原文进归档表，和寄存器的变化在一次提交里。' },
+      { hot: ['note'], say: '原始消息一条不丢，History 能拿回完整的对话。' }
+    ] },
+  { title: '工具策略：放行、拒绝、改参数、等人',
+    scene: [
+      B('call', 40, 40, 300, 140, '工具调用', 'notes_delete', '', { ss: 24 }),
+      B('pol', 390, 40, 650, 140, 'Config.ToolPolicy', '派发前问一次，决定写进调用记录', 'core', { cls: 'mono' }),
+      B('a', 40, 290, 235, 140, 'Allow', '照常派发', 'good', { cls: 'mono', ts: 30, ss: 21 }),
+      B('d', 295, 290, 235, 140, 'Deny', '不执行', 'bad', { cls: 'mono', ts: 30, ss: 21 }),
+      B('r', 550, 290, 235, 140, 'Rewrite', '换掉参数', '', { cls: 'mono', ts: 30, ss: 21 }),
+      B('q', 805, 290, 235, 140, 'Require\nApproval', '整轮等人', 'dev', { cls: 'mono', ts: 26, ss: 21 }),
+      B('wait', 40, 520, 1000, 130, 'Waiting(Approval)', '这一轮的调用都不派发 · 每个待批一个 approval_needed', '', { cls: 'mono' }),
+      B('ok', 40, 700, 1000, 130, 'm.Approve', 'Allow · Edit · Deny：最后一个决定提交时，整轮一起派发', 'ext', { cls: 'mono' }),
+      E('cp', 'call', 'pol'), E('pa', 'pol', 'a'), E('pd', 'pol', 'd'), E('pr', 'pol', 'r'), E('pq', 'pol', 'q'),
+      E('qw', 'q', 'wait'), E('wo', 'wait', 'ok')
+    ],
+    beats: [
+      { on: ['call', 'pol'], send: ['cp'], say: '每个工具调用第一次派发之前，问一次 ToolPolicy。决定和调用记录一起提交。' },
+      { on: ['a', 'd', 'r'], send: ['pa', 'pd', 'pr'], say: '可以放行、拒绝（模型收到带原因的错误结果），或者换掉参数再执行。' },
+      { hot: ['q'], send: [{ e: 'pq', c: 'hot' }], say: '也可以要求人工批准。钩子必须快，慢的判断交给人。' },
+      { on: ['wait'], send: ['qw'], say: '一轮里只要有一个要批准，整轮都不派发。这时没有在途调用，取消、重启都好处理。' },
+      { on: ['ok'], send: [{ e: 'wo', c: 'good' }], say: 'm.Approve 可以放行、改参数或拒绝。最后一个决定提交时，整轮一起派发。' }
+    ] }
+  ] },
+
+// ============================================================ 09
+{ title: '看得见，也验得过',
+  copy: {
+    title: 'Agent 运行时怎么验',
+    body: `neumann 拆解第 9 集，最后一集：观测和验证。
+
+每次提交都带事件，事件有序号，断线可以从序号接着读。observe 包一个 handler 挂上 /status、/queue、/tasks、/events（SSE）、/metrics 和 pprof；OTel 指标以 neumann. 开头，追踪从事件重建。
+
+验过的：
+· 所有包 -race -count=20 全绿
+· 真实模型 + kill -9，3 次全过
+· 200 个任务打网关，计费恒等式对得上
+· agentbench 45 题跑两遍：85/90
+
+还没验到的：真实网关上的过载减半。44 个请求同时在途，网关也没回过一次 429。`,
+    tags: '#Go语言 #AIAgent #可观测性 #OpenTelemetry #测试 #程序员'
+  },
+  slides: [
+  { title: '事件：带序号，能补读',
+    scene: [
+      B('m', 40, 40, 300, 150, 'Machine', '每次提交带事件', 'core'),
+      B('ev', 390, 40, 650, 150, '事件表', '#1 accepted · #2 core_up · #3 step', 'store', { ss: 22 }),
+      B('sse', 40, 320, 300, 140, '/events', 'SSE，断线按序号续读', '', { cls: 'mono', ss: 21 }),
+      B('st', 390, 320, 300, 140, '/status', '组、窗口、熔断、队列', '', { cls: 'mono', ss: 21 }),
+      B('met', 740, 320, 300, 140, '/metrics', 'OTel 指标 neumann.*', '', { cls: 'mono', ss: 21 }),
+      B('tr', 40, 540, 480, 140, '追踪', '从事件重建，用事件的时间'),
+      B('pp', 560, 540, 480, 140, 'pprof · slog', '性能剖析 · 活动日志'),
+      B('note', 40, 720, 1000, 110, 'observe.NewHandler：一个 handler 全挂上', '', 'note', { ts: 32 }),
+      E('me', 'm', 'ev'), E('es', 'ev', 'sse'), E('et', 'ev', 'st'), E('em', 'ev', 'met'), E('etr', 'sse', 'tr')
+    ],
+    beats: [
+      { on: ['m', 'ev'], send: ['me'], say: '事件和状态同一次提交，每个事件有递增的序号。' },
+      { on: ['sse'], send: ['es'], say: '/events 用 SSE 推送。客户端断线了，带上最后一个序号重连，从那里接着读。' },
+      { on: ['st', 'met'], send: ['et', 'em'], say: '/status 看每个组的窗口、熔断、队列；/metrics 是以 neumann. 开头的 OTel 指标。' },
+      { on: ['tr', 'pp'], send: ['etr'], say: '追踪从事件重建，用事件里的时间，所以模型延迟量到的是服务商的，不是排队的。' },
+      { hot: ['note'], say: 'observe.NewHandler 一个 handler 把这些全挂上，再加 pprof。' }
+    ] },
+  { title: '验过的，和还没验到的',
+    scene: rows([
+      ['go test -race -count=20', '所有包，机器空闲时全绿', 'good'],
+      ['真实模型 + kill -9', '3 次全过，副作用只执行一次', 'good'],
+      ['200 个任务打网关', '计费恒等式完全对得上', 'good'],
+      ['agentbench 45 题 × 2', 'neumann 85/90 · 对照实现 83/90', 'good'],
+      ['还没验到', '真实网关上的过载减半：44 个在途也没等到一次 429', 'bad']
+    ].map(([t, s, k]) => [t, s, k, { ts: 34, ss: 25 }]), { h: 150, gap: 22, y0: 10, hidden: true }),
+    beats: [
+      { show: ['r1'], on: ['r1'], say: '单元测试和故障注入测试，所有包带 -race 连跑 20 遍。' },
+      { show: ['r2'], on: ['r2'], say: '真实模型跑到一半 SIGKILL，3 次全过，有副作用的工具只执行了一次。' },
+      { show: ['r3'], on: ['r3'], say: '200 个任务同时打网关，全部完成，计费账一分不差。' },
+      { show: ['r4'], on: ['r4'], say: '同一套 45 道 agent 题跑两遍，neumann 85/90，对照实现 83/90，每题 token 只多 2.8%。' },
+      { show: ['r5'], hot: ['r5'], say: '还没验到的也说清楚：过载减半在真实网关上还没触发过，需要一个会限并发的端点。' }
+    ] }
+  ] }
+];
+
+// ------------------------------------------------------------------ rendering
+const NS = 'http://www.w3.org/2000/svg';
+const FS = 1.22; // every in-card size is scaled up so cards stay readable on a phone screen
+const $ = s => document.querySelector(s);
+const svg = $('#stage'), card = $('#card');
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const qs = new URLSearchParams(location.search);
+const REC = qs.has('rec'), STILL = qs.has('still'), STUDIO = qs.has('studio');
+// default: one continuous animation through every episode, card only, no controls
+const LOOP = !REC && !STILL && !STUDIO;
+if (REC || STILL) document.body.classList.add('rec');
+if (LOOP) document.body.classList.add('loop');
+
+let ep = clamp((+qs.get('ep') || 1) - 1, 0, EP.length - 1);
+let sl = clamp((+qs.get('s') || 1) - 1, 0, EP[ep].slides.length - 1);
+let playing = !STILL, speed = 1, gen = 0, waiters = [];
+let els = {};
+
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function mk(tag, attrs = {}, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+const center = b => [b.x + b.w / 2, b.y + b.h / 2];
+function clip(b, px, py, pad = 6) {
+  const [cx, cy] = center(b), dx = px - cx, dy = py - cy;
+  if (!dx && !dy) return [cx, cy];
+  const s = Math.min(dx ? (b.w / 2 + pad) / Math.abs(dx) : Infinity, dy ? (b.h / 2 + pad) / Math.abs(dy) : Infinity);
+  return [cx + dx * s, cy + dy * s];
+}
+function fit(textEl, max) {
+  const len = textEl.getComputedTextLength();
+  if (len > max) {
+    const fs = parseFloat(getComputedStyle(textEl).fontSize);
+    textEl.style.fontSize = Math.max(14, fs * max / len) + 'px';
+  }
+}
+
+function build(slide) {
+  svg.innerHTML = '';
+  els = {};
+  const defs = mk('defs', {}, svg);
+  const m = mk('marker', { id: 'ah', viewBox: '0 0 10 10', refX: 8.5, refY: 5, markerWidth: 6, markerHeight: 6, orient: 'auto-start-reverse' }, defs);
+  mk('path', { d: 'M0 0 L10 5 L0 10 z', class: 'ah' }, m);
+  const gEdges = mk('g', {}, svg), gBoxes = mk('g', {}, svg), gTop = mk('g', {}, svg);
+  const boxes = {};
+  slide.scene.filter(d => d.type === 'box').forEach(d => boxes[d.id] = d);
+
+  for (const d of slide.scene) {
+    if (d.type === 'box') {
+      const g = mk('g', { class: `el box k-${d.k || 'plain0'} ${d.cls || ''}` }, gBoxes);
+      if (!d.k) g.classList.remove('k-plain0');
+      mk('rect', { class: 'body', x: d.x, y: d.y, width: d.w, height: d.h, rx: d.k === 'code' ? 0 : 18 }, g);
+      const tl = String(d.t).split('\n'), sll = d.s ? String(d.s).split('\n') : [];
+      let ts = (d.ts || (d.k === 'code' ? 30 : 34)) * FS, ss = (d.ss || 23) * FS;
+      let total = tl.length * ts * 1.22 + (sll.length ? 10 + sll.length * ss * 1.4 : 0);
+      if (total > d.h - 14) { const k = (d.h - 14) / total; ts *= k; ss *= k; total = d.h - 14; }
+      let y = d.y + d.h / 2 - total / 2;
+      const left = d.align === 'left';
+      const x = left ? d.x + 30 : d.x + d.w / 2;
+      for (const line of tl) {
+        y += ts * 1.22;
+        const t = mk('text', { class: 't', x, y: y - ts * .28, 'text-anchor': left ? 'start' : 'middle' }, g);
+        t.style.fontSize = ts + 'px';
+        t.textContent = line;
+      }
+      if (sll.length) y += 10;
+      for (const line of sll) {
+        y += ss * 1.4;
+        const t = mk('text', { class: 's', x, y: y - ss * .38, 'text-anchor': left ? 'start' : 'middle' }, g);
+        t.style.fontSize = ss + 'px';
+        t.textContent = line;
+      }
+      els[d.id] = { d, el: g };
+    } else if (d.type === 'edge') {
+      const a = boxes[d.a], b = boxes[d.b];
+      let path = d.d, mid;
+      if (!path) {
+        const ca = center(a), cb = center(b);
+        if (d.bend) {
+          const mx = (ca[0] + cb[0]) / 2, my = (ca[1] + cb[1]) / 2, dx = cb[0] - ca[0], dy = cb[1] - ca[1], L = Math.hypot(dx, dy);
+          const c = [mx - dy / L * d.bend, my + dx / L * d.bend];
+          const s = clip(a, c[0], c[1]), e = clip(b, c[0], c[1]);
+          path = `M${s[0]} ${s[1]} Q${c[0]} ${c[1]} ${e[0]} ${e[1]}`;
+        } else {
+          const s = clip(a, cb[0], cb[1]), e = clip(b, ca[0], ca[1]);
+          path = `M${s[0]} ${s[1]} L${e[0]} ${e[1]}`;
+        }
+      }
+      const g = mk('g', { class: 'el' }, gEdges);
+      const p = mk('path', { class: 'edge' + (d.dash ? ' dash' : ''), d: path, 'marker-end': 'url(#ah)' }, g);
+      if (d.label) {
+        const L = p.getTotalLength(), pt = p.getPointAtLength(L / 2);
+        const t = mk('text', { class: 'elab', x: pt.x, y: pt.y - 14, 'text-anchor': 'middle' }, g);
+        t.textContent = d.label;
+      }
+      els[d.id] = { d, el: g, path: p };
+    } else if (d.type === 'text') {
+      const t = mk('text', { class: 'el txt', x: d.x, y: d.y, 'text-anchor': d.anchor || 'middle' }, gBoxes);
+      t.style.fontSize = (d.size || 26) * FS + 'px';
+      if (d.mono) t.style.fontFamily = 'var(--mono)';
+      if (d.ink) { t.style.fill = 'var(--ink)'; t.style.fontWeight = 700; }
+      t.textContent = d.t;
+      els[d.id] = { d, el: t };
+    } else if (d.type === 'plot') {
+      const g = mk('g', { class: 'el plot' }, gBoxes);
+      for (let k = 1; k <= 3; k++) mk('line', { class: 'grid', x1: d.x, x2: d.x + d.w, y1: d.y + d.h - d.h * k / 3, y2: d.y + d.h - d.h * k / 3 }, g);
+      mk('path', { class: 'axis', d: `M${d.x} ${d.y} L${d.x} ${d.y + d.h} L${d.x + d.w} ${d.y + d.h}` }, g);
+      const pts = d.vals.map((v, i) => [d.x + d.w * i / (d.vals.length - 1), d.y + d.h - d.h * v / d.max]);
+      const line = mk('path', { class: 'line', d: 'M' + pts.map(p => p.join(' ')).join(' L') }, g);
+      const L = line.getTotalLength();
+      line.style.strokeDasharray = L; line.style.strokeDashoffset = L;
+      const yl = mk('text', { class: 'lab', x: d.x - 16, y: d.y + 20, 'text-anchor': 'end' }, g); yl.textContent = d.yl || '';
+      const xl = mk('text', { class: 'lab', x: d.x + d.w, y: d.y + d.h + 40, 'text-anchor': 'end' }, g); xl.textContent = d.xl || '';
+      els[d.id] = { d, el: g, line, L };
+      for (const mkr of d.marks || []) {
+        const [px, py] = pts[mkr.i];
+        const mg = mk('g', { class: 'el gone' }, g);
+        mk('circle', { cx: px, cy: py, r: 11, fill: 'var(--amber)' }, mg);
+        const t = mk('text', { class: 'lab', x: px + (mkr.dx ?? 18), y: py + (mkr.dy ?? 46), 'text-anchor': mkr.anchor || 'start' }, mg);
+        t.style.fill = 'var(--ink)'; t.style.fontWeight = 700;
+        t.textContent = mkr.t;
+        els[mkr.id] = { d: mkr, el: mg };
+      }
+    }
+  }
+  for (const d of slide.scene) {
+    if (d.type !== 'token') continue;
+    const g = mk('g', { class: 'tok' }, gTop);
+    const r = mk('rect', { rx: 30, height: 60, y: -30 }, g);
+    const t = mk('text', { y: 11, 'text-anchor': 'middle' }, g);
+    t.textContent = d.label;
+    const w = t.getComputedTextLength() + 44;
+    r.setAttribute('width', w); r.setAttribute('x', -w / 2);
+    els[d.id] = { d, el: g, boxes };
+    placeToken(d.id, d.at);
+  }
+  // fit text inside boxes
+  for (const id in els) {
+    const it = els[id];
+    if (it.d.type !== 'box') continue;
+    it.el.querySelectorAll('text').forEach(t => fit(t, it.d.w - (it.d.align === 'left' ? 50 : 32)));
+  }
+  for (const d of slide.scene) if (d.hidden) els[d.id].el.classList.add('gone');
+}
+
+function placeToken(id, at) {
+  const it = els[id];
+  let x, y;
+  if (Array.isArray(at)) [x, y] = at;
+  else { const b = it.boxes[at]; [x, y] = [b.x + b.w / 2, b.y + b.h]; }
+  it.el.style.transform = `translate(${x}px, ${y}px)`;
+}
+
+const STATES = ['on', 'hot', 'sgood', 'sbad'];
+function applyPersistent(b) {
+  for (const id of b.show || []) els[id] && els[id].el.classList.remove('gone');
+  for (const id of b.hide || []) els[id] && els[id].el.classList.add('gone');
+  for (const id of b.dim || []) els[id] && els[id].el.classList.add('dim');
+  for (const id of b.undim || []) els[id] && els[id].el.classList.remove('dim');
+  for (const id in b.set || {}) {
+    const it = els[id]; if (!it) continue;
+    const s = it.el.querySelector('text.s'); if (s) s.textContent = b.set[id];
+  }
+  for (const [id, at] of b.move || []) placeToken(id, at);
+  if (b.plot) { const it = els[b.plot[0]]; it.line.style.strokeDashoffset = it.L * (1 - b.plot[1]); }
+}
+function applyHighlight(b) {
+  for (const id in els) if (els[id].d.type === 'box') els[id].el.classList.remove(...STATES);
+  const add = (ids, c) => (ids || []).forEach(id => els[id] && els[id].el.classList.add(c));
+  add(b.on, 'on'); add(b.hot, 'hot'); add(b.good, 'sgood'); add(b.bad, 'sbad');
+}
+function fitSay() {
+  const s = $('#say'), box = s.parentElement;
+  let fs = 43; s.style.fontSize = fs + 'px';
+  while (s.scrollHeight > box.clientHeight - 40 && fs > 30) { fs -= 1; s.style.fontSize = fs + 'px'; }
+}
+function setSay(text) {
+  const s = $('#say');
+  s.style.opacity = 0;
+  setTimeout(() => { s.textContent = text || ''; fitSay(); s.style.opacity = 1; }, reduce ? 0 : 180);
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms / speed));
+function packet(spec, g) {
+  const o = typeof spec === 'string' ? { e: spec } : spec;
+  const it = els[o.e]; if (!it || !it.path) return Promise.resolve();
+  return sleep(o.delay || 0).then(() => new Promise(res => {
+    if (g !== gen) return res();
+    const p = it.path, L = p.getTotalLength();
+    const halo = mk('circle', { r: 22, class: 'pkh ' + (o.c ? 'c-' + o.c : '') }, svg);
+    const dot = mk('circle', { r: 11, class: 'pk ' + (o.c ? 'c-' + o.c : '') }, svg);
+    p.classList.add('hot');
+    const dur = (reduce ? 1 : Math.min(1300, Math.max(650, L * 2.1))) / speed, t0 = performance.now();
+    const step = now => {
+      if (g !== gen) { halo.remove(); dot.remove(); return res(); }
+      const k = Math.min(1, (now - t0) / dur), e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+      const pt = p.getPointAtLength((o.rev ? 1 - e : e) * L);
+      for (const c of [halo, dot]) { c.setAttribute('cx', pt.x); c.setAttribute('cy', pt.y); }
+      if (k < 1) requestAnimationFrame(step);
+      else { setTimeout(() => { halo.remove(); dot.remove(); p.classList.remove('hot'); }, 250); res(); }
+    };
+    requestAnimationFrame(step);
+  }));
+}
+function stamp(text) {
+  const s = $('#stamp'); s.textContent = text; s.classList.remove('go'); void s.offsetWidth; s.classList.add('go');
+}
+
+async function runBeat(b, g) {
+  setSay(b.say);
+  if (b.stamp) stamp(b.stamp);
+  applyPersistent(b);
+  applyHighlight(b);
+  await Promise.all((b.send || []).map(s => packet(s, g)));
+  if (g !== gen) return;
+  const read = b.say ? Math.min(7500, Math.max(2600, b.say.length * 125)) : 1500;
+  await sleep(read);
+}
+
+function finalState(slide) {
+  card.classList.add('instant');
+  slide.beats.forEach(applyPersistent);
+  const last = slide.beats[slide.beats.length - 1];
+  applyHighlight(last);
+  $('#say').textContent = last.say || '';
+  fitSay();
+  $('#say').style.opacity = 1;
+  if (!STILL) requestAnimationFrame(() => requestAnimationFrame(() => card.classList.remove('instant')));
+}
+
+function chrome() {
+  const e = EP[ep], s = e.slides[sl];
+  $('#kick').textContent = `neumann 拆解 · ${String(ep + 1).padStart(2, '0')}`;
+  $('#ttl').textContent = s.title;
+  $('#page').textContent = `${sl + 1} / ${e.slides.length}`;
+  $('#dots').innerHTML = e.slides.map((_, i) => `<i class="${i === sl ? 'on' : ''}"></i>`).join('');
+  $('#where').textContent = `第 ${ep + 1} 集 · ${sl + 1}/${e.slides.length}`;
+  document.querySelectorAll('#eps button.ep').forEach((bt, i) => bt.setAttribute('aria-current', String(i === ep)));
+  document.querySelectorAll('#eps .slides button').forEach(bt => {
+    const cur = +bt.dataset.ep === ep && +bt.dataset.sl === sl;
+    bt.setAttribute('aria-current', String(cur));
+    if (cur) { const side = $('#side'), r = bt.getBoundingClientRect(), sr = side.getBoundingClientRect();
+      if (r.top < sr.top + 60 || r.bottom > sr.bottom - 20) side.scrollTop += r.top - sr.top - sr.height / 3; }
+  });
+  $('#c-title').textContent = e.copy.title;
+  $('#c-body').textContent = e.copy.body;
+  $('#c-tags').textContent = e.copy.tags;
+  const base = location.pathname.split('/').pop();
+  $('#c-urls').textContent = `连续播放全部：${base}\n录一集：${base}?ep=${ep + 1}&rec=1\n截这一页：${base}?ep=${ep + 1}&s=${sl + 1}&still=1`;
+}
+
+async function show(g) {
+  const slide = EP[ep].slides[sl];
+  chrome();
+  card.classList.add('instant');
+  build(slide);
+  $('#say').textContent = '';
+  if (!STILL) requestAnimationFrame(() => card.classList.remove('instant'));
+  window.__ready = true;
+  if (STILL) { finalState(slide); window.__done = true; return; }
+  for (let i = 0; i < slide.beats.length; i++) {
+    if (!playing) { await new Promise(r => waiters.push(r)); }
+    if (g !== gen) return;
+    await runBeat(slide.beats[i], g);
+    if (g !== gen) return;
+  }
+  await sleep(900);
+  if (g !== gen) return;
+  if (!playing) { await new Promise(r => waiters.push(r)); if (g !== gen) return; }
+  if (sl < EP[ep].slides.length - 1) { sl++; start(); }
+  else if (LOOP) { ep = (ep + 1) % EP.length; sl = 0; start(); }
+  else { window.__done = true; if (!REC) { playing = false; syncPlay(); } }
+}
+function start() { gen++; const w = waiters; waiters = []; w.forEach(f => f()); show(gen); }
+function syncPlay() { $('#play').textContent = playing ? '暂停' : '播放'; }
+
+// ------------------------------------------------------------------ layout & controls
+function layout() {
+  const wrap = $('#stagewrap'), frame = $('#frame');
+  const rec = REC || STILL, stacked = STUDIO && window.innerWidth <= 1180;
+  const W = rec ? window.innerWidth : wrap.clientWidth;
+  const H = rec ? window.innerHeight : stacked ? window.innerHeight - 170 : (wrap.clientHeight || window.innerHeight);
+  const s = Math.min(W / 1080, Math.max(H, 320) / 1440);
+  frame.style.width = 1080 * s + 'px'; frame.style.height = 1440 * s + 'px';
+  card.style.transform = `scale(${s})`;
+}
+new ResizeObserver(layout).observe($('#stagewrap'));
+window.addEventListener('resize', layout);
+
+function jump(i, j) {
+  ep = i; sl = j; playing = true; syncPlay(); closeToc(); start();
+}
+EP.forEach((e, i) => {
+  const li = document.createElement('li');
+  const bt = document.createElement('button');
+  bt.className = 'ep';
+  bt.innerHTML = `<span class="no">${String(i + 1).padStart(2, '0')}</span><span></span>`;
+  bt.lastChild.textContent = e.title;
+  bt.addEventListener('click', () => jump(i, 0));
+  li.appendChild(bt);
+  if (!STUDIO) {
+    const ol = document.createElement('ol');
+    ol.className = 'slides';
+    e.slides.forEach((s, j) => {
+      const sli = document.createElement('li');
+      const sb = document.createElement('button');
+      sb.dataset.ep = i; sb.dataset.sl = j;
+      sb.innerHTML = `<span class="sn">${j + 1}</span><span></span>`;
+      sb.lastChild.textContent = s.title;
+      sb.addEventListener('click', () => jump(i, j));
+      sli.appendChild(sb); ol.appendChild(sli);
+    });
+    li.appendChild(ol);
+  }
+  $('#eps').appendChild(li);
+});
+function openToc() { document.body.classList.add('tocopen'); $('#scrim').hidden = false; $('#tocbtn').setAttribute('aria-expanded', 'true'); $('#tocbtn').textContent = '关闭'; }
+function closeToc() { document.body.classList.remove('tocopen'); $('#scrim').hidden = true; $('#tocbtn').setAttribute('aria-expanded', 'false'); $('#tocbtn').textContent = '目录'; }
+$('#tocbtn').addEventListener('click', () => document.body.classList.contains('tocopen') ? closeToc() : openToc());
+$('#scrim').addEventListener('click', closeToc);
+$('#play').addEventListener('click', () => {
+  playing = !playing; syncPlay();
+  if (playing) { const w = waiters; waiters = []; w.forEach(f => f()); }
+});
+$('#next').addEventListener('click', () => {
+  if (sl < EP[ep].slides.length - 1) sl++; else if (ep < EP.length - 1) { ep++; sl = 0; }
+  start();
+});
+$('#prev').addEventListener('click', () => {
+  if (sl > 0) sl--; else if (ep > 0) { ep--; sl = EP[ep].slides.length - 1; }
+  start();
+});
+$('#replay').addEventListener('click', start);
+$('#still').addEventListener('click', () => { gen++; playing = false; syncPlay(); finalState(EP[ep].slides[sl]); });
+const speeds = [1, 1.5, 2, 0.75];
+$('#speed').addEventListener('click', e => { speed = speeds[(speeds.indexOf(speed) + 1) % speeds.length]; e.currentTarget.textContent = speed + '×'; });
+$('#rec').addEventListener('click', () => { location.search = `?ep=${ep + 1}&rec=1`; });
+if (STUDIO) $('#rec').textContent = '录制本集';
+document.querySelectorAll('[data-copy]').forEach(bt => bt.addEventListener('click', async () => {
+  const el = document.getElementById(bt.dataset.copy);
+  try { await navigator.clipboard.writeText(el.textContent); bt.textContent = '已复制'; }
+  catch { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); bt.textContent = '已选中'; }
+  setTimeout(() => bt.textContent = '复制', 1500);
+}));
+let touchX = null, touchY = null;
+$('#frame').addEventListener('touchstart', e => { touchX = e.touches[0].clientX; touchY = e.touches[0].clientY; }, { passive: true });
+$('#frame').addEventListener('touchend', e => {
+  if (touchX == null) return;
+  const dx = e.changedTouches[0].clientX - touchX, dy = e.changedTouches[0].clientY - touchY;
+  touchX = null;
+  if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) (dx < 0 ? $('#next') : $('#prev')).click();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight') $('#next').click();
+  else if (e.key === 'ArrowLeft') $('#prev').click();
+  else if (e.key === ' ') { e.preventDefault(); $('#play').click(); }
+});
+
+syncPlay();
+layout();
+(document.fonts ? document.fonts.ready : Promise.resolve()).then(() => start());
+})();
+</script>
+</body>
+</html>
