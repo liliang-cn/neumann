@@ -433,7 +433,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 - 第 3 条用 5.3 的同一套判断（`canCompact`，按目标的 Caps 和组的 `CompactKeep` 算），通过则迁移提交里 `PC = StepCompact`；不通过才是 `check = "context"`，`detail` 写明哪一条放不下（某一轮放不进压缩请求，或请求和最新一轮本身就放不下）。迁移清掉任务学到的 `Window` 和 `CompactChunk`（换了服务商）；`SetClass`、类被删除时的 `Rehome` 同样，任务在等工具时保留 `StepTools`，下一条模型指令按新窗口量。
 - reasoning 由 vCore 在组请求时过滤（`forProvider`）：`Provider` 非空且不等于目标适配器 `Provider()` 的 reasoning 块不发，块全被去掉的消息不发，它两边同角色的消息并成一条（角色仍然交替，严格的服务商不会收到非法序列）；寄存器原样保留，迁回原服务商时还在。两个适配器本来也按 `Provider` 丢弃外来 reasoning（Anthropic 丢 thinking，OpenAI 兼容不渲染 reasoning），过滤在 vCore 做是为了对任何适配器成立。
 - 迁移提交：`State = Ready`、`PC = StepModel`、`ReadySince` 不变、`Retries` 不变、`migrated`（`{from, to, reason: "group_down"}`）；交还后进新组的就绪队列，触发新组扩容。准入计数随之从旧类移到新类。
-- 手动迁移 `m.SetClass(ctx, id, class)`：同样的校验，不通过返回 `*MigrateError`（`Check`、`Detail`），什么都不提交；`PinClass` 只禁止自动迁移，不拦操作员。只能在指令之间移动：任务在就绪队列、`Waiting(Group / Backoff / Reconcile)`、`Suspended` 时取出、提交、交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试。等旧组的 `Waiting(Group)` 改为 `Ready`，其他状态不变（退避保留 `WakeAt`）；`migrated` 的 `reason` 为 `manual`。
+- 手动迁移 `m.SetClass(ctx, id, class)`：同样的校验，不通过返回 `*MigrateError`（`Check`、`Detail`），什么都不提交；`PinClass` 只禁止自动迁移，不拦操作员。只能在指令之间移动：任务在就绪队列、`Waiting(Group / Backoff / Reconcile)`、`Suspended` 时取出、提交、交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试（`SetPriority` 不同，忙的任务在下一个边界落地，6.4）。等旧组的 `Waiting(Group)` 改为 `Ready`，其他状态不变（退避保留 `WakeAt`）；`migrated` 的 `reason` 为 `manual`。
 
 ### 6.4 抢占与续写
 
@@ -447,7 +447,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 - `v` 这次调用已经跑了至少 `PreemptAfter`，不满时挂一个定时器，到点再查；
 - `v.Preempts < MaxPreempts`。
 
-多个候选时抢优先级数最大（最不急）的，同级抢这次调用跑得最短的（损失最少）。一次只抢一个，被抢的任务交还之后再查下一次。检查的触发点：任务进入就绪队列、`SetPriority` 提交之后、上面的定时器到点。
+多个候选时抢优先级数最大（最不急）的，同级抢这次调用跑得最短的（损失最少）。一次只抢一个，被抢的任务交还之后再查下一次。检查的触发点：任务进入就绪队列、`SetPriority` 提交之后（忙的任务在边界落地后交还、进入就绪队列时）、上面的定时器到点。
 
 **被抢的调用**：用 `errPreempted` 作为原因取消这次调用的 context（任务自己的 context 不受影响），适配器像对待取消一样返回。组开着抢占时，机器总是用流式调用（适配器实现了 `Streamer` 就用，不管有没有增量接收方），自己累加收到的正文增量（`Delta.Text`）。然后一次提交：`step` 和 `preempted`（`{by, kept, ran_ms, n}`：抢它的任务、保留的字符数、这次调用跑了多久、这一步第几次被抢）；任务回 `Ready`，PC 不变，`ReadySince = now`，`Preempts + 1`；`Partial` 追加这次收到的正文，适配器不支持续写（`Caps.Prefill` 为假）时清空、`kept` 为 0。
 
@@ -493,7 +493,7 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 
 **持久化**：`Partial` 只随提交持久化。在调用中途崩溃，重启后按 4.5 重做，用的是最近一次提交的 `Partial`。加字段之前写下的 TCB 解码为空。
 
-**重排**：`m.SetPriority(ctx, id, p)`（`p ≥ 0`，0 交互、越大越不急）。任务在调度器手里（就绪、退避、熔断等待、待核对、待批准）时取出，提交新的 `Priority` 和 `priority_set`（`{priority, was}`）事件，再交还；在 vCore 上或等工具时返回 `ErrTaskBusy`，调用方重试。已结束的返回 `ErrFinished`。提交之后做一次抢占检查。
+**重排**：`m.SetPriority(ctx, id, p)`（`p ≥ 0`，0 交互、越大越不急）。任务在调度器手里（就绪、退避、熔断等待、待核对、待批准、挂起）时取出，提交新的 `Priority` 和 `priority_set`（`{priority, was}`）事件，再交还，之后做一次抢占检查。任务在 vCore 上或等工具时不等它：和挂起一样（9.9）先作为中断提交（中断表的新种类 `priority`，`Text` 是新优先级的十进制），提交之后就返回 nil，崩溃后仍然有效；持有任务的一方在下一个指令边界落地（指令开头、指令提交、工具轮结束、操作员的批准 / 核对、交还、重启恢复），新的 `Priority` 和 `priority_set` 跟这个边界自己的状态变化在同一次提交里。不再返回 `ErrTaskBusy`（`SetClass` 仍然返回）。已结束的返回 `ErrFinished`，不存在的 `ErrNotFound`。
 
 实现中的决定（`internal/core/preempt.go`，续写在 `internal/core/model.go` 的 `modelStep` / `modelCall`）：
 
@@ -509,7 +509,9 @@ vCore 增减发 `core_up` / `core_down` 事件，原因：`demand`、`overload`�
 - **合并**：`Partial` 接在回答第一段文本的前面；回答没有文本时作为一段文本插在工具调用之前、开头的 reasoning 之后（服务商要求 reasoning 在前）。`PartialThink` 接在第一个 reasoning 段前面，没有就作为第一段。截断判断在合并**之前**、只看这次调用的回答做（评审发现：原来先合并，只想不答、跑满上限的续写因为合并后"有内容"，任务就以被截断的前缀作为答案结束了，`TestThinkingOnlyContinuationIsRedone`）。
 - **始终流式**：组开着抢占、或机器有增量接收方（`Machine` 总是有）时，适配器实现了 `Streamer` 就流式调用；收到的 `Delta.Text` 累加在 vCore 上，有接收方才转发。所以"流中断也续写"不要求组开着抢占：只要这次调用是流式的、适配器 `Caps.Prefill` 为真。
 - **`first_ms`**：机器时钟上从调用适配器前一刻到第一块增量（正文或推理都算）的毫秒数，`step` 事件在调用之后改写带上它；`prefill` 在合并插话的钩子里写上。`check_ms` 也改为在原事件上改写，三者可以同时出现。
-- **`SetPriority`**：优先级没变时什么都不提交、返回 nil；`ReadySince` 不变（不重新排队尾）。负数报错。`Submit` 也放开到任何 `≥ 0` 的优先级（原来只接受 0、1）。调度器本来就按数值比较、老化把任何大于 0 的提成 0，`Queue` 的 `Background` 计所有大于 0 的。
+- **`SetPriority`**：优先级没变时什么都不提交、返回 nil；`ReadySince` 不变（不重新排队尾）。负数报错。
+- **忙的任务改优先级**（`Env.PriorityInterrupt`、`landPriority`）：原来在 vCore 上或等工具时返回 `ErrTaskBusy` 让调用方重试，而云端任务几乎总处在这两种状态，`neu` 的 `/pri` 和 stdio 的 `priority` 实际上用不了。现在和挂起走同一套机制：提交 `priority` 中断，再 `Nudge`（不切断调用）；没人在干活的任务（被拒之后正好交还了）由改的一方取出、落地、交还，等工具的任务归它的批次，不取。"没变"按待落地的算：有待落地的就看最后一条，否则看任务自己的，和它相同什么都不提交。落地：所有待落地的 `priority` 中断按序号只看最后一条，全部标为已送达；任务的优先级因此变了才发一个 `priority_set`（`was` 是落地前的），中途改了又改回来就没有事件；排在这次提交自己的事件之后、同一次落地的 `suspended` / `resumed` 之前。和挂起不同，优先级不必等任何等待结束，任何非终态都能落地：所有落地挂起的地方（`landSuspend`）都先落地优先级，指令开头只有优先级待落地时给任务打标记（`Mark`），由这条指令自己的提交落地；等批准、待核对的任务在重启恢复时也单独提交一次落地。终态提交（答案、预算、失败、取消）不落地：存储把它和其他中断一起标为已送达，没有事件，任务保留原来的优先级。取出的一方是 `SetPriority` 自己时（任务在调度器手里），待落地的 `priority` 中断一并标为已送达，它的 `p` 最后到、为准。
+- **在途调用按发出时的优先级算**：被调得更不急的任务，它正在跑的模型调用仍按登记时的优先级参与抢占检查，边界之前不会为一个比它新优先级更急的任务被切断；交还时按新优先级排队，之后的检查照常。被调得更急的任务也要到边界、重新就绪时才可能抢别人。一次调用最多也就是一个量子加一次回答的时间，不为此改在途登记（`TestSetPriorityLessUrgentDoesNotPreemptTheCall`）。验证：`TestSetPriorityDuringAModelCall`（立即返回、调用不受影响、多次改最后一次为准、和待落地相同不提交、`priority_set` 一个、在派发工具的提交里）、`TestSetPriorityDuringAToolCall`（工具轮结束落地，之后排在等得更久的后台任务前面）、`TestSetPriorityThenCancel`、`TestSetPriorityPendingSurvivesARestart`、`TestCrashAtEveryCommitPointWithAPriorityChange`（第一次模型调用中、付款中各改一次，每个提交点前后各崩一次，SQLite：32 个崩溃点，重启时有待落地优先级的 6 个；最终优先级是最后提交成功的那次，`priority_set` 从提交时的优先级连成一条链、每次都是变化），core 的 `TestLandPriority`、`TestPriorityInterrupt` 等，一致性套件的 `PriorityRoundTripsInOrder` / `PriorityIsAppliedSilently`，`TestPriorityOverTheWire`（stdio）。`Submit` 也放开到任何 `≥ 0` 的优先级（原来只接受 0、1）。调度器本来就按数值比较、老化把任何大于 0 的提成 0，`Queue` 的 `Background` 计所有大于 0 的。
 - **续写被拒**（`modelCall`）：`modelStep` 把它是否在请求末尾放了前缀作为参数传给 `modelCall`（压缩传假），不从 TCB 推断。失败分支里被抢、挂起、取消先走各自的路；流中断先 `keepPartial`；`ContextLength` 去压缩；然后，续写的调用、任务的 context 没结束（取消、Deadline、强制停机）、这次调用的流里没收到能接上前缀的东西（正文都算，思考只在接着想时算）、`prefixRefused`（`Permanent`，或 `Transient` 且包 `ErrEmptyResponse` / `ErrResponseLost`）时清空两者：`Permanent` 走计次的退避（`retry`，`modelFailed` 的计次部分拆出来的），其余照常 `modelFailed`；再在 `model_retry` 上补 `dropped` / `dropped_think`（`amendRetry`，像 `amendStep` 一样按类型 `retryData` 改写原事件）。适配器 panic 不在此列，任务照旧失败。没有新增提交点：丢弃随记录失败的那次提交落盘（`TestFailedThoughtContinuationStartsOver`、`TestFailedContinuationStartsOver`（从这次提交重启）、`TestLostContinuationThatAddedNothingStartsOver`、`TestRejectedContinuationIsRetriedFresh`；保留前缀：`TestContinuationFailuresThatKeepThePrefix`、`TestContinuationErrorAfterStreamingKeepsItsPrefix`、`TestBrokenContinuationKeepsWhatItAdded`、`TestCutOffContinuationKeepsItsPrefix`（被抢、挂起，包括第一块之前就被挂起））。
 - **只有思考的截断**（13）：判定为截断且无内容，并且回答里有 reasoning 段、或用量报了推理 token、或**这次调用流出过 `Delta.Reasoning`**（Ollama 两者都不报，截断的回答连段都没有，只能从流里看）。适配器 `Caps.ThinkOff` 为真且任务还没关思考时，置 `NoThink`、`MaxOut` 不变重做：一次有回答的调用，发 `model_retry`（`class = "truncated"`，`no_think: true`，`max_out` 是这次的上限，`attempt` 不变），不计入 `Truncations`；关掉思考仍被截断才走两次放大，`NoThink` 一直开着。下一次有回答且没被截断的调用清除 `NoThink`（和 `Truncations` 同时）。请求的 `NoThink` 取自 TCB，适配器 `ThinkOff` 为假时它自己忽略。
 - **想完了没作答**（`modelStep`）：截断判断之后，`stopped` = 没截断、没有正文（`TrimSpace` 之后）和工具调用，并且有思考（同上三种迹象）或这次是接着想的调用。`truncated`、`thinkingOnly` 判断正文也用 `TrimSpace`。和截断共用撤回寄存器、插话、`Partial` 的分支；能关思考走 `redoWithoutThinking`（带 `stopped`，事件 `class` 为 `"thought"`，`attempt` 为 `Retries`），否则 `redoThought`：`Retries` 恢复为这次调用之前的值再加一，到上限 `failWith(model_error)`，否则 `model_retry` 加 `ready`；续写正文的调用在这里清空 `Partial`、`amendRetry` 补 `dropped`。执行组看到的是成功（`modelCall` 里 `err == nil`）。压缩（`execCompact`）：请求的 `NoThink` 取 `Caps.ThinkOff`；截断照旧清零 `Retries`，空摘要不清零、交给 `modelFailed`，有摘要才清零（`TestAFreshThoughtThatStopsIsRedoneWithoutThinking`、`TestAContinuedTextAnsweredWithThinkingOnly`、`TestARedoWithoutThinkingThatStaysEmptyIsBounded`、`TestAThoughtThatStopsWithoutThinkOff`、`TestATrulyEmptyTurnStaysTransient`、`TestAThoughtForASummaryIsBounded`、`TestCompactionTurnsThinkingOff`、崩溃扫描 `TestCrashAtEveryCommitPointWithAThoughtThatStops`）。
@@ -762,9 +764,11 @@ m.ResumeTask(ctx, id) error  // 提交后返回；ErrNotFound / ErrFinished / Er
 
 **恢复**：任务是 `Suspended` 时，恢复方从等待集合取出，提交 `Ready`（`ReadySince = now`）和 `resumed`（`{pending: false}`），交还调度器，触发一次抢占检查（6.4）。挂起还没落地（任务在 vCore 上或等工具）时，恢复抵消它：落地方按序号依次看待送达的挂起、恢复中断，最后一条是恢复就不挂起，全部标为已送达，事件是 `resumed`（`{pending: true}`），跟在它放行的那条指令的提交里、排在那条指令自己的 `step` / `usage` 之后，任务照常往下走。最后一条是挂起就落地，前面的恢复一并标为已送达，只有一个 `suspended`。前面没有挂起的恢复（并发的重复恢复）标为已送达，没有事件。既没挂起、也没有待落地的挂起：`ErrNotSuspended`，什么都不提交。重复挂起一个已挂起（或挂起已待落地）的任务：成功，什么都不提交。
 
-**挂起期间**：Deadline 照常触发（9.4），取消照常生效（9.5：由取消方从等待集合取出做最终提交）。插话照收，留在中断表里，恢复后的第一步送达。`SetPriority`、`SetClass` 可以改挂起中的任务，任务仍是 `Suspended`。挂起的任务仍计入未结束任务数（9.2）。保留的 `Partial` / `PartialThink` 恢复后续写，规则同 6.4（换了组、适配器不能续写就丢掉）。
+**挂起期间**：Deadline 照常触发（9.4），取消照常生效（9.5：由取消方从等待集合取出做最终提交）。插话照收，留在中断表里，恢复后的第一步送达。`SetPriority`、`SetClass` 可以改挂起中的任务，任务仍是 `Suspended`。
 
-**持久化**：`Suspended` 重启后仍是 `Suspended`（4.5），再发一次 `recovered`（`{from: "suspended"}`）。待送达的挂起、恢复中断在恢复流程里按上面的规则落地：`Running` 中崩溃的任务先看挂起，最后一条是挂起就提交 `Suspended`（`recovered` + `suspended`，`was = "model"`，`Unconfirmed + 1`）而不是重做；退避、熔断等待的任务同理（`was` 为 `backoff` / `group`）；就绪的任务单独一次提交；挂起的任务有待送达的恢复就 `Ready`；等工具、待批准、待核对的照常等，等完那次提交落地。
+**优先级中断**：任务在 vCore 上或等工具时的 `SetPriority`（6.4）也是这里的中断（种类 `priority`），在上面这些边界落地，和挂起、恢复同一次提交（`priority_set` 在 `suspended` / `resumed` 前面）。和挂起不同，它在等工具、待批准、待核对时也不用等：哪个边界先到哪里落地；终态提交丢弃它，没有事件。挂起的任务仍计入未结束任务数（9.2）。保留的 `Partial` / `PartialThink` 恢复后续写，规则同 6.4（换了组、适配器不能续写就丢掉）。
+
+**持久化**：`Suspended` 重启后仍是 `Suspended`（4.5），再发一次 `recovered`（`{from: "suspended"}`）。待送达的挂起、恢复、优先级中断在恢复流程里按上面的规则落地（优先级在恢复流程为任务做的那次提交里落地，待批准、待核对的任务为它单独提交一次）：`Running` 中崩溃的任务先看挂起，最后一条是挂起就提交 `Suspended`（`recovered` + `suspended`，`was = "model"`，`Unconfirmed + 1`）而不是重做；退避、熔断等待的任务同理（`was` 为 `backoff` / `group`）；就绪的任务单独一次提交；挂起的任务有待送达的恢复就 `Ready`；等工具、待批准、待核对的照常等，等完那次提交落地。
 
 **观测**：`Status.Suspended`（JSON `suspended`）、`GroupStatus.Suspended`、`ClassQueue.Suspended` 是挂起的任务数；`observe` 在根 span 下开一个 `suspended` span（`suspended` → `resumed` 或终态，带 `was`），根 span 上记 `suspended`、`resumed` 事件；仪表 `neumann.tasks.suspended`；`Log` 两行 info。被挂起打断的模型调用 `outcome = suspended`，不算失败；挂起的时间不算进任何模型、工具 span（细节见 14 节）。
 
@@ -981,7 +985,7 @@ type Event struct {
 
 stdio 前端：每条指令一行 JSON，处理完回一行 `{"ok":true,"task_id":...}` 或错误（返回即已持久化）；事件另起一个流，支持 `{"kind":"subscribe","from_seq":N}` 补读。`steer` 可带 `from`（发送方，10.1）；stdio 的对端就是操作员，它给的 `from` 不做核实。
 
-操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`priority`（`task_id`、`priority`）对应 `m.SetPriority`，任务正在执行时 `task_busy`。`suspend`、`resume`（`task_id`）对应 `m.Suspend` / `m.ResumeTask`（9.9），不在挂起中的任务恢复时错误码 `not_suspended`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`，`args` 必须是对象）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
+操作员控制也走同一协议：`class`（`task_id`、`class`）、`cores`（`class`、`cores`）、`autoscale`（`class`、`on`）、`group_reset`（`class`）、`queue`；`submit` 可带 `pin_class`。`class` 被校验拒绝时错误码 `incompatible`，带 `check`；任务正在执行时 `task_busy`。`priority`（`task_id`、`priority`）对应 `m.SetPriority`，任务正在执行或等工具时也是提交后即回 ok（在下一个边界落地，6.4），不会 `task_busy`。`suspend`、`resume`（`task_id`）对应 `m.Suspend` / `m.ResumeTask`（9.9），不在挂起中的任务恢复时错误码 `not_suspended`。`approve`（`task_id`、`call_id`、`decision`：`{"verdict":"allow"}`、`{"verdict":"deny","reason":…}`、`{"verdict":"edit","args":{…}}`，`args` 必须是对象）对应 `m.Approve`，任务或调用不在等批准时错误码 `not_awaiting_approval`。工具策略只能在 Go 里配置（`Config.ToolPolicy`）。
 
 实现在 `proto/jsonl`（线格式的完整说明在它的包文档里），`cmd/neumann` 把它接到 stdin/stdout。回复和事件共用 stdout，每行第一个字段 `"type"` 是 `"reply"` 或 `"event"`：宿主进程（Node、Python）天然只有 stdout，多开一个 fd 两边都别扭；共用一个流还给出了顺序，`subscribe` 的回复恰好落在旧流最后一个事件和新流第一个事件之间。指令可带 `"id"`，回复原样带回；指令按到达顺序逐条执行。读得慢的一方不阻塞机器：事件按输出写出的速度从主存读，回复优先于积压的事件写出。
 
@@ -1049,7 +1053,7 @@ err = m.Stop(ctx)                          // 停止取指，等在途指令和�
 err = m.SetCores("little", 8)              // 固定窗口；多出的 vCore 执行完当前指令后退役
 err = m.AutoScale("little", true)          // 恢复自适应
 err = m.SetClass(ctx, id, "little")        // 手动迁移：*MigrateError / ErrTaskBusy / ErrFinished / ErrNotFound
-err = m.SetPriority(ctx, id, 0)            // 重排（6.4）：ErrTaskBusy / ErrFinished / ErrNotFound；之后可能抢占
+err = m.SetPriority(ctx, id, 0)            // 重排（6.4）：ErrFinished / ErrNotFound；忙的任务在下一个边界落地；之后可能抢占
 err = m.GroupReset(ctx, "big")             // 额度耗尽熔断后复位
 err = m.Approve(ctx, id, "c-3", neumann.ApprovalDecision{Verdict: neumann.ApproveAllow}) // 回答待批准的调用：ErrNotAwaitingApproval / ErrNotFound
 err = m.SteerWith(ctx, id, "…", neumann.SteerOptions{From: "operator"}) // 带发送方、幂等键的插话（10.1）

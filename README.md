@@ -609,6 +609,14 @@ moves a task to another group between instructions (`ErrTaskBusy` means try
 again). `m.GroupReset(ctx, class)` closes a breaker, which an exhausted quota
 never does by itself.
 
+**Priorities.** `m.SetPriority(ctx, id, p)` reorders a task: 0 is
+interactive, larger is less urgent. A queued or waiting task changes before
+the call returns. A task whose model call or tools are running is not waited
+for: the change is committed, holds across a restart, and takes effect at the
+task's next instruction boundary (the end of that call or tool round), with
+the last of several changes winning. Unlike `SetClass`, it never returns
+`ErrTaskBusy`. Each effective change is one `priority_set` event.
+
 **Suspend and resume.** `m.Suspend(ctx, id)` takes a task off the machine
 until `m.ResumeTask(ctx, id)`; both return once committed and hold across a
 restart. A ready or backing-off task is suspended at once, a model call in
@@ -640,7 +648,8 @@ NEUMANN_API_KEY=... go run ./cmd/neumann -provider openai -base-url https://host
 ```
 
 An `"ok":true` reply to `submit`, `steer`, `cancel`, `resolve`, `approve`, `class`,
-`priority`, `suspend` or `resume` means the instruction is committed. The other kinds (`status`, `queue`,
+`priority`, `suspend` or `resume` means the instruction is committed (a
+`priority` for a busy task lands at its next boundary). The other kinds (`status`, `queue`,
 `cores`, `autoscale`, `group_reset`, `unsubscribe`) and the error codes are
 documented in package `proto/jsonl`. Run `go run ./cmd/neumann -help` for
 every flag and its environment variable. Without `-store` state is in memory
