@@ -137,12 +137,21 @@ type Config struct {
 	// unfinished. A task's events are kept for as long as it runs, however
 	// long that is, and go together once its last event is older than
 	// EventRetention; machine-level events (no TaskID) go one by one. The
-	// newest event is always kept. Age is the event's commit time
-	// (proto.Event.Time, stamped by the store's clock) against Clock: keep
-	// the two the same, as they are by default. 0 keeps every event.
+	// newest event is always kept. 0 keeps every event. A pass runs at
+	// Start and then every minute (every EventRetention when that is
+	// shorter, but not more often than every second).
 	//
-	// Pruning never fails or holds up a commit; see Events for what a
-	// reader that comes back after a prune sees. It needs a Store that is a
+	// Age is the event's commit time (proto.Event.Time), which the store
+	// stamps with its own clock, against Clock. They are the same wall clock
+	// by default; with a custom Clock, give the store the same one
+	// (sqlite.WithClock(clock.Now), or Memory.Now for mem.NewMemory). If the
+	// store's clock runs ahead of Clock, retention prunes nothing until
+	// Clock catches up; if it runs behind, every finished task looks old
+	// and is pruned at once.
+	//
+	// Pruning never fails a commit, and holds one up for at most one short
+	// store call (design §4.4.2); see Events for what a reader that comes
+	// back after a prune sees. It needs a Store that is a
 	// mem.EventPruner (mem.NewMemory and mem/sqlite are): New refuses one
 	// that is not, rather than let the log grow while it was asked not to.
 	EventRetention time.Duration
@@ -728,7 +737,7 @@ func (m *Machine) Start(ctx context.Context) error {
 }
 
 // Stop shuts the machine down. It first stops event retention (cancelling
-// a prune in flight and waiting for it, within ctx), refuses new work and
+// it and waiting for the store call in flight, if any), refuses new work and
 // closes the scheduler, then waits for the vCores and in-flight tool batches to commit
 // and hand their tasks back. If ctx ends first it halts what is left (running
 // calls are cancelled and their results are not committed; those tasks keep
@@ -749,7 +758,7 @@ func (m *Machine) Stop(ctx context.Context) error {
 	}
 	// Pruning first: it is not work anyone waits for, and the store must be
 	// let go of once Stop returns.
-	m.stopRetention(ctx)
+	m.stopRetention()
 	// No instruction is fetched, and no vCore started, from here on. Close
 	// only stops fetching: tool batches and admitted submits can still hand
 	// tasks back. Every vCore retires (core_down, shutdown) once its

@@ -440,16 +440,32 @@ swapped out included.
 **Event retention.** The event log keeps every event unless
 `Config.EventRetention` is set (0, the default, keeps everything). With
 `EventRetention: 7 * 24 * time.Hour` the machine prunes in the background,
-from `Start` on, once a minute: a finished task's events are deleted
-together once the newest of them is older than a week; machine-level events
-(no task id) go one by one at the same age; the events of a task that has
-not finished are kept however long it runs, and go once it has finished and
-its last event is old enough; the newest event is always kept. Pruning
-deletes at most 500 events per store call with a short pause between calls,
-so a commit waits for at most one such batch; a prune that fails is logged
-and retried on the next pass, and never fails a commit. `Stop` cancels a
-pass in flight and waits for it. Task state, call records, interrupts and
-archives are not touched: recovery never reads the event log.
+from `Start` on, once a minute (every `EventRetention` when that is shorter,
+but never more often than every second): a finished task's events are
+deleted together once the newest of them is older than a week;
+machine-level events (no task id) go one by one at the same age; the events
+of a task that has not finished are kept however long it runs, and go once
+it has finished and its last event is old enough; the newest event is
+always kept. A pass walks the old part of the log in store calls that each
+look at no more than 500 old events (kept or deleted), going on from where
+the call before stopped, with a short pause between calls. On `mem/sqlite`
+a call is one transaction on the store's writer whose cost does not grow
+with the old events kept before it (a running task's, say), so a commit
+that arrives during it waits for that one call: under a millisecond on a
+laptop when it deletes nothing, plus the fsync of its deletes when it does.
+(`mem.NewMemory` walks its whole log under its lock on every call: fine for
+tests, not for a long log.) A prune that fails is logged and retried on the
+next pass, and never fails a commit. `Stop` cancels retention and waits for
+the store call in flight before it does anything else. Task state, call
+records, interrupts and archives are not touched: recovery never reads the
+event log.
+
+Age is an event's commit time, stamped by the store's clock, against
+`Config.Clock`; both are the wall clock by default. With a custom `Clock`,
+give the store the same one: `sqlite.WithClock(clock.Now)`, or set `Now` on
+a `mem.NewMemory()`. Otherwise retention prunes nothing while the machine's
+clock is behind the store's, and every finished task at once when it is
+ahead.
 
 Sequence numbers are dense as committed, so a pruned event is a gap in
 `Seq`. A reader that resumes from a seq whose next events were pruned gets

@@ -258,27 +258,67 @@ func TestEventsAfterAPrunedSeq(t *testing.T) {
 	}
 }
 
-// slowPruner holds every prune until its context ends, as a prune of a large
-// log in flight would, and fails every one when failing is set.
+// slowPruner holds every prune until its context ends, then takes linger
+// more to return, as a store call in flight finishing its transaction
+// would; it fails every one when failing is set, and returns at once,
+// pruning nothing, when quick is set.
 type slowPruner struct {
 	*mem.Memory
 	failing bool
+	quick   bool
+	linger  time.Duration
 	entered chan struct{}
 	once    sync.Once
 	active  atomic.Int32
 	calls   atomic.Int32
 }
 
-func (s *slowPruner) PruneEvents(ctx context.Context, before time.Time, limit int) (int, error) {
+func (s *slowPruner) PruneEvents(ctx context.Context, before time.Time, after int64, limit int) (int, int64, error) {
 	s.calls.Add(1)
-	if s.failing {
-		return 0, errors.New("disk on fire")
+	switch {
+	case s.failing:
+		return 0, 0, errors.New("disk on fire")
+	case s.quick:
+		return 0, 0, nil
 	}
 	s.active.Add(1)
 	defer s.active.Add(-1)
 	s.once.Do(func() { close(s.entered) })
 	<-ctx.Done()
-	return 0, ctx.Err()
+	time.Sleep(s.linger)
+	return 0, 0, ctx.Err()
+}
+
+// Stop waits for the store call in flight even when its own context has
+// already ended: once it returns, retention touches the store no more.
+func TestStopWaitsForThePruneWhateverItsContext(t *testing.T) {
+	store := &slowPruner{Memory: mem.NewMemory(), entered: make(chan struct{}), linger: 50 * time.Millisecond}
+	m, err := neumann.New(neumann.Config{Model: &sim.Model{Fn: func(model.Request) (model.Response, error) { return sim.Reply("ok"), nil }},
+		Store: store, EventRetention: time.Hour, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(bg); err != nil {
+		t.Fatal(err)
+	}
+	<-store.entered
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	m.Stop(ctx) // its error is about the deadline, not retention
+	if n := store.active.Load(); n != 0 {
+		t.Fatalf("%d prunes still running after Stop", n)
+	}
+}
+
+// However short EventRetention is, passes are at least a second apart.
+func TestRetentionPassesAreASecondApart(t *testing.T) {
+	store := &slowPruner{Memory: mem.NewMemory(), quick: true}
+	startWith(t, neumann.Config{Model: &sim.Model{Fn: func(model.Request) (model.Response, error) { return sim.Reply("ok"), nil }},
+		Store: store, EventRetention: time.Microsecond})
+	time.Sleep(300 * time.Millisecond)
+	if n := store.calls.Load(); n != 1 {
+		t.Fatalf("%d passes in 300ms, want the one Start runs", n)
+	}
 }
 
 // Stop cancels a prune in flight and waits for it: none runs once Stop has
