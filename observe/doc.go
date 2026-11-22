@@ -20,6 +20,14 @@
 // returns (or Metrics.Seq) resumes from it after a restart; Head gives the
 // end of the log, for observers that should count only from now on.
 //
+// With event retention (neumann.Config.EventRetention) the log keeps only
+// recent events and those of unfinished tasks. A host that resumes from a
+// seq older than the retention age misses the events pruned after it: the
+// machine logs the gap once, Follow goes on with the oldest kept event
+// after the seq, and /events sends a "pruned" event first (NewHandler). A
+// Tracer then sees some tasks only from partway through, as it does any
+// task begun before the seq it started from (neumann.partial).
+//
 //	reader, prom, _ := observe.PrometheusReader()
 //	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 //	metrics, _ := observe.NewMetrics(m, mp, observe.MetricsOptions{})
@@ -142,6 +150,7 @@
 //	neumann.cache.misses          counter  {lookup}      —
 //	neumann.cache.evictions       counter  {entry}       —
 //	neumann.deltas.dropped        counter  {delta}       —
+//	neumann.events.pruned         counter  {event}       —                  Status.EventsPruned: deleted by event retention
 //	neumann.process.goroutines    gauge    {goroutine}   —
 //	neumann.process.heap          gauge    By            —                  live and unswept heap objects
 //	neumann.process.rss           gauge    By            —                  Linux only

@@ -54,6 +54,11 @@ func (f ObserverFunc) Observe(ev proto.Event) { f(ev) }
 // Follow reads the durable log at its own pace, so a slow observer never
 // holds the machine up; it only falls behind. It returns ctx.Err() when ctx
 // ended, nil when the stream did.
+//
+// If event retention pruned events after fromSeq (or prunes them while
+// Follow is further behind than the retention age), Follow feeds the kept
+// events, in order, with the gaps the pruned ones left (the machine's
+// Events logs the first gap); it neither waits for them nor fails.
 func Follow(ctx context.Context, src EventSource, fromSeq int64, obs ...Observer) (int64, error) {
 	last := fromSeq
 	flush := func() {

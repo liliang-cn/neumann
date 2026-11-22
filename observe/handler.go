@@ -44,11 +44,21 @@ type HandlerOptions struct {
 //	GET /events?from_seq=N committed events with Seq > N as server-sent events
 //	                       (id: seq, event: kind, data: the event as JSON),
 //	                       the log first, then live; Last-Event-ID resumes
-//	                       after that seq; &task=ID keeps one task's events
+//	                       after that seq; &task=ID keeps one task's events;
+//	                       a "pruned" event marks a gap retention left (see
+//	                       below)
 //	GET /metrics           HandlerOptions.Metrics, if set
 //	GET /debug/pprof/...   runtime profiles, if HandlerOptions.Pprof
 //
 // There is no endpoint that changes anything; other methods get 405.
+//
+// A client that resumes from a seq above 0 whose following events were
+// deleted by event retention (neumann.Config.EventRetention) first gets one
+// event of kind "pruned", with no id (Last-Event-ID stays where it was) and
+// data {"after_seq": A, "next_seq": B}: seqs A+1 to B-1 are gone, and the
+// stream goes on from B, the oldest kept event after A. It comes once per
+// connection, at the first gap; from 0, the client asked for whatever is
+// kept and gets no marker.
 //
 // /tasks and /events expose task content: prompts, answers, tool arguments
 // and results. Do not serve the handler where anyone but the operator can
@@ -187,12 +197,22 @@ func (h *handler) events(w http.ResponseWriter, r *http.Request) {
 	tick := time.NewTicker(h.o.KeepAlive)
 	defer tick.Stop()
 	unflushed := false
+	last, marked := from, from <= 0
 	for {
 		select {
 		case ev, ok := <-evs:
 			if !ok {
 				return
 			}
+			// Seqs are dense as committed: a skipped one was pruned.
+			if !marked && ev.Seq > last+1 {
+				marked = true
+				if _, err := fmt.Fprintf(w, "event: pruned\ndata: {\"after_seq\":%d,\"next_seq\":%d}\n\n", last, ev.Seq); err != nil {
+					return
+				}
+				unflushed = true
+			}
+			last = ev.Seq
 			if only == "" || ev.TaskID == only {
 				if err := writeEvent(w, ev); err != nil {
 					return

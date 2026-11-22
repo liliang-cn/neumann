@@ -125,6 +125,7 @@ type sse struct {
 type sseEvent struct {
 	id, event string
 	ev        proto.Event
+	data      string
 }
 
 func openSSE(t *testing.T, srv *httptest.Server, path string, header ...string) *sse {
@@ -158,7 +159,7 @@ func (s *sse) next() sseEvent {
 			}
 			line = strings.TrimRight(line, "\n")
 			switch {
-			case line == "" && e.id != "":
+			case line == "" && (e.id != "" || e.event != ""):
 				got <- nil
 				return
 			case strings.HasPrefix(line, "id: "):
@@ -166,6 +167,7 @@ func (s *sse) next() sseEvent {
 			case strings.HasPrefix(line, "event: "):
 				e.event = line[7:]
 			case strings.HasPrefix(line, "data: "):
+				e.data = line[6:]
 				if err := json.Unmarshal([]byte(line[6:]), &e.ev); err != nil {
 					got <- err
 					return
