@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/liliang-cn/neumann/proto"
@@ -80,14 +81,37 @@ const (
 // reason, the StopReason the task ends with ("cancelled" or "deadline"). A
 // suspend and a resume carry no text (design §9.9): the holder of the task
 // applies them at its next instruction boundary, in seq order, and only the
-// last of them counts. Unlike a cancel, neither refuses any commit; a
-// terminal commit applies them silently, as any interrupt but a steer.
+// last of them counts. A priority's Text is the new priority in decimal
+// (PriorityInterrupt): an operator's SetPriority on a task that is executing
+// an instruction or waiting for its tools (design §6.4), applied at the same
+// boundaries, the last one counting. Unlike a cancel, none of these refuses
+// any commit; a terminal commit applies them silently, as any interrupt but
+// a steer.
 const (
-	InterruptSteer   = "steer"
-	InterruptCancel  = "cancel"
-	InterruptSuspend = "suspend"
-	InterruptResume  = "resume"
+	InterruptSteer    = "steer"
+	InterruptCancel   = "cancel"
+	InterruptSuspend  = "suspend"
+	InterruptResume   = "resume"
+	InterruptPriority = "priority"
 )
+
+// PriorityInterrupt is the interrupt that gives task id priority p.
+func PriorityInterrupt(id string, p int) Interrupt {
+	return Interrupt{TaskID: id, Kind: InterruptPriority, Text: strconv.Itoa(p)}
+}
+
+// PriorityOf is the priority a priority interrupt carries; ok is false for
+// another kind, or a Text that is not a priority (a number below 0).
+func PriorityOf(in Interrupt) (p int, ok bool) {
+	if in.Kind != InterruptPriority {
+		return 0, false
+	}
+	p, err := strconv.Atoi(in.Text)
+	if err != nil || p < 0 {
+		return 0, false
+	}
+	return p, true
+}
 
 // CancelReason is the StopReason that the final commit of the cancel in must
 // carry: its Text, or "cancelled" when it has none.

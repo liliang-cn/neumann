@@ -77,6 +77,8 @@ func Run(t *testing.T, newStore Factory) {
 		{"PruneKeepsTheNewestEvent", testPruneKeepsTheNewestEvent},
 		{"PruneWaitsForTheTaskToFinish", testPruneWaitsForTheTaskToFinish},
 		{"PruneNothing", testPruneNothing},
+		{"PriorityRoundTripsInOrder", testPriorityRoundTripsInOrder},
+		{"PriorityIsAppliedSilently", testPriorityIsAppliedSilently},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore) })
@@ -902,5 +904,60 @@ func testSuspendAndResumeAreAppliedSilently(t *testing.T, newStore Factory) {
 	}
 	if _, err := s.Commit(ctx, suspension("b", mem.InterruptResume)); !errors.Is(err, mem.ErrNotFound) {
 		t.Fatalf("resume of an unknown task: %v, want ErrNotFound", err)
+	}
+}
+
+// A priority interrupt (an operator's SetPriority on a busy task, design
+// §6.4) keeps its kind, its number (Text) and its order among the task's
+// other interrupts, and refuses no commit: the holder lands it at its next
+// boundary, marking exactly those it applied.
+func testPriorityRoundTripsInOrder(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{mem.PriorityInterrupt("a", 3)}})
+	mustCommit(t, s, steer("a", "s"))
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{mem.PriorityInterrupt("a", 0)}})
+	tc.State, tc.Wait, tc.Version = task.Waiting, task.WaitIO, 2
+	r := mem.CallRecord{TaskID: "a", CallID: "c-1", Index: 1, Tool: "x", Status: mem.CallDispatched, Attempt: 1}
+	mustCommit(t, s, mem.CommitSet{Task: tc, Calls: []mem.CallRecord{r}})
+	pending, err := s.Interrupts(ctx, "a", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, in := range pending {
+		got = append(got, in.Kind+":"+in.Text)
+	}
+	if strings.Join(got, ",") != "priority:3,steer:s,priority:0" {
+		t.Fatalf("pending %v", got)
+	}
+	if p, ok := mem.PriorityOf(pending[2]); !ok || p != 0 {
+		t.Fatalf("PriorityOf %+v: %d, %v", pending[2], p, ok)
+	}
+	tc.State, tc.Wait, tc.Priority, tc.Version = task.Ready, task.WaitNone, 0, 3
+	mustCommit(t, s, mem.CommitSet{Task: tc, Applied: []int64{pending[0].Seq, pending[2].Seq}})
+	left, _ := s.Interrupts(ctx, "a", true)
+	if len(left) != 1 || left[0].Kind != mem.InterruptSteer {
+		t.Fatalf("left pending %+v", left)
+	}
+}
+
+// A terminal commit applies a pending priority interrupt with every other
+// one and reports nothing: a task that ended is not reordered.
+func testPriorityIsAppliedSilently(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	tc := newTask("a")
+	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
+	mustCommit(t, s, mem.CommitSet{NewInterrupts: []mem.Interrupt{mem.PriorityInterrupt("a", 4)}})
+	tc.State, tc.StopReason, tc.Version = task.Cancelled, "cancelled", 2
+	if evs := mustCommit(t, s, mem.CommitSet{Task: tc}); len(evs) != 0 {
+		t.Fatalf("events %+v", evs)
+	}
+	if pending, _ := s.Interrupts(ctx, "a", true); len(pending) != 0 {
+		t.Fatalf("pending %+v", pending)
+	}
+	if got, _ := s.Load(ctx, "a"); got.Priority != 0 {
+		t.Fatalf("priority %d", got.Priority)
 	}
 }
