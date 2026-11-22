@@ -1,6 +1,7 @@
 // Package storetest is the conformance suite every mem.Store must pass: the
 // in-memory store and the SQLite store run the same cases, so they cannot
-// drift apart in the semantics the machine relies on (design §4).
+// drift apart in the semantics the machine relies on (design §4). The
+// retention cases (Prune*) run only for a store that is a mem.EventPruner.
 //
 // A new Store runs it from a test:
 //
@@ -70,6 +71,11 @@ func Run(t *testing.T, newStore Factory) {
 		{"SuspendAndResumeRoundTripInOrder", testSuspendAndResumeRoundTripInOrder},
 		{"PendingSuspendRefusesNothing", testPendingSuspendRefusesNothing},
 		{"SuspendAndResumeAreAppliedSilently", testSuspendAndResumeAreAppliedSilently},
+		{"PruneOnlyEligibleEvents", testPruneOnlyEligibleEvents},
+		{"PruneOldestFirstWithinLimit", testPruneOldestFirstWithinLimit},
+		{"PruneKeepsTheNewestEvent", testPruneKeepsTheNewestEvent},
+		{"PruneWaitsForTheTaskToFinish", testPruneWaitsForTheTaskToFinish},
+		{"PruneNothing", testPruneNothing},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) { c.fn(t, newStore) })

@@ -27,12 +27,16 @@ type Memory struct {
 	calls      map[string][]CallRecord
 	interrupts map[string][]Interrupt
 	archive    map[string][]task.Message
-	events     []proto.Event
+	events     []proto.Event // in Seq order; pruning leaves gaps
+	lastSeq    int64         // the Seq of the last event committed
 	taskSeq    map[string]int64
 	intSeq     int64
 }
 
-var _ Store = (*Memory)(nil)
+var (
+	_ Store       = (*Memory)(nil)
+	_ EventPruner = (*Memory)(nil)
+)
 
 func NewMemory() *Memory {
 	return &Memory{
@@ -101,7 +105,8 @@ func (m *Memory) Commit(ctx context.Context, c CommitSet) ([]proto.Event, error)
 	for i := range events {
 		events[i].Time = m.stamped
 		m.taskSeq[events[i].TaskID]++
-		events[i].Seq = int64(len(m.events)) + 1
+		m.lastSeq++
+		events[i].Seq = m.lastSeq
 		events[i].TaskSeq = m.taskSeq[events[i].TaskID]
 		m.events = append(m.events, cloneEvent(events[i]))
 	}
@@ -278,22 +283,57 @@ func (m *Memory) Events(ctx context.Context, afterSeq int64, limit int) ([]proto
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if afterSeq < 0 {
-		afterSeq = 0
+	from := sort.Search(len(m.events), func(i int) bool { return m.events[i].Seq > afterSeq })
+	end := len(m.events)
+	if limit > 0 && from+limit < end {
+		end = from + limit
 	}
-	n := int64(len(m.events))
-	if afterSeq >= n {
+	if from >= end {
 		return nil, nil
 	}
-	end := n
-	if limit > 0 && afterSeq+int64(limit) < end {
-		end = afterSeq + int64(limit)
-	}
-	out := make([]proto.Event, 0, end-afterSeq)
-	for _, e := range m.events[afterSeq:end] {
+	out := make([]proto.Event, 0, end-from)
+	for _, e := range m.events[from:end] {
 		out = append(out, cloneEvent(e))
 	}
 	return out, nil
+}
+
+// PruneEvents deletes the events EventPruner allows, oldest first. It reads
+// the whole log, which is fine for the store meant for tests.
+func (m *Memory) PruneEvents(ctx context.Context, before time.Time, limit int) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.events) < 2 {
+		return 0, nil
+	}
+	newest := len(m.events) - 1
+	old := func(i int) bool { return i != newest && m.events[i].Time.Before(before) }
+	// A task's events can go only if all of them can.
+	young := map[string]bool{}
+	for i, e := range m.events {
+		if e.TaskID != "" && !old(i) {
+			young[e.TaskID] = true
+		}
+	}
+	gone := 0
+	kept := m.events[:0:0]
+	for i, e := range m.events {
+		ok := (limit <= 0 || gone < limit) && old(i)
+		if ok && e.TaskID != "" {
+			t, exists := m.tasks[e.TaskID]
+			ok = !young[e.TaskID] && !(exists && !t.State.Terminal())
+		}
+		if ok {
+			gone++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	m.events = kept
+	return gone, nil
 }
 
 func (m *Memory) Archive(ctx context.Context, taskID string) ([]task.Message, error) {

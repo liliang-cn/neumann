@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -83,7 +84,8 @@ CREATE TABLE IF NOT EXISTS archive (
 	task_id TEXT NOT NULL,
 	msg     BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS archive_task ON archive (task_id, seq);`
+CREATE INDEX IF NOT EXISTS archive_task ON archive (task_id, seq);
+CREATE INDEX IF NOT EXISTS events_task ON events (task_id, seq);`
 
 type Store struct {
 	db   *sql.DB
@@ -107,13 +109,19 @@ func WithClock(now func() time.Time) Option {
 	return func(s *Store) { s.now = now }
 }
 
-var _ mem.Store = (*Store)(nil)
+var (
+	_ mem.Store       = (*Store)(nil)
+	_ mem.EventPruner = (*Store)(nil)
+)
 
+// A request is a commit set, or a prune when prune is set: the writer runs
+// a prune in a transaction of its own, between batches of commits.
 type request struct {
-	c   mem.CommitSet
-	evs []proto.Event
-	err error
-	ok  chan struct{}
+	c     mem.CommitSet
+	prune *pruneReq
+	evs   []proto.Event
+	err   error
+	ok    chan struct{}
 }
 
 // Open opens (creating if needed) the database at path. Commits are durable
@@ -263,12 +271,21 @@ func (s *Store) Commit(ctx context.Context, c mem.CommitSet) ([]proto.Event, err
 func (s *Store) writer() {
 	defer close(s.done)
 	for first := range s.reqs {
+		if first.prune != nil {
+			s.pruneEvents(first)
+			continue
+		}
 		batch := []*request{first}
+		var prune *request // queued behind the batch: it runs after it
 	drain:
 		for len(batch) < maxBatch {
 			select {
 			case r, ok := <-s.reqs:
 				if !ok {
+					break drain
+				}
+				if r.prune != nil {
+					prune = r
 					break drain
 				}
 				batch = append(batch, r)
@@ -277,6 +294,9 @@ func (s *Store) writer() {
 			}
 		}
 		s.write(batch)
+		if prune != nil {
+			s.pruneEvents(prune)
+		}
 	}
 }
 
@@ -668,4 +688,146 @@ func (s *Store) Archive(ctx context.Context, taskID string) ([]task.Message, err
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+type pruneReq struct {
+	before time.Time
+	limit  int
+	n      int
+}
+
+// PruneEvents deletes the events mem.EventPruner allows, oldest first. It
+// runs on the writer, in a transaction of its own between two batches of
+// commits, so it never contends with them for the write lock; commits that
+// arrive meanwhile wait for it and go into the next batch, which is why the
+// caller keeps limit small. Like Commit, once queued it is not abandoned
+// when ctx ends.
+//
+// The space deleted events took stays in the file and is reused by the
+// events committed after them: with retention the file stops growing at
+// what MaxAge worth of events takes, but does not shrink. VACUUM, run
+// while no machine has the file open, gives the space back.
+func (s *Store) PruneEvents(ctx context.Context, before time.Time, limit int) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	r := &request{prune: &pruneReq{before: before, limit: limit}, ok: make(chan struct{})}
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return 0, ErrClosed
+	}
+	s.reqs <- r
+	s.mu.RUnlock()
+	<-r.ok
+	return r.prune.n, r.err
+}
+
+func (s *Store) pruneEvents(r *request) {
+	defer close(r.ok)
+	ctx := context.Background()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		r.err = fmt.Errorf("sqlite: begin prune: %w", err)
+		return
+	}
+	n, err := prune(ctx, tx, r.prune.before, r.prune.limit)
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		tx.Rollback()
+		r.err = fmt.Errorf("sqlite: prune events: %w", err)
+		return
+	}
+	r.prune.n = n
+}
+
+// pruneChunk bounds the seqs in one DELETE statement, below SQLite's limit
+// on bound parameters.
+const pruneChunk = 500
+
+func prune(ctx context.Context, tx *sql.Tx, before time.Time, limit int) (int, error) {
+	var top sql.NullInt64
+	if err := tx.QueryRowContext(ctx, "SELECT MAX(seq) FROM events").Scan(&top); err != nil || !top.Valid {
+		return 0, err
+	}
+	cut, err := oldThrough(ctx, tx, before.UnixNano(), top.Int64)
+	if err != nil {
+		return 0, err
+	}
+	// Event times never decrease with seq, so the events that are old and
+	// not the newest are those with seq <= bound: the scan stops there on
+	// the primary key, and a task's newest event is one lookup in
+	// events_task.
+	bound := min(cut, top.Int64-1)
+	if bound <= 0 {
+		return 0, nil
+	}
+	if limit <= 0 {
+		limit = -1 // SQLite: no limit
+	}
+	rows, err := tx.QueryContext(ctx, `
+		SELECT e.seq FROM events e
+		WHERE e.seq <= ?1 AND (e.task_id = '' OR (
+			NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = e.task_id AND t.terminal = 0)
+			AND (SELECT MAX(o.seq) FROM events o WHERE o.task_id = e.task_id) <= ?1))
+		ORDER BY e.seq LIMIT ?2`, bound, limit)
+	if err != nil {
+		return 0, err
+	}
+	var gone []any
+	for rows.Next() {
+		var seq int64
+		if err := rows.Scan(&seq); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		gone = append(gone, seq)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(gone) == 0 {
+		return 0, err
+	}
+	for chunk := range slices.Chunk(gone, pruneChunk) {
+		q := "DELETE FROM events WHERE seq IN (?" + strings.Repeat(",?", len(chunk)-1) + ")"
+		if _, err := tx.ExecContext(ctx, q, chunk...); err != nil {
+			return 0, err
+		}
+	}
+	return len(gone), nil
+}
+
+// oldThrough is the highest seq whose event is stamped before before (Unix
+// nanoseconds), 0 if there is none. Events read back before they had times
+// count as older than any. Times never decrease with seq, so it is a binary
+// search on the primary key, a few dozen point reads, where a scan for it
+// would read every old event and an index on time would cost every commit.
+func oldThrough(ctx context.Context, tx *sql.Tx, before, top int64) (int64, error) {
+	// at(n): the first event with seq >= n, and whether it is old.
+	at := func(n int64) (int64, bool, error) {
+		var seq, t int64
+		err := tx.QueryRowContext(ctx, "SELECT seq, COALESCE(time, 0) FROM events WHERE seq >= ? ORDER BY seq LIMIT 1", n).Scan(&seq, &t)
+		return seq, t < before, err
+	}
+	first, old, err := at(0)
+	if err != nil || !old {
+		return 0, err
+	}
+	// Invariant: the first event at or after lo is old (its seq is found);
+	// the first at or after hi is not, or hi is past top.
+	found, lo, hi := first, first, top+1
+	for lo+1 < hi {
+		mid := lo + (hi-lo)/2
+		seq, old, err := at(mid)
+		if err != nil {
+			return 0, err
+		}
+		if old {
+			found, lo = seq, seq
+		} else {
+			hi = mid
+		}
+	}
+	return found, nil
 }

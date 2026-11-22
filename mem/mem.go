@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/liliang-cn/neumann/proto"
 	"github.com/liliang-cn/neumann/task"
@@ -154,7 +155,9 @@ func SteerEventData(in Interrupt) map[string]any {
 //     Task, and goes in or is refused with the rest of the commit.
 //   - Events get their Seq and TaskSeq; Commit returns them. Both are dense:
 //     Seq counts 1, 2, 3… across all events and TaskSeq 1, 2, 3… per task,
-//     with no gap left by a rejected commit.
+//     with no gap left by a rejected commit. They are dense as committed:
+//     an EventPruner can later delete events, leaving gaps in what Events
+//     reads, but a Seq is never given out twice.
 type CommitSet struct {
 	Task          *task.TCB
 	NewTask       bool
@@ -190,4 +193,42 @@ type Store interface {
 	// Archive is everything Archive commits appended for a task, oldest
 	// first; empty for a task with none, or none at all.
 	Archive(ctx context.Context, taskID string) ([]task.Message, error)
+}
+
+// EventPruner is a Store that can delete old events, so that the event log
+// does not grow without bound (Config.EventRetention of package neumann,
+// design §4.4.2). It is optional: a Store without it keeps every event, and
+// a machine asked for retention over such a store refuses to start.
+//
+// An event is eligible as of a time before when all of these hold:
+//
+//   - its Time is before before;
+//   - it is not the newest event in the log (so a Seq is never handed out
+//     again, and the log's head stays readable);
+//   - it has no TaskID (a machine-level event), or its task is not
+//     unfinished (terminal, or not in the store at all) and every event of
+//     that task meets the two conditions above.
+//
+// So the events of an unfinished task are never pruned, however old, and a
+// finished task's events become eligible together, once its last one is
+// old enough (a bounded prune may still take them over more than one
+// call). An event committed for a task after its events went (a late
+// result's tool_late, say) is pruned on its own when it is old. Event times
+// never decrease with Seq (CommitTime), and a store may rely on it.
+//
+// Seqs are dense as committed, so pruned events are the gaps a reader
+// finds: a reader that has read everything up to n has missed nothing as
+// long as the next event it reads is n+1. The newest event stays, so a gap
+// is always followed by an event that shows it.
+//
+// Every implementation must pass the retention cases of mem/storetest, which
+// run whenever the Store under test is an EventPruner.
+type EventPruner interface {
+	// PruneEvents deletes eligible events, lowest Seq first, at most limit
+	// of them (limit <= 0: no bound), and returns how many it deleted. It
+	// never deletes anything else, and the events it keeps read back
+	// exactly as before, Seq and TaskSeq unchanged. Each call is atomic and
+	// should be short: the caller bounds the work with limit and calls
+	// again while it returns limit.
+	PruneEvents(ctx context.Context, before time.Time, limit int) (int, error)
 }
