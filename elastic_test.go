@@ -127,6 +127,23 @@ func coreEvents(t *testing.T, m *neumann.Machine, kind string) []coreData {
 	return out
 }
 
+// waitCoreDowns waits, on the event stream, until n core_down events have
+// been committed.
+func waitCoreDowns(t *testing.T, m *neumann.Machine, n int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+	defer cancel()
+	seen := 0
+	for ev := range m.Events(ctx, 0) {
+		if ev.Kind == proto.EvCoreDown && ev.TaskID == "" {
+			if seen++; seen == n {
+				return
+			}
+		}
+	}
+	t.Fatalf("%d core_down events within 5s, want %d", seen, n)
+}
+
 func reasons(cs []coreData) map[string]int {
 	out := map[string]int{}
 	for _, c := range cs {
@@ -649,6 +666,9 @@ func TestCoresRetireOnlyBetweenInstructions(t *testing.T) {
 	open()
 	doneAll(t, m, ids)
 	waitFor(t, func() bool { return groupOf(t, m, "g").Live == 1 })
+	// A retiring vCore leaves Live before its core_down is committed: wait
+	// for the three events themselves, not just for Live.
+	waitCoreDowns(t, m, 3)
 	downs := coreEvents(t, m, proto.EvCoreDown)
 	if len(downs) != 3 || reasons(downs)["manual"] != 3 {
 		t.Fatalf("core_down %+v", downs)
