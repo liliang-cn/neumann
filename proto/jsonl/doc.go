@@ -80,7 +80,9 @@
 // every committed event with seq > N, read from the store, then live ones as
 // they are committed; a second subscribe replaces the first. A client that
 // reconnects (or restarts) with the last seq it handled gets exactly what it
-// missed. An event line is the event itself with "type" in front:
+// missed, unless event retention (neumann.Config.EventRetention) deleted
+// some of it: seqs are dense as committed, so those show as a gap in seq,
+// and the stream goes on with the events kept. An event line is the event itself with "type" in front:
 //
 //	{"type":"event","kind":"answer","task_id":"8c0f…","seq":12,"task_seq":5,"data":{"text":"4"}}
 //

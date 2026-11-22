@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -129,6 +130,22 @@ type Config struct {
 	BackoffBase     time.Duration
 	BackoffMax      time.Duration
 	BackoffJitter   func(step time.Duration) time.Duration
+
+	// EventRetention, when positive, prunes the event log in the background
+	// (design §4.4.2), so that it does not grow without bound: an event is
+	// deleted once it is older than EventRetention, unless its task is
+	// unfinished. A task's events are kept for as long as it runs, however
+	// long that is, and go together once its last event is older than
+	// EventRetention; machine-level events (no TaskID) go one by one. The
+	// newest event is always kept. Age is the event's commit time
+	// (proto.Event.Time, stamped by the store's clock) against Clock: keep
+	// the two the same, as they are by default. 0 keeps every event.
+	//
+	// Pruning never fails or holds up a commit; see Events for what a
+	// reader that comes back after a prune sees. It needs a Store that is a
+	// mem.EventPruner (mem.NewMemory and mem/sqlite are): New refuses one
+	// that is not, rather than let the log grow while it was asked not to.
+	EventRetention time.Duration
 }
 
 // GroupConfig is one execution group (design §6).
@@ -299,6 +316,13 @@ type Machine struct {
 	queued   map[string]int // each class's MaxQueued; 0 = none
 	defClass string
 	limiters []*limit.Limiter // in Config order
+
+	// Event retention (retention.go): the pruning loop's cancel and its end,
+	// set by Start when Config.EventRetention asks for it, and the events it
+	// has deleted.
+	retainStop   context.CancelFunc
+	retainDone   chan struct{}
+	eventsPruned atomic.Int64
 }
 
 // New validates cfg and attaches the devices to a bus (closing them if
@@ -329,6 +353,12 @@ func New(cfg Config) (*Machine, error) {
 	}
 	if cfg.MessageFormat == nil {
 		cfg.MessageFormat = DefaultMessageFormat
+	}
+	if cfg.EventRetention < 0 {
+		return nil, fmt.Errorf("neumann: EventRetention %v is negative", cfg.EventRetention)
+	}
+	if _, ok := cfg.Store.(mem.EventPruner); cfg.EventRetention > 0 && !ok {
+		return nil, fmt.Errorf("neumann: EventRetention needs a store that can prune events (mem.EventPruner); %T is not one", cfg.Store)
 	}
 	groups, pinned, err := groupConfigs(cfg)
 	if err != nil {
@@ -643,7 +673,8 @@ func (m *Machine) commit(ctx context.Context, c mem.CommitSet) error {
 // sent again under the same idempotency key, and a call with side effects
 // whose outcome is now unknown is either reported to the model (if its tool
 // allows it) or held for an operator (see Resolve). If recovery fails, Start
-// returns the error and may be called again.
+// returns the error and may be called again. Once it has recovered, Start
+// begins event retention, when Config.EventRetention asks for it.
 func (m *Machine) Start(ctx context.Context) error {
 	m.life.Lock()
 	defer m.life.Unlock()
@@ -692,11 +723,13 @@ func (m *Machine) Start(ctx context.Context) error {
 	// vCores start as work arrives (design §6.1): now for the recovered
 	// ready queues, later whenever a task joins one.
 	m.env.StartCores(runCtx)
+	m.startRetention()
 	return nil
 }
 
-// Stop shuts the machine down. It first refuses new work and closes the
-// scheduler, then waits for the vCores and in-flight tool batches to commit
+// Stop shuts the machine down. It first stops event retention (cancelling
+// a prune in flight and waiting for it, within ctx), refuses new work and
+// closes the scheduler, then waits for the vCores and in-flight tool batches to commit
 // and hand their tasks back. If ctx ends first it halts what is left (running
 // calls are cancelled and their results are not committed; those tasks keep
 // their last committed state) and waits at most 2s more. In every case it
@@ -714,6 +747,9 @@ func (m *Machine) Stop(ctx context.Context) error {
 	if already {
 		return nil
 	}
+	// Pruning first: it is not work anyone waits for, and the store must be
+	// let go of once Stop returns.
+	m.stopRetention(ctx)
 	// No instruction is fetched, and no vCore started, from here on. Close
 	// only stops fetching: tool batches and admitted submits can still hand
 	// tasks back. Every vCore retires (core_down, shutdown) once its
@@ -932,11 +968,21 @@ func (m *Machine) Steer(ctx context.Context, taskID, text string) error {
 // ends when ctx ends, or after the machine stops and the subscriber has read
 // everything committed. A slow subscriber never blocks the machine and never
 // misses an event: it reads the log at its own pace.
+//
+// With Config.EventRetention (or a store pruned by an earlier run), the log
+// holds only what retention kept, and Events streams that: what is gone is
+// a gap in Seq, which is dense as committed. A subscriber that resumes from
+// a seq inside the pruned part of the log (or falls further behind than
+// the retention age) gets the events kept after it, in order, with gaps
+// where events were pruned; a gap after the seq it asked for means it
+// missed those events. Events logs that once per stream, for a fromSeq
+// above 0: from 0, the subscriber asked for whatever is kept.
 func (m *Machine) Events(ctx context.Context, fromSeq int64) <-chan proto.Event {
 	out := make(chan proto.Event, 64)
 	go func() {
 		defer close(out)
 		after := fromSeq
+		warned := fromSeq <= 0
 		for {
 			wake, closed := m.hub.wait()
 			evs, err := m.store.Events(ctx, after, 256)
@@ -947,6 +993,10 @@ func (m *Machine) Events(ctx context.Context, fromSeq int64) <-chan proto.Event 
 				return
 			}
 			for _, ev := range evs {
+				if !warned && ev.Seq > after+1 {
+					warned = true
+					m.cfg.Logf("neumann: events after seq %d: seqs %d to %d were pruned (event retention); going on from %d", after, after+1, ev.Seq-1, ev.Seq)
+				}
 				select {
 				case out <- ev:
 					after = ev.Seq
@@ -971,6 +1021,7 @@ func (m *Machine) Events(ctx context.Context, fromSeq int64) <-chan proto.Event 
 }
 
 // EventLog reads committed events with Seq > afterSeq; limit 0 means all.
+// With Config.EventRetention it reads what retention kept: see Events.
 func (m *Machine) EventLog(ctx context.Context, afterSeq int64, limit int) ([]proto.Event, error) {
 	return m.store.Events(ctx, afterSeq, limit)
 }
@@ -1026,6 +1077,7 @@ type Status struct {
 	Suspended  int `json:"suspended"`  // suspended by an operator (Suspend)
 
 	DeltasDropped int64 `json:"deltas_dropped"` // streamed pieces a slow subscriber missed
+	EventsPruned  int64 `json:"events_pruned"`  // events deleted by Config.EventRetention since Start
 
 	Groups   []GroupStatus  `json:"groups"`
 	Limiters []limit.Status `json:"limiters"`
@@ -1069,7 +1121,7 @@ func (m *Machine) Status() Status {
 	m.admit.Lock()
 	u := m.active
 	m.admit.Unlock()
-	st := Status{Ready: r, Waiting: w, Held: h, Unfinished: u, DeltasDropped: m.deltas.dropped.Load(), Cache: m.bus.CacheStats()}
+	st := Status{Ready: r, Waiting: w, Held: h, Unfinished: u, DeltasDropped: m.deltas.dropped.Load(), EventsPruned: m.eventsPruned.Load(), Cache: m.bus.CacheStats()}
 	queues, now := m.sched.Queues(), m.cfg.Clock.Now()
 	for _, g := range m.groups {
 		gs, q := g.Ctl.Snapshot(), queues[g.Class]
