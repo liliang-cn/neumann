@@ -737,7 +737,8 @@ func (m *Machine) Start(ctx context.Context) error {
 }
 
 // Stop shuts the machine down. It first stops event retention (cancelling
-// it and waiting for the store call in flight, if any), refuses new work and
+// it and waiting for the store call in flight, if any, whatever ctx says:
+// see mem.EventPruner), refuses new work and
 // closes the scheduler, then waits for the vCores and in-flight tool batches to commit
 // and hand their tasks back. If ctx ends first it halts what is left (running
 // calls are cancelled and their results are not committed; those tasks keep

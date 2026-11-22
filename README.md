@@ -451,7 +451,7 @@ look at no more than 500 old events (kept or deleted), going on from where
 the call before stopped, with a short pause between calls. On `mem/sqlite`
 a call is one transaction on the store's writer whose cost does not grow
 with the old events kept before it (a running task's, say), so a commit
-that arrives during it waits for that one call: under a millisecond on a
+that arrives during it waits for that one call: about a millisecond on a
 laptop when it deletes nothing, plus the fsync of its deletes when it does.
 (`mem.NewMemory` walks its whole log under its lock on every call: fine for
 tests, not for a long log.) A prune that fails is logged and retried on the

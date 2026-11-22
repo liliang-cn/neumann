@@ -240,5 +240,9 @@ type EventPruner interface {
 	// finishes, or until the log's newest event, its own or its task's,
 	// stops being the newest: a pass that moves after forward misses at
 	// most those events, which the next pass takes.
+	//
+	// A call must return soon after ctx ends: Machine.Stop waits for the
+	// call in flight however long it takes, and its own ctx does not cut
+	// that wait short, so a call that blocks holds Stop.
 	PruneEvents(ctx context.Context, before time.Time, after int64, limit int) (pruned int, next int64, err error)
 }

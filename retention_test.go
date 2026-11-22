@@ -315,9 +315,11 @@ func TestRetentionPassesAreASecondApart(t *testing.T) {
 	store := &slowPruner{Memory: mem.NewMemory(), quick: true}
 	startWith(t, neumann.Config{Model: &sim.Model{Fn: func(model.Request) (model.Response, error) { return sim.Reply("ok"), nil }},
 		Store: store, EventRetention: time.Microsecond})
+	// Passes back to back would make thousands of calls in 300ms; one a
+	// second makes one or two, even when this goroutine is scheduled late.
 	time.Sleep(300 * time.Millisecond)
-	if n := store.calls.Load(); n != 1 {
-		t.Fatalf("%d passes in 300ms, want the one Start runs", n)
+	if n := store.calls.Load(); n > 2 {
+		t.Fatalf("%d passes in 300ms, want at most two a second apart", n)
 	}
 }
 

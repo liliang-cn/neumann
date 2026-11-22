@@ -17,7 +17,7 @@ import (
 // nothing on the machine's clock) between two calls. On mem/sqlite a call
 // is one transaction on the writer whose cost does not depend on how many
 // old events are kept before it, so a commit that arrives during it waits
-// for that one call, under a millisecond on a laptop when it deletes nothing
+// for that one call, about a millisecond on a laptop when it deletes nothing
 // (BenchmarkPruneKeptOldRows), plus the fsync of its deletes when it does.
 const (
 	pruneEvery    = time.Minute
