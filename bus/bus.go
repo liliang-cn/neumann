@@ -204,7 +204,8 @@ func (b *Bus) Recovery(name string) (device string, effect Effect, reportUnknown
 
 // Outcome is how a call ended, for a caller that must know whether the
 // device ran: a cancelled task records a call that never reached its device
-// as cancelled, and one that did as unknown.
+// as cancelled, and one that did as unknown, unless its tool is declared
+// ReadOnly, which is recorded cancelled either way.
 type Outcome int
 
 const (

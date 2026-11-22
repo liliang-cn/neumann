@@ -25,7 +25,11 @@
 //   - Effects. Each tool declares an [Effect]. The zero value is [SideEffect],
 //     so a tool that says nothing is never sent twice by recovery. Declare
 //     [ReadOnly] or [Idempotent] only when a repeat is harmless; recovery after
-//     a crash relies on it (design §4.2).
+//     a crash relies on it (design §4.2). Cancellation relies on [ReadOnly]
+//     too (design §9.5): a ReadOnly call cut off by a cancel is recorded
+//     cancelled and no operator is asked to check it, so declare ReadOnly
+//     only when the call leaves nothing a person would need to check, even
+//     if it ran.
 //   - Exactly one result. [Bus.Call] never returns a Go error: a refusal, a
 //     timeout ([ToolDef.Timeout], default [DefaultTimeout]), a cancellation or
 //     a device panic becomes an error result for the model. Timeouts and

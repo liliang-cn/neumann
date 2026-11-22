@@ -169,7 +169,9 @@ device to deduplicate by key.
 
 Cancellation sorts calls the same way (design §9.5): a call that never reached
 its device is `cancelled`; one that did is `unknown` with a
-`reconcile_needed` event marked `cancelled` (the task does not wait for it);
+`reconcile_needed` event marked `cancelled` (the task does not wait for it),
+unless its tool is declared `ReadOnly`: that one is `cancelled` too, with no
+`reconcile_needed`, because the declaration says there is nothing to check;
 a result that arrives after the final commit is kept as `late` and never
 reaches the model.
 

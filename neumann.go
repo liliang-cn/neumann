@@ -845,7 +845,9 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 // across a restart. A model call in flight for it is interrupted at once and
 // in-flight tool calls see their context cancelled. The final commit marks
 // calls that never reached their device cancelled; a call that did is marked
-// unknown with a reconcile_needed event, and the task does not wait for it. A
+// unknown with a reconcile_needed event, and the task does not wait for it,
+// unless its tool is declared ReadOnly: that one is marked cancelled too,
+// and nobody is asked to check it. A
 // result that arrives after that is kept on its call record as late (a
 // tool_late event) and never reaches the model. Each undelivered steer is
 // reported by a steer_dropped event.

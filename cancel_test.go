@@ -137,8 +137,8 @@ func TestCancelATaskWithAToolInFlight(t *testing.T) {
 	}
 }
 
-// The same with a read-only call in flight: it cannot have changed
-// anything, so it is recorded cancelled and no reconcile_needed is raised;
+// The same with a read-only call in flight: its tool declares it leaves
+// nothing to check, so it is recorded cancelled and no reconcile_needed is raised;
 // its answer, when the device gives one, is late and never reaches the
 // model.
 func TestCancelATaskWithAReadOnlyToolInFlight(t *testing.T) {

@@ -29,7 +29,10 @@
 // destructiveHint never loosens anything: a tool that says it is not
 // destructive is still SideEffect. Annotations are hints from the server, not
 // guarantees, and recovery after a crash relies on them (design §4.2): a
-// ReadOnly or Idempotent call may be sent again. [WithEffect] overrides the
+// ReadOnly or Idempotent call may be sent again. Cancellation relies on
+// readOnlyHint as well, on the server's word (design §9.5): a ReadOnly call
+// cut off by a cancel is recorded cancelled, and no operator is asked to
+// check whether it did anything. [WithEffect] overrides the
 // mapping per tool. Overriding toward ReadOnly or Idempotent is the operator's
 // statement that a repeat is harmless, and the operator's responsibility.
 //

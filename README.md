@@ -770,8 +770,9 @@ What neumann promises:
   `deadline`) even across a restart; calls it had in flight are recorded as
   cancelled, unknown or late, and a late result never reaches the model. A
   call that may have reached its device is unknown, with a `reconcile_needed`
-  event marked `cancelled`, unless it is `ReadOnly`: a read changed nothing,
-  so it is recorded cancelled and nobody is asked to check it.
+  event marked `cancelled`, unless its tool is declared `ReadOnly`: the
+  declaration says it leaves nothing to check, so it is recorded cancelled
+  and nobody is asked to check it. Declare `ReadOnly` only when that is true.
 - **Events can be replayed.** Sequence numbers are dense and global; reading
   from any `Seq` gives the same sequence a subscriber that never disconnected
   saw.

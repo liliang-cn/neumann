@@ -365,7 +365,7 @@ func TestCancelOfAHeldTask(t *testing.T) {
 
 // Recovery finishes a cancel whose interrupt was committed but whose final
 // commit was not: planned calls never run, dispatched ones are unknown, but
-// a read-only one, which cannot have changed anything, is cancelled (as is a
+// a read-only one, declared to leave nothing to check, is cancelled (as is a
 // read-only retry whose earlier attempt may have run).
 func TestRecoverFinishesACommittedCancel(t *testing.T) {
 	var runs atomic.Int32
@@ -760,7 +760,7 @@ func TestHeldBackCallFinalisesWhateverTheClockSaysLater(t *testing.T) {
 	got := load(t, store)
 	if r := callsOf(t, store)["c-1"]; got.State != task.Failed || got.StopReason != "deadline" || r.Status != mem.CallCancelled || runs.Load() != 0 {
 		// Cancelled: the held-back re-send is read-only (it may have run
-		// before the restart, but it changed nothing).
+		// before the restart, but its tool declares nothing to check).
 		t.Fatalf("task %s %q, record %s, runs %d", got.State, got.StopReason, r.Status, runs.Load())
 	}
 }
@@ -869,8 +869,8 @@ func reconcileIDs(t *testing.T, store *mem.Memory) []string {
 	return ids
 }
 
-// A read-only call abandoned while its device ran cannot have changed
-// anything: the final commit records it cancelled, with no reconcile_needed,
+// A read-only call abandoned while its device ran is declared to leave
+// nothing to check: the final commit records it cancelled, with no reconcile_needed,
 // whether the task was cancelled or ran out of time. An idempotent and a
 // side-effecting call cut off with it stay unknown, reported for an operator.
 // The read's real result, when it comes, is recorded late like theirs and

@@ -1,13 +1,22 @@
 package task
 
 // Effect is what calling a tool does to the world; recovery after a crash
-// depends on it. The zero value is SideEffect: an undeclared tool is assumed
-// to have one, so a crash makes the machine stop and ask rather than repeat it.
+// and cancellation depend on it. The zero value is SideEffect: an undeclared
+// tool is assumed to have one, so a crash makes the machine stop and ask
+// rather than repeat it.
 type Effect int
 
 const (
 	SideEffect Effect = iota
+	// ReadOnly: a repeat is harmless, and the call leaves nothing a person
+	// would need to check, even if it ran. Recovery sends it again after a
+	// crash, and a cancel that cuts it off records it cancelled without
+	// asking an operator (design §9.5). The declaration is what makes that
+	// safe: declare it only when it is true.
 	ReadOnly
+	// Idempotent: a repeat is harmless (the device deduplicates by key), but
+	// the call may change something. Recovery sends it again; a cancel that
+	// cuts it off records it unknown, for an operator.
 	Idempotent
 )
 

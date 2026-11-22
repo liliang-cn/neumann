@@ -142,7 +142,7 @@ var errCannotFinalise = errors.New("cannot assemble the final commit of a cancel
 //     reconcile_needed event marked cancelled: the record is left for an
 //     operator, and the task does not wait for it;
 //   - except that a ReadOnly call that ran, or may have, is cancelled, with
-//     no reconcile_needed: it changed nothing, so there is nothing to check.
+//     no reconcile_needed: its tool declares it leaves nothing to check.
 //     A result it returns later is still recorded late (lateFor), and never
 //     reaches the model. An Idempotent one stays unknown: its write may have
 //     happened;
@@ -162,9 +162,9 @@ func (e *Env) cancelSet(ctx context.Context, t *task.TCB, c mem.CommitSet, fates
 	if !ok {
 		reason = fallback
 	}
-	// unknown records a call that ran, or may have. A read-only one cannot
-	// have changed anything, whatever its device did: it is cancelled, and
-	// there is nothing for an operator to check.
+	// unknown records a call that ran, or may have. A ReadOnly one is
+	// cancelled instead: its tool declares that it leaves nothing for an
+	// operator to check, whatever its device did.
 	unknown := func(r mem.CallRecord) mem.CallRecord {
 		if r.Effect == task.ReadOnly {
 			r.Status = mem.CallCancelled

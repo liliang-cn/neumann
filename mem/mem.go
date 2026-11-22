@@ -15,7 +15,7 @@ import (
 // CallStatus is where a call is in its life. A cancelled task's final commit
 // leaves no call planned or dispatched: one that never reached its device is
 // cancelled, one that did (or may have) is unknown, except a ReadOnly one,
-// which changed nothing and is cancelled too; a result that arrives after
+// declared to leave nothing to check, which is cancelled too; a result that arrives after
 // that commit is kept on the record as late and never reaches the model.
 type CallStatus string
 
