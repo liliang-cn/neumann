@@ -1289,16 +1289,20 @@ func (m *Machine) SetClass(ctx context.Context, taskID, class string) error {
 // A task the scheduler holds (ready, backing off, waiting for its group, an
 // approval or reconciliation, suspended) is changed before SetPriority
 // returns; then, in a group that preempts, a call of a less urgent task may
-// be cut off for it (one held for a moment by another operator call, or a
-// vCore about to hand it back into such a wait, takes it at that hand-back).
-// A task executing an instruction or waiting for its tools is not waited for: SetPriority returns once the change is committed
-// as an interrupt, which, like a suspend, holds across a restart and lands
-// at the task's next instruction boundary (the instruction's commit, the
-// end of its tool round), in that boundary's commit. Several changes before
-// it lands: the last one counts. Until then the task runs at its old
-// priority: a model call in flight is not cut off for a task more urgent
-// than its new priority, nor does a task made more urgent preempt anything
-// before it is ready again. A task that ends first never changes.
+// be cut off for it. One held for a moment by someone else (another
+// operator call, or a vCore about to hand it back) takes the change at that
+// hand-back, unless it is handed back waiting for its tools: then at the end
+// of the tool round, as below.
+//
+// A task executing an instruction or waiting for its tools is not waited
+// for: SetPriority returns once the change is committed as an interrupt,
+// which, like a suspend, holds across a restart and lands at the task's
+// next instruction boundary (the instruction's commit, the end of its tool
+// round), in that boundary's commit. Several changes before it lands: the
+// last one counts. Until then the task runs at its old priority: a model
+// call in flight is not cut off for a task more urgent than its new
+// priority, nor does a task made more urgent preempt anything before it is
+// ready again. A task that ends first never changes.
 //
 // A finished task gives ErrFinished, an unknown one ErrNotFound, a
 // negative priority an error. The priority the task has, or will have once
@@ -1326,6 +1330,8 @@ func (m *Machine) SetPriority(ctx context.Context, taskID string, p int) error {
 		// someone else): its holder lands the change.
 		err := m.env.PriorityInterrupt(ctx, taskID, p)
 		if errors.Is(err, ErrFinished) {
+			// Found finished, or finished before the interrupt's commit
+			// (the store's error names the task already): said once.
 			return fmt.Errorf("neumann: task %s: %w", taskID, ErrFinished)
 		}
 		return err
@@ -1479,20 +1485,33 @@ var ErrNotReconciling = core.ErrNotReconciling
 
 // Resolve answers a call held for reconciliation (a reconcile_needed event
 // names it). When the task holds no other unknown call, its round is settled
-// and the task resumes.
+// and the task resumes. A task committed as reconciling but held for a
+// moment by someone else (another operator call, a priority landing) is
+// waited for, as Approve waits; one no longer reconciling once it is handed
+// back gives ErrNotReconciling.
 func (m *Machine) Resolve(ctx context.Context, taskID, callID string, o Outcome) error {
 	if err := m.enter(); err != nil {
 		return err
 	}
 	defer m.inflight.Done()
-	t, ok := m.sched.CheckoutIf(taskID, func(t *task.TCB) bool {
-		return t.State == task.Waiting && t.Wait == task.WaitReconcile
-	})
+	reconciling := func(t *task.TCB) bool { return t.State == task.Waiting && t.Wait == task.WaitReconcile }
+	since := m.sched.Backs(taskID) // before the store is read: a hand-back after it is seen
+	t, ok := m.sched.CheckoutIf(taskID, reconciling)
 	if !ok {
-		if _, err := m.store.Load(ctx, taskID); err != nil {
+		stored, err := m.store.Load(ctx, taskID)
+		if err != nil {
 			return err
 		}
-		return fmt.Errorf("neumann: task %s: %w", taskID, ErrNotReconciling)
+		if reconciling(stored) {
+			// Committed as reconciling, and held for a moment: by an
+			// operator call that takes it (SetClass, SetPriority, another
+			// Resolve), or by a landing (a priority, a suspend's signal).
+			// Each lets go at once.
+			t, ok = m.sched.CheckoutWait(ctx, taskID, since, reconciling)
+		}
+		if !ok {
+			return fmt.Errorf("neumann: task %s: %w", taskID, ErrNotReconciling)
+		}
 	}
 	batch, err := m.env.Resolve(ctx, t, callID, o)
 	if errors.Is(err, mem.ErrCancelPending) {

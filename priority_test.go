@@ -1,6 +1,7 @@
 package neumann_test
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -245,5 +246,42 @@ func TestSetPriorityPendingSurvivesARestart(t *testing.T) {
 	}
 	if k := kinds(t, m, "R"); !strings.HasPrefix(k, "recovered,priority_set") {
 		t.Fatalf("R's events %s", k)
+	}
+}
+
+// endingStore finishes task "A" just before a priority interrupt for it is
+// committed: the task ends between SetPriority's read of it and its commit.
+type endingStore struct{ mem.Store }
+
+func (s endingStore) Commit(ctx context.Context, c mem.CommitSet) ([]proto.Event, error) {
+	for _, in := range c.NewInterrupts {
+		if in.Kind == mem.InterruptPriority && in.TaskID == "A" {
+			tc, err := s.Store.Load(ctx, "A")
+			if err == nil {
+				tc.State, tc.StopReason = task.Done, "end_turn"
+				tc.Version++
+				s.Store.Commit(ctx, mem.CommitSet{Task: tc})
+			}
+		}
+	}
+	return s.Store.Commit(ctx, c)
+}
+
+// A task that ends between SetPriority's look at it and the interrupt's
+// commit is finished, named once in the error.
+func TestSetPriorityOnATaskThatEndsMeanwhile(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	gate, release := newGate()
+	defer release()
+	m, _ := start(t, neumann.Config{Store: endingStore{mem.NewMemory()}, Logf: func(string, ...any) {}}, func(model.Request) (model.Response, error) {
+		entered <- struct{}{}
+		<-gate
+		return sim.Reply("done"), nil
+	})
+	submit(t, m, proto.Instruction{TaskID: "A", Input: "A"})
+	<-entered
+	err := m.SetPriority(bg, "A", 3)
+	if !errors.Is(err, neumann.ErrFinished) || strings.Count(err.Error(), "A") != 1 {
+		t.Fatalf("SetPriority: %v", err)
 	}
 }

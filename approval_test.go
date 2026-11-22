@@ -674,3 +674,68 @@ func TestRewriteArgsMustBeAnObject(t *testing.T) {
 		}
 	}
 }
+
+// holdingStore holds the first commit that carries a priority_set until
+// release: whoever makes it keeps its task out of the scheduler meanwhile.
+type holdingStore struct {
+	mem.Store
+	entered chan struct{}
+	gate    chan struct{}
+	once    sync.Once
+}
+
+func (s *holdingStore) Commit(ctx context.Context, c mem.CommitSet) ([]proto.Event, error) {
+	if slices.ContainsFunc(c.Events, func(ev proto.Event) bool { return ev.Kind == proto.EvPrioritySet }) {
+		s.once.Do(func() { close(s.entered); <-s.gate })
+	}
+	return s.Store.Commit(ctx, c)
+}
+
+// A Resolve that comes while another operator call holds the reconciling
+// task for a moment (here SetPriority, its commit slow) waits for it to be
+// handed back and then answers the call, as Approve does: the task is still
+// reconciling. Once the task no longer is, Resolve says so.
+func TestResolveWaitsForAMomentaryHolder(t *testing.T) {
+	store := &holdingStore{Store: mem.NewMemory(), entered: make(chan struct{}), gate: make(chan struct{})}
+	held := &task.TCB{
+		ID: "held", State: task.Waiting, Wait: task.WaitIO, PC: task.StepTools, Class: neumann.DefaultClass,
+		Regs: []task.Message{task.Text(task.RoleUser, "pay"), {Role: task.RoleAssistant, Parts: []task.Part{
+			{Kind: task.PartToolCall, CallID: "c-1", Name: "dev_slow", Args: json.RawMessage(`{}`)}}}},
+		CallSeq: 1, Version: 1,
+	}
+	rec := mem.CallRecord{TaskID: "held", CallID: "c-1", Index: 1, Tool: "dev_slow", Status: mem.CallDispatched, Attempt: 1, Key: "held/c-1/1", Device: "dev"}
+	if _, err := store.Commit(bg, mem.CommitSet{Task: held, NewTask: true, Calls: []mem.CallRecord{rec}}); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan string, 1)
+	gate, release := newGate()
+	defer release()
+	m, _ := start(t, neumann.Config{Store: store, Devices: []bus.Device{gateDev(entered, gate)}},
+		func(model.Request) (model.Response, error) { return sim.Reply("done"), nil })
+	if got := loadTask(t, m, "held"); got.Wait != task.WaitReconcile {
+		t.Fatalf("recovered as %s/%s", got.State, got.Wait)
+	}
+	prio := make(chan error, 1)
+	go func() { prio <- m.SetPriority(bg, "held", 3) }()
+	<-store.entered // SetPriority holds the task
+	resolved := make(chan error, 1)
+	go func() { resolved <- m.Resolve(bg, "held", "c-1", neumann.Outcome{Result: "paid"}) }()
+	select {
+	case err := <-resolved:
+		t.Fatalf("Resolve did not wait for the holder: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(store.gate)
+	if err := <-prio; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-resolved; err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got := waitDone(t, m, "held"); got.State != task.Done || got.Priority != 3 {
+		t.Fatalf("ended %s at priority %d", got.State, got.Priority)
+	}
+	if err := m.Resolve(bg, "held", "c-1", neumann.Outcome{Result: "paid"}); !errors.Is(err, neumann.ErrNotReconciling) {
+		t.Fatalf("resolve of a finished task: %v", err)
+	}
+}
