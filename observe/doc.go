@@ -83,7 +83,7 @@
 // refused by the tool policy or an operator, never run), unknown
 // (reconcile_needed, or reported unknown at recovery), resolved, late,
 // cancelled (no result when its task ended, a call still held for approval
-// among them). A task's: done, failed, cancelled. A held call's verdict
+// and a read-only call cut off while it ran among them). A task's: done, failed, cancelled. A held call's verdict
 // (design §9.7): allow, edit, deny, or cancelled when its task ended first;
 // a restart that announces a held call again neither counts it again nor
 // restarts its wait. A final answer the answer check saw (design §9.8):

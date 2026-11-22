@@ -608,9 +608,10 @@ type RateReporter interface { // 可选
    - `planned` 的调用 → `cancelled`，从未派发；
    - `dispatched` 且这次发送没有到达设备、之前也没发过 → `cancelled`；之前发过的（重启后同一 `Key` 重发、或结果未知后的重试）按结果未知处理；有更早尝试的 `planned`（操作员要求重试）同样；
    - `dispatched` 且结果未知 → `unknown`，发 `reconcile_needed`（带 `cancelled: true`；任务已取消，不再等待核对，但记录留给操作员）；
+   - 例外：`Effect` 为 `ReadOnly` 的调用，凡是上面按结果未知处理的情况（设备跑着时放弃、之前发过、有更早尝试的 `planned`）一律 → `cancelled`，不发 `reconcile_needed`：只读调用不可能改变外部状态，没有什么要操作员核对的。所以对只读调用，`cancelled` 不再意味着"从未到达设备"。`Idempotent` 和 `SideEffect` 不变：幂等的写可能已经发生，操作员仍然要知道；
    - `dispatched` 且结果已经回来 → `done`，结果不进寄存器；
    - 任务转 `Cancelled`，未送达的插话各一个 `steer_dropped`。
-4. 取消之后才到达的工具结果，调用记录标为 `late` 并保存结果，不进入寄存器，发 `tool_late` 事件。
+4. 取消之后才到达的工具结果，调用记录标为 `late` 并保存结果，不进入寄存器，发 `tool_late` 事件；最终提交记为 `cancelled` 的只读调用也一样。
 
 挂起、退避、熔断等待和待批准中的任务取消时没有在途调用，由取消方从等待集合取出、直接做最终提交（退避定时器一并停掉；待批准这一轮的 `planned` 调用全部 `cancelled`）。在限流器上等额度的任务归 vCore 持有：取消信号打断等待，vCore 做最终提交。
 
@@ -1062,7 +1063,7 @@ neumann/            Machine、Config、公开 API、操作员控制（Resolve、
    第一阶段留下的 8 处接缝已全部处理：`Running` 在调用前提交；调用记录在规划时记下 `Device`、`Effect`、`ReportUnknown`；tool 消息从调用记录组装；`dispatched` 但从未发出的调用会进入核对（预写日志固有）；准入计数在 `Start` 时从未完成任务数初始化；`Submit` / `Steer` 锁内预留、锁外提交，`Stop` 带截止时间地等它们；单条结果提交失败时 `tool_result` 随完成提交补发；`core`、`sched` 已移到 `internal/`。
    验证：`TestCrashAtEveryCommitPoint`（每个提交点注入一次崩溃，SQLite，压测 30 轮）、`TestKillNine`（真进程 SIGKILL，副作用只执行一次）。
 3. **取消、Deadline 与故障注入**：9.4、9.5；在每一个提交点前后注入崩溃。
-   已完成：`Commit` 在有未送达取消时只接受取消的最终提交、拒绝 `dispatched`（`ErrCancelPending`，两个 Store 同一规则，一致性套件覆盖），取消信号到达前提交被拒的一方据此最终提交，先提交的取消一定赢；`m.Cancel(ctx, id)` 提交取消中断（`Text` 是原因）后返回，结束的任务返回 `ErrFinished`、不存在的返回 `ErrNotFound`；调度器持有每个任务的 context 和 Deadline 定时器（`Budget.Deadline`，绝对时间，`Submit` 时给出），不论状态；没人在干活的任务（就绪、待核对、挂起，以后的退避、熔断等待）由取消方 `Sched.Cancel` 取出并做最终提交，vCore 或工具批次持有的任务只收到信号，交还时 `Requeue` 在同一把锁下拒收，由持有方最终提交——取消不会落在提交和交还之间；总线 `Run` 区分"没碰到设备"（之前没发过的才是 `cancelled`）、"设备跑着时放弃"（`unknown` + 带 `cancelled` 标记的 `reconcile_needed`，任务不等）和结果，放弃之后设备的真实结果在最终提交之后记为 `late` 并发 `tool_late`，不进寄存器；模型调用期间被取消算一次 `Unconfirmed`，已回来的工具调用记为 `cancelled`、从不派发；Deadline 已过的任务不再开始任何指令、不再把任何调用交给总线（包括恢复和 `resolve` 的批次），即使定时器还没跑；晚到结果只在最终提交落盘后记录，`Stop` 等在途的晚到提交；恢复时有未完成的取消中断就直接做最终提交，Deadline 重新挂上、已过的立即触发。
+   已完成：`Commit` 在有未送达取消时只接受取消的最终提交、拒绝 `dispatched`（`ErrCancelPending`，两个 Store 同一规则，一致性套件覆盖），取消信号到达前提交被拒的一方据此最终提交，先提交的取消一定赢；`m.Cancel(ctx, id)` 提交取消中断（`Text` 是原因）后返回，结束的任务返回 `ErrFinished`、不存在的返回 `ErrNotFound`；调度器持有每个任务的 context 和 Deadline 定时器（`Budget.Deadline`，绝对时间，`Submit` 时给出），不论状态；没人在干活的任务（就绪、待核对、挂起，以后的退避、熔断等待）由取消方 `Sched.Cancel` 取出并做最终提交，vCore 或工具批次持有的任务只收到信号，交还时 `Requeue` 在同一把锁下拒收，由持有方最终提交——取消不会落在提交和交还之间；总线 `Run` 区分"没碰到设备"（之前没发过的才是 `cancelled`）、"设备跑着时放弃"（`unknown` + 带 `cancelled` 标记的 `reconcile_needed`，任务不等；`ReadOnly` 调用例外，设备跑着时放弃或之前发过的都记为 `cancelled`、不发 `reconcile_needed`：它改变不了什么）和结果，放弃之后设备的真实结果在最终提交之后记为 `late` 并发 `tool_late`，不进寄存器；模型调用期间被取消算一次 `Unconfirmed`，已回来的工具调用记为 `cancelled`、从不派发；Deadline 已过的任务不再开始任何指令、不再把任何调用交给总线（包括恢复和 `resolve` 的批次），即使定时器还没跑；晚到结果只在最终提交落盘后记录，`Stop` 等在途的晚到提交；恢复时有未完成的取消中断就直接做最终提交，Deadline 重新挂上、已过的立即触发。
    验证：`TestCrashAtEveryCommitPoint*`（支付、执行中取消、执行中超时、模型调用期间取消已提交但未通知（要工具 / 给答案）、只读调用里超时后重启六种任务，每个提交点之前和之后各崩一次，SQLite；"之后"= 提交已落盘、调用方没收到）、`TestAcceptedInputSurvivesACrash`（第 18 节 9）、`TestDeadlineFiresInEveryState`（第 18 节 10：就绪、等工具、待核对、执行中、已过期）、`TestCancelWhileToolsInFlight` / `TestCancelledPlannedCallsNeverRun` / `TestLateResultIsRecordedLate`（第 18 节 11）。
 4. **自适应伸缩、限流器与迁移**：拥塞窗口、限流器、错误分类、熔断、迁移校验、第二个适配器。
    已完成（错误处理接进 vCore 循环，vCore 数仍固定、仍只有一个组）：`execModel` 用 `model.ClassifyWith` 分类，按第 11 节处理每一类；`Waiting(Backoff)` 带 `WakeAt` 提交后由调度器挂定时器，到点提交 `Ready`、`ReadySince` 不变；`Retries` 持久化、成功清零、默认 8 次；截断无内容按 `MaxOut` × 4 重做两次（`model.Request.MaxOut`，两个适配器都发 `max_tokens`）；`Config.Limiters` / `Config.Limits`，调用前 `ReserveAll`（等额度在 `Running` 提交之前、可被取消/Deadline 打断、`Stop` 时原样交还），调用后先结算再校准，按 7.2 的表退还，`RateLimited` 暂停限流器；每个类一个 `core.Group`（`internal/group` 的窗口与熔断），调用前 `Admit`、调用后 `Report`，熔断时任务惰性转 `Waiting(Group)`，半开定时器唤醒最早的任务去探测，`group_up` 唤醒全部，`m.GroupReset` 复位额度熔断；`Status` 带每组窗口/熔断和每个限流器的快照；重启时 `Waiting(Backoff)` / `Waiting(Group)` 直接就绪。新提交路径（退避、等组、截断重做、唤醒）都遵守 4.1 规则 4。

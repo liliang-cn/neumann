@@ -154,7 +154,7 @@ func (e *Env) dispatch(taskID string, allow, deny []string, batch []Send) {
 					b.notSent[i] = true // cancelled before it reached the device
 					return
 				case bus.Abandoned:
-					return // cancelled while it ran: its outcome is unknown
+					return // cancelled while it ran: its outcome is unknown (cancelSet)
 				}
 				b.results[i], b.got[i], b.cached[i] = res, true, hit
 				r.Status = mem.CallDone

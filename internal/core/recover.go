@@ -84,7 +84,8 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 	}
 	if reason, ok := cancelReason(pending); ok {
 		// A cancel was committed and its final commit was not: finish it.
-		// Nothing is sent again; whatever was in flight is unknown.
+		// Nothing is sent again; whatever was in flight is unknown, or
+		// cancelled when it is read-only (cancelSet).
 		from := t.State.String()
 		if t.State == task.Waiting {
 			from += "_" + t.Wait.String()

@@ -1,7 +1,10 @@
 package observe
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -281,6 +284,40 @@ func TestMetricsForEveryOtherEvent(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// A read-only call cut off by a cancel gets no reconcile_needed (design
+// §9.5): it ends cancelled with its task, its answer later counted late, and
+// nothing is logged at error level.
+func TestMetricsForACancelledReadOnlyCall(t *testing.T) {
+	reader, mp := newReader(t)
+	m, err := NewMetrics(nil, mp, MetricsOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s script
+	s.add(0, proto.EvAccepted, "a", map[string]any{"class": "default"})
+	s.add(time.Second, proto.EvStep, "a", map[string]any{"pc": "model", "core": 1})
+	s.add(time.Second, proto.EvUsage, "a", usage(10, 2, 0, 0))
+	s.add(time.Second, proto.EvToolCall, "a", map[string]any{"call_id": "c-1", "tool": "git_log"})
+	s.add(3*time.Second, proto.EvCancelled, "a", map[string]any{"stop_reason": "cancelled"})
+	s.add(4*time.Second, proto.EvToolLate, "a", map[string]any{"call_id": "c-1", "is_error": false})
+	feed(m, s.evs)
+	var buf bytes.Buffer
+	feed(NewLog(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))), s.evs)
+
+	c := collect(t, reader)
+	c.must("neumann.tool.calls", map[string]string{"tool": "git_log", "outcome": "cancelled"}, 1)
+	c.must("neumann.tool.calls", map[string]string{"tool": "git_log", "outcome": "late"}, 1)
+	if _, ok := c.num("neumann.tool.calls", map[string]string{"tool": "git_log", "outcome": "unknown"}); ok {
+		t.Error("counted unknown")
+	}
+	if _, ok := c.num("neumann.reconcile.needed", nil); ok {
+		t.Error("counted a reconcile")
+	}
+	if strings.Contains(buf.String(), "level=ERROR") {
+		t.Errorf("logged at error level:\n%s", buf.String())
 	}
 }
 

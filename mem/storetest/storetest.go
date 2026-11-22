@@ -539,24 +539,30 @@ func testCancelInterruptIsAppliedSilently(t *testing.T, newStore Factory) {
 }
 
 // A cancelled task's calls end cancelled or unknown in its final commit, and a
-// result that arrives after it is recorded as late on the terminal task.
+// result that arrives after it is recorded as late on the terminal task,
+// whether the call was unknown or (read-only) cancelled.
 func testCancelledAndLateCallsRoundTrip(t *testing.T, newStore Factory) {
 	s := newStore(t)
 	tc := newTask("a")
 	mustCommit(t, s, mem.CommitSet{Task: tc, NewTask: true})
 	planned := mem.CallRecord{TaskID: "a", CallID: "c-1", Index: 1, Tool: "dev_x", Status: mem.CallPlanned, Device: "dev"}
 	sent := mem.CallRecord{TaskID: "a", CallID: "c-2", Index: 2, Tool: "dev_y", Status: mem.CallDispatched, Attempt: 1, Key: "a/c-2/1", Device: "dev"}
-	mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{planned, sent}})
-	planned.Status, sent.Status = mem.CallCancelled, mem.CallUnknown
+	// A read-only call given up on while it ran is cancelled, and its result
+	// may still come back late.
+	read := mem.CallRecord{TaskID: "a", CallID: "c-3", Index: 3, Tool: "dev_z", Status: mem.CallDispatched, Attempt: 1, Key: "a/c-3/1", Device: "dev", Effect: task.ReadOnly}
+	mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{planned, sent, read}})
+	planned.Status, sent.Status, read.Status = mem.CallCancelled, mem.CallUnknown, mem.CallCancelled
 	tc.State, tc.Version = task.Cancelled, 2
-	mustCommit(t, s, mem.CommitSet{Task: tc, Calls: []mem.CallRecord{planned, sent}})
+	mustCommit(t, s, mem.CommitSet{Task: tc, Calls: []mem.CallRecord{planned, sent, read}})
 	sent.Status, sent.Result = mem.CallLate, &task.ToolResult{Content: "paid"}
-	evs := mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{sent}, Events: []proto.Event{proto.NewEvent(proto.EvToolLate, "a", nil)}})
-	if len(evs) != 1 || evs[0].Kind != proto.EvToolLate {
+	read.Status, read.Result = mem.CallLate, &task.ToolResult{Content: "balance 10"}
+	evs := mustCommit(t, s, mem.CommitSet{Calls: []mem.CallRecord{sent, read}, Events: []proto.Event{
+		proto.NewEvent(proto.EvToolLate, "a", nil), proto.NewEvent(proto.EvToolLate, "a", nil)}})
+	if len(evs) != 2 || evs[0].Kind != proto.EvToolLate {
 		t.Fatalf("events %+v", evs)
 	}
 	got, _ := s.Calls(ctx, "a")
-	if !reflect.DeepEqual(got, []mem.CallRecord{planned, sent}) {
+	if !reflect.DeepEqual(got, []mem.CallRecord{planned, sent, read}) {
 		t.Fatalf("calls %+v", got)
 	}
 }

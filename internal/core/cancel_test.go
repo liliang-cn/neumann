@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -363,7 +364,9 @@ func TestCancelOfAHeldTask(t *testing.T) {
 }
 
 // Recovery finishes a cancel whose interrupt was committed but whose final
-// commit was not: planned calls never run, dispatched ones are unknown.
+// commit was not: planned calls never run, dispatched ones are unknown, but
+// a read-only one, which cannot have changed anything, is cancelled (as is a
+// read-only retry whose earlier attempt may have run).
 func TestRecoverFinishesACommittedCancel(t *testing.T) {
 	var runs atomic.Int32
 	e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
@@ -372,6 +375,8 @@ func TestRecoverFinishesACommittedCancel(t *testing.T) {
 		mem.CallRecord{Tool: "dev_pay", Status: mem.CallDispatched, Attempt: 1},
 		mem.CallRecord{Tool: "dev_read", Status: mem.CallDispatched, Attempt: 1, Effect: task.ReadOnly},
 		mem.CallRecord{Tool: "dev_pay", Status: mem.CallPlanned},
+		mem.CallRecord{Tool: "dev_put", Status: mem.CallDispatched, Attempt: 1, Effect: task.Idempotent},
+		mem.CallRecord{Tool: "dev_read", Status: mem.CallPlanned, Attempt: 1, Effect: task.ReadOnly},
 	)
 	if _, err := store.Commit(bg, mem.CommitSet{NewInterrupts: []mem.Interrupt{
 		{TaskID: "t1", Kind: mem.InterruptSteer, Text: "also"},
@@ -388,7 +393,8 @@ func TestRecoverFinishesACommittedCancel(t *testing.T) {
 		t.Fatalf("task %s %q", got.State, got.StopReason)
 	}
 	recs := callsOf(t, store)
-	want := map[string]mem.CallStatus{"c-1": mem.CallDone, "c-2": mem.CallUnknown, "c-3": mem.CallUnknown, "c-4": mem.CallCancelled}
+	want := map[string]mem.CallStatus{"c-1": mem.CallDone, "c-2": mem.CallUnknown, "c-3": mem.CallCancelled, "c-4": mem.CallCancelled,
+		"c-5": mem.CallUnknown, "c-6": mem.CallCancelled}
 	for id, st := range want {
 		if recs[id].Status != st {
 			t.Fatalf("%s: %s, want %s", id, recs[id].Status, st)
@@ -397,8 +403,8 @@ func TestRecoverFinishesACommittedCancel(t *testing.T) {
 	if runs.Load() != 0 {
 		t.Fatalf("devices ran %d times", runs.Load())
 	}
-	if n := len(eventsOfKind(store, proto.EvReconcileNeeded)); n != 2 {
-		t.Fatalf("%d reconcile_needed, want one per unknown call", n)
+	if ids := reconcileIDs(t, store); strings.Join(ids, ",") != "c-2,c-5" {
+		t.Fatalf("reconcile_needed for %v, want one per unknown call", ids)
 	}
 	if n := len(eventsOfKind(store, proto.EvSteerDropped)); n != 1 {
 		t.Fatalf("%d steer_dropped", n)
@@ -627,33 +633,6 @@ func TestCancelledRetryStaysUnknown(t *testing.T) {
 	}
 }
 
-// A task whose deadline has passed sends nothing more, including a recovered
-// re-send whose deadline timer has not run yet; the re-sent call may have run
-// before the restart, so it is unknown.
-func TestExpiredDeadlineStopsARecoveredResend(t *testing.T) {
-	var runs atomic.Int32
-	e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
-	crashSite(t, store, mem.CallRecord{Tool: "dev_read", Status: mem.CallDispatched, Attempt: 1, Effect: task.ReadOnly})
-	tc := load(t, store)
-	tc.Budget.Deadline = time.Now().Add(-time.Second)
-	tc.Version++
-	if _, err := store.Commit(bg, mem.CommitSet{Task: tc}); err != nil {
-		t.Fatal(err)
-	}
-	tc = load(t, store)
-	batch, err := e.Recover(bg, tc)
-	if err != nil || len(batch) != 1 {
-		t.Fatalf("batch %+v err %v", batch, err)
-	}
-	e.Sched.Add(tc)
-	e.Dispatch("t1", nil, nil, batch)
-	e.WaitBatches()
-	got := load(t, store)
-	if r := callsOf(t, store)["c-1"]; r.Status != mem.CallUnknown || runs.Load() != 0 || got.State != task.Failed || got.StopReason != "deadline" {
-		t.Fatalf("record %+v runs %d task %s %q", r, runs.Load(), got.State, got.StopReason)
-	}
-}
-
 // Late results are bounded: when the cancel's final commit fails, a result
 // arriving later is dropped rather than waiting forever; and CloseLate waits
 // for a late commit already under way.
@@ -779,7 +758,9 @@ func TestHeldBackCallFinalisesWhateverTheClockSaysLater(t *testing.T) {
 	e.Dispatch("t1", nil, nil, batch)
 	e.WaitBatches()
 	got := load(t, store)
-	if r := callsOf(t, store)["c-1"]; got.State != task.Failed || got.StopReason != "deadline" || r.Status != mem.CallUnknown || runs.Load() != 0 {
+	if r := callsOf(t, store)["c-1"]; got.State != task.Failed || got.StopReason != "deadline" || r.Status != mem.CallCancelled || runs.Load() != 0 {
+		// Cancelled: the held-back re-send is read-only (it may have run
+		// before the restart, but it changed nothing).
 		t.Fatalf("task %s %q, record %s, runs %d", got.State, got.StopReason, r.Status, runs.Load())
 	}
 }
@@ -868,4 +849,145 @@ func TestDeadlineFinalisationLosingToACancelStillEnds(t *testing.T) {
 			t.Fatalf("refusals %d, task %s %q, model calls %d", refusals.Load(), got.State, got.StopReason, sm.Calls())
 		}
 	})
+}
+
+// reconcileIDs returns the call ids of the reconcile_needed events, and
+// fails the test on one not marked cancelled.
+func reconcileIDs(t *testing.T, store *mem.Memory) []string {
+	t.Helper()
+	var ids []string
+	for _, ev := range eventsOfKind(store, proto.EvReconcileNeeded) {
+		var d struct {
+			CallID    string `json:"call_id"`
+			Cancelled bool   `json:"cancelled"`
+		}
+		if err := json.Unmarshal(ev.Data, &d); err != nil || !d.Cancelled {
+			t.Fatalf("reconcile_needed %s: not marked cancelled (%v)", ev.Data, err)
+		}
+		ids = append(ids, d.CallID)
+	}
+	return ids
+}
+
+// A read-only call abandoned while its device ran cannot have changed
+// anything: the final commit records it cancelled, with no reconcile_needed,
+// whether the task was cancelled or ran out of time. An idempotent and a
+// side-effecting call cut off with it stay unknown, reported for an operator.
+// The read's real result, when it comes, is recorded late like theirs and
+// never reaches the registers.
+func TestCancelOfAReadOnlyCallInFlight(t *testing.T) {
+	for _, tc := range []struct {
+		reason string
+		state  task.State
+	}{{ReasonCancelled, task.Cancelled}, {ReasonDeadline, task.Failed}} {
+		t.Run(tc.reason, func(t *testing.T) {
+			entered := make(chan struct{}, 3)
+			gate := make(chan struct{})
+			deaf := func(name string) builtin.Func {
+				return func(context.Context, bus.DeviceCall) (string, error) {
+					entered <- struct{}{}
+					<-gate // ignores its context
+					return name + " result", nil
+				}
+			}
+			dev := builtin.New("dev").
+				Add(bus.ToolDef{Name: "look", Effect: bus.ReadOnly}, deaf("look")).
+				Add(bus.ToolDef{Name: "put", Effect: bus.Idempotent}, deaf("put")).
+				Add(bus.ToolDef{Name: "pay"}, deaf("pay"))
+			e, store, _ := newTestEnv(t, func(model.Request) (model.Response, error) {
+				return sim.CallTools("dev_look", "dev_put", "dev_pay"), nil
+			}, dev)
+			e.Sched.Add(newTask(t, e, store, "q"))
+			e.step(bg, take(t, e), 0)
+			for range 3 {
+				<-entered
+			}
+			if err := e.Cancel(bg, "t1", tc.reason); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "the final commit", func() bool { return load(t, store).State == tc.state })
+			recs := callsOf(t, store)
+			want := map[string]mem.CallStatus{"c-1": mem.CallCancelled, "c-2": mem.CallUnknown, "c-3": mem.CallUnknown}
+			for id, st := range want {
+				if r := recs[id]; r.Status != st || r.Result != nil {
+					t.Fatalf("at the final commit, %s: %+v, want %s", id, r, st)
+				}
+			}
+			if ids := reconcileIDs(t, store); strings.Join(ids, ",") != "c-2,c-3" {
+				t.Fatalf("reconcile_needed for %v, want the idempotent and side-effecting calls only", ids)
+			}
+
+			close(gate)
+			waitFor(t, "the late results", func() bool {
+				for _, r := range callsOf(t, store) {
+					if r.Status != mem.CallLate {
+						return false
+					}
+				}
+				return true
+			})
+			e.WaitBatches()
+			if r := callsOf(t, store)["c-1"]; r.Result == nil || r.Result.Content != "look result" {
+				t.Fatalf("late record %+v", r)
+			}
+			var late []string
+			for _, ev := range eventsOfKind(store, proto.EvToolLate) {
+				var d struct {
+					CallID string `json:"call_id"`
+				}
+				json.Unmarshal(ev.Data, &d)
+				late = append(late, d.CallID)
+			}
+			if slices.Sort(late); strings.Join(late, ",") != "c-1,c-2,c-3" {
+				t.Fatalf("tool_late for %v", late)
+			}
+			got := load(t, store)
+			if got.State != tc.state || got.StopReason != tc.reason {
+				t.Fatalf("task %s %q", got.State, got.StopReason)
+			}
+			for _, msg := range got.Regs {
+				if msg.Role == task.RoleTool {
+					t.Fatal("a late result reached the registers")
+				}
+			}
+		})
+	}
+}
+
+// A recovered re-send held back for a passed deadline may have run before
+// the restart: a read-only one is cancelled all the same, with nothing to
+// reconcile; an idempotent one is unknown and reported.
+func TestExpiredDeadlineHoldsBackAResendByEffect(t *testing.T) {
+	for _, tc := range []struct {
+		effect    task.Effect
+		status    mem.CallStatus
+		reconcile int
+	}{{task.ReadOnly, mem.CallCancelled, 0}, {task.Idempotent, mem.CallUnknown, 1}} {
+		t.Run(tc.effect.String(), func(t *testing.T) {
+			var runs atomic.Int32
+			e, store, _ := newTestEnv(t, reply, recoverDevices(&runs, nil))
+			crashSite(t, store, mem.CallRecord{Tool: "dev_read", Status: mem.CallDispatched, Attempt: 1, Effect: tc.effect})
+			tk := load(t, store)
+			tk.Budget.Deadline = time.Now().Add(-time.Second)
+			tk.Version++
+			if _, err := store.Commit(bg, mem.CommitSet{Task: tk}); err != nil {
+				t.Fatal(err)
+			}
+			tk = load(t, store)
+			batch, err := e.Recover(bg, tk)
+			if err != nil || len(batch) != 1 {
+				t.Fatalf("batch %+v err %v", batch, err)
+			}
+			e.Sched.Add(tk)
+			e.Dispatch("t1", nil, nil, batch)
+			e.WaitBatches()
+			got := load(t, store)
+			if r := callsOf(t, store)["c-1"]; r.Status != tc.status || runs.Load() != 0 || got.State != task.Failed || got.StopReason != "deadline" {
+				t.Fatalf("record %+v runs %d task %s %q", r, runs.Load(), got.State, got.StopReason)
+			}
+			if n := len(reconcileIDs(t, store)); n != tc.reconcile {
+				t.Fatalf("%d reconcile_needed, want %d", n, tc.reconcile)
+			}
+		})
+	}
 }

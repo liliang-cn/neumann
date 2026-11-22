@@ -141,6 +141,11 @@ var errCannotFinalise = errors.New("cannot assemble the final commit of a cancel
 //     is cancelled; any other ran, or may have, and is unknown, with a
 //     reconcile_needed event marked cancelled: the record is left for an
 //     operator, and the task does not wait for it;
+//   - except that a ReadOnly call that ran, or may have, is cancelled, with
+//     no reconcile_needed: it changed nothing, so there is nothing to check.
+//     A result it returns later is still recorded late (lateFor), and never
+//     reaches the model. An Idempotent one stays unknown: its write may have
+//     happened;
 //   - the task ends Cancelled, or Failed for a deadline or a removed class, with the reason as
 //     StopReason. The store reports each undelivered steer as steer_dropped
 //     in the same commit.
@@ -157,7 +162,14 @@ func (e *Env) cancelSet(ctx context.Context, t *task.TCB, c mem.CommitSet, fates
 	if !ok {
 		reason = fallback
 	}
+	// unknown records a call that ran, or may have. A read-only one cannot
+	// have changed anything, whatever its device did: it is cancelled, and
+	// there is nothing for an operator to check.
 	unknown := func(r mem.CallRecord) mem.CallRecord {
+		if r.Effect == task.ReadOnly {
+			r.Status = mem.CallCancelled
+			return r
+		}
 		r.Status = mem.CallUnknown
 		c.Events = append(c.Events, proto.NewEvent(proto.EvReconcileNeeded, t.ID, map[string]any{
 			"call_id": r.CallID, "tool": r.Tool, "device": r.Device, "args": string(r.Args), "key": r.Key,

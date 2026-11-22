@@ -137,6 +137,57 @@ func TestCancelATaskWithAToolInFlight(t *testing.T) {
 	}
 }
 
+// The same with a read-only call in flight: it cannot have changed
+// anything, so it is recorded cancelled and no reconcile_needed is raised;
+// its answer, when the device gives one, is late and never reaches the
+// model.
+func TestCancelATaskWithAReadOnlyToolInFlight(t *testing.T) {
+	entered, gate := make(chan struct{}), make(chan struct{})
+	dev := builtin.New("dev").Add(bus.ToolDef{Name: "look", Effect: bus.ReadOnly}, func(context.Context, bus.DeviceCall) (string, error) {
+		close(entered)
+		<-gate // ignores its context
+		return "balance 10", nil
+	})
+	m, _ := start(t, neumann.Config{Devices: []bus.Device{dev}}, func(model.Request) (model.Response, error) {
+		return sim.CallTools("dev_look"), nil
+	})
+	ctx, cancel := context.WithTimeout(bg, 5*time.Second)
+	defer cancel()
+	events := m.Events(ctx, 0)
+	id := submit(t, m, proto.Instruction{Input: "go"})
+	<-entered
+	if err := m.Cancel(bg, id); err != nil {
+		t.Fatal(err)
+	}
+	for ev := range events {
+		if ev.TaskID == id && ev.Kind == proto.EvCancelled {
+			if st := callStatus(t, m, id); st["c-1"] != mem.CallCancelled {
+				t.Fatalf("at the final commit: calls %v", st)
+			}
+			close(gate)
+		}
+		if ev.TaskID == id && ev.Kind == proto.EvToolLate {
+			break
+		}
+	}
+	recs, _ := m.Calls(bg, id)
+	if len(recs) != 1 || recs[0].Status != mem.CallLate || recs[0].Result == nil || recs[0].Result.Content != "balance 10" {
+		t.Fatalf("records %+v", recs)
+	}
+	if k := kindsOf(t, m, id); slices.Contains(k, proto.EvReconcileNeeded) {
+		t.Fatalf("events %v", k)
+	}
+	got, _ := m.Load(bg, id)
+	if got.State != task.Cancelled {
+		t.Fatalf("task %s", got.State)
+	}
+	for _, msg := range got.Regs {
+		if msg.Role == task.RoleTool {
+			t.Fatal("the late result reached the registers")
+		}
+	}
+}
+
 // A late result after a cancel, end to end: recorded late, never in the
 // registers, reported by tool_late.
 func TestLateResultThroughTheMachine(t *testing.T) {

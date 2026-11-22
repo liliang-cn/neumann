@@ -287,6 +287,18 @@ func (w *world) devices() []bus.Device {
 			<-ctx.Done()
 			return "paid", nil
 		}).
+		// clook reads, then the user cancels the task while the read is
+		// still in flight; it answers a little after the machine has let
+		// go, so its answer is late.
+		Add(bus.ToolDef{Name: "clook", Effect: bus.ReadOnly}, func(ctx context.Context, c bus.DeviceCall) (string, error) {
+			w.note(c)
+			if err := w.m.Load().Cancel(bg, c.Key[:strings.Index(c.Key, "/")]); err != nil {
+				return "balance 10", nil // the process died: nothing will cancel this call
+			}
+			<-ctx.Done()
+			time.Sleep(10 * time.Millisecond)
+			return "balance 10", nil
+		}).
 		// spay pays, and the operator suspends the task while it does (once).
 		Add(bus.ToolDef{Name: "spay"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
 			w.note(c)
@@ -411,6 +423,10 @@ func cancelInTheGap(resp model.Response) func(*world) modelFn {
 var (
 	payScenario    = crashScenario{name: "pay", model: fixed(payModel), maxPays: 1, ends: map[task.State]string{task.Done: "end_turn"}}
 	cancelScenario = crashScenario{name: "cancel", model: fixed(lookThenPay("dev_cpay")), maxPays: 1,
+		ends: map[task.State]string{task.Done: "end_turn", task.Cancelled: "cancelled"}}
+	// The same with the task cancelled while a read is in flight: the read
+	// ends cancelled, never reported for reconciliation.
+	cancelReadScenario = crashScenario{name: "cancel_read", model: fixed(lookThenPay("dev_clook")),
 		ends: map[task.State]string{task.Done: "end_turn", task.Cancelled: "cancelled"}}
 	deadlineScenario = crashScenario{name: "deadline", model: fixed(lookThenPay("dev_dpay")), deadline: 30 * time.Minute, maxPays: 1,
 		ends: map[task.State]string{task.Done: "end_turn", task.Failed: "deadline"}}
@@ -736,7 +752,7 @@ type crashRun struct {
 	commits   int64    // made by the first machine
 	resolved  bool     // the second machine needed an operator
 	recovered bool     // the second machine finished a cancel the first one committed
-	unsent    bool     // a read-only call it may have re-sent was not, and is unknown
+	unsent    bool     // a read-only call that reached its device was given up on, and is cancelled
 	fromGroup bool     // the second machine recovered the task from Waiting(Group)
 	retries   []string // the classes of the model_retry events, in order
 	compacted int      // compacted events, both processes
@@ -978,14 +994,19 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	recs, _ := s2.Calls(bg, id)
 	for _, r := range recs {
-		if r.Status == mem.CallUnknown && r.Effect == task.ReadOnly {
-			run.unsent = true
-		}
 		w.mu.Lock()
 		sent := len(w.keys[id+"/"+r.CallID])
 		w.mu.Unlock()
 		if r.Status == mem.CallCancelled && sent > 0 {
-			t.Fatalf("crash after %d commits (after=%v): call %s is recorded as never sent, but a device saw it %d times", n, after, r.CallID, sent)
+			// A read-only call given up on after it was sent is cancelled
+			// too: it changed nothing. Any other cancelled call never ran.
+			if r.Effect != task.ReadOnly {
+				t.Fatalf("crash after %d commits (after=%v): call %s is recorded as never sent, but a device saw it %d times", n, after, r.CallID, sent)
+			}
+			run.unsent = true
+		}
+		if r.Status == mem.CallUnknown && r.Effect == task.ReadOnly {
+			t.Fatalf("crash after %d commits (after=%v): read-only call %s is left unknown", n, after, r.CallID)
 		}
 	}
 	w.mu.Lock()
@@ -1161,7 +1182,8 @@ func checkEventsHaveState(t *testing.T, s mem.Store, id string) {
 				t.Fatalf("approval_needed %s, but the record is %+v", d.CallID, r)
 			}
 		case proto.EvReconcileNeeded:
-			if !known || r.Attempt < 1 {
+			// Never for a read-only call: it cannot have changed anything.
+			if !known || r.Attempt < 1 || r.Effect == task.ReadOnly {
 				t.Fatalf("reconcile_needed %s, but the record is %+v", d.CallID, r)
 			}
 		case proto.EvDone, proto.EvFailed, proto.EvCancelled:
@@ -1268,6 +1290,20 @@ func TestCrashAtEveryCommitPointWhileCancelling(t *testing.T) {
 		t.Fatal("no crash point fell between the cancel and its final commit")
 	}
 	t.Logf("%d crash points; recovery finished the cancel at %d of them", points, recovered)
+}
+
+// The same sweep with the task cancelled while a read-only call is in
+// flight: wherever the crash falls, the read ends cancelled (or late), and
+// no reconcile_needed is ever raised for it.
+func TestCrashAtEveryCommitPointWhileCancellingARead(t *testing.T) {
+	points, _, recovered, unsent, _ := sweepAll(t, cancelReadScenario)
+	if recovered == 0 {
+		t.Fatal("no crash point fell between the cancel and its final commit")
+	}
+	if unsent == 0 {
+		t.Fatal("no crash point left the read recorded cancelled after it was sent")
+	}
+	t.Logf("%d crash points; recovery finished the cancel at %d; the read stayed cancelled at %d", points, recovered, unsent)
 }
 
 // The same sweep with the task's deadline passing while its payment is in
