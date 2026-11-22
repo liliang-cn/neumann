@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -752,7 +753,8 @@ type crashRun struct {
 	commits   int64    // made by the first machine
 	resolved  bool     // the second machine needed an operator
 	recovered bool     // the second machine finished a cancel the first one committed
-	unsent    bool     // a read-only call that reached its device was given up on, and is cancelled
+	heldBack  bool     // a read-only call the restart found re-sendable was held back for a passed deadline, and is cancelled
+	readCut   bool     // a read-only call that reached its device was given up on, and is cancelled
 	fromGroup bool     // the second machine recovered the task from Waiting(Group)
 	retries   []string // the classes of the model_retry events, in order
 	compacted int      // compacted events, both processes
@@ -886,6 +888,25 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	if tc, err := s2.Load(bg, id); err == nil && sc.parked != nil && tc.State == task.Suspended {
 		sc.parked.Add(1)
 	}
+	// What the restart finds: which read-only calls are still dispatched,
+	// how often a device saw each so far, and whether a cancel is pending
+	// (then the restart finishes it and re-sends nothing).
+	type found struct {
+		dispatched bool
+		sent       int
+	}
+	atRestart := map[string]found{}
+	cancelPending := false
+	if recs, err := s2.Calls(bg, id); err == nil {
+		w.mu.Lock()
+		for _, r := range recs {
+			atRestart[r.CallID] = found{r.Status == mem.CallDispatched && r.Effect == task.ReadOnly, len(w.keys[id+"/"+r.CallID])}
+		}
+		w.mu.Unlock()
+	}
+	if pending, err := s2.Interrupts(bg, id, true); err == nil {
+		cancelPending = slices.ContainsFunc(pending, func(in mem.Interrupt) bool { return in.Kind == mem.InterruptCancel })
+	}
 	m2 := newMachine(t, s2, w, sc.model(w))
 	finish := sweepPatience
 	if sc.patience > 0 {
@@ -999,11 +1020,18 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 		w.mu.Unlock()
 		if r.Status == mem.CallCancelled && sent > 0 {
 			// A read-only call given up on after it was sent is cancelled
-			// too: it changed nothing. Any other cancelled call never ran.
+			// too: its tool declares nothing to check. Any other cancelled
+			// call never ran.
 			if r.Effect != task.ReadOnly {
 				t.Fatalf("crash after %d commits (after=%v): call %s is recorded as never sent, but a device saw it %d times", n, after, r.CallID, sent)
 			}
-			run.unsent = true
+			run.readCut = true
+			// Sent by the first process and still dispatched at the restart,
+			// with no cancel pending: the restart re-sends it, and only a
+			// passed deadline keeps that re-send from reaching a device.
+			if f := atRestart[r.CallID]; f.dispatched && f.sent > 0 && sent == f.sent && !cancelPending && r.Attempt == 1 && got.StopReason == "deadline" {
+				run.heldBack = true
+			}
 		}
 		if r.Status == mem.CallUnknown && r.Effect == task.ReadOnly {
 			t.Fatalf("crash after %d commits (after=%v): read-only call %s is left unknown", n, after, r.CallID)
@@ -1182,7 +1210,7 @@ func checkEventsHaveState(t *testing.T, s mem.Store, id string) {
 				t.Fatalf("approval_needed %s, but the record is %+v", d.CallID, r)
 			}
 		case proto.EvReconcileNeeded:
-			// Never for a read-only call: it cannot have changed anything.
+			// Never for a read-only call: its tool declares nothing to check.
 			if !known || r.Attempt < 1 || r.Effect == task.ReadOnly {
 				t.Fatalf("reconcile_needed %s, but the record is %+v", d.CallID, r)
 			}
@@ -1214,11 +1242,11 @@ func checkEventsHaveState(t *testing.T, s mem.Store, id string) {
 // right after, each possible number of commits, and a fresh machine on the
 // same database always finishes the task without paying twice.
 func sweep(t *testing.T, sc crashScenario) (points int, resolved, recovered int) {
-	points, resolved, recovered, _, _ = sweepAll(t, sc)
+	points, resolved, recovered, _, _, _ = sweepAll(t, sc)
 	return points, resolved, recovered
 }
 
-func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, unsent, fromGroup int) {
+func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, heldBack, fromGroup, readCut int) {
 	clean := runAndCrash(t, sc, 1<<30, false) // a clean run: how many commits there are
 	if clean.commits < 3 {
 		t.Fatalf("a clean run made only %d commits", clean.commits)
@@ -1262,8 +1290,11 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 					if run.recovered {
 						recovered++
 					}
-					if run.unsent {
-						unsent++
+					if run.heldBack {
+						heldBack++
+					}
+					if run.readCut {
+						readCut++
 					}
 					if run.fromGroup {
 						fromGroup++
@@ -1272,7 +1303,7 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 			}
 		})
 	}
-	return points, resolved, recovered, unsent, fromGroup
+	return points, resolved, recovered, heldBack, fromGroup, readCut
 }
 
 func TestCrashAtEveryCommitPoint(t *testing.T) {
@@ -1296,14 +1327,14 @@ func TestCrashAtEveryCommitPointWhileCancelling(t *testing.T) {
 // flight: wherever the crash falls, the read ends cancelled (or late), and
 // no reconcile_needed is ever raised for it.
 func TestCrashAtEveryCommitPointWhileCancellingARead(t *testing.T) {
-	points, _, recovered, unsent, _ := sweepAll(t, cancelReadScenario)
+	points, _, recovered, _, _, readCut := sweepAll(t, cancelReadScenario)
 	if recovered == 0 {
 		t.Fatal("no crash point fell between the cancel and its final commit")
 	}
-	if unsent == 0 {
+	if readCut == 0 {
 		t.Fatal("no crash point left the read recorded cancelled after it was sent")
 	}
-	t.Logf("%d crash points; recovery finished the cancel at %d; the read stayed cancelled at %d", points, recovered, unsent)
+	t.Logf("%d crash points; recovery finished the cancel at %d; the read stayed cancelled at %d", points, recovered, readCut)
 }
 
 // The same sweep with the task's deadline passing while its payment is in
@@ -1393,7 +1424,7 @@ func TestCrashAtEveryCommitPointWithAThoughtThatStops(t *testing.T) {
 // process leaves the task in Waiting(Group), and every crash point, before
 // and after its commit, still finishes the task once, paying once.
 func TestCrashAtEveryCommitPointWithTheGroupDown(t *testing.T) {
-	points, held, _, _, fromGroup := sweepAll(t, quotaScenario)
+	points, held, _, _, fromGroup, _ := sweepAll(t, quotaScenario)
 	if held == 0 {
 		t.Fatal("no crash point left the payment's outcome unknown")
 	}
@@ -1406,11 +1437,11 @@ func TestCrashAtEveryCommitPointWithTheGroupDown(t *testing.T) {
 // The same sweep with the deadline passing inside a read-only call, so that
 // a restart finds the call re-sendable after the deadline.
 func TestCrashAtEveryCommitPointPastTheDeadline(t *testing.T) {
-	points, _, recovered, unsent, _ := sweepAll(t, expireScenario)
-	if unsent == 0 {
-		t.Fatal("no crash point left a re-sendable call behind a passed deadline")
+	points, _, recovered, heldBack, _, _ := sweepAll(t, expireScenario)
+	if heldBack == 0 {
+		t.Fatal("no crash point made the restart hold back a read-only re-send for the passed deadline")
 	}
-	t.Logf("%d crash points; recovery finished the deadline at %d; a re-send was held back at %d", points, recovered, unsent)
+	t.Logf("%d crash points; recovery finished the deadline at %d; a re-send was held back at %d", points, recovered, heldBack)
 }
 
 // The same sweep on two groups, with the task moving from one to the other
