@@ -137,7 +137,10 @@ type request struct {
 //
 // Every event is stamped with its commit time (proto.Event.Time), stored as
 // Unix nanoseconds. A database written before events had times gets the
-// column at Open; its old events read back with a zero time.
+// column at Open; its old events read back with a zero time. One written
+// before event retention gets the events_task index (task_id, seq) that
+// PruneEvents reads at Open, built once: on a large log the first Open takes
+// that long.
 func Open(path string, opts ...Option) (*Store, error) {
 	if path == "" || path == ":memory:" || strings.HasPrefix(path, "file::memory:") {
 		return nil, fmt.Errorf("sqlite: open %q: need a file path (an in-memory database is per connection)", path)
