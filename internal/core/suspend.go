@@ -259,12 +259,13 @@ func (e *Env) landAtStart(t *task.TCB, pending []mem.Interrupt) (c mem.CommitSet
 // PriorityInterrupt, or handed back while it was nudged. It commits only
 // when there is something to apply. A suspend left pending (a priority's
 // taker took a task waiting for an operator, where a suspend lands only
-// once the wait is over) marks the task again, for whoever ends the wait.
-// On error t is unchanged.
+// once the wait is over) marks the task again, for whoever ends the wait;
+// so does a read of the interrupts that fails. On error t is unchanged.
 func (e *Env) landHeld(ctx context.Context, t *task.TCB) error {
 	e.Sched.Heard(t.ID)
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
+		e.Sched.Mark(t.ID) // what it was nudged for lands at a later boundary
 		return fmt.Errorf("read interrupts: %w", err)
 	}
 	moved := t.Clone()

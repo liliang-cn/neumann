@@ -390,7 +390,9 @@ func (e *Env) SetPriority(ctx context.Context, t *task.TCB, p int) error {
 // in that boundary's own commit, with a priority_set event if the task's
 // priority changes; the hand-back that follows runs the preemption check
 // for a ready task. A task back with the scheduler by the time the interrupt
-// is committed is taken and landed here (signal). The same priority as the
+// is committed is taken and landed here (signal); one its holder hands back
+// into a wait for an operator is landed right after that hand-back
+// (landWaiting), not left for the operator. The same priority as the
 // task will have once what is pending lands commits nothing. A task that
 // ends first drops it: the store applies it with the terminal commit,
 // silently. A finished task is ErrFinished, an unknown one ErrNotFound.
@@ -406,7 +408,7 @@ func (e *Env) PriorityInterrupt(ctx context.Context, id string, p int) error {
 		return err
 	}
 	if t.State.Terminal() {
-		return fmt.Errorf("%w: %s", mem.ErrFinished, id)
+		return mem.ErrFinished // the machine names the task, as for one it took
 	}
 	now := t.Priority
 	if q, ok := lastPriority(priorities(pending, nil)); ok {
@@ -420,6 +422,49 @@ func (e *Env) PriorityInterrupt(ctx context.Context, id string, p int) error {
 	}
 	e.signal(ctx, id, false, notOnIO)
 	return nil
+}
+
+// operatorWait reports whether t waits for an operator: an approval, or
+// reconciliation.
+func operatorWait(t *task.TCB) bool {
+	return t.State == task.Waiting && (t.Wait == task.WaitApproval || t.Wait == task.WaitReconcile)
+}
+
+// landWaiting lands the priorities of task id, just handed back into a wait
+// for an operator, that were nudged while it was held. Such a wait refuses
+// no hand-back (sched.Hand refuses one only where a suspend lands at once),
+// so without this they would wait for the operator. It takes the task
+// (PriorityInterrupt's filter, notOnIO), lands them (landHeld) and hands it
+// back, until none is pending. A suspend pending alongside lands only when
+// the wait is over: landHeld marks the task again for whoever ends it, and
+// since the loop goes on only while priorities are pending, that mark never
+// makes it spin. Each turn lands every priority it reads, so it ends unless
+// more keep coming; a landing that fails ends it, the task left marked for
+// its next boundary.
+func (e *Env) landWaiting(ctx context.Context, id string) {
+	for e.halt().Err() == nil && e.Sched.Nudged(id) {
+		pending, err := e.Store.Interrupts(ctx, id, true)
+		if err != nil || len(priorities(pending, nil)) == 0 {
+			return
+		}
+		t, ok := e.Sched.Nudge(id, false, notOnIO)
+		if !ok {
+			return // held by someone else again: their hand-back lands it
+		}
+		err = e.landHeld(ctx, t)
+		switch {
+		case errors.Is(err, mem.ErrCancelPending):
+			e.finalise(ctx, t, mem.CommitSet{}, nil, ReasonCancelled)
+			return
+		case err != nil:
+			e.Logf("neumann: task %s: landing a priority failed; its next boundary lands it: %v", id, err)
+			e.handBackOnce(ctx, t, nil)
+			return
+		}
+		if !e.handBackOnce(ctx, t, nil) {
+			return
+		}
+	}
 }
 
 // notOnIO accepts a task nobody is at work on for a priority to land on at

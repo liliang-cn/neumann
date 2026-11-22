@@ -1289,8 +1289,9 @@ func (m *Machine) SetClass(ctx context.Context, taskID, class string) error {
 // A task the scheduler holds (ready, backing off, waiting for its group, an
 // approval or reconciliation, suspended) is changed before SetPriority
 // returns; then, in a group that preempts, a call of a less urgent task may
-// be cut off for it. A task executing an instruction or waiting for its
-// tools is not waited for: SetPriority returns once the change is committed
+// be cut off for it (one held for a moment by another operator call, or a
+// vCore about to hand it back into such a wait, takes it at that hand-back).
+// A task executing an instruction or waiting for its tools is not waited for: SetPriority returns once the change is committed
 // as an interrupt, which, like a suspend, holds across a restart and lands
 // at the task's next instruction boundary (the instruction's commit, the
 // end of its tool round), in that boundary's commit. Several changes before
@@ -1323,7 +1324,11 @@ func (m *Machine) SetPriority(ctx context.Context, taskID string, p int) error {
 	if !ok {
 		// On a vCore or waiting for its tools (or held for a moment by
 		// someone else): its holder lands the change.
-		return m.env.PriorityInterrupt(ctx, taskID, p)
+		err := m.env.PriorityInterrupt(ctx, taskID, p)
+		if errors.Is(err, ErrFinished) {
+			return fmt.Errorf("neumann: task %s: %w", taskID, ErrFinished)
+		}
+		return err
 	}
 	err := m.env.SetPriority(ctx, t, p)
 	if errors.Is(err, mem.ErrCancelPending) {

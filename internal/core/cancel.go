@@ -326,8 +326,22 @@ func (e *Env) cancelInstead(ctx context.Context, t *task.TCB, c mem.CommitSet) {
 // not taken back where that lands at once (sched.Hand): handBack lands it
 // (landHeld) and hands it back again, as often as it takes. A landing the
 // store refuses for a cancel finalises the task; one that fails otherwise
-// is left to the task's next instruction, or its restart.
+// is left to the task's next instruction, or its restart. A priority
+// nudged while it was held, handed back into a wait for an operator, lands
+// right after (landWaiting).
 func (e *Env) handBack(ctx context.Context, t *task.TCB, unsent []Send) bool {
+	id, operator := t.ID, operatorWait(t)
+	if !e.handBackOnce(ctx, t, unsent) {
+		return false
+	}
+	if operator {
+		e.landWaiting(context.WithoutCancel(ctx), id)
+	}
+	return true
+}
+
+// handBackOnce is handBack without landWaiting.
+func (e *Env) handBackOnce(ctx context.Context, t *task.TCB, unsent []Send) bool {
 	queued, done := e.handOver(context.WithoutCancel(ctx), t)
 	if queued || done {
 		return queued

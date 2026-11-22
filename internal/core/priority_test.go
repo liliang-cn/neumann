@@ -1,10 +1,12 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/liliang-cn/neumann/internal/sched"
 	"github.com/liliang-cn/neumann/mem"
@@ -253,5 +255,87 @@ func TestRecoverLandsAPriority(t *testing.T) {
 				t.Fatalf("priority %d, pending %s, events %s", got.Priority, pendingKinds(t, store), kinds(store))
 			}
 		})
+	}
+}
+
+// A priority committed while a holder has the task out, which it then hands
+// back into a wait for an operator (an approval, reconciliation), lands at
+// that hand-back: such a wait refuses no hand-back (only a suspend waits for
+// it to end), so the hand-back lands it rather than leaving it until the
+// operator acts. A suspend pending alongside still waits for the operator,
+// marked for them, and the hand-back does not spin on it.
+func TestPriorityLandsAtAHandBackIntoAnOperatorWait(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		wait    task.WaitReason
+		suspend bool
+	}{
+		{"approval", task.WaitApproval, false},
+		{"reconcile", task.WaitReconcile, false},
+		{"approval with a suspend pending", task.WaitApproval, true},
+		{"reconcile with a suspend pending", task.WaitReconcile, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e, store, _ := newTestEnv(t, reply)
+			e.Sched.Add(newTask(t, e, store, "q"))
+			held := take(t, e)
+			held.State, held.Wait = task.Waiting, c.wait
+			held.Version++
+			if _, err := store.Commit(bg, mem.CommitSet{Task: held}); err != nil {
+				t.Fatal(err)
+			}
+			if c.suspend {
+				if err := e.Suspend(bg, "t1"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := e.PriorityInterrupt(bg, "t1", 7); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan bool, 1)
+			go func() { done <- e.handBack(bg, held, nil) }()
+			select {
+			case ok := <-done:
+				if !ok {
+					t.Fatal("not handed back")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the hand-back did not return")
+			}
+			got := load(t, store)
+			want := ""
+			if c.suspend {
+				want = "suspend:"
+			}
+			if got.Priority != 7 || got.State != task.Waiting || got.Wait != c.wait || pendingKinds(t, store) != want {
+				t.Fatalf("%s/%s at priority %d, pending %s", got.State, got.Wait, got.Priority, pendingKinds(t, store))
+			}
+			if e.Sched.Nudged("t1") != c.suspend {
+				t.Fatalf("nudged %v", e.Sched.Nudged("t1"))
+			}
+		})
+	}
+}
+
+// failingInterrupts is a store whose interrupt reads fail.
+type failingInterrupts struct{ mem.Store }
+
+func (failingInterrupts) Interrupts(context.Context, string, bool) ([]mem.Interrupt, error) {
+	return nil, errors.New("disk on fire")
+}
+
+// A landing that cannot read the task's interrupts leaves it marked: what
+// it was nudged for (a suspend a priority's taker found pending, its mark
+// cleared by the take) lands at a later boundary instead of never.
+func TestLandHeldKeepsTheMarkWhenItCannotRead(t *testing.T) {
+	e, store, _ := newTestEnv(t, reply)
+	e.Sched.Add(newTask(t, e, store, "q"))
+	held := take(t, e)
+	e.Store = failingInterrupts{store}
+	if err := e.landHeld(bg, held); err == nil {
+		t.Fatal("a failed read landed")
+	}
+	if !e.Sched.Nudged("t1") {
+		t.Fatal("the mark was lost")
 	}
 }
