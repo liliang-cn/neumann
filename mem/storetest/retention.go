@@ -55,13 +55,26 @@ func seqs(evs []proto.Event) []int64 {
 	return out
 }
 
+// mustPrune runs a whole pass: calls of at most limit events each, going on
+// from the next each returns, until one says there is nothing further. It
+// returns how many the pass deleted.
 func mustPrune(t *testing.T, p mem.EventPruner, before time.Time, limit int) int {
 	t.Helper()
-	n, err := p.PruneEvents(ctx, before, limit)
-	if err != nil {
-		t.Fatalf("prune: %v", err)
+	total, after := 0, int64(0)
+	for {
+		n, next, err := p.PruneEvents(ctx, before, after, limit)
+		if err != nil {
+			t.Fatalf("prune: %v", err)
+		}
+		total += n
+		if next == 0 {
+			return total
+		}
+		if next <= after {
+			t.Fatalf("prune after %d went on from %d", after, next)
+		}
+		after = next
 	}
-	return n
 }
 
 // retentionLog commits a log with every kind of event retention tells apart
@@ -161,21 +174,78 @@ func testPruneOnlyEligibleEvents(t *testing.T, newStore Factory) {
 	read(12, 0)
 }
 
-// A bounded prune deletes the oldest eligible events first, and pruning in
-// bounded steps ends where one unbounded prune does.
-func testPruneOldestFirstWithinLimit(t *testing.T, newStore Factory) {
+// A bounded call looks at the old events after the cursor, lowest first,
+// at most limit of them, deletes the eligible ones among them, and says
+// where to go on; a pass in bounded calls ends where one unbounded call
+// does.
+func testPruneWalksWithACursor(t *testing.T, newStore Factory) {
 	s := newStore(t)
 	p := pruner(t, s)
 	log, before, eligible := retentionLog(t, s)
-	for i := range eligible {
-		if n := mustPrune(t, p, before, 1); n != 1 {
-			t.Fatalf("step %d pruned %d, want 1", i, n)
+	var gone []int64
+	after := int64(0)
+	for seq := int64(1); seq <= 8; seq++ { // the old events, 9 on are young
+		n, next, err := p.PruneEvents(ctx, before, after, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next != seq {
+			t.Fatalf("call after %d went on from %d, want %d", after, next, seq)
+		}
+		want := 0
+		if slices.Contains(eligible, seq) {
+			gone, want = append(gone, seq), 1
+		}
+		if n != want {
+			t.Fatalf("call after %d deleted %d, want %d", after, n, want)
 		}
 		all, _ := s.Events(ctx, 0, 0)
-		sameEvents(t, fmt.Sprintf("step %d", i), all, without(log, eligible[:i+1]))
+		sameEvents(t, fmt.Sprintf("after the call at %d", seq), all, without(log, gone))
+		after = next
 	}
-	if n := mustPrune(t, p, before, 1); n != 0 {
-		t.Fatalf("pruned %d once nothing was eligible", n)
+	if n, next, err := p.PruneEvents(ctx, before, after, 1); err != nil || n != 0 || next != 0 {
+		t.Fatalf("past the old events: %d, %d, %v; want 0, 0", n, next, err)
+	}
+	// The same pass in calls of 3 deletes the same: 3, 3, then 2 with no
+	// further old event.
+	s2 := newStore(t)
+	log2, before2, eligible2 := retentionLog(t, s2)
+	if n := mustPrune(t, pruner(t, s2), before2, 3); n != len(eligible2) {
+		t.Fatalf("a pass in calls of 3 deleted %d, want %d", n, len(eligible2))
+	}
+	all, _ := s2.Events(ctx, 0, 0)
+	sameEvents(t, "after a pass in calls of 3", all, without(log2, eligible2))
+}
+
+// A call looks at no more than limit events, however many old events an
+// unfinished task keeps before them: those it looked at once in a pass, it
+// does not look at again in the same pass.
+func testPruneLooksAtNoMoreThanLimit(t *testing.T, newStore Factory) {
+	s := newStore(t)
+	p := pruner(t, s)
+	run := newTask("run")
+	mustCommit(t, s, mem.CommitSet{Task: run, NewTask: true, Events: []proto.Event{ev(proto.EvAccepted, "run")}})
+	steps := make([]proto.Event, 99)
+	for i := range steps {
+		steps[i] = ev(proto.EvStep, "run")
+	}
+	old := mustCommit(t, s, mem.CommitSet{Events: steps})
+	later(t, old[len(old)-1].Time)
+	mustCommit(t, s, mem.CommitSet{Events: []proto.Event{ev(proto.EvCoreUp, "")}})
+	before := time.Now()
+	after := int64(0)
+	for call := 1; call <= 10; call++ {
+		n, next, err := p.PruneEvents(ctx, before, after, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 || next != after+10 {
+			t.Fatalf("call %d after %d: deleted %d, went on from %d; want 0 and %d", call, after, n, next, after+10)
+		}
+		after = next
+	}
+	if n, next, _ := p.PruneEvents(ctx, before, after, 10); n != 0 || next != 0 {
+		t.Fatalf("after the last old event: %d, %d", n, next)
 	}
 }
 

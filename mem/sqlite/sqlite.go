@@ -695,35 +695,41 @@ func (s *Store) Archive(ctx context.Context, taskID string) ([]task.Message, err
 
 type pruneReq struct {
 	before time.Time
+	after  int64
 	limit  int
 	n      int
+	next   int64
 }
 
-// PruneEvents deletes the events mem.EventPruner allows, oldest first. It
-// runs on the writer, in a transaction of its own between two batches of
-// commits, so it never contends with them for the write lock; commits that
-// arrive meanwhile wait for it and go into the next batch, which is why the
-// caller keeps limit small. Like Commit, once queued it is not abandoned
+// PruneEvents deletes the events mem.EventPruner allows, looking at no
+// more than limit old events. It runs on the writer, in a transaction of
+// its own between two batches of commits, so it never contends with them
+// for the write lock; commits that arrive meanwhile wait for it and go into
+// the next batch, which is why the caller keeps limit small. A call costs
+// a binary search for the old end of the log (a few dozen point reads),
+// then for each event it looks at, two lookups in events_task and one in
+// tasks: it does not grow with the old events kept before after, however
+// many an unfinished task has. Like Commit, once queued it is not abandoned
 // when ctx ends.
 //
 // The space deleted events took stays in the file and is reused by the
 // events committed after them: with retention the file stops growing at
 // what MaxAge worth of events takes, but does not shrink. VACUUM, run
 // while no machine has the file open, gives the space back.
-func (s *Store) PruneEvents(ctx context.Context, before time.Time, limit int) (int, error) {
+func (s *Store) PruneEvents(ctx context.Context, before time.Time, after int64, limit int) (int, int64, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	r := &request{prune: &pruneReq{before: before, limit: limit}, ok: make(chan struct{})}
+	r := &request{prune: &pruneReq{before: before, after: after, limit: limit}, ok: make(chan struct{})}
 	s.mu.RLock()
 	if s.closed {
 		s.mu.RUnlock()
-		return 0, ErrClosed
+		return 0, 0, ErrClosed
 	}
 	s.reqs <- r
 	s.mu.RUnlock()
 	<-r.ok
-	return r.prune.n, r.err
+	return r.prune.n, r.prune.next, r.err
 }
 
 func (s *Store) pruneEvents(r *request) {
@@ -734,7 +740,8 @@ func (s *Store) pruneEvents(r *request) {
 		r.err = fmt.Errorf("sqlite: begin prune: %w", err)
 		return
 	}
-	n, err := prune(ctx, tx, r.prune.before, r.prune.limit)
+	p := r.prune
+	n, next, err := prune(ctx, tx, p.before, p.after, p.limit)
 	if err == nil {
 		err = tx.Commit()
 	}
@@ -743,62 +750,81 @@ func (s *Store) pruneEvents(r *request) {
 		r.err = fmt.Errorf("sqlite: prune events: %w", err)
 		return
 	}
-	r.prune.n = n
+	p.n, p.next = n, next
 }
 
 // pruneChunk bounds the seqs in one DELETE statement, below SQLite's limit
 // on bound parameters.
 const pruneChunk = 500
 
-func prune(ctx context.Context, tx *sql.Tx, before time.Time, limit int) (int, error) {
+func prune(ctx context.Context, tx *sql.Tx, before time.Time, after int64, limit int) (int, int64, error) {
 	var top sql.NullInt64
 	if err := tx.QueryRowContext(ctx, "SELECT MAX(seq) FROM events").Scan(&top); err != nil || !top.Valid {
-		return 0, err
+		return 0, 0, err
 	}
-	cut, err := oldThrough(ctx, tx, before.UnixNano(), top.Int64)
+	at := before.UnixNano()
+	cut, err := oldThrough(ctx, tx, at, top.Int64)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	// Event times never decrease with seq, so the events that are old and
-	// not the newest are those with seq <= bound: the scan stops there on
-	// the primary key, and a task's newest event is one lookup in
-	// events_task.
+	// Event times never decrease with seq, so the old events (not the
+	// newest one) are those with seq <= bound: the scan runs on the
+	// primary key from after to there, and stops after limit of them. Each
+	// event's own time is checked as well, and so is the time of its
+	// task's newest event, so that a log whose times went back (rows
+	// edited by hand, or written untimed after timed ones) loses no event
+	// that is not old: bound may then be off, which only makes a prune
+	// look at less, or at rows the time check skips.
 	bound := min(cut, top.Int64-1)
-	if bound <= 0 {
-		return 0, nil
+	if bound <= after {
+		return 0, 0, nil
 	}
+	sqlLimit := limit
 	if limit <= 0 {
-		limit = -1 // SQLite: no limit
+		sqlLimit = -1 // SQLite: no limit
 	}
 	rows, err := tx.QueryContext(ctx, `
-		SELECT e.seq FROM events e
-		WHERE e.seq <= ?1 AND (e.task_id = '' OR (
+		SELECT e.seq, e.task_id = '' OR (
 			NOT EXISTS (SELECT 1 FROM tasks t WHERE t.id = e.task_id AND t.terminal = 0)
-			AND (SELECT MAX(o.seq) FROM events o WHERE o.task_id = e.task_id) <= ?1))
-		ORDER BY e.seq LIMIT ?2`, bound, limit)
+			AND EXISTS (SELECT 1 FROM events o
+				WHERE o.seq = (SELECT MAX(n.seq) FROM events n WHERE n.task_id = e.task_id)
+				AND o.seq <= ?2 AND COALESCE(o.time, 0) < ?3))
+		FROM events e
+		WHERE e.seq > ?1 AND e.seq <= ?2 AND COALESCE(e.time, 0) < ?3
+		ORDER BY e.seq LIMIT ?4`, after, bound, at, sqlLimit)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	var gone []any
+	seen := 0
+	var last int64
 	for rows.Next() {
 		var seq int64
-		if err := rows.Scan(&seq); err != nil {
+		var ok bool
+		if err := rows.Scan(&seq, &ok); err != nil {
 			rows.Close()
-			return 0, err
+			return 0, 0, err
 		}
-		gone = append(gone, seq)
+		seen, last = seen+1, seq
+		if ok {
+			gone = append(gone, seq)
+		}
 	}
 	rows.Close()
-	if err := rows.Err(); err != nil || len(gone) == 0 {
-		return 0, err
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+	var next int64
+	if limit > 0 && seen == limit {
+		next = last
 	}
 	for chunk := range slices.Chunk(gone, pruneChunk) {
 		q := "DELETE FROM events WHERE seq IN (?" + strings.Repeat(",?", len(chunk)-1) + ")"
 		if _, err := tx.ExecContext(ctx, q, chunk...); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
-	return len(gone), nil
+	return len(gone), next, nil
 }
 
 // oldThrough is the highest seq whose event is stamped before before (Unix

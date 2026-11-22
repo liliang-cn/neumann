@@ -298,33 +298,40 @@ func (m *Memory) Events(ctx context.Context, afterSeq int64, limit int) ([]proto
 	return out, nil
 }
 
-// PruneEvents deletes the events EventPruner allows, oldest first. It reads
-// the whole log, which is fine for the store meant for tests.
-func (m *Memory) PruneEvents(ctx context.Context, before time.Time, limit int) (int, error) {
+// PruneEvents deletes the events EventPruner allows. It walks the whole
+// log under the store's lock on every call, O(n) in the events kept with
+// every commit waiting, so a pass of k calls costs O(k·n): fine for the
+// store meant for tests, not for a long log.
+func (m *Memory) PruneEvents(ctx context.Context, before time.Time, after int64, limit int) (int, int64, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.events) < 2 {
-		return 0, nil
-	}
 	newest := len(m.events) - 1
 	old := func(i int) bool { return i != newest && m.events[i].Time.Before(before) }
-	// A task's events can go only if all of them can.
-	young := map[string]bool{}
+	last := map[string]int{} // each task's newest event
 	for i, e := range m.events {
-		if e.TaskID != "" && !old(i) {
-			young[e.TaskID] = true
+		if e.TaskID != "" {
+			last[e.TaskID] = i
 		}
 	}
-	gone := 0
+	gone, seen := 0, 0
+	var next int64
 	kept := m.events[:0:0]
 	for i, e := range m.events {
-		ok := (limit <= 0 || gone < limit) && old(i)
-		if ok && e.TaskID != "" {
+		if e.Seq <= after || next != 0 || !old(i) {
+			kept = append(kept, e)
+			continue
+		}
+		seen++
+		if limit > 0 && seen == limit {
+			next = e.Seq
+		}
+		ok := true
+		if e.TaskID != "" {
 			t, exists := m.tasks[e.TaskID]
-			ok = !young[e.TaskID] && !(exists && !t.State.Terminal())
+			ok = old(last[e.TaskID]) && !(exists && !t.State.Terminal())
 		}
 		if ok {
 			gone++
@@ -333,7 +340,7 @@ func (m *Memory) PruneEvents(ctx context.Context, before time.Time, limit int) (
 		kept = append(kept, e)
 	}
 	m.events = kept
-	return gone, nil
+	return gone, next, nil
 }
 
 func (m *Memory) Archive(ctx context.Context, taskID string) ([]task.Message, error) {

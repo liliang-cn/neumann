@@ -200,21 +200,22 @@ type Store interface {
 // design §4.4.2). It is optional: a Store without it keeps every event, and
 // a machine asked for retention over such a store refuses to start.
 //
-// An event is eligible as of a time before when all of these hold:
-//
-//   - its Time is before before;
-//   - it is not the newest event in the log (so a Seq is never handed out
-//     again, and the log's head stays readable);
-//   - it has no TaskID (a machine-level event), or its task is not
-//     unfinished (terminal, or not in the store at all) and every event of
-//     that task meets the two conditions above.
+// An event is old as of a time before when its Time is before before and
+// it is not the newest event in the log (so a Seq is never handed out
+// again, and the log's head stays readable). An old event is eligible when
+// it has no TaskID (a machine-level event), or its task is not unfinished
+// (terminal, or not in the store at all) and that task's newest event (by
+// Seq) is old too.
 //
 // So the events of an unfinished task are never pruned, however old, and a
 // finished task's events become eligible together, once its last one is
 // old enough (a bounded prune may still take them over more than one
 // call). An event committed for a task after its events went (a late
 // result's tool_late, say) is pruned on its own when it is old. Event times
-// never decrease with Seq (CommitTime), and a store may rely on it.
+// never decrease with Seq (CommitTime), so a task's newest event is also
+// its latest; a store may rely on that to find old events by Seq, as long
+// as it never deletes an event whose own Time is not before before, should
+// a log break the rule.
 //
 // Seqs are dense as committed, so pruned events are the gaps a reader
 // finds: a reader that has read everything up to n has missed nothing as
@@ -224,11 +225,20 @@ type Store interface {
 // Every implementation must pass the retention cases of mem/storetest, which
 // run whenever the Store under test is an EventPruner.
 type EventPruner interface {
-	// PruneEvents deletes eligible events, lowest Seq first, at most limit
-	// of them (limit <= 0: no bound), and returns how many it deleted. It
-	// never deletes anything else, and the events it keeps read back
-	// exactly as before, Seq and TaskSeq unchanged. Each call is atomic and
-	// should be short: the caller bounds the work with limit and calls
-	// again while it returns limit.
-	PruneEvents(ctx context.Context, before time.Time, limit int) (int, error)
+	// PruneEvents looks at the old events with Seq > after, lowest Seq
+	// first, at most limit of them (limit <= 0: all), and deletes the
+	// eligible ones among them. It returns how many it deleted, and next:
+	// the Seq of the last event it looked at when it looked at limit of
+	// them, so that the caller goes on with after = next, or 0 when there
+	// was no further old event to look at. limit bounds the work of a call,
+	// not only what it deletes: the old events an unfinished task keeps are
+	// looked at once per pass of calls, not once per call.
+	//
+	// It never deletes anything else, and the events it keeps read back
+	// exactly as before, Seq and TaskSeq unchanged. Each call is atomic. An
+	// event found not eligible stays so for the same before until its task
+	// finishes, or until the log's newest event, its own or its task's,
+	// stops being the newest: a pass that moves after forward misses at
+	// most those events, which the next pass takes.
+	PruneEvents(ctx context.Context, before time.Time, after int64, limit int) (pruned int, next int64, err error)
 }

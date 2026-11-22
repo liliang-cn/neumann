@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -43,7 +44,7 @@ func TestPruneSurvivesReopen(t *testing.T) {
 	if _, err := s.Commit(ctx, coreUp()); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.PruneEvents(ctx, t0.Add(time.Minute), 0); err != nil || n != 6 {
+	if n, _, err := s.PruneEvents(ctx, t0.Add(time.Minute), 0, 0); err != nil || n != 6 {
 		t.Fatalf("pruned %d, %v; want 6", n, err)
 	}
 	if err := s.Close(); err != nil {
@@ -97,7 +98,7 @@ func TestPruneUntimedEvents(t *testing.T) {
 	if _, err := s.Commit(ctx, coreUp()); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.PruneEvents(ctx, now, 0); err != nil || n != 2 {
+	if n, _, err := s.PruneEvents(ctx, now, 0, 0); err != nil || n != 2 {
 		t.Fatalf("pruned %d, %v; want the 2 untimed events", n, err)
 	}
 	all, _ := s.Events(ctx, 0, 0)
@@ -150,18 +151,25 @@ func TestPruneAlongsideCommits(t *testing.T) {
 			}
 		})
 	}
-	pruned := 0
-	for {
-		n, err := s.PruneEvents(ctx, t0.Add(time.Minute), 7)
-		if err != nil {
-			t.Fatal(err)
-		}
-		pruned += n
-		if n < 7 {
-			break
+	pass := func() int {
+		pruned, after := 0, int64(0)
+		for {
+			n, next, err := s.PruneEvents(ctx, t0.Add(time.Minute), after, 7)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pruned += n
+			if next == 0 {
+				return pruned
+			}
+			after = next
 		}
 	}
+	pruned := pass()
 	wg.Wait()
+	// While done's last event was the newest, the pass found done's events
+	// not eligible and went past them; the next pass takes them.
+	pruned += pass()
 	close(errs)
 	for err := range errs {
 		t.Fatalf("commit during prune: %v", err)
@@ -178,5 +186,97 @@ func TestPruneAlongsideCommits(t *testing.T) {
 	}
 	if len(all) != 2+old+1+200-pruned {
 		t.Fatalf("%d events left, want %d", len(all), 2+old+1+200-pruned)
+	}
+}
+
+// A log whose times went back (here edited by hand; also a database an
+// older binary wrote untimed rows to after timed ones) loses no event that
+// is not old itself, and keeps a finished task whose newest event is not
+// old whole, as the memory store does.
+func TestPruneChecksEachEventsTime(t *testing.T) {
+	s := open(t, filepath.Join(t.TempDir(), "neumann.db"))
+	defer s.Close()
+	t0 := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	s.now = func() time.Time { return t0 }
+	commit := func(c mem.CommitSet) {
+		t.Helper()
+		if _, err := s.Commit(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ev := func(kind, id string) []proto.Event { return []proto.Event{proto.NewEvent(kind, id, nil)} }
+	a := &task.TCB{ID: "a", State: task.Ready, Class: "default", Version: 1}
+	b := &task.TCB{ID: "b", State: task.Ready, Class: "default", Version: 1}
+	commit(mem.CommitSet{Task: a, NewTask: true, Events: ev(proto.EvAccepted, "a")}) // 1
+	commit(mem.CommitSet{Task: b, NewTask: true, Events: ev(proto.EvAccepted, "b")}) // 2
+	commit(mem.CommitSet{Events: ev(proto.EvCoreUp, "")})                            // 3
+	for _, tc := range []*task.TCB{a, b} {                                           // 4, 5
+		end := tc.Clone()
+		end.Version, end.State = 2, task.Done
+		commit(mem.CommitSet{Task: end, Events: ev(proto.EvDone, tc.ID)})
+	}
+	commit(mem.CommitSet{Events: ev(proto.EvCoreUp, "")}) // 6
+	commit(mem.CommitSet{Events: ev(proto.EvCoreUp, "")}) // 7
+	// 3 (machine-level) and 5 (b's newest) move into the future, the rest
+	// stay old: the binary search finds the old end at 7, past both.
+	future := t0.Add(24 * time.Hour).UnixNano()
+	if _, err := s.db.Exec("UPDATE events SET time = ? WHERE seq IN (3, 5)", future); err != nil {
+		t.Fatal(err)
+	}
+	if n, _, err := s.PruneEvents(ctx, t0.Add(time.Hour), 0, 0); err != nil || n != 3 {
+		t.Fatalf("pruned %d, %v; want a's two events and seq 6", n, err)
+	}
+	all, _ := s.Events(ctx, 0, 0)
+	if !slices.Equal(seqsOf(all), []int64{2, 3, 5, 7}) {
+		t.Fatalf("seqs %v, want [2 3 5 7]: b whole, 3 young, 7 newest", seqsOf(all))
+	}
+}
+
+// A call's cost does not grow with the old events an unfinished task keeps
+// before the cursor: compare ns/op across the sizes.
+//
+//	go test -run - -bench PruneKeptOldRows ./mem/sqlite
+func BenchmarkPruneKeptOldRows(b *testing.B) {
+	for _, kept := range []int{1000, 10000, 100000} {
+		b.Run(fmt.Sprint(kept), func(b *testing.B) {
+			s, err := Open(filepath.Join(b.TempDir(), "neumann.db"))
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer s.Close()
+			t0 := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+			var now atomic.Int64
+			now.Store(t0.UnixNano())
+			s.now = func() time.Time { return time.Unix(0, now.Load()) }
+			run := &task.TCB{ID: "run", State: task.Ready, Class: "default", Version: 1}
+			if _, err := s.Commit(ctx, mem.CommitSet{Task: run, NewTask: true}); err != nil {
+				b.Fatal(err)
+			}
+			evs := make([]proto.Event, 1000)
+			for i := range evs {
+				evs[i] = proto.NewEvent(proto.EvStep, "run", nil)
+			}
+			for range kept / len(evs) {
+				if _, err := s.Commit(ctx, mem.CommitSet{Events: evs}); err != nil {
+					b.Fatal(err)
+				}
+			}
+			now.Store(t0.Add(time.Hour).UnixNano())
+			if _, err := s.Commit(ctx, mem.CommitSet{Events: evs[:1]}); err != nil {
+				b.Fatal(err)
+			}
+			before := t0.Add(time.Minute)
+			const limit = 500
+			after := int64(0)
+			b.ResetTimer()
+			for b.Loop() {
+				// One call of a pass, its cursor kept from the call before.
+				_, next, err := s.PruneEvents(ctx, before, after, limit)
+				if err != nil {
+					b.Fatal(err)
+				}
+				after = next
+			}
+		})
 	}
 }
