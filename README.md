@@ -32,7 +32,8 @@ before v1.
   `Cancel` returns once the cancel is committed, and it holds across a crash.
 - **A replayable event log.** Everything that happens is an event with a
   global sequence number. A client that reconnects with the last number it
-  saw gets exactly what it missed.
+  saw gets exactly what it missed. Retention, when you turn it on, deletes
+  old events of finished tasks and keeps everything a running task has.
 - **Slow tools do not hold a core.** A task waiting for tools gives its vCore
   to other tasks; the tool results wake it up.
 
@@ -413,7 +414,9 @@ by exactly one; events get dense sequence numbers; a pending cancel refuses
 everything but the task's final commit; an interrupt's `From` and `Key` are
 kept as committed (without `Key`, a keyed steer, and so a `bus/tasks` send
 sent again after a restart, would arrive twice). The machine never closes the
-store; its owner does, after `Stop`.
+store; its owner does, after `Stop`. A store that also implements
+`mem.EventPruner` supports event retention; the suite's `Prune*` cases run
+for it, and are skipped for a store without it.
 
 ## Operating it
 
@@ -433,6 +436,32 @@ for _, g := range m.Status().Groups {
 event. `m.EventLog`, `m.Load` and `m.Calls` read the store directly;
 `m.History(ctx, id)` is a task's whole conversation, the messages compaction
 swapped out included.
+
+**Event retention.** The event log keeps every event unless
+`Config.EventRetention` is set (0, the default, keeps everything). With
+`EventRetention: 7 * 24 * time.Hour` the machine prunes in the background,
+from `Start` on, once a minute: a finished task's events are deleted
+together once the newest of them is older than a week; machine-level events
+(no task id) go one by one at the same age; the events of a task that has
+not finished are kept however long it runs, and go once it has finished and
+its last event is old enough; the newest event is always kept. Pruning
+deletes at most 500 events per store call with a short pause between calls,
+so a commit waits for at most one such batch; a prune that fails is logged
+and retried on the next pass, and never fails a commit. `Stop` cancels a
+pass in flight and waits for it. Task state, call records, interrupts and
+archives are not touched: recovery never reads the event log.
+
+Sequence numbers are dense as committed, so a pruned event is a gap in
+`Seq`. A reader that resumes from a seq whose next events were pruned gets
+the oldest kept events after it, in order (`m.Events` logs the first gap
+once; `observe.Follow` goes on; `/events` sends a `pruned` event first, see
+Observability); one that starts from 0 gets whatever is kept.
+`Status.EventsPruned` (and the `neumann.events.pruned` metric) counts the
+deleted events. Retention needs a store that implements `mem.EventPruner`:
+both built-in stores do, and `New` refuses `EventRetention` over one that
+does not. With `mem/sqlite` the space deleted events took is reused by new
+ones, so the file stops growing; it does not shrink (run `VACUUM` with the
+machine stopped for that).
 
 **Steering and cancelling.** `m.Steer(ctx, id, text)` adds a message to a
 running task (delivered at its next model call, or reported as
@@ -657,7 +686,9 @@ http.Handle("/", observe.NewHandler(m, observe.HandlerOptions{Metrics: prom, Tok
   `log/slog` (no prompts or arguments).
 - **HTTP** (`observe.NewHandler`, read-only): `/status`, `/queue`,
   `/tasks/{id}`, `/events?from_seq=N` (server-sent events, replay then live,
-  `Last-Event-ID` resumes), `/metrics` when given, `/debug/pprof/` only when
+  `Last-Event-ID` resumes; resuming past events that retention deleted
+  first sends one `pruned` event, without an id, with `after_seq` and
+  `next_seq`), `/metrics` when given, `/debug/pprof/` only when
   `Pprof` is set. `/tasks` and `/events` expose prompts and tool arguments:
   set `Token` or keep the handler private.
 
@@ -775,7 +806,9 @@ What neumann promises:
   and nobody is asked to check it. Declare `ReadOnly` only when that is true.
 - **Events can be replayed.** Sequence numbers are dense and global; reading
   from any `Seq` gives the same sequence a subscriber that never disconnected
-  saw.
+  saw. With `Config.EventRetention`, that holds for the events retention
+  kept; what it deleted shows as a gap in `Seq`, never as a log that looks
+  complete.
 - **Usage counts only what a provider confirmed.** A request whose response
   was lost is counted in `Unconfirmed`, not in `Used`; budgets count both.
 
@@ -812,8 +845,7 @@ Designed but not built yet:
 - long-term memory and RAG, sub-agents, multimodal input;
 - the operator controls `Pause` / `Resume` / `Drain` (per-task
   `Suspend` / `ResumeTask` are built);
-- a token budget per task (`Budget` has `MaxSteps` and `Deadline`);
-- retention for the event log, which grows without bound for now.
+- a token budget per task (`Budget` has `MaxSteps` and `Deadline`).
 
 ## Testing
 

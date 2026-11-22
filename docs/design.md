@@ -238,13 +238,33 @@ type CallRecord struct {
 - 每个事件有全局序号 `Seq`（单调递增）和任务内序号 `TaskSeq`。
 - 事件只在提交成功后发布给订阅者。
 - 订阅：`m.Events(ctx, fromSeq)`；`m.EventLog(ctx, afterSeq, limit)` 直接读。第一阶段没有内存环形缓冲，订阅者每次被唤醒都从 Store 按序号读，语义相同。订阅者先从内存环形缓冲读；落后太多、超出缓冲时，自动改为从 `Store.Events` 按序号补读，追上后再回到内存。**生产者从不阻塞，订阅者也不丢事件。**
-- 第一版事件表不自动清理；清理策略（按时间或按已确认的序号）属于运维配置，留到有真实数据量再定。
+- 事件表默认不清理；`Config.EventRetention` 打开保留期后按 4.4.2 在后台清理。`Seq` 在提交时是稠密的，清理留下的是序号上的空洞。
 
 ### 4.4.1 流式增量
 
 模型调用默认流式：适配器实现 `model.Streamer` 就走流式，正文和推理的增量实时推给 `m.Deltas(ctx)` 的订阅者（`proto.Delta{TaskID, Step, Text, Reasoning}`）。增量是预览，不提交、没有序号：订阅者落后超过 1024 条就丢（计入 `Status.DeltasDropped`），推送从不阻塞 vCore；失败或被打断的一步可能已经流出过文字。记录以提交的 `answer` 事件为准。模型不支持流式时，`Start` 记一条日志——包一层只转发 `Call` 的适配器会悄悄关掉流式，这是实际踩到过的。
 
 实测 cpa 上的 gemini-3.8-flash-high：它先在后台推理、推理不流出，首段正文只比整段回答早 9–75ms。流式的收益取决于模型：推理可见或回答较长时才明显。
+
+### 4.4.2 保留期
+
+事件表只追加，常驻的机器跑久了会无限增长。`Config.EventRetention`（`time.Duration`，默认 0 = 全部保留，与以前完全相同）打开后，机器在后台按年龄清理事件。只按时间、不按条数：按条数的上限没法和"未结束任务的事件一条不删"同时成立，运维要说的也是"留一周"。
+
+规则（`mem.EventPruner` 的文档是准的那份）：以 `before = Clock.Now() - EventRetention` 为界，一条事件可以删，当且仅当
+
+- 它的 `Time`（提交时刻，由 Store 的时钟盖）早于 `before`；
+- 它不是日志里最新的一条（序号永不复用：SQLite 的 `INTEGER PRIMARY KEY` 删了最大行会把序号再发一次；日志末尾也一直读得到，`observe.Head` 不受影响）；
+- 它不属于任何任务（机器级事件，逐条删），或者它的任务不是未结束的（终态，或 Store 里没有这个任务），并且这个任务的每一条事件都满足上面两条。
+
+所以未结束任务的事件不论多老都不删：跑得比保留期还长的任务，事件一直保留到它结束，结束后等它最后一条事件也过了保留期，再一起删。不按序号一刀切，是因为那样会删掉一个运行中任务的前半段事件，`Tracer` 重建的 trace 就缺了根。任务结束后又提交的事件（晚到结果的 `tool_late`）让这个任务整体再晚一些才删；在任务的事件删掉之后才到的，到期后单独删。
+
+节奏：`Start` 时跑一遍，之后每 `min(EventRetention, 1 分钟)` 一遍（用机器的 `Clock`，假时钟驱动得了）。每次 Store 调用最多删 500 条，两次调用之间停 20ms（真实时间，只为摊开负载），直到一次删得不满 500。清理失败只记日志，下一遍再试，从不让提交失败；`Stop` 一开始就取消清理并等它结束。`Status.EventsPruned` 是本次启动以来删掉的条数，`observe` 导出为 `neumann.events.pruned`。
+
+Store 支持：`mem.EventPruner` 是可选接口（`PruneEvents(ctx, before, limit)`），不改 `mem.Store`，第三方 Store 不受影响。两个内置 Store 都实现，行为由 `mem/storetest` 的 `Prune*` 用例约束，Store 不实现时这些用例跳过。配置了保留期而 Store 不支持时 `New` 直接报错：只记一条日志的话，磁盘照样涨，而运维以为已经有了保留期。
+
+SQLite：清理请求走写入 goroutine，在两批提交之间单独一个事务，不和提交抢写锁；期间到达的提交排进下一批，最多等一批清理的时间。事件时间随 `Seq` 单调不减（`mem.CommitTime`），所以"早于 `before`"就是"`seq` 不超过某个值"，这个值在主键上二分查找（几十次单行读），而不是给 `time` 建索引让每次提交多写一棵 B 树；新加的 `events_task (task_id, seq)` 索引用来一次查到一个任务的最新事件，`Open` 时 `CREATE INDEX IF NOT EXISTS` 建上（旧库第一次打开时建一次）。没有 `time` 的旧事件按最老算。删掉的页进空闲链表，被之后的事件复用：开着保留期，文件长到大约"保留期内的事件"那么大就不再长，但不会缩小；`auto_vacuum` 要在建表前设定，对已有的库要整库 `VACUUM` 才生效，所以不在范围内，要缩小文件就在机器停着时跑一次 `VACUUM`。
+
+读者：`Seq` 在提交时稠密，清理不改剩下事件的 `Seq` 和 `TaskSeq`，所以被删的事件就是读者看到的空洞，不需要另外的标记，也没有竞态：读完 n 之后下一条是 n+1 就什么都没漏。`m.Events` / `m.EventLog` 照常从 `afterSeq` 往后读留下的事件，不报错、不挂起；`fromSeq > 0` 的订阅第一次遇到空洞时记一条日志（从 0 读的订阅要的就是"留下的全部"，不记）。`observe.Follow` 照常往下喂；`/events` 在第一个空洞前发一个没有 id 的 `pruned` 事件（`{"after_seq": A, "next_seq": B}`），`Last-Event-ID` 不变。读者离线超过保留期再回来，会看到某些任务从半截开始，`Tracer` 按"从中途接着读"处理（`neumann.partial`）。
 
 ### 4.5 重启
 
@@ -1009,6 +1029,7 @@ m, err := neumann.New(neumann.Config{
     Devices:   []bus.Device{builtin, mcpGitHub, skillsDir},
     ToolPolicy: policy,                    // 可选：每个调用第一次派发前的决定（9.7）
     AnswerCheck: check,                    // 可选：最终答案提交前的检查（9.8）
+    EventRetention: 7 * 24 * time.Hour,    // 可选：事件保留期（4.4.2），默认全部保留
     System:    "You are ...",
     MaxQueued: 1000,
 })
