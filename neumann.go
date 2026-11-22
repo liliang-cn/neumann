@@ -227,9 +227,10 @@ const (
 // "context", or "caps" when the target's adapter panicked reporting them.
 type MigrateError = core.MigrateError
 
-// ErrTaskBusy is returned by SetClass and SetPriority for a task that is
-// executing an instruction or waiting for its tools: it can be changed
-// between instructions only, and the caller may try again.
+// ErrTaskBusy is returned by SetClass for a task that is executing an
+// instruction or waiting for its tools: it can be moved between
+// instructions only, and the caller may try again. (SetPriority never
+// returns it: a busy task takes its new priority at its next boundary.)
 var ErrTaskBusy = errors.New("neumann: task is executing an instruction or waiting for its tools")
 
 // DefaultSteerFormat tells the model that a message arrived while it was
@@ -1282,14 +1283,26 @@ func (m *Machine) SetClass(ctx context.Context, taskID, class string) error {
 // SetPriority changes a task's priority (design §6.4, §9.6): 0 is
 // interactive, a larger number is less urgent, and a ready queue takes the
 // smaller first (a background task that waits long enough competes as 0).
-// It returns once the change is committed (a priority_set event {priority,
-// was} records it); the task keeps its place in its queue. Then, in a group
-// that preempts, a call of a less urgent task may be cut off for it.
+// The task keeps its place in its queue, and a priority_set event
+// {priority, was} records the change.
 //
-// A task can be changed between instructions only: one executing an
-// instruction or waiting for its tools gives ErrTaskBusy, and the caller may
-// try again. A finished task gives ErrFinished, an unknown one ErrNotFound,
-// a negative priority an error. The task's own priority commits nothing.
+// A task the scheduler holds (ready, backing off, waiting for its group, an
+// approval or reconciliation, suspended) is changed before SetPriority
+// returns; then, in a group that preempts, a call of a less urgent task may
+// be cut off for it. A task executing an instruction or waiting for its
+// tools is not waited for: SetPriority returns once the change is committed
+// as an interrupt, which, like a suspend, holds across a restart and lands
+// at the task's next instruction boundary (the instruction's commit, the
+// end of its tool round), in that boundary's commit. Several changes before
+// it lands: the last one counts. Until then the task runs at its old
+// priority: a model call in flight is not cut off for a task more urgent
+// than its new priority, nor does a task made more urgent preempt anything
+// before it is ready again. A task that ends first never changes.
+//
+// A finished task gives ErrFinished, an unknown one ErrNotFound, a
+// negative priority an error. The priority the task has, or will have once
+// what is pending lands, commits nothing. Unlike SetClass, SetPriority
+// never gives ErrTaskBusy.
 func (m *Machine) SetPriority(ctx context.Context, taskID string, p int) error {
 	if p < 0 {
 		return fmt.Errorf("neumann: priority %d is negative; 0 is interactive, larger is less urgent", p)
@@ -1308,14 +1321,9 @@ func (m *Machine) SetPriority(ctx context.Context, taskID string, p int) error {
 		return false
 	})
 	if !ok {
-		tc, err := m.store.Load(ctx, taskID)
-		switch {
-		case err != nil:
-			return err
-		case tc.State.Terminal():
-			return fmt.Errorf("neumann: task %s: %w", taskID, ErrFinished)
-		}
-		return fmt.Errorf("neumann: task %s: %w", taskID, ErrTaskBusy)
+		// On a vCore or waiting for its tools (or held for a moment by
+		// someone else): its holder lands the change.
+		return m.env.PriorityInterrupt(ctx, taskID, p)
 	}
 	err := m.env.SetPriority(ctx, t, p)
 	if errors.Is(err, mem.ErrCancelPending) {

@@ -77,6 +77,9 @@ func round(t *task.TCB, recs []mem.CallRecord) []mem.CallRecord {
 // A suspended task stays Suspended, and is announced again (recovered,
 // from "suspended"). A suspend left pending (a tool round in flight, a call
 // held for an operator) is marked for the commit that ends the wait.
+// Pending priorities (design §6.4) land wherever the task stopped, with the
+// commit recovery makes for it: one that would make none (waiting for an
+// operator) gets the task in it.
 func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
 	if err != nil {
@@ -167,7 +170,7 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 			}
 		}
 		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "reconcile", "held": held})
-		return nil, e.Commit(ctx, mem.CommitSet{Events: []proto.Event{ev}})
+		return nil, e.Commit(ctx, e.recoverPriority(t, mem.CommitSet{Events: []proto.Event{ev}}, pending))
 	case t.State == task.Waiting && t.Wait == task.WaitApproval:
 		// Still waiting for an operator: each held call is announced again,
 		// so an operator reading events from now on learns of it. The policy
@@ -183,7 +186,7 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 			}
 		}
 		ev := proto.NewEvent(proto.EvRecovered, t.ID, map[string]any{"from": "waiting_approval", "pending": len(evs)})
-		return nil, e.Commit(ctx, mem.CommitSet{Events: append([]proto.Event{ev}, evs...)})
+		return nil, e.Commit(ctx, e.recoverPriority(t, mem.CommitSet{Events: append([]proto.Event{ev}, evs...)}, pending))
 	case t.State == task.Suspended:
 		// Still suspended, unless a resume is pending: an operator reading
 		// events from now on learns that it waits for them.
@@ -195,11 +198,22 @@ func (e *Env) Recover(ctx context.Context, t *task.TCB) ([]Send, error) {
 			c.Task = nil
 		}
 		return nil, e.Commit(ctx, c)
-	case t.State == task.Ready && len(suspensions(pending, nil)) > 0:
+	case t.State == task.Ready && len(suspensions(pending, nil))+len(priorities(pending, nil)) > 0:
 		t.Version++
 		return nil, e.Commit(ctx, e.landSuspend(t, mem.CommitSet{Task: t}, pending, wasReady, "", ""))
 	}
 	return nil, nil
+}
+
+// recoverPriority puts t in c, recovery's commit for a task that otherwise
+// stays as it is, when it has priorities pending, and lands them there.
+func (e *Env) recoverPriority(t *task.TCB, c mem.CommitSet, pending []mem.Interrupt) mem.CommitSet {
+	if len(priorities(pending, nil)) == 0 {
+		return c
+	}
+	t.Version++
+	c.Task = t
+	return e.landPriority(t, c, pending)
 }
 
 // checkRound refuses a round whose call log this version cannot settle, so a

@@ -45,7 +45,9 @@
 //	class        task_id, class (both required): moves the task to that group (Machine.SetClass)
 //	priority     task_id, priority (both required, priority >= 0: 0 is interactive, larger is
 //	             less urgent): changes the task's priority, then a call of a less urgent task
-//	             may be preempted for it (Machine.SetPriority)
+//	             may be preempted for it (Machine.SetPriority); a task on a vCore or waiting
+//	             for its tools is answered ok once the change is committed, and takes it at
+//	             its next instruction boundary
 //	suspend      task_id (required): takes the task off the machine until a resume; a ready task
 //	             is suspended before the reply, a model call in flight is cut off, and a tool
 //	             round or a round held for approval finishes first (Machine.Suspend); suspending
@@ -67,7 +69,7 @@
 // not_found, finished, not_reconciling, not_awaiting_approval
 // (approve: the task is not waiting for approval, or the call is not held),
 // not_suspended (resume: the task is not suspended and has no suspend pending),
-// busy (with "count" and "limit"), task_busy (class, priority: the task is
+// busy (with "count" and "limit"), task_busy (class: the task is
 // executing an instruction or waiting for its tools; try again), incompatible (class: the group cannot take the task; "check"
 // names the failed check: tools, tool_count, context or caps), stopped,
 // not_started, failed (anything else, an unknown class among them). A

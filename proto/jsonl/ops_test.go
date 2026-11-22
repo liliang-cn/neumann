@@ -144,9 +144,10 @@ func TestOperatorControlsOverTheWire(t *testing.T) {
 }
 
 // priority over the wire (design §12): it needs a task_id and a priority of
-// 0 or more (0 itself given, not left out); a task on a vCore is task_busy,
-// an unknown one not_found, and a ready task's change is committed with a
-// priority_set event before the reply.
+// 0 or more (0 itself given, not left out); a task on a vCore is answered
+// ok as soon as the change is committed, before its instruction ends (it
+// lands at the task's next boundary), an unknown one not_found, and a ready
+// task's change is committed with a priority_set event before the reply.
 func TestPriorityOverTheWire(t *testing.T) {
 	for _, line := range []string{
 		`{"kind":"priority","task_id":"t1"}`,
@@ -180,7 +181,10 @@ func TestPriorityOverTheWire(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	mustOK(t, h.do(`{"kind":"submit","input":"q","task_id":"q","priority":1}`, nil), proto.KindSubmit)
-	mustFail(t, h.do(`{"kind":"priority","task_id":"hold","priority":2}`, nil), CodeTaskBusy)
+	mustOK(t, h.do(`{"kind":"priority","task_id":"hold","priority":2}`, nil), KindPriority)
+	if tc, err := h.m.Load(bg, "hold"); err != nil || tc.State != task.Running || tc.Priority != 0 {
+		t.Fatalf("hold after priority: %+v, %v", tc, err)
+	}
 	mustFail(t, h.do(`{"kind":"priority","task_id":"nope","priority":2}`, nil), CodeNotFound)
 	r := h.do(`{"id":7,"kind":"priority","task_id":"q","priority":0}`, nil)
 	mustOK(t, r, KindPriority)

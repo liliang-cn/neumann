@@ -3,6 +3,8 @@ package core
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -348,19 +350,132 @@ func runes(s string) int { return utf8.RuneCountInString(strings.ToValidUTF8(s, 
 // between instructions) priority p: the operator's reordering (design §6.4).
 // It commits the new priority with a priority_set event {priority, was};
 // nothing else about the task changes, its place in the queue (ReadySince)
-// included. The same priority commits nothing. On error t is unchanged; on
-// success the caller hands it back, and then runs the preemption check.
+// included. A priority still pending for the task (PriorityInterrupt, its
+// holder at the time failed to land it) came before this one: it is applied
+// in the same commit, and p wins. The same priority with nothing pending
+// commits nothing. On error t is unchanged; on success the caller hands it
+// back, and then runs the preemption check.
 func (e *Env) SetPriority(ctx context.Context, t *task.TCB, p int) error {
-	if t.Priority == p {
+	pending, err := e.Store.Interrupts(ctx, t.ID, true)
+	if err != nil {
+		return fmt.Errorf("read interrupts: %w", err)
+	}
+	ps := priorities(pending, nil)
+	if t.Priority == p && len(ps) == 0 {
 		return nil
 	}
 	moved := t.Clone()
-	moved.Priority = p
 	moved.Version++
-	ev := proto.NewEvent(proto.EvPrioritySet, t.ID, map[string]any{"priority": p, "was": t.Priority})
-	if err := e.Commit(ctx, mem.CommitSet{Task: moved, Events: []proto.Event{ev}}); err != nil {
+	c := mem.CommitSet{Task: moved}
+	for _, in := range ps {
+		c.Applied = append(c.Applied, in.Seq)
+	}
+	if p != t.Priority {
+		moved.Priority = p
+		c.Events = []proto.Event{priorityEvent(t.ID, p, t.Priority)}
+	}
+	if err := e.Commit(ctx, c); err != nil {
 		return err
 	}
 	*t = *moved
 	return nil
+}
+
+// PriorityInterrupt is SetPriority for a task its caller could not take:
+// one executing an instruction on a vCore or waiting for its tools (design
+// §6.4). It commits a priority interrupt carrying p and returns: it never
+// waits for the instruction. The task's holder applies it at its next
+// boundary, where suspends land (design §9.9: instruction start and commit,
+// the end of a tool round, an operator's decision, a hand-back, recovery),
+// in that boundary's own commit, with a priority_set event if the task's
+// priority changes; the hand-back that follows runs the preemption check
+// for a ready task. A task back with the scheduler by the time the interrupt
+// is committed is taken and landed here (signal). The same priority as the
+// task will have once what is pending lands commits nothing. A task that
+// ends first drops it: the store applies it with the terminal commit,
+// silently. A finished task is ErrFinished, an unknown one ErrNotFound.
+func (e *Env) PriorityInterrupt(ctx context.Context, id string, p int) error {
+	// The pending interrupts first, then the task: a landing between the
+	// two reads shows the same priority in both.
+	pending, err := e.Store.Interrupts(ctx, id, true)
+	if err != nil {
+		return err
+	}
+	t, err := e.Store.Load(ctx, id)
+	if err != nil {
+		return err
+	}
+	if t.State.Terminal() {
+		return fmt.Errorf("%w: %s", mem.ErrFinished, id)
+	}
+	now := t.Priority
+	if q, ok := lastPriority(priorities(pending, nil)); ok {
+		now = q
+	}
+	if now == p {
+		return nil
+	}
+	if err := e.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{mem.PriorityInterrupt(id, p)}}); err != nil {
+		return err
+	}
+	e.signal(ctx, id, false, notOnIO)
+	return nil
+}
+
+// notOnIO accepts a task nobody is at work on for a priority to land on at
+// once: any but one waiting for its tools, whose batch holds it.
+func notOnIO(t *task.TCB) bool { return t.State != task.Waiting || t.Wait != task.WaitIO }
+
+// priorities are the pending priority interrupts that applied does not
+// hold, in seq order.
+func priorities(pending []mem.Interrupt, applied []int64) []mem.Interrupt {
+	var out []mem.Interrupt
+	for _, in := range pending {
+		if in.Kind == mem.InterruptPriority && !slices.Contains(applied, in.Seq) {
+			out = append(out, in)
+		}
+	}
+	return out
+}
+
+// lastPriority is the priority the last of ps that carries one gives.
+func lastPriority(ps []mem.Interrupt) (int, bool) {
+	for i := len(ps) - 1; i >= 0; i-- {
+		if p, ok := mem.PriorityOf(ps[i]); ok {
+			return p, true
+		}
+	}
+	return 0, false
+}
+
+func priorityEvent(id string, p, was int) proto.Event {
+	return proto.NewEvent(proto.EvPrioritySet, id, map[string]any{"priority": p, "was": was})
+}
+
+// landPriority lands t's pending priority interrupts in c, the commit its
+// holder is about to make (c.Task is t). The last of them decides and all
+// of them are applied, whatever t is doing: unlike a suspend, a priority
+// needs no wait to be over. A priority_set {priority, was} goes after c's
+// own events when t's priority changes; several changes, or one undone
+// before it landed, are one event or none. A terminal c is left alone: the
+// store applies them with no event. One whose number does not parse (a
+// store written by hand) is applied and ignored.
+func (e *Env) landPriority(t *task.TCB, c mem.CommitSet, pending []mem.Interrupt) mem.CommitSet {
+	ps := priorities(pending, c.Applied)
+	if len(ps) == 0 || t.State.Terminal() {
+		return c
+	}
+	applied := slices.Clone(c.Applied)
+	for _, in := range ps {
+		if _, ok := mem.PriorityOf(in); !ok && e.Logf != nil {
+			e.Logf("neumann: task %s: priority interrupt %d carries %q, not a priority; ignored", t.ID, in.Seq, in.Text)
+		}
+		applied = append(applied, in.Seq)
+	}
+	c.Applied = applied
+	if p, ok := lastPriority(ps); ok && p != t.Priority {
+		c.Events = append(c.Events, priorityEvent(t.ID, p, t.Priority))
+		t.Priority = p
+	}
+	return c
 }

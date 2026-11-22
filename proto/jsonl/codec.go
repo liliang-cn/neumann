@@ -57,7 +57,7 @@ const (
 	CodeNotFound       = "not_found"       // no such task
 	CodeFinished       = "finished"        // the task has already ended
 	CodeNotReconciling = "not_reconciling" // resolve: the task or call is not held for an operator
-	CodeTaskBusy       = "task_busy"       // class, priority: the task is executing an instruction or waiting for its tools; try again
+	CodeTaskBusy       = "task_busy"       // class: the task is executing an instruction or waiting for its tools; try again
 	CodeIncompatible   = "incompatible"    // class: the target group cannot take the task; check says which check failed
 	CodeBusy           = "busy"            // submit: the machine is at capacity; count and limit say how full
 	CodeStopped        = "stopped"         // the machine is stopping

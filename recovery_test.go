@@ -104,6 +104,44 @@ type world struct {
 	suspWait  atomic.Bool
 	suspSent  atomic.Bool // the first process's operator has sent its suspend
 	deny      bool
+
+	// prio: an operator changes the task's priority twice, once each
+	// across processes (setPrio): to prioSteps[0] during its first model
+	// call, and to prioSteps[1] while its payment runs (dev_ppay). prioAt
+	// says a change was asked for, prioOK that SetPriority returned nil:
+	// it was committed.
+	prio   bool
+	prioAt [2]atomic.Bool
+	prioOK [2]atomic.Bool
+}
+
+var prioSteps = [2]int{3, 1}
+
+// setPrio is the operator's i-th change of task id's priority, made once
+// across processes, on the machine running now.
+func (w *world) setPrio(i int, id string) {
+	if !w.prio || !w.prioAt[i].CompareAndSwap(false, true) {
+		return
+	}
+	if w.m.Load().SetPriority(bg, id, prioSteps[i]) == nil {
+		w.prioOK[i].Store(true)
+	}
+}
+
+// prioAllowed are the priorities the task may end with: the last change
+// committed, or a change asked for after it whose commit may have landed as
+// the process died.
+func (w *world) prioAllowed() []int {
+	allowed := []int{0}
+	for i, p := range prioSteps {
+		switch {
+		case w.prioOK[i].Load():
+			allowed = []int{p}
+		case w.prioAt[i].Load():
+			allowed = append(allowed, p)
+		}
+	}
+	return allowed
 }
 
 // suspendDue reports whether the operator is still to suspend the task as
@@ -300,6 +338,14 @@ func (w *world) devices() []bus.Device {
 			time.Sleep(10 * time.Millisecond)
 			return "balance 10", nil
 		}).
+		// ppay pays, and the operator changes the task's priority while it
+		// does (once).
+		Add(bus.ToolDef{Name: "ppay"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
+			w.note(c)
+			w.pays.Add(1)
+			w.setPrio(1, c.Key[:strings.Index(c.Key, "/")])
+			return "paid", nil
+		}).
 		// spay pays, and the operator suspends the task while it does (once).
 		Add(bus.ToolDef{Name: "spay"}, func(_ context.Context, c bus.DeviceCall) (string, error) {
 			w.note(c)
@@ -380,6 +426,11 @@ type crashScenario struct {
 	// left the task Suspended.
 	suspend bool
 	parked  *atomic.Int32
+	// prio: the operator changes the task's priority during its first
+	// model call and during its payment (world.prio); unlanded counts the
+	// runs whose restart found a change committed and not landed.
+	prio     bool
+	unlanded *atomic.Int32
 	// suspendOn, deny: an operator suspends the task as it starts to wait
 	// (world.suspendOn) and resumes it; was is what the clean run's one
 	// suspended event must say the task was doing.
@@ -516,10 +567,32 @@ var (
 		{name: "thought_without_think_off", model: thoughtOnceModel, maxPays: 1, retries: "thought",
 			ends: map[task.State]string{task.Done: "end_turn"}},
 	}
+	// The operator raises the task's priority number during its first model
+	// call (it lands with the commit that dispatches the read) and lowers it
+	// while the payment runs (it lands with the round's results). The
+	// changes' interrupts and their landings are commit points like any
+	// other: a change committed and not landed lands at the restart.
+	priorityScenario = crashScenario{name: "priority", model: prioModel, prio: true, unlanded: new(atomic.Int32), maxPays: 1,
+		ends: map[task.State]string{task.Done: "end_turn"}}
 	migrateScenario = crashScenario{name: "migrate", model: fixed(bigModel), little: func(req model.Request) (model.Response, error) {
 		return sim.Reply("done"), nil
 	}, maxPays: 1, retries: "quota_exhausted", class: "little", moved: new(atomic.Int32), ends: map[task.State]string{task.Done: "end_turn"}}
 )
+
+// prioModel reads, then pays with dev_ppay, then answers; during its first
+// call the operator changes the task's priority (once, across processes).
+func prioModel(w *world) modelFn {
+	return func(req model.Request) (model.Response, error) {
+		switch sim.ToolRounds(req) {
+		case 0:
+			w.setPrio(0, "pay-1")
+			return sim.CallTools("dev_look"), nil
+		case 1:
+			return sim.CallTools("dev_ppay"), nil
+		}
+		return sim.Reply("done"), nil
+	}
+}
 
 // pageModel pays, then reads five pages, then answers; a compaction request
 // it summarises (sim.Summarize), and it counts rounds through summaries.
@@ -762,6 +835,7 @@ type crashRun struct {
 	prefilled int      // its steps that continued a prefill
 	suspended int      // suspended events of the task, both processes
 	was       []string // what each says the task was doing
+	prioSets  int      // priority_set events of the task, both processes
 }
 
 // runAndCrash runs sc on a machine that dies after n commits (after: right
@@ -781,6 +855,7 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	w.preempt = sc.preempt
 	w.suspend = sc.suspend
 	w.suspendOn, w.deny = sc.suspendOn, sc.deny
+	w.prio = sc.prio
 
 	s1, err := sqlite.Open(path)
 	if err != nil {
@@ -906,6 +981,9 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	}
 	if pending, err := s2.Interrupts(bg, id, true); err == nil {
 		cancelPending = slices.ContainsFunc(pending, func(in mem.Interrupt) bool { return in.Kind == mem.InterruptCancel })
+	}
+	if pending, _ := s2.Interrupts(bg, id, true); sc.unlanded != nil && slices.ContainsFunc(pending, func(in mem.Interrupt) bool { return in.Kind == mem.InterruptPriority }) {
+		sc.unlanded.Add(1)
 	}
 	m2 := newMachine(t, s2, w, sc.model(w))
 	finish := sweepPatience
@@ -1053,8 +1131,14 @@ func runAndCrash(t *testing.T, sc crashScenario, n int64, after bool) (run crash
 	if sc.rounds > 0 {
 		checkCompacted(t, m2, got, recs, sc.rounds)
 	}
+	if sc.prio {
+		run.prioSets = checkPriorities(t, s2, got, w.prioAllowed())
+	}
 	all, _ := s2.Events(bg, 0, 0)
 	for _, ev := range all {
+		if ev.Kind == proto.EvPrioritySet && ev.TaskID == id && !sc.prio {
+			t.Fatalf("priority_set %s, though nobody changed the priority", ev.Data)
+		}
 		if ev.Kind == proto.EvCompacted && ev.TaskID == id {
 			run.compacted++
 		}
@@ -1164,6 +1248,39 @@ func checkChecked(t *testing.T, s mem.Store, got *task.TCB, failed bool) {
 	}
 }
 
+// checkPriorities checks a task whose priority an operator changed: it
+// ends at one of the priorities allowed, and its priority_set events are
+// one chain from the priority it was submitted with (0) to that one, each
+// a change: a priority landed twice, or lost after its event, breaks it. It
+// returns how many there are.
+func checkPriorities(t *testing.T, s mem.Store, got *task.TCB, allowed []int) int {
+	t.Helper()
+	if !slices.Contains(allowed, got.Priority) {
+		t.Fatalf("the task ended at priority %d, want one of %v", got.Priority, allowed)
+	}
+	all, _ := s.Events(bg, 0, 0)
+	at, n := 0, 0
+	for _, ev := range all {
+		if ev.TaskID != got.ID || ev.Kind != proto.EvPrioritySet {
+			continue
+		}
+		var d struct{ Priority, Was int }
+		json.Unmarshal(ev.Data, &d)
+		if d.Was != at || d.Priority == d.Was {
+			t.Fatalf("priority_set %s after the priority was %d", ev.Data, at)
+		}
+		at = d.Priority
+		n++
+	}
+	if at != got.Priority {
+		t.Fatalf("the priority_set events end at %d, the task at %d", at, got.Priority)
+	}
+	if pending, _ := s.Interrupts(bg, got.ID, true); len(pending) != 0 {
+		t.Fatalf("pending after the end: %+v", pending)
+	}
+	return n
+}
+
 // checkEventsHaveState is the other half of design §18 test 7: every event in
 // the log has the state it describes, so no event was ever visible without it.
 func checkEventsHaveState(t *testing.T, s mem.Store, id string) {
@@ -1259,6 +1376,9 @@ func sweepAll(t *testing.T, sc crashScenario) (points int, resolved, recovered, 
 	}
 	if sc.suspend && (clean.suspended != 2 || clean.prefilled != 1) {
 		t.Fatalf("a clean run was suspended %d times and continued %d calls", clean.suspended, clean.prefilled)
+	}
+	if sc.prio && (clean.prioSets != 2 || clean.commits == 0) {
+		t.Fatalf("a clean run set the priority %d times", clean.prioSets)
 	}
 	if sc.was != "" && strings.Join(clean.was, ",") != sc.was {
 		t.Fatalf("a clean run was suspended from %v, want %s", clean.was, sc.was)
@@ -1537,6 +1657,24 @@ func TestCrashAtEveryCommitPointWithAPreemption(t *testing.T) {
 		t.Fatal("no crash point fell between a preemption and the call that continues it")
 	}
 	t.Logf("%d crash points; the operator was needed at %d; the restart continued a preempted answer at %d", points, held, preemptScenario.cont.Load())
+}
+
+// The same sweep with an operator changing the task's priority twice: during
+// its first model call, and while its payment runs. A crash before and
+// after every commit, the changes' interrupts and their landings included,
+// still finishes the task once, paying once, at the last priority
+// committed, with one priority_set per change: a change committed and not
+// landed lands at the restart, and none lands twice.
+func TestCrashAtEveryCommitPointWithAPriorityChange(t *testing.T) {
+	priorityScenario.unlanded.Store(0)
+	points, held, _ := sweep(t, priorityScenario)
+	if held == 0 {
+		t.Fatal("no crash point left the payment's outcome unknown")
+	}
+	if priorityScenario.unlanded.Load() == 0 {
+		t.Fatal("no crash point left a priority change for the restart to land")
+	}
+	t.Logf("%d crash points; the operator was needed at %d; the restart landed a priority change at %d", points, held, priorityScenario.unlanded.Load())
 }
 
 // The same sweep with an operator suspending the task twice and resuming

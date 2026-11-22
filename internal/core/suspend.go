@@ -57,7 +57,7 @@ func (e *Env) Suspend(ctx context.Context, id string) error {
 	if err := e.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{in}}); err != nil {
 		return err
 	}
-	e.signal(ctx, id, true)
+	e.signal(ctx, id, true, sched.Landable)
 	return nil
 }
 
@@ -79,18 +79,19 @@ func (e *Env) ResumeTask(ctx context.Context, id string) error {
 	if err := e.Commit(ctx, mem.CommitSet{NewInterrupts: []mem.Interrupt{in}}); err != nil {
 		return err
 	}
-	e.signal(ctx, id, false)
+	e.signal(ctx, id, false, sched.Landable)
 	return nil
 }
 
-// signal is what follows a committed suspend (cut) or resume: the task is
-// taken and landed here when nobody is at work on it, and its holder is
-// told otherwise (sched.Nudge); a suspend also cuts off a model call in
-// flight for it, or its wait for room in a limiter. Nudging comes first:
-// a call that registers after the cut finds the mark (cuttable).
-func (e *Env) signal(ctx context.Context, id string, cut bool) {
+// signal is what follows a committed suspend (cut), resume or priority:
+// the task is taken and landed here when nobody is at work on it and idle
+// accepts it, and its holder is told otherwise (sched.Nudge); a suspend
+// also cuts off a model call in flight for it, or its wait for room in a
+// limiter. Nudging comes first: a call that registers after the cut finds
+// the mark (cuttable).
+func (e *Env) signal(ctx context.Context, id string, cut bool, idle func(*task.TCB) bool) {
 	ctx = context.WithoutCancel(ctx)
-	t, ok := e.Sched.Nudge(id, cut, sched.Landable)
+	t, ok := e.Sched.Nudge(id, cut, idle)
 	if !ok {
 		if cut {
 			e.cut(id)
@@ -103,7 +104,7 @@ func (e *Env) signal(ctx context.Context, id string, cut bool) {
 		e.finalise(ctx, t, mem.CommitSet{}, nil, ReasonCancelled)
 		return
 	case err != nil:
-		e.Logf("neumann: task %s: landing a suspend or resume failed; its next instruction lands it: %v", id, err)
+		e.Logf("neumann: task %s: landing a suspend, resume or priority failed; its next instruction lands it: %v", id, err)
 	}
 	e.handBack(ctx, t, nil)
 }
@@ -170,7 +171,13 @@ func suspensions(pending []mem.Interrupt, applied []int64) []mem.Interrupt {
 // Events go after c's own: an observer reads the instruction's step and
 // usage first. A terminal c is left alone: the store applies them with no
 // event, and a task that ended does not stop to be suspended.
+//
+// Every landing of a suspend is also where t's pending priorities land
+// (landPriority), before it and whatever t is doing: each of these points is
+// a boundary of t's, and a suspend that must wait for t's tools has no
+// reason to hold a priority back.
 func (e *Env) landSuspend(t *task.TCB, c mem.CommitSet, pending []mem.Interrupt, was, kept, keptThink string) mem.CommitSet {
+	c = e.landPriority(t, c, pending)
 	ss := suspensions(pending, c.Applied)
 	if len(ss) == 0 || t.State.Terminal() {
 		return c
@@ -200,8 +207,9 @@ func (e *Env) landSuspend(t *task.TCB, c mem.CommitSet, pending []mem.Interrupt,
 	return c
 }
 
-// foldSuspend lands, in c (whose task is t), a suspend or resume nudged
-// while the caller held t (sched.Nudged): it reads t's interrupts again.
+// foldSuspend lands, in c (whose task is t), a suspend, resume or priority
+// nudged while the caller held t (sched.Nudged): it reads t's interrupts
+// again.
 // A read that fails leaves them pending, the task marked: its hand-back
 // lands them. So does a suspend that lands only once t's wait is over (its
 // tools, an approval): whoever ends that wait folds it.
@@ -227,10 +235,15 @@ func (e *Env) foldSuspend(ctx context.Context, t *task.TCB, c mem.CommitSet, was
 // pending (design §9.9): a suspend that no resume follows lands at once,
 // nothing runs, and the commit returned is the instruction's (ok); a
 // suspend that a resume cancelled is left for the instruction's own commit
-// to apply, the task marked so that it does.
+// to apply, the task marked so that it does. So is a pending priority
+// (design §6.4) with no suspend to land it: the instruction runs, at the
+// priority it was fetched by, and its commit applies it.
 func (e *Env) landAtStart(t *task.TCB, pending []mem.Interrupt) (c mem.CommitSet, ok bool) {
 	ss := suspensions(pending, nil)
 	if len(ss) == 0 {
+		if len(priorities(pending, nil)) > 0 {
+			e.Sched.Mark(t.ID)
+		}
 		return c, false
 	}
 	if ss[len(ss)-1].Kind == mem.InterruptResume {
@@ -241,10 +254,13 @@ func (e *Env) landAtStart(t *task.TCB, pending []mem.Interrupt) (c mem.CommitSet
 	return e.landSuspend(t, mem.CommitSet{Task: t}, pending, wasReady, "", ""), true
 }
 
-// landHeld lands the pending suspends and resumes of a task the caller
-// holds between instructions: taken by the suspender or resumer, or handed
-// back while it was nudged. It commits only when there is something to
-// apply. On error t is unchanged.
+// landHeld lands the pending suspends, resumes and priorities of a task the
+// caller holds between instructions: taken by the suspender, resumer or
+// PriorityInterrupt, or handed back while it was nudged. It commits only
+// when there is something to apply. A suspend left pending (a priority's
+// taker took a task waiting for an operator, where a suspend lands only
+// once the wait is over) marks the task again, for whoever ends the wait.
+// On error t is unchanged.
 func (e *Env) landHeld(ctx context.Context, t *task.TCB) error {
 	e.Sched.Heard(t.ID)
 	pending, err := e.Store.Interrupts(ctx, t.ID, true)
@@ -254,6 +270,9 @@ func (e *Env) landHeld(ctx context.Context, t *task.TCB) error {
 	moved := t.Clone()
 	moved.Version++
 	c := e.landSuspend(moved, mem.CommitSet{Task: moved}, pending, heldWas(t), "", "")
+	if len(suspensions(pending, c.Applied)) > 0 {
+		e.Sched.Mark(t.ID)
+	}
 	if len(c.Applied) == 0 {
 		return nil
 	}

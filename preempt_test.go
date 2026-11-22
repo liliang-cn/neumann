@@ -606,8 +606,9 @@ func TestLostStreamWithoutPrefillStartsOver(t *testing.T) {
 }
 
 // SetPriority (design §6.4): a ready task and a waiting one change priority
-// in place (priority_set {priority, was}); one on a vCore is busy, a
-// finished one finished, an unknown one not found; the task's own priority
+// in place (priority_set {priority, was}); one on a vCore given its own
+// priority commits nothing (TestSetPriorityDuringAModelCall covers a
+// change), a finished one is finished, an unknown one not found; the task's own priority
 // commits nothing. Made more urgent than a call in flight past its quantum,
 // a ready task cuts it off at once.
 func TestSetPriority(t *testing.T) {
@@ -628,8 +629,8 @@ func TestSetPriority(t *testing.T) {
 	onAir(t, lm, "B", 1)
 	submitAs(t, m, "C", 1)
 
-	if err := m.SetPriority(bg, "B", 0); !errors.Is(err, neumann.ErrTaskBusy) {
-		t.Fatalf("on a vCore: %v", err)
+	if err := m.SetPriority(bg, "B", 1); err != nil || len(eventData(t, m, "B", proto.EvPrioritySet)) != 0 {
+		t.Fatalf("on a vCore, its own priority: %v", err)
 	}
 	if err := m.SetPriority(bg, "nope", 0); !errors.Is(err, neumann.ErrNotFound) {
 		t.Fatalf("unknown: %v", err)

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"strconv"
@@ -143,7 +142,7 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, src *l
 		case "/pri":
 			var n int
 			if n, err = strconv.Atoi(arg); err == nil {
-				err = retryBusy(ctx, func() error { return a.M.SetPriority(ctx, id, n) })
+				err = a.M.SetPriority(ctx, id, n) // a busy task takes it at its next boundary
 			}
 		case "/suspend":
 			err = a.M.Suspend(ctx, id)
@@ -193,23 +192,6 @@ func repl(ctx context.Context, a *app.App, tr *app.Tracker, con *console, src *l
 			say("error: %v", err)
 		} else if cmd != "/help" && cmd != "/status" && cmd != "/usage" && cmd != "/tasks" && cmd != "/wait" && cmd != "/bg" {
 			say("ok")
-		}
-	}
-}
-
-// retryBusy retries an operator call that is refused while the task runs
-// an instruction (ErrTaskBusy), for up to 30s.
-func retryBusy(ctx context.Context, f func() error) error {
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		err := f()
-		if !errors.Is(err, neumann.ErrTaskBusy) || time.Now().After(deadline) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }
