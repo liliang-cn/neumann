@@ -13,9 +13,12 @@
 //
 // # The devices
 //
-// CortexDB serves about 130 tools and annotates none of them, so through
-// bus/mcp every one is SideEffect. The example wraps each MCP device in a
-// filter that keeps a few tools and declares their effect:
+// CortexDB serves about 130 tools, each annotated with readOnlyHint and, if it
+// writes, idempotentHint and destructiveHint (v2.166.0 and later); bus/mcp
+// maps them to effects. The example wraps each MCP device in a filter that
+// keeps a few tools and checks that the server declares the effect the
+// example relies on, so an older server, whose tools all arrive SideEffect,
+// fails at attach instead of running with the wrong recovery:
 //
 //   - cortex: knowledge_memory_recall, memory_search and memory_get,
 //     ReadOnly and Cacheable. Recall bumps a memory's recall count, which is
@@ -23,12 +26,15 @@
 //   - cortexw: memory_save, Idempotent, one call at a time. Config.MaxPerDevice
 //     is one number for every device, so the writer serializes itself.
 //
-// Delete, purge and the rest are left out; a host that wants them keeps them
-// SideEffect, so a crash mid-call is held for an operator.
+// Delete, drop and the rest are left out. Note that bus/mcp does not consult
+// destructiveHint: memory_delete is idempotent and destructive, so it arrives
+// Idempotent (a repeat is harmless, which is all an effect says). A host that
+// wants a person to see each delete holds it with a ToolPolicy.
 //
 // # Why memory_save is Idempotent
 //
-// memory_save is an upsert on memory_id. The writer sets memory_id to
+// CortexDB declares memory_save idempotent because it is an upsert on
+// memory_id; that holds only if a repeat carries the same id. The writer sets memory_id to
 // neu:<task>:<call> from the call's idempotency key (task/call/attempt),
 // dropping the attempt: a call sent again after a restart, or as a later
 // attempt, writes the same row. The model's own memory_id, if it gives one,
@@ -61,7 +67,7 @@ import (
 	"github.com/liliang-cn/neumann/task"
 )
 
-// The tools each device keeps, with their effect.
+// The tools each device keeps, with the effect the server must declare.
 var (
 	readTools = map[string]bus.Effect{
 		"knowledge_memory_recall": bus.ReadOnly,
@@ -178,8 +184,8 @@ func main() {
 // afterWrite, when set, runs after memory_save has reached CortexDB and
 // before its result goes back to the machine.
 func machine(store mem.Store, server, dbPath string, afterWrite func()) *neumann.Machine {
-	read := &cortexDevice{name: "cortex", inner: stdio("cortex", server, dbPath, readTools), keep: readTools, cache: true}
-	write := &cortexDevice{name: "cortexw", inner: stdio("cortexw", server, dbPath, writeTools), keep: writeTools, serial: true, after: afterWrite}
+	read := &cortexDevice{name: "cortex", inner: stdio("cortex", server, dbPath), keep: readTools, cache: true}
+	write := &cortexDevice{name: "cortexw", inner: stdio("cortexw", server, dbPath), keep: writeTools, serial: true, after: afterWrite}
 	m, err := neumann.New(neumann.Config{
 		Model:   script(),
 		Store:   store,
@@ -193,20 +199,15 @@ func machine(store mem.Store, server, dbPath string, afterWrite func()) *neumann
 	return m
 }
 
-// stdio is CortexDB's MCP server on dbPath, forced to local mode, with the
-// effects the example declares for the tools it keeps.
-func stdio(name, server, dbPath string, keep map[string]bus.Effect) *mcp.Device {
-	opts := []mcp.Option{
+// stdio is CortexDB's MCP server on dbPath, forced to local mode.
+func stdio(name, server, dbPath string) *mcp.Device {
+	return mcp.Stdio(name, server, nil,
 		mcp.WithEnv("CORTEXDB_REMOTE=", "CORTEXDB_GRPC_TOKEN=", "CORTEXDB_PATH="+dbPath),
-		mcp.WithStderr(os.Stderr),
-	}
-	for tool, e := range keep {
-		opts = append(opts, mcp.WithEffect(tool, e))
-	}
-	return mcp.Stdio(name, server, nil, opts...)
+		mcp.WithStderr(os.Stderr))
 }
 
-// cortexDevice is a CortexDB MCP device cut down to the tools in keep. A
+// cortexDevice is a CortexDB MCP device cut down to the tools in keep, each
+// of which must be declared with the effect keep names. A
 // serial device runs one call at a time. memory_save gets a memory_id derived
 // from the call's idempotency key (see memoryID).
 type cortexDevice struct {
@@ -233,7 +234,9 @@ func (d *cortexDevice) Tools(ctx context.Context) ([]bus.ToolDef, error) {
 		if !ok {
 			continue
 		}
-		def.Effect = e
+		if def.Effect != e {
+			return nil, fmt.Errorf("%s: the server declares %s %s, want %s (CortexDB v2.166.0 or later annotates its tools)", d.name, def.Name, def.Effect, e)
+		}
 		def.Cacheable = d.cache && e == bus.ReadOnly
 		out = append(out, def)
 	}
@@ -340,7 +343,7 @@ func script() model.Adapter {
 // countSaved counts the memories whose id starts with prefix, straight from
 // the server, outside any machine.
 func countSaved(ctx context.Context, server, dbPath, prefix string) (int, error) {
-	d := stdio("count", server, dbPath, nil)
+	d := stdio("count", server, dbPath)
 	defer d.Close()
 	res, err := d.Call(ctx, bus.DeviceCall{Tool: "memory_list_all", Args: json.RawMessage(`{}`)})
 	if err != nil || res.IsError {

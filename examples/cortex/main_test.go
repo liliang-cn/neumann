@@ -19,6 +19,14 @@ type fake struct {
 	saved   []string // memory_id of each memory_save
 	running atomic.Int32
 	most    atomic.Int32
+	old     bool // a server before v2.166.0: no annotations, every tool SideEffect
+}
+
+// declared is what CortexDB v2.166.0 declares for the fake's tools.
+var declared = map[string]bus.Effect{
+	"memory_save": bus.Idempotent, "memory_delete": bus.Idempotent,
+	"knowledge_memory_recall": bus.ReadOnly, "memory_search": bus.ReadOnly,
+	"memory_get": bus.ReadOnly, "graph_cypher_query": bus.ReadOnly,
 }
 
 func (f *fake) Name() string { return "fake" }
@@ -27,7 +35,11 @@ func (f *fake) Close() error { return nil }
 func (f *fake) Tools(context.Context) ([]bus.ToolDef, error) {
 	var defs []bus.ToolDef
 	for _, n := range []string{"memory_save", "memory_delete", "knowledge_memory_recall", "memory_search", "memory_get", "graph_cypher_query"} {
-		defs = append(defs, bus.ToolDef{Name: n})
+		def := bus.ToolDef{Name: n}
+		if !f.old {
+			def.Effect = declared[n]
+		}
+		defs = append(defs, def)
 	}
 	return defs, nil
 }
@@ -79,6 +91,10 @@ func TestToolsAreFilteredAndDeclared(t *testing.T) {
 	}
 	if _, err := w.Call(ctx, bus.DeviceCall{Tool: "memory_delete", Key: "t/c/1", Task: "t"}); err == nil {
 		t.Fatal("writer ran memory_delete, which it does not keep")
+	}
+	old := &cortexDevice{name: "cortexw", inner: &fake{old: true}, keep: writeTools}
+	if _, err := old.Tools(ctx); err == nil {
+		t.Fatal("a server that declares memory_save SideEffect attached as Idempotent")
 	}
 	missing := &cortexDevice{name: "x", inner: &fake{}, keep: map[string]bus.Effect{"no_such_tool": bus.ReadOnly}}
 	if _, err := missing.Tools(ctx); err == nil {
