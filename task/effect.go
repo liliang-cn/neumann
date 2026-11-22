@@ -14,7 +14,8 @@ const (
 	// asking an operator (design §9.5). The declaration is what makes that
 	// safe: declare it only when it is true.
 	ReadOnly
-	// Idempotent: a repeat is harmless (the device deduplicates by key), but
+	// Idempotent: a repeat is harmless (for example, the device deduplicates
+	// by key), but
 	// the call may change something. Recovery sends it again; a cancel that
 	// cuts it off records it unknown, for an operator.
 	Idempotent

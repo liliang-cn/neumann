@@ -24,7 +24,8 @@ import (
 //     the provider's latency as the machine sees it.
 //   - AdapterMS: the adapter's own time in those calls (no commits).
 //   - ToolMS: the commit that dispatched a round (the model step that
-//     asked for the calls) → the round's last result, per round.
+//     asked for the calls) → the round's last result, or the task's end
+//     when that cuts the round off, per round.
 //   - DeviceMS: the devices' own time in those calls, per round the
 //     longest call (calls of a round run in parallel).
 //   - SuspendedMS: suspended → resumed.
@@ -218,9 +219,10 @@ func Compute(evs []proto.Event, fp string, shared bool, calls []app.CallRecord, 
 			ready = ev.Time
 		case proto.EvDone, proto.EvFailed, proto.EvCancelled:
 			if pending > 0 && !toolsAt.IsZero() {
-				// A round its task's end cut off: a read-only call given up
-				// on gets no event of its own (no reconcile_needed), so the
-				// round ends here.
+				// A round its task's end cut off: a call that gets no event
+				// of its own at the end (a read-only call given up on, or a
+				// planned or held-back call cancelled unsent) leaves the
+				// round open, so it ends here.
 				m.ToolMS += ms(ev.Time.Sub(toolsAt))
 				toolsAt = time.Time{}
 			}

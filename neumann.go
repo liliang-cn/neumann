@@ -847,9 +847,9 @@ func (m *Machine) Submit(ctx context.Context, in proto.Instruction) (string, err
 // calls that never reached their device cancelled; a call that did is marked
 // unknown with a reconcile_needed event, and the task does not wait for it,
 // unless its tool is declared ReadOnly: that one is marked cancelled too,
-// and nobody is asked to check it. A
-// result that arrives after that is kept on its call record as late (a
-// tool_late event) and never reaches the model. Each undelivered steer is
+// and nobody is asked to check it. A result that arrives after that is kept
+// on its call record as late (a tool_late event) and never reaches the
+// model. Each undelivered steer is
 // reported by a steer_dropped event.
 //
 // Cancel returns ErrFinished for a task that has already ended and

@@ -165,7 +165,8 @@ it to the probe's wall time.
 Per task, from the committed events: wall time, queue time (ready but not
 running: from the commit that made the task ready to its next `model_call`),
 model time (`model_call` → the step's commit), tool time (the dispatching
-commit → the round's last result), suspended time, model calls, answered
+commit → the round's last result, or the task's end if that cuts the
+round off), suspended time, model calls, answered
 steps, tool calls and rounds, tokens (prompt, cached with the cache hit
 rate, completion, reasoning), each step's `first_ms` (only steps that
 streamed text or reasoning have one), retries (their backoff counts as
