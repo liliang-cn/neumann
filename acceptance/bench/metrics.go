@@ -217,6 +217,14 @@ func Compute(evs []proto.Event, fp string, shared bool, calls []app.CallRecord, 
 			}
 			ready = ev.Time
 		case proto.EvDone, proto.EvFailed, proto.EvCancelled:
+			if pending > 0 && !toolsAt.IsZero() {
+				// A round its task's end cut off: a read-only call given up
+				// on gets no event of its own (no reconcile_needed), so the
+				// round ends here.
+				m.ToolMS += ms(ev.Time.Sub(toolsAt))
+				toolsAt = time.Time{}
+			}
+			pending = 0
 			if m.Outcome == "" {
 				end = ev.Time
 				m.Outcome, m.StopReason = ev.Kind, d.StopReason
