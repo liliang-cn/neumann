@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -313,8 +314,94 @@ func TestPriorityLandsAtAHandBackIntoAnOperatorWait(t *testing.T) {
 			if e.Sched.Nudged("t1") != c.suspend {
 				t.Fatalf("nudged %v", e.Sched.Nudged("t1"))
 			}
+			if n := strings.Count(kinds(store), proto.EvPrioritySet); n != 1 {
+				t.Fatalf("%d priority_set events: %s", n, kinds(store))
+			}
 		})
 	}
+}
+
+// heldInApproval is a task taken out of the scheduler and committed
+// waiting for approval, with priority 7 committed for it while it is held.
+func heldInApproval(t *testing.T, e *Env, store *mem.Memory) *task.TCB {
+	t.Helper()
+	e.Sched.Add(newTask(t, e, store, "q"))
+	held := take(t, e)
+	held.State, held.Wait = task.Waiting, task.WaitApproval
+	held.Version++
+	if _, err := store.Commit(bg, mem.CommitSet{Task: held}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.PriorityInterrupt(bg, "t1", 7); err != nil {
+		t.Fatal(err)
+	}
+	return held
+}
+
+// landWaiting ends where it cannot land: a cancel committed first
+// finalises the task instead; a task someone else holds again is left to
+// their hand-back; a landing that fails hands the task back still marked,
+// for its next boundary.
+func TestLandWaitingExits(t *testing.T) {
+	t.Run("cancelled", func(t *testing.T) {
+		e, store, _ := newTestEnv(t, reply)
+		held := heldInApproval(t, e, store)
+		// Committed, its owner not told yet (the gap inside Cancel).
+		addInterrupt(t, store, mem.Interrupt{TaskID: "t1", Kind: mem.InterruptCancel, Text: "cancelled"})
+		if !e.handBack(bg, held, nil) {
+			t.Fatal("not handed back")
+		}
+		if got := load(t, store); got.State != task.Cancelled || got.Priority != 0 || pendingKinds(t, store) != "" {
+			t.Fatalf("%s at priority %d, pending %s", got.State, got.Priority, pendingKinds(t, store))
+		}
+		if _, _, held := e.Sched.Counts(); held != 0 {
+			t.Fatalf("%d held", held)
+		}
+	})
+	t.Run("held by someone else", func(t *testing.T) {
+		e, store, _ := newTestEnv(t, reply)
+		heldInApproval(t, e, store) // still out of the scheduler
+		done := make(chan struct{})
+		go func() { e.landWaiting(bg, "t1"); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("landWaiting did not return")
+		}
+		if got := load(t, store); got.Priority != 0 || pendingKinds(t, store) != "priority:7" || !e.Sched.Nudged("t1") {
+			t.Fatalf("priority %d, pending %s, nudged %v", got.Priority, pendingKinds(t, store), e.Sched.Nudged("t1"))
+		}
+	})
+	t.Run("landing fails", func(t *testing.T) {
+		e, store, _ := newTestEnv(t, reply)
+		held := heldInApproval(t, e, store)
+		fs := &failAfter{Store: store}
+		fs.left.Store(1) // landWaiting's own read; landHeld's fails
+		e.Store = fs
+		if !e.handBack(bg, held, nil) {
+			t.Fatal("not handed back")
+		}
+		e.Store = store
+		if got := load(t, store); got.Priority != 0 || pendingKinds(t, store) != "priority:7" || !e.Sched.Nudged("t1") {
+			t.Fatalf("priority %d, pending %s, nudged %v", got.Priority, pendingKinds(t, store), e.Sched.Nudged("t1"))
+		}
+		if _, waiting, held := e.Sched.Counts(); waiting != 1 || held != 0 {
+			t.Fatalf("waiting %d, held %d", waiting, held)
+		}
+	})
+}
+
+// failAfter is a store whose interrupt reads fail once left runs out.
+type failAfter struct {
+	mem.Store
+	left atomic.Int32
+}
+
+func (s *failAfter) Interrupts(ctx context.Context, id string, unapplied bool) ([]mem.Interrupt, error) {
+	if s.left.Add(-1) < 0 {
+		return nil, errors.New("disk on fire")
+	}
+	return s.Store.Interrupts(ctx, id, unapplied)
 }
 
 // failingInterrupts is a store whose interrupt reads fail.
